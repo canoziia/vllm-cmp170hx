@@ -105,13 +105,27 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-## Run with MTP, PP4, 1M context and NVMe PLE
+## Run the default production configuration without MTP
+
+The repository default is the final patched image with MTP disabled. PP4, V2,
+1M context, NVMe PLE, prefix caching, chunked prefill and structured outputs
+remain enabled.
 
 ```bash
-podman compose -f compose.yml config
-podman compose -f compose.yml up -d
+podman compose config
+podman compose up -d
 curl -H "Authorization: Bearer $VLLM_API_KEY" \
   http://127.0.0.1:18000/health
+```
+
+## Enable MTP
+
+The image always contains the MTP fixes. To enable native Qwen MTP, use the
+explicit MTP Compose file:
+
+```bash
+podman compose -f compose.mtp.yml config
+podman compose -f compose.mtp.yml up -d
 ```
 
 The production-tested MTP setting is deliberately one step:
@@ -122,20 +136,6 @@ The production-tested MTP setting is deliberately one step:
 
 The checkpoint has one MTP layer. Reusing it for more speculative steps is not
 the tested configuration and may reduce acceptance quality.
-
-## Run the same final image without MTP
-
-The image always contains the MTP fixes. MTP is enabled only by the command-line
-`--speculative-config` argument. The no-MTP Compose file simply omits it:
-
-```bash
-podman compose -f compose.no-mtp.yml config
-podman compose -f compose.no-mtp.yml up -d
-```
-
-All other major production settings remain enabled: PP4, V2, 1M context,
-`gpu-memory-utilization=0.95`, disk-backed PLE, prefix caching, chunked prefill,
-and structured outputs.
 
 ## PLE / n-gram disk offload
 
