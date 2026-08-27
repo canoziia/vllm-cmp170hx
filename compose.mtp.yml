@@ -1,13 +1,12 @@
 services:
   qwen38-flash-next:
-    # This is the same final image as compose.yml; MTP is disabled only by
-    # omitting --speculative-config.
     image: ${VLLM_IMAGE:-localhost/vllm-cmp170hx:qwen3.8-flash-next}
     container_name: qwen38-flash-next
     restart: unless-stopped
 
     devices:
       - nvidia.com/gpu=all
+
     shm_size: "16g"
 
     ports:
@@ -21,29 +20,46 @@ services:
       VLLM_WORKER_MULTIPROC_METHOD: spawn
       VLLM_USE_V2_MODEL_RUNNER: "1"
       VLLM_PP_LAYER_PARTITION: "12,12,12,12"
+
+      # Keep the 47.68-GiB PLE/n-gram table in the original safetensors files.
       VLLM_PLE_CPU_OFFLOAD: "1"
       VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/${QWEN_SNAPSHOT:-bcd9f01ddc9cff2316eb84281bebcd5b058bddce}
       VLLM_PLE_NVME_BACKEND: pread
       VLLM_PLE_NVME_PREAD_WORKERS: "8"
       SAFETENSORS_FAST_GPU: "0"
+
+      # Required because the requested length exceeds the native 262,144 tokens.
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
 
     command:
       - Qwen/Qwen3.8-Flash-Next-FP8
+
+      # Four PCIe-connected CMP 170HX cards: pipeline parallelism avoids TP all-reduce.
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
       - --distributed-executor-backend=mp
       - --language-model-only
+
+      # Qwen static YaRN: 262,144 x 4 ~= 1M tokens.
       - --max-model-len=1000000
       - '--hf-overrides={"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
+
+      # QSA storage is BF16. Explicit BF16 SSM state keeps target/draft page geometry equal.
       - --kv-cache-dtype=bfloat16
+      - --mamba-ssm-cache-dtype=bfloat16
       - --mamba-cache-mode=align
+
+      # Native one-layer Qwen MTP. One speculative token is the production-tested setting.
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
+
       - --api-key=${VLLM_API_KEY:-change-me}
       - --served-model-name=Qwen/Qwen3.8-Flash-Next-FP8
+
       - --enable-auto-tool-choice
       - --reasoning-parser=qwen3
       - --tool-call-parser=qwen3_coder
       - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true}'
+
       - --max-num-seqs=10
       - --max-num-batched-tokens=1024
       - --gpu-memory-utilization=0.95
