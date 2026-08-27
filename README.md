@@ -83,9 +83,22 @@ To inspect or apply the patches without building a container:
 
 See [`patches/README.md`](patches/README.md) for the functional split.
 
-## Configure
+## Model files
 
-Download `Qwen/Qwen3.8-Flash-Next-FP8`, then create the local environment file:
+Download `Qwen/Qwen3.8-Flash-Next-FP8` into the Hugging Face cache. The Compose
+files pass the explicit model ID `Qwen/Qwen3.8-Flash-Next-FP8` to vLLM and mount
+the cached repository at its standard Hugging Face hub path. `QWEN_MODEL_CACHE`
+points to the repository directory containing `snapshots/`, not to an individual
+safetensors file:
+
+```text
+/root/app/vllm/cache/huggingface/hub/
+└── models--Qwen--Qwen3.8-Flash-Next-FP8/
+    └── snapshots/
+        └── bcd9f01ddc9cff2316eb84281bebcd5b058bddce/
+```
+
+Copy and edit the example environment:
 
 ```bash
 cp .env.example .env
@@ -133,7 +146,19 @@ The checkpoint's PLE table is approximately 47.68 GiB:
 128 logical shards in 33 safetensors files
 ```
 
-The production Compose uses eight-worker `pread`; `mmap` is also supported.
+The following variables keep it in the original files and read only requested
+rows:
+
+```yaml
+VLLM_PLE_CPU_OFFLOAD: "1"
+VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/<snapshot>
+VLLM_PLE_NVME_BACKEND: pread
+VLLM_PLE_NVME_PREAD_WORKERS: "8"
+```
+
+Set `VLLM_PLE_NVME_BACKEND=mmap` to use the mmap backend. The production example
+uses eight-worker `pread` because it performed better for random row access on
+the tested host.
 
 The NVMe path currently requires TP=1 and DP=1. PP=4 is supported; only PP0 owns
 the PLE layer and offload connector.
