@@ -115,7 +115,7 @@ remain enabled.
 podman compose config
 podman compose up -d
 curl -H "Authorization: Bearer $VLLM_API_KEY" \
-  http://127.0.0.1:18000/health
+  http://127.0.0.1:8000/health
 ```
 
 ## Enable MTP
