@@ -72,7 +72,7 @@ The script performs these steps:
 2. Copies only the nine source files touched by the patch series.
 3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
 4. Applies `patches/*.patch` in lexical order.
-5. Verifies all ten final files against `manifests/final-v2-mtp-r9.sha256`.
+5. Verifies all ten final files against `manifests/final-qwen38-flash-next.sha256`.
 6. Builds a thin derived image containing only the patched Python files.
 
 To inspect or apply the patches without building a container:
