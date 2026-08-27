@@ -85,9 +85,11 @@ See [`patches/README.md`](patches/README.md) for the functional split.
 
 ## Model files
 
-Download `Qwen/Qwen3.8-Flash-Next-FP8` into the Hugging Face cache. The example
-mounts the repository directory (the directory containing `snapshots/`), not an
-individual safetensors file:
+Download `Qwen/Qwen3.8-Flash-Next-FP8` into the Hugging Face cache. The Compose
+files pass the explicit model ID `Qwen/Qwen3.8-Flash-Next-FP8` to vLLM and mount
+the cached repository at its standard Hugging Face hub path. `QWEN_MODEL_CACHE`
+points to the repository directory containing `snapshots/`, not to an individual
+safetensors file:
 
 ```text
 /root/app/vllm/cache/huggingface/hub/
@@ -149,7 +151,7 @@ rows:
 
 ```yaml
 VLLM_PLE_CPU_OFFLOAD: "1"
-VLLM_PLE_NVME_PATH: /models/qwen/snapshots/<snapshot>
+VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/<snapshot>
 VLLM_PLE_NVME_BACKEND: pread
 VLLM_PLE_NVME_PREAD_WORKERS: "8"
 ```
