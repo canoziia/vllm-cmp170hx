@@ -107,10 +107,10 @@ index 7cc35ed..171a955 100644
                      regular_weights.append((name, loaded_weight))
 diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
 new file mode 100644
-index 0000000..b08360e
+index 0000000..7acd5b7
 --- /dev/null
 +++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,328 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""mmap-backed FP8 PLE table for Qwen3.8-Flash-Next.
 +
@@ -123,6 +123,7 @@ index 0000000..b08360e
 +
 +from __future__ import annotations
 +
++import ctypes
 +import json
 +import mmap
 +import os
@@ -185,13 +186,49 @@ index 0000000..b08360e
 +            )
 +        self._fds: dict[Path, int] = {}
 +        self._pread_pool: ThreadPoolExecutor | None = None
++        self._native_pread: Any | None = None
++        self._pread_workers = max(
++            1, int(os.getenv("VLLM_PLE_NVME_PREAD_WORKERS", "48"))
++        )
++        self._shard_fds: np.ndarray | None = None
++        self._shard_row_starts: np.ndarray | None = None
++        self._shard_byte_offsets: np.ndarray | None = None
 +        if self._backend == "pread":
 +            paths = {shard.path for shard in self._shards}
 +            self._fds = {path: os.open(path, os.O_RDONLY) for path in paths}
-+            workers = max(1, int(os.getenv("VLLM_PLE_NVME_PREAD_WORKERS", "8")))
-+            self._pread_pool = ThreadPoolExecutor(
-+                max_workers=workers, thread_name_prefix="ple-pread"
++            self._shard_fds = np.asarray(
++                [self._fds[shard.path] for shard in self._shards], dtype=np.int32
 +            )
++            self._shard_row_starts = np.asarray(
++                [shard.row_start for shard in self._shards], dtype=np.int64
++            )
++            self._shard_byte_offsets = np.asarray(
++                [shard.byte_offset for shard in self._shards], dtype=np.int64
++            )
++            native_path = os.getenv(
++                "VLLM_PLE_NATIVE_PREAD_LIBRARY",
++                "/usr/local/lib/libvllm_ple_pread.so",
++            )
++            try:
++                native_library = ctypes.CDLL(native_path)
++                native_pread = native_library.ple_pread_rows
++                native_pread.argtypes = [
++                    ctypes.POINTER(ctypes.c_int),
++                    ctypes.POINTER(ctypes.c_int64),
++                    ctypes.c_void_p,
++                    ctypes.c_size_t,
++                    ctypes.c_size_t,
++                    ctypes.c_int,
++                ]
++                native_pread.restype = ctypes.c_int
++                self._native_pread = native_pread
++            except (OSError, AttributeError):
++                logger.warning(
++                    "PLE native pread helper unavailable; using Python fallback"
++                )
++                self._pread_pool = ThreadPoolExecutor(
++                    max_workers=self._pread_workers, thread_name_prefix="ple-pread"
++                )
 +        logger.info(
 +            "PLE %s table ready: %.2f GiB, rows=%d, dim=%d, shards=%d, files=%d",
 +            self._backend,
@@ -324,16 +361,44 @@ index 0000000..b08360e
 +        output_bytes = output.view(torch.uint8).numpy().reshape(-1, self.embedding_dim)
 +        shard_ids = np.searchsorted(self._row_ends, ids, side="right")
 +        if self._backend == "pread":
-+            assert self._pread_pool is not None
-+            locations = []
-+            for row, shard_id in zip(ids, shard_ids, strict=True):
-+                shard = self._shards[int(shard_id)]
-+                offset = shard.byte_offset + (int(row) - shard.row_start) * shard.row_bytes
-+                locations.append((self._fds[shard.path], shard.row_bytes, offset))
-+            rows = self._pread_pool.map(self._pread_one, locations)
-+            output_bytes[:] = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(
-+                -1, self.embedding_dim
-+            )
++            if self._native_pread is not None and ids.size:
++                assert self._shard_fds is not None
++                assert self._shard_row_starts is not None
++                assert self._shard_byte_offsets is not None
++                file_descriptors = np.ascontiguousarray(
++                    self._shard_fds[shard_ids], dtype=np.int32
++                )
++                offsets = np.ascontiguousarray(
++                    self._shard_byte_offsets[shard_ids]
++                    + (ids - self._shard_row_starts[shard_ids]) * self.embedding_dim,
++                    dtype=np.int64,
++                )
++                status = self._native_pread(
++                    file_descriptors.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
++                    offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
++                    ctypes.c_void_p(output.data_ptr()),
++                    ids.size,
++                    self.embedding_dim,
++                    self._pread_workers,
++                )
++                if status != 0:
++                    raise OSError(f"PLE native pread failed for {-status} row(s)")
++            elif ids.size:
++                assert self._pread_pool is not None
++                locations = []
++                for row, shard_id in zip(ids, shard_ids, strict=True):
++                    shard = self._shards[int(shard_id)]
++                    offset = (
++                        shard.byte_offset
++                        + (int(row) - shard.row_start) * shard.row_bytes
++                    )
++                    locations.append(
++                        (self._fds[shard.path], shard.row_bytes, offset)
++                    )
++                rows = self._pread_pool.map(self._pread_one, locations)
++                output_bytes[:] = np.frombuffer(
++                    b"".join(rows), dtype=np.uint8
++                ).reshape(-1, self.embedding_dim)
 +        else:
 +            for shard_id in np.unique(shard_ids):
 +                positions = np.nonzero(shard_ids == shard_id)[0]
@@ -357,6 +422,10 @@ index 0000000..b08360e
 +        for fd in self._fds.values():
 +            os.close(fd)
 +        self._fds.clear()
++        self._native_pread = None
++        self._shard_fds = None
++        self._shard_row_starts = None
++        self._shard_byte_offsets = None
 +        self._arrays.clear()
 +        for mapping in self._maps.values():
 +            mapping.close()
@@ -370,6 +439,74 @@ index 0000000..b08360e
 +            self.close()
 +        except Exception:
 +            pass
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 64b4474..f4c95b8 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -104,6 +104,8 @@ class PleOffloadConnector:
+         self._d2h_stream: torch.cuda.Stream | None = None
+         self._input_ready_event: torch.cuda.Event | None = None
+         self._d2h_done_event: torch.cuda.Event | None = None
++        self._reuse_ready_event: torch.cuda.Event | None = None
++        self._request_in_flight = False
+ 
+         try:
+             self._zmq_ctx = zmq.Context()
+@@ -120,6 +122,7 @@ class PleOffloadConnector:
+                         self._d2h_stream = torch.cuda.Stream(device=self.device)
+                         self._input_ready_event = torch.cuda.Event()
+                         self._d2h_done_event = torch.cuda.Event()
++                    self._reuse_ready_event = torch.cuda.Event()
+                 self._start_request_thread(ipc_addr)
+         except Exception:
+             self.close()
+@@ -376,6 +379,14 @@ class PleOffloadConnector:
+         if self.tp_rank != 0:
+             return
+ 
++        # The CPU worker owns one shared input/output slot per DP rank and
++        # drops duplicate pending requests. Wait until the previous forward has
++        # consumed its PLE output before publishing the next fixed-buffer input.
++        if self._request_in_flight:
++            assert self._reuse_ready_event is not None
++            self._reuse_ready_event.synchronize()
++            self._request_in_flight = False
++
+         if self._uses_cuda_inputs:
+             assert self._input_ready_event is not None
+             # The background copy stream waits for runner input production
+@@ -386,7 +397,11 @@ class PleOffloadConnector:
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
+         )
+-        self._request_queue.put_nowait(request)
++        try:
++            self._request_queue.put(request, timeout=10)
++        except queue.Full as error:
++            raise RuntimeError("Timed out queueing a PLE offload request") from error
++        self._request_in_flight = True
+ 
+     def prepare_forward(
+         self,
+@@ -416,6 +431,9 @@ class PleOffloadConnector:
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer.release_offloaded_output(stream)
++        if self.tp_rank == 0 and self._request_in_flight:
++            assert self._reuse_ready_event is not None
++            self._reuse_ready_event.record(stream)
+ 
+     def close(self) -> None:
+         """Stop request transport and release host registrations."""
+@@ -435,6 +453,8 @@ class PleOffloadConnector:
+         if self._pinned_input_buffers:
+             with torch.accelerator.device_index(self.device.index):
+                 self._unpin_input_buffers()
++        self._reuse_ready_event = None
++        self._request_in_flight = False
+         self._d2h_done_event = None
+         self._input_ready_event = None
+         self._d2h_stream = None
 diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
 index e86aeab..db6d4a7 100644
 --- a/vllm/v1/ple_offload/worker.py
@@ -459,74 +596,3 @@ index e86aeab..db6d4a7 100644
              if matched_checkpoint_tensors == 0:
                  raise RuntimeError(
                      "PLE offload checkpoint filter matched no weights for "
-
-
-
-diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
-index 64b4474..f4c95b8 100644
---- a/vllm/v1/ple_offload/connector.py
-+++ b/vllm/v1/ple_offload/connector.py
-@@ -104,6 +104,8 @@ class PleOffloadConnector:
-         self._d2h_stream: torch.cuda.Stream | None = None
-         self._input_ready_event: torch.cuda.Event | None = None
-         self._d2h_done_event: torch.cuda.Event | None = None
-+        self._reuse_ready_event: torch.cuda.Event | None = None
-+        self._request_in_flight = False
- 
-         try:
-             self._zmq_ctx = zmq.Context()
-@@ -120,6 +122,7 @@ class PleOffloadConnector:
-                         self._d2h_stream = torch.cuda.Stream(device=self.device)
-                         self._input_ready_event = torch.cuda.Event()
-                         self._d2h_done_event = torch.cuda.Event()
-+                    self._reuse_ready_event = torch.cuda.Event()
-                 self._start_request_thread(ipc_addr)
-         except Exception:
-             self.close()
-@@ -376,6 +379,14 @@ class PleOffloadConnector:
-         if self.tp_rank != 0:
-             return
- 
-+        # The CPU worker owns one shared input/output slot per DP rank and
-+        # drops duplicate pending requests. Wait until the previous forward has
-+        # consumed its PLE output before publishing the next fixed-buffer input.
-+        if self._request_in_flight:
-+            assert self._reuse_ready_event is not None
-+            self._reuse_ready_event.synchronize()
-+            self._request_in_flight = False
-+
-         if self._uses_cuda_inputs:
-             assert self._input_ready_event is not None
-             # The background copy stream waits for runner input production
-@@ -386,7 +397,11 @@ class PleOffloadConnector:
-             num_tokens=num_tokens,
-             num_reqs=num_reqs,
-         )
--        self._request_queue.put_nowait(request)
-+        try:
-+            self._request_queue.put(request, timeout=10)
-+        except queue.Full as error:
-+            raise RuntimeError("Timed out queueing a PLE offload request") from error
-+        self._request_in_flight = True
- 
-     def prepare_forward(
-         self,
-@@ -416,6 +431,9 @@ class PleOffloadConnector:
-         stream = torch.cuda.current_stream(self.device)
-         for layer in self._layers.values():
-             layer.release_offloaded_output(stream)
-+        if self.tp_rank == 0 and self._request_in_flight:
-+            assert self._reuse_ready_event is not None
-+            self._reuse_ready_event.record(stream)
- 
-     def close(self) -> None:
-         """Stop request transport and release host registrations."""
-@@ -435,6 +453,8 @@ class PleOffloadConnector:
-         if self._pinned_input_buffers:
-             with torch.accelerator.device_index(self.device.index):
-                 self._unpin_input_buffers()
-+        self._reuse_ready_event = None
-+        self._request_in_flight = False
-         self._d2h_done_event = None
-         self._input_ready_event = None
-         self._d2h_stream = None
