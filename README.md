@@ -190,6 +190,10 @@ These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal
 | Configuration | Result |
 | --- | ---: |
 | V2, no MTP, 256-token steady decode | 50.47 tok/s |
+| V2, no MTP, 32K high-entropy prefill before native PLE `pread` | 724.8 tok/s |
+| V2, no MTP, 32K high-entropy prefill after native PLE `pread` | 2,935 tok/s cold / 6,638 tok/s warm |
+| Native PLE random-row microbenchmark, 1,024-token batch | approximately 4,100–4,770 tok/s |
+| V2, no MTP, 16 concurrent independent requests | 3,061 aggregate prompt+output tok/s |
 | V2, MTP=1, steady decode run 1 | 61.91 tok/s |
 | V2, MTP=1, steady decode run 2 | 65.74 tok/s |
 | MTP acceptance in those runs | 62.0% / 64.1% |
