@@ -99,7 +99,6 @@ individual safetensors file:
 Copy and edit the example environment:
 
 ```bash
-cd examples
 cp .env.example .env
 $EDITOR .env
 ```
@@ -107,7 +106,6 @@ $EDITOR .env
 ## Run with MTP, PP4, 1M context and NVMe PLE
 
 ```bash
-cd examples
 podman compose -f compose.yml config
 podman compose -f compose.yml up -d
 curl -H "Authorization: Bearer $VLLM_API_KEY" \
@@ -126,10 +124,9 @@ the tested configuration and may reduce acceptance quality.
 ## Run the same final image without MTP
 
 The image always contains the MTP fixes. MTP is enabled only by the command-line
-`--speculative-config` argument. The no-MTP example simply omits it:
+`--speculative-config` argument. The no-MTP Compose file simply omits it:
 
 ```bash
-cd examples
 podman compose -f compose.no-mtp.yml config
 podman compose -f compose.no-mtp.yml up -d
 ```
@@ -166,7 +163,7 @@ the PLE layer and offload connector.
 
 ## Long context
 
-The checkpoint natively declares 262,144 positions. The Compose examples request
+The checkpoint natively declares 262,144 positions. The Compose files request
 approximately 1M using static YaRN:
 
 ```json

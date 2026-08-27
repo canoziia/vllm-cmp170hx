@@ -1,4 +1,4 @@
-examples/.env
+.env
 *.log
 *.tmp
 .DS_Store
