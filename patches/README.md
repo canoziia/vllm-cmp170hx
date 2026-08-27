@@ -15,6 +15,6 @@ The patches are applied in lexical order to files extracted from
 ## Integrity
 
 `manifests/base-qwen38-flash-next.sha256` pins every extracted source file before
-patching. `manifests/final-v2-mtp-r9.sha256` verifies the final patched output.
+patching. `manifests/final-qwen38-flash-next.sha256` verifies the final patched output.
 The build fails if the base image changes any pinned file or if a patch produces
 unexpected output.

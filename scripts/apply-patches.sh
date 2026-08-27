@@ -10,7 +10,7 @@ usage() {
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MANIFEST="$REPO_ROOT/manifests/base-qwen38-flash-next.sha256"
-FINAL_MANIFEST="$REPO_ROOT/manifests/final-v2-mtp-r9.sha256"
+FINAL_MANIFEST="$REPO_ROOT/manifests/final-qwen38-flash-next.sha256"
 
 [[ -d "$SOURCE_TREE/vllm" ]] || {
   echo "Missing $SOURCE_TREE/vllm" >&2
