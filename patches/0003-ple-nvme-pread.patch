@@ -1,0 +1,461 @@
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+index 7cc35ed..171a955 100644
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""GPU-resident Qwen3.8-Flash-Next position-learning enhancement layers."""
++"""Qwen3.8-Flash-Next position-learning enhancement layers."""
+ 
+ import math
++import os
+ from collections.abc import Iterable, Sequence
+ 
+ import torch
+@@ -53,6 +54,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+ from ..common.ple import copy_ple_embedding_shard_
++from .ple_nvme import MMapNGramEmbedding
+ 
+ _MASK64 = (1 << 64) - 1
+ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+@@ -279,16 +281,30 @@ class Qwen3_8FlashNextNGramEmbedding(PleOffloadLayer):
+         )
+         divisor = int(config.make_ngram_vocab_size_divisible_by)
+         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
+-        self.ngram_embedding = VocabParallelEmbedding(
+-            padded_vocab_size,
+-            self.head_dim,
+-            params_dtype=params_dtype,
+-            padding_size=divisor,
+-            prefix=f"{prefix}.ngram_embedding",
+-            quant_method=_get_ple_embedding_quant_method(
+-                quant_config, f"{prefix}.ngram_embedding"
+-            ),
+-        )
++        nvme_snapshot = os.getenv("VLLM_PLE_NVME_PATH", "").strip()
++        if nvme_snapshot:
++            if not envs.VLLM_PLE_CPU_OFFLOAD or not is_offload_process():
++                raise RuntimeError(
++                    "VLLM_PLE_NVME_PATH requires VLLM_PLE_CPU_OFFLOAD=1 and "
++                    "must be initialized by the dedicated PLE worker"
++                )
++            self.ngram_embedding = MMapNGramEmbedding(
++                nvme_snapshot,
++                expected_rows=padded_vocab_size,
++                embedding_dim=self.head_dim,
++                expected_shards=self.split_ngram_parts,
++            )
++        else:
++            self.ngram_embedding = VocabParallelEmbedding(
++                padded_vocab_size,
++                self.head_dim,
++                params_dtype=params_dtype,
++                padding_size=divisor,
++                prefix=f"{prefix}.ngram_embedding",
++                quant_method=_get_ple_embedding_quant_method(
++                    quant_config, f"{prefix}.ngram_embedding"
++                ),
++            )
+         self.register_buffer(
+             "positions_buffer",
+             torch.arange(max_total_tokens, dtype=torch.int64),
+@@ -428,18 +444,24 @@ class Qwen3_8FlashNextNGramEmbedding(PleOffloadLayer):
+         ngram_ids = torch.cat(id_blocks, dim=-1)
+         if output_buffer is not None:
+             output = output_buffer[:num_tokens, : self.embedding_dim]
+-            torch.index_select(
+-                self.ngram_embedding.weight,
+-                0,
+-                ngram_ids.reshape(-1),
+-                out=output.reshape(-1, self.head_dim),
+-            )
++            output_rows = output.reshape(-1, self.head_dim)
++            if isinstance(self.ngram_embedding, MMapNGramEmbedding):
++                self.ngram_embedding.gather(ngram_ids.reshape(-1), output_rows)
++            else:
++                torch.index_select(
++                    self.ngram_embedding.weight,
++                    0,
++                    ngram_ids.reshape(-1),
++                    out=output_rows,
++                )
+             return output
+         return self.ngram_embedding(ngram_ids).flatten(-2)
+ 
+     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
+         """Keep quantized lookup results in their embedding storage dtype."""
+         embedding = getattr(self, "ngram_embedding", None)
++        if isinstance(embedding, MMapNGramEmbedding):
++            return torch.float8_e4m3fn
+         weight = getattr(embedding, "weight", None)
+         if weight is not None:
+             return weight.dtype
+@@ -489,6 +511,11 @@ class Qwen3_8FlashNextNGramEmbedding(PleOffloadLayer):
+                 loaded.add(name)
+                 continue
+             if name.startswith(shard_prefix) and name.endswith(".weight"):
++                if isinstance(self.ngram_embedding, MMapNGramEmbedding):
++                    # The table remains in the original safetensors shards.
++                    # Mark the runtime table as satisfied without materializing it.
++                    loaded.add("ngram_embedding.weight")
++                    continue
+                 shard_text = name[len(shard_prefix) : -len(".weight")]
+                 if not shard_text.isdigit():
+                     regular_weights.append((name, loaded_weight))
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+new file mode 100644
+index 0000000..b08360e
+--- /dev/null
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++"""mmap-backed FP8 PLE table for Qwen3.8-Flash-Next.
++
++This correctness-first backend keeps the large n-gram table in its original
++sharded safetensors files and copies only selected rows into the PLE CPU
++worker's pinned output buffer. Linux page cache provides the first-stage cache;
++an io_uring/O_DIRECT backend can replace this reader after PP correctness is
++established.
++"""
++
++from __future__ import annotations
++
++import json
++import mmap
++import os
++import re
++import struct
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.weight$")
++
++
++@dataclass(frozen=True)
++class _Shard:
++    index: int
++    row_start: int
++    row_end: int
++    path: Path
++    byte_offset: int
++    row_bytes: int
++
++
++class MMapNGramEmbedding(nn.Module):
++    """FP8 E4M3 embedding table backed by safetensors mmap regions."""
++
++    def __init__(
++        self,
++        snapshot: str | os.PathLike[str],
++        *,
++        expected_rows: int,
++        embedding_dim: int,
++        expected_shards: int,
++    ) -> None:
++        super().__init__()
++        self.snapshot = Path(snapshot).resolve()
++        self.embedding_dim = int(embedding_dim)
++        self.org_vocab_size = int(expected_rows)
++        self.register_buffer(
++            "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
++        )
++        self._handles: dict[Path, Any] = {}
++        self._maps: dict[Path, mmap.mmap] = {}
++        self._arrays: dict[int, np.ndarray] = {}
++        self._shards = self._build_manifest(expected_shards)
++        self._row_ends = np.asarray([s.row_end for s in self._shards], dtype=np.int64)
++        self._backend = os.getenv("VLLM_PLE_NVME_BACKEND", "pread").strip().lower()
++        if self._backend not in {"pread", "mmap"}:
++            raise ValueError(
++                f"unsupported VLLM_PLE_NVME_BACKEND={self._backend!r}; "
++                "expected 'pread' or 'mmap'"
++            )
++        self._fds: dict[Path, int] = {}
++        self._pread_pool: ThreadPoolExecutor | None = None
++        if self._backend == "pread":
++            paths = {shard.path for shard in self._shards}
++            self._fds = {path: os.open(path, os.O_RDONLY) for path in paths}
++            workers = max(1, int(os.getenv("VLLM_PLE_NVME_PREAD_WORKERS", "8")))
++            self._pread_pool = ThreadPoolExecutor(
++                max_workers=workers, thread_name_prefix="ple-pread"
++            )
++        logger.info(
++            "PLE %s table ready: %.2f GiB, rows=%d, dim=%d, shards=%d, files=%d",
++            self._backend,
++            self.org_vocab_size * self.embedding_dim / (1024**3),
++            self.org_vocab_size,
++            self.embedding_dim,
++            len(self._shards),
++            len({s.path for s in self._shards}),
++        )
++
++    @staticmethod
++    def _read_header(path: Path) -> tuple[int, dict[str, Any]]:
++        with path.open("rb") as handle:
++            header_len_raw = handle.read(8)
++            if len(header_len_raw) != 8:
++                raise ValueError(f"short safetensors header in {path}")
++            header_len = struct.unpack("<Q", header_len_raw)[0]
++            if header_len <= 0 or header_len > 128 * 1024 * 1024:
++                raise ValueError(f"invalid safetensors header length {header_len} in {path}")
++            header = json.loads(handle.read(header_len))
++        return 8 + header_len, header
++
++    def _build_manifest(self, expected_shards: int) -> tuple[_Shard, ...]:
++        index_path = self.snapshot / "model.safetensors.index.json"
++        with index_path.open() as handle:
++            weight_map = json.load(handle)["weight_map"]
++
++        matches: list[tuple[int, str, str]] = []
++        for name, filename in weight_map.items():
++            match = _SHARD_RE.search(name)
++            if match:
++                matches.append((int(match.group(1)), name, filename))
++        matches.sort()
++        if len(matches) != expected_shards:
++            raise ValueError(
++                f"expected {expected_shards} PLE shards, found {len(matches)} in {index_path}"
++            )
++        if [x[0] for x in matches] != list(range(expected_shards)):
++            raise ValueError("PLE shard indices are not contiguous")
++
++        header_cache: dict[Path, tuple[int, dict[str, Any]]] = {}
++        records: list[tuple[int, Path, int, int, int]] = []
++        for shard_index, name, filename in matches:
++            path = (self.snapshot / filename).resolve()
++            if not path.is_file():
++                raise FileNotFoundError(path)
++            data_start, header = header_cache.setdefault(path, self._read_header(path))
++            metadata = header.get(name)
++            if metadata is None:
++                raise ValueError(f"{name!r} missing from {path}")
++            if metadata.get("dtype") != "F8_E4M3":
++                raise ValueError(
++                    f"NVMe PLE requires F8_E4M3, got {metadata.get('dtype')} for {name}"
++                )
++            shape = tuple(int(x) for x in metadata["shape"])
++            if len(shape) != 2 or shape[1] != self.embedding_dim:
++                raise ValueError(
++                    f"invalid PLE shard shape {shape}; expected (*, {self.embedding_dim})"
++                )
++            begin, end = (int(x) for x in metadata["data_offsets"])
++            expected_bytes = shape[0] * self.embedding_dim
++            if end - begin != expected_bytes:
++                raise ValueError(f"invalid byte length for {name}")
++            records.append(
++                (shard_index, path, data_start + begin, shape[0], self.embedding_dim)
++            )
++
++        row_start = 0
++        shards: list[_Shard] = []
++        for shard_index, path, byte_offset, rows, row_bytes in records:
++            shards.append(
++                _Shard(
++                    index=shard_index,
++                    row_start=row_start,
++                    row_end=row_start + rows,
++                    path=path,
++                    byte_offset=byte_offset,
++                    row_bytes=row_bytes,
++                )
++            )
++            row_start += rows
++        if row_start != self.org_vocab_size:
++            raise ValueError(
++                f"PLE snapshot has {row_start} rows; expected {self.org_vocab_size}"
++            )
++        return tuple(shards)
++
++    def _array(self, shard: _Shard) -> np.ndarray:
++        array = self._arrays.get(shard.index)
++        if array is not None:
++            return array
++        mapping = self._maps.get(shard.path)
++        if mapping is None:
++            handle = shard.path.open("rb")
++            mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
++            self._handles[shard.path] = handle
++            self._maps[shard.path] = mapping
++        array = np.ndarray(
++            (shard.row_end - shard.row_start, shard.row_bytes),
++            dtype=np.uint8,
++            buffer=mapping,
++            offset=shard.byte_offset,
++        )
++        self._arrays[shard.index] = array
++        return array
++
++    @staticmethod
++    def _pread_one(location: tuple[int, int, int]) -> bytes:
++        fd, nbytes, offset = location
++        data = os.pread(fd, nbytes, offset)
++        if len(data) != nbytes:
++            raise OSError(
++                f"short PLE pread at offset {offset}: {len(data)} != {nbytes}"
++            )
++        return data
++
++    @torch.inference_mode()
++    def gather(self, indices: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
++        """Copy selected FP8 rows byte-for-byte into a CPU float8 tensor."""
++        if indices.device.type != "cpu" or out.device.type != "cpu":
++            raise ValueError("PLE disk gather requires CPU tensors")
++        if out.dtype != torch.float8_e4m3fn:
++            raise ValueError(f"PLE mmap output must be FP8 E4M3, got {out.dtype}")
++        ids = indices.reshape(-1).to(torch.int64).numpy()
++        if ids.size and (ids.min() < 0 or ids.max() >= self.org_vocab_size):
++            raise IndexError("PLE row id outside mmap table")
++        output = out.reshape(-1, self.embedding_dim)
++        if output.shape[0] != ids.size:
++            raise ValueError("PLE mmap output shape does not match indices")
++        output_bytes = output.view(torch.uint8).numpy().reshape(-1, self.embedding_dim)
++        shard_ids = np.searchsorted(self._row_ends, ids, side="right")
++        if self._backend == "pread":
++            assert self._pread_pool is not None
++            locations = []
++            for row, shard_id in zip(ids, shard_ids, strict=True):
++                shard = self._shards[int(shard_id)]
++                offset = shard.byte_offset + (int(row) - shard.row_start) * shard.row_bytes
++                locations.append((self._fds[shard.path], shard.row_bytes, offset))
++            rows = self._pread_pool.map(self._pread_one, locations)
++            output_bytes[:] = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(
++                -1, self.embedding_dim
++            )
++        else:
++            for shard_id in np.unique(shard_ids):
++                positions = np.nonzero(shard_ids == shard_id)[0]
++                shard = self._shards[int(shard_id)]
++                local_ids = ids[positions] - shard.row_start
++                output_bytes[positions] = self._array(shard)[local_ids]
++        return out
++
++    def forward(self, indices: torch.Tensor) -> torch.Tensor:
++        output = torch.empty(
++            (*indices.shape, self.embedding_dim),
++            dtype=torch.float8_e4m3fn,
++            device="cpu",
++        )
++        return self.gather(indices, output)
++
++    def close(self) -> None:
++        pool, self._pread_pool = self._pread_pool, None
++        if pool is not None:
++            pool.shutdown(wait=True)
++        for fd in self._fds.values():
++            os.close(fd)
++        self._fds.clear()
++        self._arrays.clear()
++        for mapping in self._maps.values():
++            mapping.close()
++        for handle in self._handles.values():
++            handle.close()
++        self._maps.clear()
++        self._handles.clear()
++
++    def __del__(self) -> None:
++        try:
++            self.close()
++        except Exception:
++            pass
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index e86aeab..db6d4a7 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -20,7 +20,9 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
+ """
+ 
+ import contextlib
++import json
+ import multiprocessing.process
++import os
+ import pickle
+ import signal
+ import tempfile
+@@ -28,6 +30,7 @@ import threading
+ from collections.abc import Iterable
+ from dataclasses import dataclass
+ from multiprocessing.connection import Connection
++from pathlib import Path
+ from typing import Any, cast
+ 
+ import msgspec
+@@ -280,8 +283,15 @@ class PleOffloadWorker:
+ 
+             # Model components read the active VllmConfig while the meta model
+             # is constructed, so keep the context around runner initialization.
+-            with set_current_vllm_config(vllm_config):
+-                runner = PleOffloadRunner(vllm_config)
++            # This subprocess intentionally owns an isolated PP1 world. Do not
++            # let the main PP4 layer-partition override leak into make_layers().
++            pp_partition = os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
++            try:
++                with set_current_vllm_config(vllm_config):
++                    runner = PleOffloadRunner(vllm_config)
++            finally:
++                if pp_partition is not None:
++                    os.environ["VLLM_PP_LAYER_PARTITION"] = pp_partition
+ 
+             zmq_context = zmq.Context()
+             pull_socket = zmq_context.socket(zmq.PULL)
+@@ -420,8 +430,46 @@ class PleOffloadRunner:
+             for layer in offload_layers.values():
+                 initialize_dummy_weights(layer, model_config)
+         elif isinstance(loader, DefaultModelLoader):
+-            all_weights = loader.get_all_weights(model_config, model)
+-            loaded_params = model.load_weights(offload_only_iter(all_weights))
++            nvme_snapshot = os.getenv("VLLM_PLE_NVME_PATH", "").strip()
++            if nvme_snapshot:
++                # The 47.68-GiB table remains in safetensors and is served by
++                # MMapNGramEmbedding. Load only the four small PLE metadata/
++                # scale tensors instead of making this subprocess enumerate
++                # every tensor in the 172.8-GiB checkpoint.
++                from safetensors import safe_open
++
++                snapshot = Path(nvme_snapshot)
++                index_path = snapshot / "model.safetensors.index.json"
++                with index_path.open() as handle:
++                    weight_map = json.load(handle)["weight_map"]
++                selected = {
++                    name: filename
++                    for name, filename in weight_map.items()
++                    if ".ple.ple_embedding." in name
++                    and ".ngram_embedding.shard_" not in name
++                }
++                if not selected:
++                    raise RuntimeError(
++                        f"No non-shard PLE metadata tensors found in {index_path}"
++                    )
++
++                def nvme_metadata_iter() -> Iterable[tuple[str, torch.Tensor]]:
++                    nonlocal matched_checkpoint_tensors
++                    by_file: dict[str, list[str]] = {}
++                    for name, filename in selected.items():
++                        by_file.setdefault(filename, []).append(name)
++                    for filename, names in by_file.items():
++                        with safe_open(
++                            snapshot / filename, framework="pt", device="cpu"
++                        ) as tensors:
++                            for name in names:
++                                matched_checkpoint_tensors += 1
++                                yield name, tensors.get_tensor(name)
++
++                loaded_params = model.load_weights(nvme_metadata_iter())
++            else:
++                all_weights = loader.get_all_weights(model_config, model)
++                loaded_params = model.load_weights(offload_only_iter(all_weights))
+             if matched_checkpoint_tensors == 0:
+                 raise RuntimeError(
+                     "PLE offload checkpoint filter matched no weights for "

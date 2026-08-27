@@ -1,0 +1,77 @@
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/model.py b/vllm/models/qwen3_8_flash_next/nvidia/model.py
+index 736fe73..a9b32ba 100644
+--- a/vllm/models/qwen3_8_flash_next/nvidia/model.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/model.py
+@@ -54,10 +54,12 @@ from vllm.model_executor.models.qwen3_vl import (
+ )
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
++    PPMissingLayer,
+     StageMissingLayer,
+     WeightsMapper,
+     _merge_multimodal_embeddings,
+     extract_layer_index,
++    is_pp_missing_parameter,
+     make_empty_intermediate_tensors_factory,
+     make_layers,
+     maybe_fuse_shared_experts,
+@@ -402,7 +404,12 @@ class Qwen3_8FlashNextModel(nn.Module):
+             if layer_type == "full_attention"
+             and getattr(config, "indexer_n_heads", None) is not None
+         )
+-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
++        if get_pp_group().is_first_rank:
++            self.embed_tokens = VocabParallelEmbedding(
++                self.vocab_size, config.hidden_size
++            )
++        else:
++            self.embed_tokens = PPMissingLayer()
+ 
+         def get_layer(prefix: str) -> Qwen3_8FlashNextDecoderLayer:
+             layer_idx = extract_layer_index(prefix)
+@@ -549,6 +556,12 @@ class Qwen3_8FlashNextModel(nn.Module):
+         return sample_hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        # The initial Qwen3.8 branch implemented PP forward boundaries but did
++        # not filter checkpoint entries owned by other stages. Real loading
++        # therefore failed on final-mixer weights at PP0 and on missing layers
++        # elsewhere (dummy loading cannot expose this). Filter against this
++        # stage's PPMissingLayer tree before delegating to AutoWeightsLoader.
++        is_last_rank = get_pp_group().is_last_rank
+         weights = (
+             (
+                 _remap_qsa_cache_scale_name(name, self._qsa_layer_ids),
+@@ -556,6 +569,12 @@ class Qwen3_8FlashNextModel(nn.Module):
+             )
+             for name, weight in weights
+         )
++        weights = (
++            (name, weight)
++            for name, weight in weights
++            if not is_pp_missing_parameter(name, self)
++            and (is_last_rank or not name.startswith("hyper_connection_mixer."))
++        )
+         weights = maybe_fuse_shared_experts(
+             weights,
+             n_routed_experts=getattr(self.config, "num_experts", 0) or 0,
+@@ -622,11 +641,14 @@ class Qwen3_8FlashNextForCausalLM(
+         self.model = Qwen3_8FlashNextModel(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+-        self.lm_head = ParallelLMHead(
+-            config.vocab_size,
+-            config.hidden_size,
+-            prefix=maybe_prefix(prefix, "lm_head"),
+-        )
++        if get_pp_group().is_last_rank:
++            self.lm_head = ParallelLMHead(
++                config.vocab_size,
++                config.hidden_size,
++                prefix=maybe_prefix(prefix, "lm_head"),
++            )
++        else:
++            self.lm_head = PPMissingLayer()
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
