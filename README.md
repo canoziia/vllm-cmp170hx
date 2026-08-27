@@ -69,10 +69,10 @@ OUTPUT_IMAGE=localhost/vllm-cmp170hx:qwen3.8-flash-next \
 The script performs these steps:
 
 1. Creates a stopped container from the official Qwen image.
-2. Copies only the nine source files touched by the patch series.
+2. Copies only the ten source files touched by the patch series.
 3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
 4. Applies `patches/*.patch` in lexical order.
-5. Verifies all ten final files against `manifests/final-qwen38-flash-next.sha256`.
+5. Verifies all eleven final files against `manifests/final-qwen38-flash-next.sha256`.
 6. Builds a thin derived image containing only the patched Python files.
 
 To inspect or apply the patches without building a container:
@@ -203,9 +203,9 @@ performance measurement.
 
 ## Patch boundaries
 
-The final image replaces ten files:
+The final image replaces eleven files:
 
-- Seven files for Qwen PP ownership and PLE NVMe offload.
+- Eight files for Qwen PP ownership and PLE NVMe offload.
 - Three files for Qwen MTP and V2 PP speculative feedback.
 
 It does **not** include the discarded profiling kernels, Humming experiments,

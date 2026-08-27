@@ -46,6 +46,7 @@ COPY vllm/models/qwen3_8_flash_next/nvidia/model.py $INSTALL_ROOT/vllm/models/qw
 COPY vllm/models/qwen3_8_flash_next/nvidia/model_state.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/model_state.py
 COPY vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
 COPY vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+COPY vllm/v1/ple_offload/connector.py $INSTALL_ROOT/vllm/v1/ple_offload/connector.py
 COPY vllm/v1/ple_offload/worker.py $INSTALL_ROOT/vllm/v1/ple_offload/worker.py
 COPY vllm/v1/worker/gpu_worker.py $INSTALL_ROOT/vllm/v1/worker/gpu_worker.py
 COPY vllm/v1/worker/gpu_model_runner.py $INSTALL_ROOT/vllm/v1/worker/gpu_model_runner.py
