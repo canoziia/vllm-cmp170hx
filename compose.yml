@@ -1,6 +1,5 @@
 services:
   qwen38-flash-next:
-    # Default production profile: final patched image with MTP disabled.
     image: ${VLLM_IMAGE:-localhost/vllm-cmp170hx:qwen3.8-flash-next}
     container_name: qwen38-flash-next
     restart: unless-stopped
