@@ -459,3 +459,74 @@ index e86aeab..db6d4a7 100644
              if matched_checkpoint_tensors == 0:
                  raise RuntimeError(
                      "PLE offload checkpoint filter matched no weights for "
+
+
+
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index 64b4474..f4c95b8 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -104,6 +104,8 @@ class PleOffloadConnector:
+         self._d2h_stream: torch.cuda.Stream | None = None
+         self._input_ready_event: torch.cuda.Event | None = None
+         self._d2h_done_event: torch.cuda.Event | None = None
++        self._reuse_ready_event: torch.cuda.Event | None = None
++        self._request_in_flight = False
+ 
+         try:
+             self._zmq_ctx = zmq.Context()
+@@ -120,6 +122,7 @@ class PleOffloadConnector:
+                         self._d2h_stream = torch.cuda.Stream(device=self.device)
+                         self._input_ready_event = torch.cuda.Event()
+                         self._d2h_done_event = torch.cuda.Event()
++                    self._reuse_ready_event = torch.cuda.Event()
+                 self._start_request_thread(ipc_addr)
+         except Exception:
+             self.close()
+@@ -376,6 +379,14 @@ class PleOffloadConnector:
+         if self.tp_rank != 0:
+             return
+ 
++        # The CPU worker owns one shared input/output slot per DP rank and
++        # drops duplicate pending requests. Wait until the previous forward has
++        # consumed its PLE output before publishing the next fixed-buffer input.
++        if self._request_in_flight:
++            assert self._reuse_ready_event is not None
++            self._reuse_ready_event.synchronize()
++            self._request_in_flight = False
++
+         if self._uses_cuda_inputs:
+             assert self._input_ready_event is not None
+             # The background copy stream waits for runner input production
+@@ -386,7 +397,11 @@ class PleOffloadConnector:
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
+         )
+-        self._request_queue.put_nowait(request)
++        try:
++            self._request_queue.put(request, timeout=10)
++        except queue.Full as error:
++            raise RuntimeError("Timed out queueing a PLE offload request") from error
++        self._request_in_flight = True
+ 
+     def prepare_forward(
+         self,
+@@ -416,6 +431,9 @@ class PleOffloadConnector:
+         stream = torch.cuda.current_stream(self.device)
+         for layer in self._layers.values():
+             layer.release_offloaded_output(stream)
++        if self.tp_rank == 0 and self._request_in_flight:
++            assert self._reuse_ready_event is not None
++            self._reuse_ready_event.record(stream)
+ 
+     def close(self) -> None:
+         """Stop request transport and release host registrations."""
+@@ -435,6 +453,8 @@ class PleOffloadConnector:
+         if self._pinned_input_buffers:
+             with torch.accelerator.device_index(self.device.index):
+                 self._unpin_input_buffers()
++        self._reuse_ready_event = None
++        self._request_in_flight = False
+         self._d2h_done_event = None
+         self._input_ready_event = None
+         self._d2h_stream = None
