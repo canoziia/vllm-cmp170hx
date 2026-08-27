@@ -18,7 +18,7 @@ services:
       VLLM_PLE_CPU_OFFLOAD: "1"
       VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/${QWEN_SNAPSHOT:-bcd9f01ddc9cff2316eb84281bebcd5b058bddce}
       VLLM_PLE_NVME_BACKEND: pread
-      VLLM_PLE_NVME_PREAD_WORKERS: "8"
+      VLLM_PLE_NVME_PREAD_WORKERS: "48"
       SAFETENSORS_FAST_GPU: "0"
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
     command:
@@ -39,8 +39,8 @@ services:
       - --reasoning-parser=qwen3
       - --tool-call-parser=qwen3_coder
       - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true}'
-      - --max-num-seqs=10
-      - --max-num-batched-tokens=1024
+      - --max-num-seqs=16
+      - --max-num-batched-tokens=8192
       - --gpu-memory-utilization=0.95
       - --long-prefill-token-threshold=0
       - --enable-chunked-prefill

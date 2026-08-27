@@ -27,7 +27,7 @@ patches; model weights remain in the original Hugging Face safetensors snapshot.
 - 1,000,000-token context using Qwen static YaRN (`factor=4`).
 - BF16 QSA KV cache and BF16 GDN recurrent state for target/draft geometry parity.
 - The 47.68-GiB PLE/n-gram embedding stays in the original safetensors files.
-- Eight-worker parallel `pread` row access; `mmap` remains available for comparison.
+- Native parallel `pread` row access directly into the FP8 output buffer; `mmap` and a pure-Python fallback remain available.
 - Prefix caching, chunked prefill, xgrammar structured outputs, reasoning and tool parsers.
 - Marlin FP8 MoE on SM80/CMP 170HX; no additional lossy weight or activation conversion.
 
@@ -73,7 +73,7 @@ The script performs these steps:
 3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
 4. Applies `patches/*.patch` in lexical order.
 5. Verifies all eleven final files against `manifests/final-qwen38-flash-next.sha256`.
-6. Builds a thin derived image containing only the patched Python files.
+6. Builds a thin derived image containing the patched Python files and the small native PLE `pread` helper.
 
 To inspect or apply the patches without building a container:
 

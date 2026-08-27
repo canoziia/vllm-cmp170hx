@@ -27,7 +27,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$WORKDIR/context"
+mkdir -p "$WORKDIR/context/native"
+cp "$REPO_ROOT/native/ple_pread.c" "$WORKDIR/context/native/ple_pread.c"
 CID=$("$ENGINE" create "$BASE_IMAGE" /bin/true)
 
 while read -r _hash relpath; do
@@ -42,6 +43,8 @@ CID=""
 
 cat >"$WORKDIR/context/Containerfile" <<CONTAINERFILE
 FROM $BASE_IMAGE
+COPY native/ple_pread.c /tmp/ple_pread.c
+RUN gcc -O3 -fopenmp -shared -fPIC -o /usr/local/lib/libvllm_ple_pread.so /tmp/ple_pread.c && rm /tmp/ple_pread.c
 COPY vllm/models/qwen3_8_flash_next/nvidia/model.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/model.py
 COPY vllm/models/qwen3_8_flash_next/nvidia/model_state.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/model_state.py
 COPY vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
