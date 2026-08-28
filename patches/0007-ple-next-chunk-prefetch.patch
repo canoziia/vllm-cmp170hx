@@ -1,0 +1,412 @@
+diff --git a/vllm/v1/ple_offload/connector.py b/vllm/v1/ple_offload/connector.py
+index f4c95b8..b995aa4 100644
+--- a/vllm/v1/ple_offload/connector.py
++++ b/vllm/v1/ple_offload/connector.py
+@@ -24,6 +24,7 @@ from vllm.model_executor.layers.ple_offload_layer import (
+ from vllm.v1.ple_offload.protocol import (
+     PleOffloadRegistration,
+     PleOffloadRequest,
++    PlePrefetch,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -372,6 +373,7 @@ class PleOffloadConnector:
+         self,
+         num_reqs: int,
+         num_tokens: int,
++        prefetch: PlePrefetch | None,
+     ) -> None:
+         """Queue one batch while keeping staging off the model thread."""
+         # Inputs are replicated across TP ranks. One request per DP rank drives
+@@ -396,6 +398,7 @@ class PleOffloadConnector:
+             dp_rank=self.dp_rank,
+             num_tokens=num_tokens,
+             num_reqs=num_reqs,
++            prefetch=prefetch,
+         )
+         try:
+             self._request_queue.put(request, timeout=10)
+@@ -408,12 +411,13 @@ class PleOffloadConnector:
+         num_reqs: int,
+         num_tokens: int,
+         dummy_run: bool,
++        prefetch: PlePrefetch | None = None,
+     ) -> None:
+         """Submit real inputs or satisfy the PLE wait for a dummy forward."""
+         if dummy_run:
+             self.signal_dummy_outputs(num_tokens)
+             return
+-        self._launch(num_reqs, num_tokens)
++        self._launch(num_reqs, num_tokens, prefetch)
+ 
+     def signal_dummy_outputs(self, num_tokens: int) -> None:
+         """Locally satisfy PLE waits for dummy and capture forwards."""
+diff --git a/vllm/v1/ple_offload/protocol.py b/vllm/v1/ple_offload/protocol.py
+index e8c0cca..c7be236 100644
+--- a/vllm/v1/ple_offload/protocol.py
++++ b/vllm/v1/ple_offload/protocol.py
+@@ -28,6 +28,18 @@ class PleOffloadRegistration:
+     ngram_context_buf: torch.Tensor | None
+ 
+ 
++@dataclass
++class PlePrefetch:
++    """Current batch identity and its predicted next prefill segments."""
++
++    req_ids: list[str]
++    req_starts: list[int]
++    next_req_ids: list[str]
++    next_starts: list[int]
++    next_token_ids: list[list[int]]
++    next_ngram_contexts: list[list[int]]
++
++
+ @dataclass
+ class PleOffloadRequest:
+     """Sent by each DP rank's TP rank zero at every inference step."""
+@@ -35,6 +47,7 @@ class PleOffloadRequest:
+     dp_rank: int
+     num_tokens: int
+     num_reqs: int
++    prefetch: PlePrefetch | None = None
+ 
+ 
+ _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
+diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
+index db6d4a7..a7a31d2 100644
+--- a/vllm/v1/ple_offload/worker.py
++++ b/vllm/v1/ple_offload/worker.py
+@@ -349,6 +349,16 @@ class PleOffloadRunner:
+         self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
+         # Shared-memory inputs are registered once per DP rank by TP rank zero.
+         self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
++        self._prefetch_enabled = os.getenv(
++            "VLLM_PLE_NEXT_CHUNK_PREFETCH", "0"
++        ) == "1"
++        self._prefetch_verify = os.getenv(
++            "VLLM_PLE_NEXT_CHUNK_VERIFY", "0"
++        ) == "1"
++        self._prefetch_bufs: dict[int, dict[str, torch.Tensor]] = {}
++        self._prefetch_keys: dict[tuple[int, str], tuple[Any, ...]] = {}
++        self._prefetch_hits = 0
++        self._prefetch_misses = 0
+         self._load_weights()
+ 
+     @property
+@@ -606,6 +616,7 @@ class PleOffloadRunner:
+         embedding_dim = int(config.ple_embed_dim)
+         for dp_rank, layer_targets in self._worker_targets.items():
+             self._pinned_bufs[dp_rank] = {}
++            self._prefetch_bufs[dp_rank] = {}
+             for layer_name, targets in layer_targets.items():
+                 if len(targets) != tp_size:
+                     raise RuntimeError(
+@@ -613,19 +624,29 @@ class PleOffloadRunner:
+                         f"{len(targets)} targets, expected {tp_size}"
+                     )
+                 targets.sort(key=lambda target: target.tp_rank)
++                output_dtype = self._layers[layer_name].get_offload_output_dtype(
++                    self.vllm_config.model_config.dtype
++                )
+                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(
+                     max_tokens,
+                     embedding_dim,
+-                    dtype=self._layers[layer_name].get_offload_output_dtype(
+-                        self.vllm_config.model_config.dtype
+-                    ),
++                    dtype=output_dtype,
+                     pin_memory=True,
+                 )
++                if self._prefetch_enabled:
++                    self._prefetch_bufs[dp_rank][layer_name] = torch.empty(
++                        max_tokens,
++                        embedding_dim,
++                        dtype=output_dtype,
++                        pin_memory=True,
++                    )
+         logger.info(
+-            "Registrations complete (dp_size=%d, tp_size=%d, layers=%s).",
++            "Registrations complete (dp_size=%d, tp_size=%d, layers=%s, "
++            "next_chunk_prefetch=%s).",
+             dp_size,
+             tp_size,
+             sorted(self.layer_names),
++            self._prefetch_enabled,
+         )
+ 
+     @torch.inference_mode()
+@@ -658,6 +679,55 @@ class PleOffloadRunner:
+ 
+             self._handle_requests(requests)
+ 
++    @staticmethod
++    def _request_key(
++        request: PleOffloadRequest,
++        input_bufs: PleOffloadInputBuffers,
++        ngram_context: torch.Tensor,
++    ) -> tuple[Any, ...] | None:
++        metadata = request.prefetch
++        if metadata is None or not (
++            len(metadata.req_ids) == len(metadata.req_starts) == request.num_reqs
++        ):
++            return None
++        query_starts = input_bufs.query_start_loc_buf[: request.num_reqs + 1]
++        records = []
++        for index, (req_id, absolute_start) in enumerate(
++            zip(metadata.req_ids, metadata.req_starts, strict=True)
++        ):
++            begin = int(query_starts[index].item())
++            end = int(query_starts[index + 1].item())
++            records.append(
++                (
++                    req_id,
++                    absolute_start,
++                    tuple(input_bufs.input_ids_buf[begin:end].tolist()),
++                    tuple(ngram_context[index].tolist()),
++                )
++            )
++        return request.num_tokens, tuple(records)
++
++    @staticmethod
++    def _prefetch_key(request: PleOffloadRequest) -> tuple[Any, ...] | None:
++        metadata = request.prefetch
++        if metadata is None or not metadata.next_req_ids or not (
++            len(metadata.next_req_ids)
++            == len(metadata.next_starts)
++            == len(metadata.next_token_ids)
++            == len(metadata.next_ngram_contexts)
++        ):
++            return None
++        return request.num_tokens, tuple(
++            (req_id, start, tuple(tokens), tuple(context))
++            for req_id, start, tokens, context in zip(
++                metadata.next_req_ids,
++                metadata.next_starts,
++                metadata.next_token_ids,
++                metadata.next_ngram_contexts,
++                strict=True,
++            )
++        )
++
+     def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
+         """Run requests layer-first so each DP rank can resume promptly."""
+         requests_by_dp: dict[int, PleOffloadRequest] = {}
+@@ -701,13 +771,41 @@ class PleOffloadRunner:
+                     if input_bufs.ngram_context_buf is not None
+                     else None
+                 )
+-                result = layer.forward_impl(
+-                    input_bufs.input_ids_buf[: request.num_tokens],
+-                    input_bufs.input_ids_buf[: request.num_tokens],
+-                    input_bufs.query_start_loc_buf[: request.num_reqs + 1],
+-                    ngram_context,
+-                    output_buffer=self._pinned_bufs[dp_rank][layer_name],
++                cache_slot = (dp_rank, layer_name)
++                current_key = self._request_key(request, input_bufs, ngram_context)
++                cache_hit = (
++                    self._prefetch_enabled
++                    and current_key is not None
++                    and self._prefetch_keys.get(cache_slot) == current_key
+                 )
++                if cache_hit:
++                    result = self._prefetch_bufs[dp_rank][layer_name][
++                        : request.num_tokens
++                    ]
++                    if self._prefetch_verify:
++                        expected = layer.forward_impl(
++                            input_bufs.input_ids_buf[: request.num_tokens],
++                            input_bufs.input_ids_buf[: request.num_tokens],
++                            input_bufs.query_start_loc_buf[: request.num_reqs + 1],
++                            ngram_context,
++                            output_buffer=self._pinned_bufs[dp_rank][layer_name],
++                        )
++                        if not torch.equal(result, expected):
++                            raise RuntimeError(
++                                "PLE next-chunk prefetch byte verification failed"
++                            )
++                    self._prefetch_hits += 1
++                else:
++                    result = layer.forward_impl(
++                        input_bufs.input_ids_buf[: request.num_tokens],
++                        input_bufs.input_ids_buf[: request.num_tokens],
++                        input_bufs.query_start_loc_buf[: request.num_reqs + 1],
++                        ngram_context,
++                        output_buffer=self._pinned_bufs[dp_rank][layer_name],
++                    )
++                    if self._prefetch_enabled:
++                        self._prefetch_misses += 1
++                self._prefetch_keys.pop(cache_slot, None)
+ 
+                 # The result is identical on every TP rank in this DP group.
+                 # Each copy stream signals only after its DMA completes.
+@@ -718,3 +816,54 @@ class PleOffloadRunner:
+                             result[slices], non_blocking=True
+                         )
+                         target.sem.signal(target.copy_stream)
++
++                future_key = (
++                    self._prefetch_key(request)
++                    if self._prefetch_enabled
++                    else None
++                )
++                if future_key is not None:
++                    # On a hit, DMA is reading the prefetch slot. Wait only for
++                    # that small H2D copy before reusing it; disk I/O then runs
++                    # concurrently with the model's GPU forward.
++                    if cache_hit:
++                        for target in targets:
++                            target.copy_stream.synchronize()
++                    assert request.prefetch is not None
++                    token_groups = request.prefetch.next_token_ids
++                    contexts = request.prefetch.next_ngram_contexts
++                    num_future_tokens = sum(map(len, token_groups))
++                    if num_future_tokens > request.num_tokens:
++                        raise ValueError("PLE prefetch exceeds current batch size")
++                    eos_token_id = int(
++                        self.vllm_config.model_config.hf_text_config.eos_token_id
++                    )
++                    prefetch_input = torch.full(
++                        (request.num_tokens,), eos_token_id, dtype=torch.int32
++                    )
++                    prefetch_query_start = [0]
++                    cursor = 0
++                    for tokens in token_groups:
++                        end = cursor + len(tokens)
++                        prefetch_input[cursor:end] = torch.tensor(
++                            tokens, dtype=torch.int32
++                        )
++                        cursor = end
++                        prefetch_query_start.append(cursor)
++                    layer.forward_impl(
++                        prefetch_input,
++                        prefetch_input,
++                        torch.tensor(prefetch_query_start, dtype=torch.int32),
++                        torch.tensor(contexts, dtype=torch.int32),
++                        output_buffer=self._prefetch_bufs[dp_rank][layer_name],
++                    )
++                    self._prefetch_keys[cache_slot] = future_key
++
++                total = self._prefetch_hits + self._prefetch_misses
++                if self._prefetch_enabled and total and total % 128 == 0:
++                    logger.info(
++                        "PLE next-chunk prefetch: hits=%d misses=%d rate=%.1f%%",
++                        self._prefetch_hits,
++                        self._prefetch_misses,
++                        100.0 * self._prefetch_hits / total,
++                    )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6e7fdcf..c954d84 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
+ 
+ import functools
+ import gc
++import os
+ import time
+ from copy import deepcopy
+ from typing import Any, NamedTuple
+@@ -76,6 +77,7 @@ from vllm.v1.outputs import (
+     make_empty_encoder_model_runner_output,
+ )
+ from vllm.v1.ple_offload.connector import PleOffloadConnector
++from vllm.v1.ple_offload.protocol import PlePrefetch
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
+@@ -323,6 +325,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
+         self._ple_offload_connector: PleOffloadConnector | None = None
++        self._ple_prefetch_enabled = (
++            self.is_first_pp_rank
++            and os.getenv("VLLM_PLE_NEXT_CHUNK_PREFETCH", "0") == "1"
++        )
++        self._ple_prefill_tokens: dict[str, np.ndarray] = {}
+ 
+         # Expert parallelism load balancer.
+         self.eplb = EPLBController(self.parallel_config, self.device)
+@@ -374,6 +381,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             ngram_context_source=ngram_context_source,
+         )
+ 
++    def _make_ple_prefetch(self, input_batch: InputBatch) -> PlePrefetch | None:
++        """Predict one equal-sized future segment for every prefill request."""
++        if (
++            not self._ple_prefetch_enabled
++            or not input_batch.has_prefill
++            or not bool(input_batch.is_prefilling_np.all())
++        ):
++            return None
++        req_ids = list(input_batch.req_ids)
++        req_starts = input_batch.num_computed_prefill_tokens_np.astype(
++            np.int64, copy=False
++        ).tolist()
++        future_req_ids: list[str] = []
++        future_starts: list[int] = []
++        future_token_ids: list[list[int]] = []
++        future_contexts: list[list[int]] = []
++        config = self.vllm_config.model_config.hf_text_config
++        context_len = int(config.ngram_size) - 1
++        eos_token_id = int(config.eos_token_id)
++        for index, req_id in enumerate(req_ids):
++            all_tokens = self._ple_prefill_tokens.get(req_id)
++            num_valid = int(input_batch.num_scheduled_tokens[index])
++            current_start = int(req_starts[index])
++            if (
++                all_tokens is None
++                or num_valid <= 0
++                or current_start + num_valid > int(input_batch.prefill_len_np[index])
++            ):
++                return PlePrefetch(req_ids, req_starts, [], [], [], [])
++            start = current_start + num_valid
++            end = min(start + num_valid, int(input_batch.prefill_len_np[index]))
++            if end <= start:
++                continue
++            context = np.full(context_len, eos_token_id, dtype=np.int32)
++            source = all_tokens[max(0, start - context_len) : start]
++            if source.size:
++                context[-source.size :] = source
++            future_req_ids.append(req_id)
++            future_starts.append(start)
++            future_token_ids.append(all_tokens[start:end].tolist())
++            future_contexts.append(context.tolist())
++        return PlePrefetch(
++            req_ids,
++            req_starts,
++            future_req_ids,
++            future_starts,
++            future_token_ids,
++            future_contexts,
++        )
++
+     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+         time_before_load = time.perf_counter()
+         if load_dummy_weights:
+@@ -969,6 +1026,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         req_idx = self.req_states.remove_request(req_id)
+         if req_idx is None:
+             return False
++        self._ple_prefill_tokens.pop(req_id, None)
+         if self.pooling_runner is not None:
+             self.pooling_runner.remove_request(req_idx)
+         if self.pp_handler is not None:
+@@ -1026,6 +1084,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 num_computed_tokens=new_req_data.num_computed_tokens,
+                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+             )
++            if self._ple_prefetch_enabled:
++                self._ple_prefill_tokens[req_id] = np.asarray(
++                    new_req_data.prefill_token_ids, dtype=np.int32
++                )
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.add_request(req_index)
+@@ -1690,6 +1752,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch.num_reqs,
+                 input_batch.num_tokens_after_padding,
+                 dummy_run,
++                self._make_ple_prefetch(input_batch) if not dummy_run else None,
+             )
+ 
+         # Run model.
