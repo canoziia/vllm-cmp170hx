@@ -73,10 +73,10 @@ index e8c0cca..c7be236 100644
  
  _PLE_OFFLOAD_REQUEST_DECODER = msgspec.msgpack.Decoder(PleOffloadRequest)
 diff --git a/vllm/v1/ple_offload/worker.py b/vllm/v1/ple_offload/worker.py
-index db6d4a7..a7a31d2 100644
+index db6d4a7..0b5e87b 100644
 --- a/vllm/v1/ple_offload/worker.py
 +++ b/vllm/v1/ple_offload/worker.py
-@@ -349,6 +349,16 @@ class PleOffloadRunner:
+@@ -349,6 +349,23 @@ class PleOffloadRunner:
          self._pinned_bufs: dict[int, dict[str, torch.Tensor]] = {}
          # Shared-memory inputs are registered once per DP rank by TP rank zero.
          self._input_bufs: dict[int, PleOffloadInputBuffers] = {}
@@ -88,12 +88,19 @@ index db6d4a7..a7a31d2 100644
 +        ) == "1"
 +        self._prefetch_bufs: dict[int, dict[str, torch.Tensor]] = {}
 +        self._prefetch_keys: dict[tuple[int, str], tuple[Any, ...]] = {}
++        self._prefetch_generated = 0
 +        self._prefetch_hits = 0
-+        self._prefetch_misses = 0
++        self._prefetch_mismatches = 0
++        self._prefetch_uncovered = 0
++        self._prefetch_ineligible = 0
++        self._prefetch_interrupted = 0
++        self._prefetch_hit_tokens = 0
++        self._prefetch_eligible_tokens = 0
++        self._prefetch_next_report = 128
          self._load_weights()
  
      @property
-@@ -606,6 +616,7 @@ class PleOffloadRunner:
+@@ -606,6 +623,7 @@ class PleOffloadRunner:
          embedding_dim = int(config.ple_embed_dim)
          for dp_rank, layer_targets in self._worker_targets.items():
              self._pinned_bufs[dp_rank] = {}
@@ -101,7 +108,7 @@ index db6d4a7..a7a31d2 100644
              for layer_name, targets in layer_targets.items():
                  if len(targets) != tp_size:
                      raise RuntimeError(
-@@ -613,19 +624,29 @@ class PleOffloadRunner:
+@@ -613,19 +631,29 @@ class PleOffloadRunner:
                          f"{len(targets)} targets, expected {tp_size}"
                      )
                  targets.sort(key=lambda target: target.tp_rank)
@@ -135,7 +142,7 @@ index db6d4a7..a7a31d2 100644
          )
  
      @torch.inference_mode()
-@@ -658,6 +679,55 @@ class PleOffloadRunner:
+@@ -658,6 +686,55 @@ class PleOffloadRunner:
  
              self._handle_requests(requests)
  
@@ -191,7 +198,7 @@ index db6d4a7..a7a31d2 100644
      def _handle_requests(self, requests: list[PleOffloadRequest]) -> None:
          """Run requests layer-first so each DP rank can resume promptly."""
          requests_by_dp: dict[int, PleOffloadRequest] = {}
-@@ -701,13 +771,41 @@ class PleOffloadRunner:
+@@ -701,13 +778,56 @@ class PleOffloadRunner:
                      if input_bufs.ngram_context_buf is not None
                      else None
                  )
@@ -203,10 +210,14 @@ index db6d4a7..a7a31d2 100644
 -                    output_buffer=self._pinned_bufs[dp_rank][layer_name],
 +                cache_slot = (dp_rank, layer_name)
 +                current_key = self._request_key(request, input_bufs, ngram_context)
++                candidate_key = self._prefetch_keys.get(cache_slot)
 +                cache_hit = (
 +                    self._prefetch_enabled
 +                    and current_key is not None
-+                    and self._prefetch_keys.get(cache_slot) == current_key
++                    and candidate_key == current_key
++                )
++                num_valid_tokens = int(
++                    input_bufs.query_start_loc_buf[request.num_reqs].item()
                  )
 +                if cache_hit:
 +                    result = self._prefetch_bufs[dp_rank][layer_name][
@@ -225,6 +236,8 @@ index db6d4a7..a7a31d2 100644
 +                                "PLE next-chunk prefetch byte verification failed"
 +                            )
 +                    self._prefetch_hits += 1
++                    self._prefetch_hit_tokens += num_valid_tokens
++                    self._prefetch_eligible_tokens += num_valid_tokens
 +                else:
 +                    result = layer.forward_impl(
 +                        input_bufs.input_ids_buf[: request.num_tokens],
@@ -234,12 +247,21 @@ index db6d4a7..a7a31d2 100644
 +                        output_buffer=self._pinned_bufs[dp_rank][layer_name],
 +                    )
 +                    if self._prefetch_enabled:
-+                        self._prefetch_misses += 1
++                        if current_key is None:
++                            self._prefetch_ineligible += 1
++                            if candidate_key is not None:
++                                self._prefetch_interrupted += 1
++                        else:
++                            self._prefetch_eligible_tokens += num_valid_tokens
++                            if candidate_key is None:
++                                self._prefetch_uncovered += 1
++                            else:
++                                self._prefetch_mismatches += 1
 +                self._prefetch_keys.pop(cache_slot, None)
  
                  # The result is identical on every TP rank in this DP group.
                  # Each copy stream signals only after its DMA completes.
-@@ -718,3 +816,54 @@ class PleOffloadRunner:
+@@ -718,3 +838,85 @@ class PleOffloadRunner:
                              result[slices], non_blocking=True
                          )
                          target.sem.signal(target.copy_stream)
@@ -285,15 +307,46 @@ index db6d4a7..a7a31d2 100644
 +                        output_buffer=self._prefetch_bufs[dp_rank][layer_name],
 +                    )
 +                    self._prefetch_keys[cache_slot] = future_key
++                    self._prefetch_generated += 1
 +
-+                total = self._prefetch_hits + self._prefetch_misses
-+                if self._prefetch_enabled and total and total % 128 == 0:
-+                    logger.info(
-+                        "PLE next-chunk prefetch: hits=%d misses=%d rate=%.1f%%",
-+                        self._prefetch_hits,
-+                        self._prefetch_misses,
-+                        100.0 * self._prefetch_hits / total,
++                eligible = (
++                    self._prefetch_hits
++                    + self._prefetch_mismatches
++                    + self._prefetch_uncovered
++                )
++                if self._prefetch_enabled and eligible >= self._prefetch_next_report:
++                    candidate_checks = self._prefetch_hits + self._prefetch_mismatches
++                    candidate_rate = (
++                        100.0 * self._prefetch_hits / candidate_checks
++                        if candidate_checks
++                        else 0.0
 +                    )
++                    step_coverage = 100.0 * self._prefetch_hits / eligible
++                    token_coverage = (
++                        100.0
++                        * self._prefetch_hit_tokens
++                        / self._prefetch_eligible_tokens
++                        if self._prefetch_eligible_tokens
++                        else 0.0
++                    )
++                    logger.info(
++                        "PLE next-chunk prefetch: generated=%d hits=%d "
++                        "mismatches=%d uncovered=%d ineligible=%d "
++                        "interrupted=%d candidate_hit_rate=%.1f%% "
++                        "prefill_step_coverage=%.1f%% "
++                        "prefill_token_coverage=%.1f%%",
++                        self._prefetch_generated,
++                        self._prefetch_hits,
++                        self._prefetch_mismatches,
++                        self._prefetch_uncovered,
++                        self._prefetch_ineligible,
++                        self._prefetch_interrupted,
++                        candidate_rate,
++                        step_coverage,
++                        token_coverage,
++                    )
++                    while self._prefetch_next_report <= eligible:
++                        self._prefetch_next_report += 128
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
 index 6e7fdcf..c954d84 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
