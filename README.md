@@ -106,13 +106,13 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-## Run the default production configuration without MTP
+## Run the default MTP3 production configuration
 
-The repository default is the final patched image with MTP disabled. PP4, V2,
-1M context, NVMe PLE, prefix caching, chunked prefill and structured outputs
-remain enabled. The production scheduler allows 4,096 batched tokens, keeps up
-to 32 request slots, and leaves `long_prefill_token_threshold=0` so a lone long
-prefill can use the full available batch budget.
+The repository default enables native Qwen MTP3 together with PP4, V2, 1M
+context, NVMe PLE, prefix caching, chunked prefill and structured outputs. The
+production scheduler allows 4,096 batched tokens, keeps up to 32 request slots,
+and leaves `long_prefill_token_threshold=0` so a lone long prefill can use the
+full available batch budget.
 
 ```bash
 podman compose config
@@ -121,17 +121,7 @@ curl -H "Authorization: Bearer $VLLM_API_KEY" \
   http://127.0.0.1:8000/health
 ```
 
-## Enable MTP
-
-The image always contains the MTP fixes. To enable native Qwen MTP, use the
-explicit MTP Compose file:
-
-```bash
-podman compose -f compose.mtp.yml config
-podman compose -f compose.mtp.yml up -d
-```
-
-The MTP Compose profile uses three recursive draft steps and moves three target
+The default MTP profile uses three recursive draft steps and moves three target
 layers away from PP3, which also owns the MTP layer, LM head, and sampler:
 
 ```text
@@ -147,6 +137,29 @@ matches across all four PP stages. The checkpoint has one MTP layer; MTP3 runs
 that same layer recursively rather than loading three copies. Acceptance beyond
 the first draft position is workload-dependent. The MTP1 benchmark results below
 remain historical reference measurements.
+
+## Run without MTP
+
+Use the explicit text-only no-MTP profile when speculative decoding is not
+wanted. It uses the balanced target-only `12,12,12,12` partition:
+
+```bash
+podman compose -f compose.no-mtp.yml config
+podman compose -f compose.no-mtp.yml up -d
+```
+
+## Enable multimodal MTP
+
+`compose.multimodal.yml` enables the vision tower together with MTP3. It accepts
+base64 `data:` media, rejects ordinary HTTP/HTTPS media URLs by allowing only the
+reserved `media-disabled.invalid` domain, and disables the RAM-backed multimodal
+processor cache. Local `file:` media remains disabled because no allowed local
+media path is configured.
+
+```bash
+podman compose -f compose.multimodal.yml config
+podman compose -f compose.multimodal.yml up -d
+```
 
 ## PLE / n-gram disk offload
 

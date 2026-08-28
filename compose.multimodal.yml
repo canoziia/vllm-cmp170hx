@@ -27,7 +27,8 @@ services:
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
       - --distributed-executor-backend=mp
-      - --language-model-only
+      - --allowed-media-domains=media-disabled.invalid
+      - --mm-processor-cache-gb=0
       - --max-model-len=1000000
       - '--hf-overrides={"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
       - --kv-cache-dtype=bfloat16
