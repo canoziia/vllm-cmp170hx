@@ -20,9 +20,9 @@ patches; model weights remain in the original Hugging Face safetensors snapshot.
 
 ## Features
 
-- TP1 x PP4 with an explicit `12,12,12,12` layer partition.
+- TP1 x PP4: `12,12,12,12` without MTP and an MTP-balanced `13,13,13,9` profile.
 - V2 Model Runner support.
-- Native one-step Qwen MTP on the last PP stage.
+- Native Qwen MTP on the last PP stage, including recursive multi-step drafting with the checkpoint's single MTP layer.
 - Correct sampled-token and draft-token propagation through V2 PP pipeline slots.
 - 1,000,000-token context using Qwen static YaRN (`factor=4`).
 - BF16 QSA KV cache and BF16 GDN recurrent state for target/draft geometry parity.
@@ -110,8 +110,8 @@ $EDITOR .env
 
 The repository default is the final patched image with MTP disabled. PP4, V2,
 1M context, NVMe PLE, prefix caching, chunked prefill and structured outputs
-remain enabled. The production scheduler allows 4,096 batched tokens, keeps 16
-request slots, and leaves `long_prefill_token_threshold=0` so a lone long
+remain enabled. The production scheduler allows 4,096 batched tokens, keeps up
+to 32 request slots, and leaves `long_prefill_token_threshold=0` so a lone long
 prefill can use the full available batch budget.
 
 ```bash
@@ -131,14 +131,22 @@ podman compose -f compose.mtp.yml config
 podman compose -f compose.mtp.yml up -d
 ```
 
-The production-tested MTP setting is deliberately one step:
+The MTP Compose profile uses three recursive draft steps and moves three target
+layers away from PP3, which also owns the MTP layer, LM head, and sampler:
 
-```json
-{"method":"mtp","num_speculative_tokens":1}
+```text
+VLLM_PP_LAYER_PARTITION=13,13,13,9
 ```
 
-The checkpoint has one MTP layer. Reusing it for more speculative steps is not
-the tested configuration and may reduce acceptance quality.
+```json
+{"method":"mtp","num_speculative_tokens":3}
+```
+
+It also keeps the Mamba recurrent state in BF16 so target and MTP cache geometry
+matches across all four PP stages. The checkpoint has one MTP layer; MTP3 runs
+that same layer recursively rather than loading three copies. Acceptance beyond
+the first draft position is workload-dependent. The MTP1 benchmark results below
+remain historical reference measurements.
 
 ## PLE / n-gram disk offload
 
