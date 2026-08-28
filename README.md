@@ -28,6 +28,7 @@ patches; model weights remain in the original Hugging Face safetensors snapshot.
 - BF16 QSA KV cache and BF16 GDN recurrent state for target/draft geometry parity.
 - The 47.68-GiB PLE/n-gram embedding stays in the original safetensors files.
 - Native parallel `pread` row access directly into the FP8 output buffer; `mmap` and a pure-Python fallback remain available.
+- Bounded next-chunk PLE prefetch for V2: future rows are gathered during the current GPU forward and reused only after exact request, position, token, and n-gram-context validation.
 - Prefix caching, chunked prefill, xgrammar structured outputs, reasoning and tool parsers.
 - Marlin FP8 MoE on SM80/CMP 170HX; no additional lossy weight or activation conversion.
 
@@ -69,10 +70,10 @@ OUTPUT_IMAGE=localhost/vllm-cmp170hx:qwen3.8-flash-next \
 The script performs these steps:
 
 1. Creates a stopped container from the official Qwen image.
-2. Copies only the ten source files touched by the patch series.
+2. Copies only the eleven source files touched by the patch series.
 3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
 4. Applies `patches/*.patch` in lexical order.
-5. Verifies all eleven final files against `manifests/final-qwen38-flash-next.sha256`.
+5. Verifies all twelve final files against `manifests/final-qwen38-flash-next.sha256`.
 6. Builds a thin derived image containing the patched Python files and the small native PLE `pread` helper.
 
 To inspect or apply the patches without building a container:
@@ -109,7 +110,9 @@ $EDITOR .env
 
 The repository default is the final patched image with MTP disabled. PP4, V2,
 1M context, NVMe PLE, prefix caching, chunked prefill and structured outputs
-remain enabled.
+remain enabled. The production scheduler allows 4,096 batched tokens, keeps 16
+request slots, and leaves `long_prefill_token_threshold=0` so a lone long
+prefill can use the full available batch budget.
 
 ```bash
 podman compose config
@@ -153,15 +156,29 @@ rows:
 VLLM_PLE_CPU_OFFLOAD: "1"
 VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/<snapshot>
 VLLM_PLE_NVME_BACKEND: pread
-VLLM_PLE_NVME_PREAD_WORKERS: "8"
+VLLM_PLE_NVME_PREAD_WORKERS: "48"
+VLLM_PLE_NEXT_CHUNK_PREFETCH: "1"
 ```
 
 Set `VLLM_PLE_NVME_BACKEND=mmap` to use the mmap backend. The production example
-uses eight-worker `pread` because it performed better for random row access on
-the tested host.
+uses 48 native `pread` workers because it performed best for random row access
+on the tested host.
+
+Next-chunk prefetch is bounded to at most the current scheduler batch and stores
+only one future PLE result batch. It is enabled only on PP0, does not cache or
+copy the 47.68-GiB table, and does not modify the scheduler. A future result is
+used only when request IDs, absolute starts, token IDs, padded batch size, and
+n-gram contexts all match the actual next batch; otherwise the worker falls back
+to the normal synchronous gather. Mixed decode/prefill batches are not
+prefetched, avoiding additional disk work on the decode path.
+
+For correctness testing only, set `VLLM_PLE_NEXT_CHUNK_VERIFY=1`. Every prefetch
+hit is then gathered synchronously a second time and compared byte-for-byte.
+This deliberately adds duplicate disk I/O and must be disabled for performance
+measurements and production.
 
 The NVMe path currently requires TP=1 and DP=1. PP=4 is supported; only PP0 owns
-the PLE layer and offload connector.
+the PLE layer, offload connector, and future-prompt state.
 
 ## Long context
 
@@ -193,6 +210,10 @@ These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal
 | V2, no MTP, 32K high-entropy prefill before native PLE `pread` | 724.8 tok/s |
 | V2, no MTP, 32K high-entropy prefill after native PLE `pread` | 2,935 tok/s cold / 6,638 tok/s warm |
 | Native PLE random-row microbenchmark, 1,024-token batch | approximately 4,100–4,770 tok/s |
+| Strict random-token 128K prefill, batch 1,024, before next-chunk prefetch | 2,594 tok/s |
+| Strict random-token 128K prefill, batch 1,024, with next-chunk prefetch | 3,611–3,791 tok/s |
+| Four concurrent strict-random 32K prefills before next-chunk prefetch | 2,819 aggregate tok/s |
+| Four concurrent strict-random 32K prefills with next-chunk prefetch | 3,724 aggregate tok/s |
 | V2, no MTP, 16 concurrent independent requests | 3,061 aggregate prompt+output tok/s |
 | V2, MTP=1, steady decode run 1 | 61.91 tok/s |
 | V2, MTP=1, steady decode run 2 | 65.74 tok/s |
@@ -207,9 +228,9 @@ performance measurement.
 
 ## Patch boundaries
 
-The final image replaces eleven files:
+The final image replaces twelve files:
 
-- Eight files for Qwen PP ownership and PLE NVMe offload.
+- Nine files for Qwen PP ownership, PLE NVMe offload, and bounded next-chunk prefetch.
 - Three files for Qwen MTP and V2 PP speculative feedback.
 
 It does **not** include the discarded profiling kernels, Humming experiments,
