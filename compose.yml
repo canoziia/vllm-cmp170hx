@@ -38,7 +38,7 @@ services:
       - --tool-call-parser=qwen3_coder
       - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true}'
       - --max-num-seqs=16
-      - --max-num-batched-tokens=8192
+      - --max-num-batched-tokens=1024
       - --gpu-memory-utilization=0.95
       - --long-prefill-token-threshold=0
       - --enable-chunked-prefill
