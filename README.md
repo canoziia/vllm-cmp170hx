@@ -177,6 +177,12 @@ hit is then gathered synchronously a second time and compared byte-for-byte.
 This deliberately adds duplicate disk I/O and must be disabled for performance
 measurements and production.
 
+Prefetch telemetry separates candidate mismatches and uncovered eligible
+prefills from decode or mixed batches that are inherently ineligible. It reports
+candidate hit rate, eligible-prefill step coverage, and valid-token coverage;
+ineligible decode steps do not reduce these rates. Logs advance once per 128
+eligible prefill lookups rather than once per 128 total model forwards.
+
 The NVMe path currently requires TP=1 and DP=1. PP=4 is supported; only PP0 owns
 the PLE layer, offload connector, and future-prompt state.
 
