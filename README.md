@@ -241,18 +241,32 @@ to `compose.yml`, `compose.no-mtp.yml`, and `compose.multimodal.yml` respectivel
 | No MTP | 55.15 | 100.64 | 160.48 | 260.77 | 417.66 | 631.01 |
 | Multimodal + MTP3 | 87.02 | 161.17 | 243.96 | 417.84 | 639.62 | 884.47 |
 
-### PLE and prefill
+### Current prefill throughput
+
+These are strict uncached end-to-end prompt-processing results with the current
+production scheduler (`max_num_batched_tokens=4096` and
+`long_prefill_token_threshold=0`) and native PLE enabled.
 
 | Configuration | Result |
 | --- | ---: |
-| V2, no MTP, 32K high-entropy prefill before native PLE `pread` | 724.8 tok/s |
-| V2, no MTP, 32K high-entropy prefill after native PLE `pread` | 2,935 tok/s cold / 6,638 tok/s warm |
+| One 128K prompt | 8,789 tok/s |
+| Four independent 32K prompts, sequential | 7,683 aggregate tok/s |
+| Four independent 32K prompts, concurrent | 7,385 aggregate tok/s |
+| Prefix-cache hit observed | 4,896 tokens |
+
+### Historical PLE optimization results
+
+The following strict-random tests use the earlier 1,024-token scheduler batch and
+are retained as an A/B record of the next-chunk prefetch optimization, not as the
+current production prefill ceiling.
+
+| Configuration | Result |
+| --- | ---: |
 | Native PLE random-row microbenchmark, 1,024-token batch | approximately 4,100–4,770 tok/s |
-| Strict random-token 128K prefill, batch 1,024, before next-chunk prefetch | 2,594 tok/s |
-| Strict random-token 128K prefill, batch 1,024, with next-chunk prefetch | 3,611–3,791 tok/s |
+| Strict random-token 128K prefill before next-chunk prefetch | 2,594 tok/s |
+| Strict random-token 128K prefill with next-chunk prefetch | 3,611–3,791 tok/s |
 | Four concurrent strict-random 32K prefills before next-chunk prefetch | 2,819 aggregate tok/s |
 | Four concurrent strict-random 32K prefills with next-chunk prefetch | 3,724 aggregate tok/s |
-| Prefix-cache hit observed | 4,896 tokens |
 
 The first request after a fresh build may trigger Triton JIT and is not a steady
 performance measurement.
