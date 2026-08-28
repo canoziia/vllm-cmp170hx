@@ -229,11 +229,22 @@ the native declaration.
 
 ## Observed results
 
-These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal:
+These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal.
+Decode results are aggregate output throughput in tok/s. The three rows correspond
+to `compose.yml`, `compose.no-mtp.yml`, and `compose.multimodal.yml` respectively.
+
+### Decode throughput
+
+| Configuration | 1 concurrent | 2 concurrent | 4 concurrent | 8 concurrent | 16 concurrent | 32 concurrent |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MTP3 | 93.42 | 189.02 | 240.21 | 421.79 | 629.72 | 846.13 |
+| No MTP | 55.15 | 100.64 | 160.48 | 260.77 | 417.66 | 631.01 |
+| Multimodal + MTP3 | 87.02 | 161.17 | 243.96 | 417.84 | 639.62 | 884.47 |
+
+### PLE and prefill
 
 | Configuration | Result |
 | --- | ---: |
-| V2, no MTP, 256-token steady decode | 50.47 tok/s |
 | V2, no MTP, 32K high-entropy prefill before native PLE `pread` | 724.8 tok/s |
 | V2, no MTP, 32K high-entropy prefill after native PLE `pread` | 2,935 tok/s cold / 6,638 tok/s warm |
 | Native PLE random-row microbenchmark, 1,024-token batch | approximately 4,100–4,770 tok/s |
@@ -241,13 +252,6 @@ These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal
 | Strict random-token 128K prefill, batch 1,024, with next-chunk prefetch | 3,611–3,791 tok/s |
 | Four concurrent strict-random 32K prefills before next-chunk prefetch | 2,819 aggregate tok/s |
 | Four concurrent strict-random 32K prefills with next-chunk prefetch | 3,724 aggregate tok/s |
-| V2, no MTP, 16 concurrent independent requests | 3,061 aggregate prompt+output tok/s |
-| V2, MTP=1, steady decode run 1 | 61.91 tok/s |
-| V2, MTP=1, steady decode run 2 | 65.74 tok/s |
-| MTP acceptance in those runs | 62.0% / 64.1% |
-| MTP KV capacity | 2,868,442 tokens |
-| Maximum 1M-token concurrency | 2.87x |
-| Two concurrent 192-token requests | 46.14 aggregate tok/s |
 | Prefix-cache hit observed | 4,896 tokens |
 
 The first request after a fresh build may trigger Triton JIT and is not a steady
