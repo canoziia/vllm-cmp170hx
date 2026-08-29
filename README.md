@@ -111,6 +111,7 @@ $EDITOR .env
 The repository default enables native Qwen MTP3 together with PP4, V2, 1M
 context, NVMe PLE, prefix caching, chunked prefill and structured outputs. The
 production scheduler allows 4,096 batched tokens, keeps up to 32 request slots,
+uses a 32-token prefix-match unit for fine-grained hybrid Mamba/QSA cache reuse,
 and leaves `long_prefill_token_threshold=0` so a lone long prefill can use the
 full available batch budget.
 
