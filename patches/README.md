@@ -12,6 +12,7 @@ The patches are applied in lexical order to files extracted from
 | `0005-v2-mtp-capture-order.patch` | Synchronize PP control flow with the CPU/Gloo group after the PP3-only MTP CUDA Graph capture. |
 | `0006-v2-pp-speculative-feedback.patch` | Pad sampled-token broadcasts to a fixed width and propagate PP3's real draft IDs to the other PP target stages through the existing V2 PPHandler channel. |
 | `0007-ple-next-chunk-prefetch.patch` | Predict one bounded future PLE batch from V2 request state, overlap its native disk gather with the current GPU forward, validate request IDs, absolute positions, token IDs, and n-gram context before reuse, and report candidate accuracy plus eligible-prefill step/token coverage without counting decode as a miss. |
+| `0008-mamba-scheduler-block-alignment.patch` | Align Mamba prefill checkpoint stops to the scheduler's hybrid-group LCM block size instead of the minimum cache-group block size, preserving reusable recurrent-state checkpoints with fine-grained prefix matching and MTP. |
 
 ## Integrity
 

@@ -29,7 +29,8 @@ patches; model weights remain in the original Hugging Face safetensors snapshot.
 - The 47.68-GiB PLE/n-gram embedding stays in the original safetensors files.
 - Native parallel `pread` row access directly into the FP8 output buffer; `mmap` and a pure-Python fallback remain available.
 - Bounded next-chunk PLE prefetch for V2: future rows are gathered during the current GPU forward and reused only after exact request, position, token, and n-gram-context validation.
-- Prefix caching, chunked prefill, xgrammar structured outputs, reasoning and tool parsers.
+- Fine-grained prefix caching with Mamba prefill checkpoints aligned to the scheduler's 832-token hybrid block instead of the minimum 8-token cache-group block.
+- Chunked prefill, xgrammar structured outputs, reasoning and tool parsers.
 - Marlin FP8 MoE on SM80/CMP 170HX; no additional lossy weight or activation conversion.
 
 ## Tested hardware and software
@@ -70,10 +71,10 @@ OUTPUT_IMAGE=localhost/vllm-cmp170hx:qwen3.8-flash-next \
 The script performs these steps:
 
 1. Creates a stopped container from the official Qwen image.
-2. Copies only the eleven source files touched by the patch series.
+2. Copies only the twelve source files touched by the patch series.
 3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
 4. Applies `patches/*.patch` in lexical order.
-5. Verifies all twelve final files against `manifests/final-qwen38-flash-next.sha256`.
+5. Verifies all thirteen final files against `manifests/final-qwen38-flash-next.sha256`.
 6. Builds a thin derived image containing the patched Python files and the small native PLE `pread` helper.
 
 To inspect or apply the patches without building a container:
@@ -274,10 +275,11 @@ performance measurement.
 
 ## Patch boundaries
 
-The final image replaces twelve files:
+The final image replaces thirteen files:
 
 - Nine files for Qwen PP ownership, PLE NVMe offload, and bounded next-chunk prefetch.
 - Three files for Qwen MTP and V2 PP speculative feedback.
+- One scheduler file for hybrid Mamba prefix-checkpoint alignment.
 
 It does **not** include the discarded profiling kernels, Humming experiments,
 BF16 linear pre-dequantization, activation quantization, zero-PLE diagnostics,
