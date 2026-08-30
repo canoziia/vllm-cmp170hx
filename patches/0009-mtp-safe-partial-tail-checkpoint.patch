@@ -1,0 +1,113 @@
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -413,19 +413,27 @@
+                 end = aligned_end
+ 
+         next_block_boundary = (start // block_size + 1) * block_size
+-        tail_boundary = (
++        latest_tail_boundary = (
+             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+             if self.mamba_partial_cache_hit
+             else 0
+         )
++        # MTP/EAGLE drops the final fine-grained hash unit on a cache hit.
++        # Stop one hash unit earlier so recurrent state is materialized at
++        # the boundary Full Attention will actually restore.
++        tail_boundary = (
++            max(latest_tail_boundary - self.hash_block_size, 0)
++            if self.use_eagle and latest_tail_boundary
++            else latest_tail_boundary
++        )
+         stops = (
+             # Same invariant: a chunk starting mid-block stops at the boundary
+             # rather than running past it.
+             next_block_boundary if start % block_size != 0 else 0,
+             # Never run past the last cacheable block boundary mid-chunk.
+             last_cache_position,
+-            # Fine-grained hits: the prompt's partial-tail entry can only be
+-            # registered by a chunk ending exactly at its last hash boundary.
++            # Fine-grained hits: recurrent state can only be registered by a
++            # chunk ending exactly at the selected safe tail boundary.
+             tail_boundary
+             if last_cache_position < tail_boundary < request.num_prompt_tokens
+             else 0,
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -806,8 +806,18 @@
+         """
+         hash_block_size = self.block_pool.hash_block_size
+         boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
++        if boundary_tokens == 0:
+             return
++        if boundary_tokens > num_tokens:
++            # EAGLE/MTP lookup drops this complete hash unit before exposing
++            # cached KV. Permit the final boundary as a drop-only marker when
++            # only tokens inside that unit remain unfinalized.
++            is_eagle_drop_marker = (
++                self.use_eagle
++                and boundary_tokens - hash_block_size <= num_tokens
++            )
++            if not is_eagle_drop_marker:
++                return
+         if boundary_tokens % self.block_size == 0:
+             return
+ 
+@@ -1821,10 +1831,18 @@
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
+-        if num_tokens != latest_prompt_hash_boundary:
++        # EAGLE/MTP drops the final fine-grained hash unit on lookup. Recurrent
++        # state cannot be rolled back, so persist the state at the boundary
++        # that Full Attention will actually restore.
++        cacheable_prompt_boundary = (
++            max(latest_prompt_hash_boundary - hash_block_size, 0)
++            if self.use_eagle
++            else latest_prompt_hash_boundary
++        )
++        if num_tokens != cacheable_prompt_boundary:
+             return None
+ 
+-        block_idx = num_tokens // self.block_size
++        block_idx = cacheable_prompt_boundary // self.block_size
+         blocks = self.req_to_blocks[request.request_id]
+         if block_idx >= len(blocks):
+             return None
+@@ -1835,7 +1853,7 @@
+         partial_hash = self.block_pool.cache_partial_block(
+             request=request,
+             block=source_block,
+-            num_tokens=num_tokens,
++            num_tokens=cacheable_prompt_boundary,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
+         )
+@@ -1846,7 +1864,9 @@
+             # in ``source_block`` but the next step's forward overwrites it. The
+             # upcoming CoW copies it into a durable cow_block; record the req so
+             # allocate_new_blocks hands that block to the connector for offload.
+-            self._producer_partial_tail_reqs[request.request_id] = num_tokens
++            self._producer_partial_tail_reqs[request.request_id] = (
++                cacheable_prompt_boundary
++            )
+         return partial_hash
+ 
+ 
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -833,8 +833,13 @@
+                         and group_block_size > self.hash_block_size
+                         else group_block_size
+                     )
++                    # The public cap is commonly prompt_len - 1. Permit lookup
++                    # of one marker unit beyond it; the finder immediately drops
++                    # that complete unit, so the restored prefix stays below the
++                    # original cap.
+                     _max_length = min(
+-                        curr_hit_length + eagle_margin, max_cache_hit_length
++                        curr_hit_length + eagle_margin,
++                        max_cache_hit_length + eagle_margin,
+                     )
+                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                     block_hashes=block_hashes,
