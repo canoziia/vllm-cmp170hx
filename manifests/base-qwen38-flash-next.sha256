@@ -9,3 +9,4 @@ f08ba0f5ad41c8b9d5145fb1fba115ffd97f35f1e59017602e235ec0823abce8  vllm/v1/worker
 ccd19277d570ea6f7611f72e27ef1f69dfc8835ae3eb1be30d4948401b8a46ee  vllm/v1/worker/gpu_model_runner.py
 79cd7d52f7c9fd3bc3f3a3bf61aec3dfe72ec6b4938d1b8b11845a0d75ae0ce4  vllm/v1/worker/gpu/pp_utils.py
 923767cea120a027ca36683bd48b7659eadbfa4cbd4acbcf52a80cee0c0a0ec4  vllm/v1/worker/gpu_worker.py
+c710f49e41e974e5b7b8f1cd2f5fb9722523f4da0165252e16351199ebd03124  vllm/v1/core/sched/scheduler.py

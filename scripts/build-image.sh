@@ -57,6 +57,7 @@ COPY vllm/v1/worker/gpu_model_runner.py $INSTALL_ROOT/vllm/v1/worker/gpu_model_r
 COPY vllm/models/qwen3_8_flash_next/nvidia/mtp.py $INSTALL_ROOT/vllm/models/qwen3_8_flash_next/nvidia/mtp.py
 COPY vllm/v1/worker/gpu/model_runner.py $INSTALL_ROOT/vllm/v1/worker/gpu/model_runner.py
 COPY vllm/v1/worker/gpu/pp_utils.py $INSTALL_ROOT/vllm/v1/worker/gpu/pp_utils.py
+COPY vllm/v1/core/sched/scheduler.py $INSTALL_ROOT/vllm/v1/core/sched/scheduler.py
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \
       vllm-cmp170hx.base="$BASE_IMAGE" \
       vllm-cmp170hx.variant="qwen3.8-flash-next"
