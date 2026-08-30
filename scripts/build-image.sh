@@ -58,6 +58,8 @@ COPY vllm/models/qwen3_8_flash_next/nvidia/mtp.py $INSTALL_ROOT/vllm/models/qwen
 COPY vllm/v1/worker/gpu/model_runner.py $INSTALL_ROOT/vllm/v1/worker/gpu/model_runner.py
 COPY vllm/v1/worker/gpu/pp_utils.py $INSTALL_ROOT/vllm/v1/worker/gpu/pp_utils.py
 COPY vllm/v1/core/sched/scheduler.py $INSTALL_ROOT/vllm/v1/core/sched/scheduler.py
+COPY vllm/v1/core/single_type_kv_cache_manager.py $INSTALL_ROOT/vllm/v1/core/single_type_kv_cache_manager.py
+COPY vllm/v1/core/kv_cache_coordinator.py $INSTALL_ROOT/vllm/v1/core/kv_cache_coordinator.py
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \
       vllm-cmp170hx.base="$BASE_IMAGE" \
       vllm-cmp170hx.variant="qwen3.8-flash-next"
