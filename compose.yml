@@ -22,12 +22,19 @@ services:
     environment:
       LD_LIBRARY_PATH: /run/opengl-driver/lib:/usr/local/cuda/lib64
       HF_HUB_OFFLINE: "1"
+      VLLM_CACHE_ROOT: /root/.cache/vllm/clean-final-b8192-v1
+      VLLM_NVFP4_STAGE_EXPERTS: "1"
       VLLM_USE_V2_MODEL_RUNNER: "1"
       VLLM_PLE_CPU_OFFLOAD: "1"
       VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/${QWEN_SNAPSHOT:?}
       VLLM_PLE_NVME_BACKEND: pread
       VLLM_PLE_NVME_PREAD_WORKERS: "16"
+      VLLM_PLE_NVME_DEDUP: "1"
+      VLLM_PLE_NVME_DEDUP_MIN_ROWS: "512"
+      VLLM_PLE_NVME_STATS_SEC: "30"
       VLLM_PLE_NEXT_CHUNK_PREFETCH: "1"
+      VLLM_QSA_DET_TOPK: "1"
+      VLLM_QSA_DET_LIB: /opt/llm/kernel-det/_C_det.so
       SAFETENSORS_FAST_GPU: "0"
     command:
       - RadixArk/Qwen3.8-Flash-Next-NVFP4
@@ -48,7 +55,7 @@ services:
       - --tool-call-parser=qwen3_coder
       - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true}'
       - --max-num-seqs=4
-      - --max-num-batched-tokens=4096
+      - --max-num-batched-tokens=8192
       - --gpu-memory-utilization=0.90
       - --long-prefill-token-threshold=0
       - --enable-chunked-prefill

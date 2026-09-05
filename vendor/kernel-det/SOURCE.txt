@@ -1,0 +1,9 @@
+Kernel source: https://github.com/jschmied/vllm
+Commit: c056c2d937f9997fd14ed67ca039c8a78f3d5ef8
+Upstream PR: https://github.com/vllm-project/vllm/pull/55122
+License: Apache-2.0 (LICENSE included from that commit)
+Files: csrc/libtorch_stable/persistent_topk.cuh, topk.cu, torch_utils.h
+Local kernel adaptation: rename public persistent_topk symbol to persistent_topk_det.
+Standalone binding/build wrapper: local implementation of the upstream operator schema.
+The earlier experiment used the standalone research repository at 20f64c4c; final
+sources are taken from the explicitly Apache-licensed vLLM PR branch instead.

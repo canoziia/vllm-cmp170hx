@@ -1,223 +1,130 @@
 # Qwen3.8 Flash Next NVFP4 on DGX Spark
 
-This branch builds an ARM64/SM121 image for serving:
+Single DGX Spark (ARM64, GB10/SM121), TP1 × PP1, text-only serving of `RadixArk/Qwen3.8-Flash-Next-NVFP4`.
 
-```text
-RadixArk/Qwen3.8-Flash-Next-NVFP4
-```
+## Precision and checkpoint
 
-on one 128-GiB NVIDIA DGX Spark. It keeps the checkpoint's approximately 47.68-GiB PLE/n-gram embedding table in its original safetensors files and reads only selected FP8 rows from local NVMe.
+Pinned revision: `7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
+Architecture: `Qwen4ExpForConditionalGeneration`; quantization: ModelOpt NVFP4.
+The original checkpoint is 125.91 GiB. Its 47.68-GiB FP8 E4M3 PLE table
+(320,001,536 rows × 160 bytes, 128 logical shards in 10 files) remains in the
+original read-only safetensors files. Only requested rows are read with native
+parallel `pread`; no full table copy or residency is required.
 
-The branch is intentionally TP1 x PP1. Multi-Spark support is not included yet.
+Routed experts retain original packed NVFP4. Attention, shared experts,
+embedding, LM head and MTP retain their checkpoint precision. No hybrid FP8
+side-layer conversion, FP8 KV, or extra weight quantization is enabled.
 
-## Verified checkpoint metadata
+## Clean-final source
 
-Revision pinned by `.env.example`:
+This branch includes the twelve patches used by the tested `clean-final` image:
+`0003`, `0007`–`0017`. See [patches/README.md](patches/README.md).
+They provide PLE offload/prefetch, Mamba correctness fixes, GB10 FLA/deterministic
+QSA fixes, and indexed/batched weight loading. Native PLE and licensed upstream
+QSA top-k sources are included. GEMV, B12x, reference mmap, expanded prefill graph,
+and other unaccepted experiments are **not** included.
 
-```text
-7b719225242aacd3dbd3f9407468c2ee9a9d2594
-```
+## Build on Spark
 
-The published metadata declares:
-
-```text
-architecture=Qwen4ExpForConditionalGeneration
-model_type=qwen4_exp
-quant_method=modelopt
-quant_algo=NVFP4
-checkpoint size=135,195,303,851 bytes (125.91 GiB)
-PLE dtype=float8_e4m3fn
-PLE logical shards=128
-```
-
-The PLE is still FP8 E4M3, not NVFP4. Removing its 47.68 GiB from unified-memory residency leaves about 78.23 GiB of checkpoint data before runtime packing and allocator overhead.
-
-## Included patches
-
-Five Spark/PP1 patches are carried:
-
-1. Safetensors-backed native `pread`/`mmap` PLE row access.
-2. Bounded V2 next-chunk PLE prefetch with exact key validation.
-3. Hybrid Mamba scheduler-block alignment.
-4. MTP-safe fine-grained recurrent partial-tail caching.
-5. `UniProcExecutor` PLE worker lifecycle support required by TP1×PP1.
-
-See [`patches/README.md`](patches/README.md) and [`SPARK-PORT.md`](SPARK-PORT.md).
-
-## Build on the Spark
-
-The official dedicated Qwen image has a Linux ARM64 manifest. Build natively on the Spark so the OpenMP helper is compiled for ARM64:
+The ARM64 base is pinned to:
+`docker.io/vllm/vllm-openai@sha256:3b0e188ffceb3d07e09c3cb5215433a0020eacf02d7f882ed3a8bfd15454477e`.
+The build extracts all files in the base manifest, verifies hashes, applies all
+patches in order, verifies the final manifest, and compiles native PLE and SM121a
+top-k extensions. The resulting image records the Git commit in its OCI labels.
 
 ```bash
-cp .env.example .env
-./scripts/build-image.sh
+cp .env.example .env  # only for a new deployment; preserve an existing .env
+TMPDIR=$HOME/app/tmp CONTAINER_ENGINE=podman \
+  OUTPUT_IMAGE=localhost/vllm-qwen38-nvfp4-spark:latest \
+  bash scripts/build-image.sh
 ```
 
-Defaults:
+On NixOS, put image temporary files under `/home`, not the small root filesystem.
+The compose file uses explicit NVIDIA devices and read-only NixOS driver mounts
+because this host has no working NVIDIA CDI setup. Adjust these for other hosts.
+Set `.env` model-cache path to the directory containing `snapshots/` and choose an
+API key before exposing the service. Never commit `.env`.
+
+## Requested runtime configuration
 
 ```text
-base image=docker.io/vllm/vllm-openai:qwen38-flash-next
-output image=vllm-qwen38-nvfp4-spark:latest
-container engine=docker
-```
-
-The build:
-
-1. Extracts only the ten touched Python files from the official ARM64 image.
-2. Verifies base SHA256 hashes.
-3. Applies patches `0003`, `0007`, `0008`, `0009`, and `0010` in order.
-4. Verifies final SHA256 hashes.
-5. Compiles `native/ple_pread.c` inside the ARM64 image with GCC/OpenMP.
-6. Produces a thin image on top of the official base.
-
-Override values when needed:
-
-```bash
-CONTAINER_ENGINE=docker \
-BASE_IMAGE=docker.io/vllm/vllm-openai:qwen38-flash-next \
-OUTPUT_IMAGE=vllm-qwen38-nvfp4-spark:latest \
-./scripts/build-image.sh
-```
-
-## Model files
-
-Download the pinned revision into the Hugging Face cache, then set `.env` so `QWEN_MODEL_CACHE` points to the repository directory containing `snapshots/`:
-
-```text
-/home/nvidia/.cache/huggingface/hub/
-└── models--RadixArk--Qwen3.8-Flash-Next-NVFP4/
-    └── snapshots/
-        └── 7b719225242aacd3dbd3f9407468c2ee9a9d2594/
-```
-
-Do not copy or convert the PLE table. `VLLM_PLE_NVME_PATH` points directly to this original snapshot.
-
-## Run
-
-```bash
-docker compose config
-docker compose up -d
-docker compose logs -f
-```
-
-The initial single-Spark profile enables all four ported features together:
-
-```text
-TP1 x PP1
-text-only
-native 262,144-token context
-MTP3
-BF16 QSA KV cache
-BF16 Mamba recurrent state
-mamba-cache-mode=align
-prefix-match-unit=32
-prefix caching
-chunked prefill
-max_num_batched_tokens=4096
+TP1 PP1, V2 runner, text-only
+max_model_len=262144 (native; no YaRN or other context extension)
+max_num_batched_tokens=8192
 max_num_seqs=4
+MTP=3
 gpu_memory_utilization=0.90
-PLE native pread workers=16
-PLE next-chunk prefetch=enabled
+KV=bfloat16, Mamba SSM=bfloat16, mamba-cache-mode=align
+prefix-match-unit=32, prefix caching, chunked prefill
+PLE native pread workers=16, bounded next-chunk prefetch enabled
+NVFP4 expert CPU staging enabled
+restart=unless-stopped
 ```
 
-The image contains all features in one build. For debugging only, next-chunk prefetch can be disabled without rebuilding:
+Batch8192 is the user's new deployment choice; historical clean-final performance
+below used batch4096. Do not present that table as a new batch8192 benchmark.
+The compile cache is isolated at `/root/.cache/vllm/clean-final-b8192-v1` under a
+persistent host mount; experimental AOT caches must not be mixed into it.
 
-```yaml
-VLLM_PLE_NEXT_CHUNK_PREFETCH: "0"
+```bash
+podman-compose config
+podman-compose up -d
+podman logs -f qwen38-nvfp4-spark
 ```
 
-The synchronous NVMe reader remains active.
+## Historical clean-final results (batch4096)
 
-## Correctness checks
+Image `727b44a9c11b1ea18816a9541d8d5d6998b38b831400f17a203214f7ea4c2a0b`.
+Normal GPU clocks after a power cycle; fixed inputs/seed, three-round medians,
+unique cache salts and `cached_tokens=0`. SSE prefill is prompt tokens / TTFT;
+pure decode excludes TTFT and the first token.
 
-Before treating the port as validated, verify on the Spark:
+| Input | Prefill tok/s | Single-stream decode tok/s |
+| --- | ---: | ---: |
+| 32K website-style predictable text | 2126.68 | 42.23 |
+| Technical document | 1918.74 | 32.03 |
+| Code | 1914.12 | 33.72 |
 
-1. The checkpoint resolves as `modelopt_fp4` and its quantized routed experts select an optimized SM121 NVFP4 backend rather than emulation.
-2. The ignored BF16 components (attention, shared experts, LM head, embeddings, vision and MTP) remain unquantized as declared by the checkpoint.
-3. All 128 PLE shards are discovered and total row count matches the config.
-4. Random PLE rows match `safetensors.safe_open` byte-for-byte.
-5. A deterministic text completion is coherent.
-6. Prefix caching works across repeated requests with MTP3 and `prefix-match-unit=32`.
-7. A long uncached prompt reports PLE prefetch hits with no verification failure.
-8. Startup and runtime logs contain no real OOM, worker death, or EngineCore failure.
+- Random 128K, non-streaming one-output-token request: 68.03s, 1926.67 tok/s.
+- Four concurrent requests: full-batch decode window 83.36 / 84.68 aggregate tok/s;
+  makespan output throughput including TTFT/tail 60.73 / 77.31 tok/s.
+- Model loading: ~805s before loader changes → ~474s (41% reduction). This excludes
+  subsequent compile/warmup/graph capture. Model residency ~78.1 GiB.
+- KV pool at one clean-final startup: 26.27 GiB / 959,898 tokens, 3.66×262144
+  theoretical concurrency. Capacity varies with startup allocations; it is not
+  the single-request context limit or a guarantee of four full-length requests.
 
-For PLE verification only:
+Older ~800 tok/s prefill / ~17–24 tok/s decode measurements were collected while
+GB10 was stuck at 507MHz. Recovery to ~2.4GHz followed a power cycle; that inference
+speedup must not be attributed to code patches. The 2900 prefill / 45 general
+decode target has **not** been achieved. A later fresh AOT-cache baseline differed
+numerically from earlier cache runs; do not combine their best values or claim
+cross-build bitwise model equivalence. See [SPARK-AUDIT.md](SPARK-AUDIT.md).
 
-```yaml
-VLLM_PLE_NEXT_CHUNK_VERIFY: "1"
-```
+## Verification
 
-This duplicates successful prefetch reads and must be disabled for performance measurements.
+`tests/test_expert_staging.py` compares original-loader parameter bytes against
+staged loading on CUDA; set `ORIGINAL_ROUTED_EXPERTS` to the unmodified base file.
+`tests/test_mamba_memmove.py` checks overlapping/non-overlapping copy cases.
+`tests/test_prefix_cache.py` requires a healthy API and `VLLM_API_KEY`; use a fresh
+`RUN_TAG`. It asserts positive output token IDs and exact cached/uncached text,
+token IDs and first-token logprobs for three prompts. These are targeted tests,
+not a full model quality evaluation.
 
-## DGX Spark validation
+Use `scripts/benchmark_vllm_decode.mjs` (Node18+, no dependencies) for reproducible
+SSE measurements, with `--uncached --seed 42 --json-output <file>` and optionally
+`--prompt-file`. Ensure no running/waiting requests before benchmarking. Do not
+use the server's ten-second average prompt throughput as request performance.
 
-Validated on one NixOS DGX Spark (`aarch64`, GB10, SM121) with image:
+## Operational safety
 
-```text
-localhost/vllm-qwen38-nvfp4-spark:latest
-d3c91d8246f63ae47020d76bf325e7960635c40e9d3ba0783c0edfc0e18d126e
-```
-
-Observed startup/runtime state:
-
-```text
-V2 Model Runner
-quantization=modelopt_fp4
-NVFP4 MoE backend=FLASHINFER_CUTLASS
-resident model memory=78.1 GiB
-weights + non-torch after warmup=81.68 GiB
-CUDA Graph memory=0.95 GiB
-KV cache=26.44 GiB / 966,121 tokens
-262,144-token request concurrency=3.69x
-health=200
-restart count=0
-fatal errors=0
-```
-
-PLE validation:
-
-```text
-47.68 GiB
-320,001,536 rows × 160 bytes
-128 logical shards / 10 physical PLE files
-ARM64 native pread helper loaded
-128 random rows byte-equal to safetensors.safe_open
-next-chunk prefetch enabled
-candidate hit rate=91.7%
-prefill token coverage=93.7%
-```
-
-### Prefill throughput
-
-Uncached random token-ID prompts, `max_tokens=1`, `max_num_batched_tokens=4096`:
-
-| Workload | Runs | Throughput |
-| --- | --- | ---: |
-| Single 32K (first new-shape run) | 1 | 684.27 tok/s |
-| Single 32K (warmed) | 1 | 815.18 tok/s |
-| Single 128K | 3 | 773.07 / 771.18 / 772.27 tok/s |
-| 4 × 32K concurrent | 1 | 809.67 aggregate tok/s |
-
-All measured prefill responses reported `cached_tokens=0`.
-
-### Decode throughput
-
-Fixed short counting prompt, deterministic sampling, completion-token count divided by wall time:
-
-| Concurrency | Output per request | Runs | Aggregate output throughput |
-| ---: | ---: | --- | ---: |
-| 1 | 512 | 3 | 23.65 / 23.34 / 24.24 tok/s |
-| 2 | 512 | 3 | 41.85 / 48.19 / 40.56 tok/s |
-| 4 | 512 | 2 | 81.72 / 81.28 tok/s |
-
-The main 1/4-concurrency benchmark accumulated 4,474 accepted MTP draft tokens out of 4,491 drafted tokens (`99.62%`). A deterministic completion and an OpenAI chat-completions request both returned coherent output.
-
-Cold startup is long because the checkpoint contains 206 safetensors files and about 296,475 tensor entries. The measured target+MTP model loading phase was about 17.5 minutes, followed by compile, kernel warmup and graph capture. This is dominated by many small ModelOpt/NVFP4 tensor load operations rather than PCIe transfer alone.
-
-## Safety
-
-- Keep the model snapshot read-only in the container.
-- Change `VLLM_API_KEY` before exposing the API.
-- Keep `SAFETENSORS_FAST_GPU=0`; PLE must remain on NVMe.
-- Do not enable activation INT8/FP8 for the Marlin fallback path.
-- Do not delete or rewrite the original PLE safetensors files.
+- Preserve original safetensors and read-only model mounts. Do not copy the whole PLE table.
+- Swap16GiB at `/home/swapfile` is an OOM buffer, not model capacity. Track
+  `pswpin/pswpout` deltas during tests. Its NixOS declaration requires the next
+  authorized rebuild for persistent configuration; no reboot/rebuild is automated here.
+- Rootless service requires user linger; `podman-restart.service` has been enabled
+  on the test host, but full reboot recovery still needs a separate host-level test.
+- Check API health, real OOM/illegal access/worker death, GPU clocks and memory
+  after startup. Ordinary allocator warnings alone do not establish a fatal OOM.
+- Keep reference/research images separate from production. Do not use skip-invalid
+  Mamba copy guards as a correctness fix.

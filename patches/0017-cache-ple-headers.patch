@@ -1,0 +1,14 @@
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+@@ -179,7 +179,9 @@
+             path = (self.snapshot / filename).resolve()
+             if not path.is_file():
+                 raise FileNotFoundError(path)
+-            data_start, header = header_cache.setdefault(path, self._read_header(path))
++            if path not in header_cache:
++                header_cache[path] = self._read_header(path)
++            data_start, header = header_cache[path]
+             metadata = header.get(name)
+             if metadata is None:
+                 raise ValueError(f"{name!r} missing from {path}")

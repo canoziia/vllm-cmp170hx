@@ -1,0 +1,171 @@
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ple_nvme.py
+@@ -16,6 +16,7 @@
+ import os
+ import re
+ import struct
++import time
+ from concurrent.futures import ThreadPoolExecutor
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -80,6 +81,19 @@
+         self._shard_fds: np.ndarray | None = None
+         self._shard_row_starts: np.ndarray | None = None
+         self._shard_byte_offsets: np.ndarray | None = None
++        self._dedup = os.getenv("VLLM_PLE_NVME_DEDUP", "1") == "1"
++        self._dedup_min_rows = max(
++            1, int(os.getenv("VLLM_PLE_NVME_DEDUP_MIN_ROWS", "512"))
++        )
++        self._scratch = np.empty((0, self.embedding_dim), dtype=np.uint8)
++        self._stats_sec = max(
++            0.0, float(os.getenv("VLLM_PLE_NVME_STATS_SEC", "30"))
++        )
++        self._stats_last = time.monotonic()
++        self._stats_calls = 0
++        self._stats_rows = 0
++        self._stats_unique_rows = 0
++        self._stats_read_seconds = 0.0
+         if self._backend == "pread":
+             paths = {shard.path for shard in self._shards}
+             self._fds = {path: os.open(path, os.O_RDONLY) for path in paths}
+@@ -117,13 +131,16 @@
+                     max_workers=self._pread_workers, thread_name_prefix="ple-pread"
+                 )
+         logger.info(
+-            "PLE %s table ready: %.2f GiB, rows=%d, dim=%d, shards=%d, files=%d",
++            "PLE %s table ready: %.2f GiB, rows=%d, dim=%d, shards=%d, files=%d, "
++            "dedup=%s, dedup_min_rows=%d",
+             self._backend,
+             self.org_vocab_size * self.embedding_dim / (1024**3),
+             self.org_vocab_size,
+             self.embedding_dim,
+             len(self._shards),
+             len({s.path for s in self._shards}),
++            self._dedup,
++            self._dedup_min_rows,
+         )
+ 
+     @staticmethod
+@@ -232,9 +249,40 @@
+             )
+         return data
+ 
++    def _record_stats(self, rows: int, unique_rows: int, read_seconds: float) -> None:
++        self._stats_calls += 1
++        self._stats_rows += rows
++        self._stats_unique_rows += unique_rows
++        self._stats_read_seconds += read_seconds
++        now = time.monotonic()
++        if not self._stats_sec or now - self._stats_last < self._stats_sec:
++            return
++        ratio = self._stats_unique_rows / max(self._stats_rows, 1)
++        logger.info(
++            "PLE NVMe gather: calls=%d rows=%d unique=%d unique_ratio=%.1f%% "
++            "read=%.1f ms read_per_call=%.2f ms",
++            self._stats_calls,
++            self._stats_rows,
++            self._stats_unique_rows,
++            ratio * 100,
++            self._stats_read_seconds * 1000,
++            self._stats_read_seconds * 1000 / max(self._stats_calls, 1),
++        )
++        self._stats_last = now
++        self._stats_calls = 0
++        self._stats_rows = 0
++        self._stats_unique_rows = 0
++        self._stats_read_seconds = 0.0
++
+     @torch.inference_mode()
+     def gather(self, indices: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+-        """Copy selected FP8 rows byte-for-byte into a CPU float8 tensor."""
++        """Copy selected FP8 rows byte-for-byte into a CPU float8 tensor.
++
++        Large batches are deduplicated and sorted independently of prompt
++        content. This eliminates repeated reads and turns each shard's accesses
++        into ascending offsets. The exact original row order is restored through
++        the inverse map before returning, so model bytes are unchanged.
++        """
+         if indices.device.type != "cpu" or out.device.type != "cpu":
+             raise ValueError("PLE disk gather requires CPU tensors")
+         if out.dtype != torch.float8_e4m3fn:
+@@ -246,9 +294,24 @@
+         if output.shape[0] != ids.size:
+             raise ValueError("PLE mmap output shape does not match indices")
+         output_bytes = output.view(torch.uint8).numpy().reshape(-1, self.embedding_dim)
+-        shard_ids = np.searchsorted(self._row_ends, ids, side="right")
++        inverse: np.ndarray | None = None
++        read_ids = ids
++        if self._dedup and ids.size >= self._dedup_min_rows:
++            read_ids, inverse = np.unique(ids, return_inverse=True)
++            if self._scratch.shape[0] < read_ids.size:
++                self._scratch = np.empty(
++                    (max(read_ids.size, self._scratch.shape[0] * 2, 4096),
++                     self.embedding_dim),
++                    dtype=np.uint8,
++                )
++            read_output = self._scratch[: read_ids.size]
++        else:
++            read_output = output_bytes
++
++        started = time.perf_counter()
++        shard_ids = np.searchsorted(self._row_ends, read_ids, side="right")
+         if self._backend == "pread":
+-            if self._native_pread is not None and ids.size:
++            if self._native_pread is not None and read_ids.size:
+                 assert self._shard_fds is not None
+                 assert self._shard_row_starts is not None
+                 assert self._shard_byte_offsets is not None
+@@ -257,23 +320,24 @@
+                 )
+                 offsets = np.ascontiguousarray(
+                     self._shard_byte_offsets[shard_ids]
+-                    + (ids - self._shard_row_starts[shard_ids]) * self.embedding_dim,
++                    + (read_ids - self._shard_row_starts[shard_ids])
++                    * self.embedding_dim,
+                     dtype=np.int64,
+                 )
+                 status = self._native_pread(
+                     file_descriptors.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                     offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+-                    ctypes.c_void_p(output.data_ptr()),
+-                    ids.size,
++                    ctypes.c_void_p(read_output.ctypes.data),
++                    read_ids.size,
+                     self.embedding_dim,
+                     self._pread_workers,
+                 )
+                 if status != 0:
+                     raise OSError(f"PLE native pread failed for {-status} row(s)")
+-            elif ids.size:
++            elif read_ids.size:
+                 assert self._pread_pool is not None
+                 locations = []
+-                for row, shard_id in zip(ids, shard_ids, strict=True):
++                for row, shard_id in zip(read_ids, shard_ids, strict=True):
+                     shard = self._shards[int(shard_id)]
+                     offset = (
+                         shard.byte_offset
+@@ -283,15 +347,19 @@
+                         (self._fds[shard.path], shard.row_bytes, offset)
+                     )
+                 rows = self._pread_pool.map(self._pread_one, locations)
+-                output_bytes[:] = np.frombuffer(
++                read_output[:] = np.frombuffer(
+                     b"".join(rows), dtype=np.uint8
+                 ).reshape(-1, self.embedding_dim)
+         else:
+             for shard_id in np.unique(shard_ids):
+                 positions = np.nonzero(shard_ids == shard_id)[0]
+                 shard = self._shards[int(shard_id)]
+-                local_ids = ids[positions] - shard.row_start
+-                output_bytes[positions] = self._array(shard)[local_ids]
++                local_ids = read_ids[positions] - shard.row_start
++                read_output[positions] = self._array(shard)[local_ids]
++        read_seconds = time.perf_counter() - started
++        if inverse is not None:
++            output_bytes[:] = read_output[inverse]
++        self._record_stats(ids.size, read_ids.size, read_seconds)
+         return out
+ 
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:

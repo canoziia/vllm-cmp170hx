@@ -1,0 +1,55 @@
+diff --git a/vllm/third_party/flash_linear_attention/ops/utils.py b/vllm/third_party/flash_linear_attention/ops/utils.py
+--- a/vllm/third_party/flash_linear_attention/ops/utils.py
++++ b/vllm/third_party/flash_linear_attention/ops/utils.py
+@@ -180,7 +180,7 @@
+     ADA = 101376  # RTX 4090
+     AMPERE = 166912  # A100
+     HOPPER = 232448  # H100
+-    DEFAULT = 102400  # Default
++    DEFAULT = 101376  # DGX Spark GB10 exposes 99 KiB per block  # Default
+ 
+     @classmethod
+     def get_shared_memory(cls, arch: str) -> int:
+diff --git a/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py b/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
+--- a/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
++++ b/vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py
+@@ -34,7 +34,7 @@
+ @triton.autotune(
+     configs=[
+         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+-        for num_warps in [2, 4]
++        for num_warps in [2]  # fla#953: avoid Blackwell tl.dot race
+         for num_stages in _CHUNK_DELTA_H_NUM_STAGES
+         for BV in [32, 64]
+     ],
+diff --git a/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py b/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+--- a/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
++++ b/vllm/models/qwen3_8_flash_next/nvidia/ops/qsa.py
+@@ -791,11 +791,22 @@
+             and current_platform.has_device_capability(90)
+             and not current_platform.is_device_capability_family(120)
+         )
+-        topk_op = (
+-            torch.ops._C.cooperative_topk
+-            if use_cooperative_topk
+-            else torch.ops._C.persistent_topk
+-        )
++        # ---- QSADET (jschmied 2026-09-03) ----
++        import os as _os
++        if _os.environ.get("VLLM_QSA_DET_TOPK"):
++            if not getattr(qsa_select_paged_tokens, "_qsadet_loaded", False):
++                _lib = _os.environ.get("VLLM_QSA_DET_LIB", "/opt/llm/kernel-det/_C_det.so")
++                torch.ops.load_library(_lib)
++                qsa_select_paged_tokens._qsadet_loaded = True
++                print(f"QSADET active: {_lib}", flush=True)
++            topk_op = torch.ops._C_det.persistent_topk
++        else:
++            topk_op = (
++                torch.ops._C.cooperative_topk
++                if use_cooperative_topk
++                else torch.ops._C.persistent_topk
++            )
++        # ---- end QSADET ----
+         topk_op(logits, visible_blocks, blocks, topk_workspace, block_topk, columns)
+         expand_qsa_block_indices_cuda(
+             blocks,
