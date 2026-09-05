@@ -46,23 +46,26 @@ The PLE remains FP8 E4M3 rather than NVFP4. Its approximately 47.68 GiB can ther
 | `0007-ple-next-chunk-prefetch.patch` | Port after the synchronous NVMe reader passes | V2 future-prompt prediction and bounded one-batch PLE prefetch are not inherently PP-specific. PP1 still benefits from overlapping SSD gather with target GPU work. Revalidate on unified memory and the Spark NVMe. |
 | `0008-mamba-scheduler-block-alignment.patch` | Port when enabling hybrid prefix caching/fine matching | This is scheduler correctness for hybrid Mamba/QSA block geometry, not CMP- or PP-specific. It is unnecessary for the first no-MTP/no-fine-prefix smoke test. |
 | `0009-mtp-safe-partial-tail-checkpoint.patch` | Port when combining MTP with fine-grained prefix matching | This preserves recurrent-state correctness when MTP drops the final fine hash unit. It is portable but should not be part of the minimal first boot. |
+| `0010-uniproc-ple-lifecycle.patch` | Required for single-Spark TP1×PP1 | Testing proved that upstream only called `spawn_ple_offload()` and `wait_ple_offload_ready()` from the multiprocess executor. `UniProcExecutor` registered the GPU connector but never started its PLE server until this lifecycle patch was added. |
 
 ## Native helper portability
 
 `native/ple_pread.c` uses Linux `pread`, fixed-width integers, and OpenMP only. It has no x86 intrinsics and is source-portable to ARM64. The `.so` itself is not portable: it must be compiled inside the Spark ARM64 image with GCC and OpenMP available.
 
-## Recommended implementation stages
+## Implemented and validated stages
 
-1. Select and pin an ARM64/SM121 vLLM base image with `qwen4_exp` and serialized ModelOpt NVFP4 support.
-2. Regenerate source and final SHA256 manifests for that exact image. Do not reuse the CMP image manifests.
-3. Start TP1 x PP1, text-only, no MTP, 32K-64K context.
-4. Port only the synchronous portion of `0003`; verify all 128 PLE shards, F8_E4M3 metadata, total rows, and random-row byte equality.
-5. Verify the selected NVFP4 Linear and MoE backends and end-to-end output correctness.
-6. Port `0007`; run byte verification and uncached long-prefill A/B.
-7. Raise context toward native 262K according to measured remaining unified memory.
-8. Enable MTP; carry only the subset of `0004` that an actual PP1 failure proves necessary.
-9. If using `--prefix-match-unit`, port and validate `0008` and `0009` together.
-10. Enable multimodal only after text, PLE, prefix cache, and MTP are independently stable.
+The following stages were completed on the ARM64 DGX Spark:
+
+1. Selected and pinned the official multi-architecture Qwen image with `qwen4_exp` and ModelOpt NVFP4 support.
+2. Regenerated ARM64 source and final SHA256 manifests.
+3. Ported `0003`, `0007`, `0008`, and `0009` together as requested.
+4. Added `0010` after real TP1×PP1 startup exposed the missing UniProc PLE lifecycle.
+5. Verified all 128 PLE shards, F8_E4M3 metadata, 320,001,536 rows, and 128 random rows byte-for-byte.
+6. Verified the SM121 NVFP4 MoE backend is `FLASHINFER_CUTLASS`, not emulation.
+7. Started native 262K context, MTP3, BF16 cache, and `prefix-match-unit=32` together.
+8. Verified health, deterministic generation, fine prefix hits, prefetch telemetry, and prefill/decode throughput.
+
+Multimodal remains intentionally disabled in the initial single-Spark profile.
 
 ## Configuration changes from CMP deployment
 

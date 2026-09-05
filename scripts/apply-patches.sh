@@ -9,8 +9,8 @@ usage() {
 [[ $# -eq 1 ]] || { usage; exit 2; }
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MANIFEST="$REPO_ROOT/manifests/base-qwen38-flash-next.sha256"
-FINAL_MANIFEST="$REPO_ROOT/manifests/final-qwen38-flash-next.sha256"
+MANIFEST="$REPO_ROOT/manifests/base-qwen38-nvfp4-spark.sha256"
+FINAL_MANIFEST="$REPO_ROOT/manifests/final-qwen38-nvfp4-spark.sha256"
 
 [[ -d "$SOURCE_TREE/vllm" ]] || {
   echo "Missing $SOURCE_TREE/vllm" >&2

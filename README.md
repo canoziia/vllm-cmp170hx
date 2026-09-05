@@ -1,295 +1,222 @@
-# vllm-cmp170hx
+# Qwen3.8 Flash Next NVFP4 on DGX Spark
 
-Reproducible patches and container build tooling for serving
-`Qwen/Qwen3.8-Flash-Next-FP8` on four NVIDIA CMP 170HX GPUs.
-
-The build starts from Qwen's dedicated vLLM image:
+This branch builds an ARM64/SM121 image for serving:
 
 ```text
-docker.io/vllm/vllm-openai:qwen38-flash-next
+RadixArk/Qwen3.8-Flash-Next-NVFP4
 ```
 
-and produces:
+on one 128-GiB NVIDIA DGX Spark. It keeps the checkpoint's approximately 47.68-GiB PLE/n-gram embedding table in its original safetensors files and reads only selected FP8 rows from local NVMe.
+
+The branch is intentionally TP1 x PP1. Multi-Spark support is not included yet.
+
+## Verified checkpoint metadata
+
+Revision pinned by `.env.example`:
 
 ```text
-localhost/vllm-cmp170hx:qwen3.8-flash-next
+7b719225242aacd3dbd3f9407468c2ee9a9d2594
 ```
 
-The Qwen checkpoint is **not modified**. The image contains only Python runtime
-patches; model weights remain in the original Hugging Face safetensors snapshot.
+The published metadata declares:
 
-## Features
+```text
+architecture=Qwen4ExpForConditionalGeneration
+model_type=qwen4_exp
+quant_method=modelopt
+quant_algo=NVFP4
+checkpoint size=135,195,303,851 bytes (125.91 GiB)
+PLE dtype=float8_e4m3fn
+PLE logical shards=128
+```
 
-- TP1 x PP4: `12,12,12,12` without MTP and an MTP-balanced `13,13,13,9` profile.
-- V2 Model Runner support.
-- Native Qwen MTP on the last PP stage, including recursive multi-step drafting with the checkpoint's single MTP layer.
-- Correct sampled-token and draft-token propagation through V2 PP pipeline slots.
-- 1,000,000-token context using Qwen static YaRN (`factor=4`).
-- BF16 QSA KV cache and BF16 GDN recurrent state for target/draft geometry parity.
-- The 47.68-GiB PLE/n-gram embedding stays in the original safetensors files.
-- Native parallel `pread` row access directly into the FP8 output buffer; `mmap` and a pure-Python fallback remain available.
-- Bounded next-chunk PLE prefetch for V2: future rows are gathered during the current GPU forward and reused only after exact request, position, token, and n-gram-context validation.
-- Fine-grained prefix caching with Mamba prefill checkpoints aligned to the scheduler's 832-token hybrid block; under MTP, recurrent state is persisted at the safe rollback boundary while Full Attention uses a drop-only tail marker.
-- Chunked prefill, xgrammar structured outputs, reasoning and tool parsers.
-- Marlin FP8 MoE on SM80/CMP 170HX; no additional lossy weight or activation conversion.
+The PLE is still FP8 E4M3, not NVFP4. Removing its 47.68 GiB from unified-memory residency leaves about 78.23 GiB of checkpoint data before runtime packing and allocator overhead.
 
-## Tested hardware and software
+## Included patches
 
-- 4 x NVIDIA CMP 170HX, 65,344 MiB each, SM80
-- PCIe-limited topology, therefore PP4 is preferred over TP4
-- Podman with NVIDIA CDI (`nvidia.com/gpu=all`)
-- vLLM base image `vllm/vllm-openai:qwen38-flash-next`
-- Qwen snapshot `bcd9f01ddc9cff2316eb84281bebcd5b058bddce`
+Five Spark/PP1 patches are carried:
 
-The source manifests intentionally pin the files copied from the base image. If
-the tag is updated upstream, the build stops rather than applying patches to
-unknown source.
+1. Safetensors-backed native `pread`/`mmap` PLE row access.
+2. Bounded V2 next-chunk PLE prefetch with exact key validation.
+3. Hybrid Mamba scheduler-block alignment.
+4. MTP-safe fine-grained recurrent partial-tail caching.
+5. `UniProcExecutor` PLE worker lifecycle support required by TP1×PP1.
 
-## Build
+See [`patches/README.md`](patches/README.md) and [`SPARK-PORT.md`](SPARK-PORT.md).
 
-Requirements:
+## Build on the Spark
 
-- `podman` (default) or Docker
-- `git`, `sha256sum`, and Bash
-- access to `docker.io/vllm/vllm-openai:qwen38-flash-next`
-
-Build with Podman:
+The official dedicated Qwen image has a Linux ARM64 manifest. Build natively on the Spark so the OpenMP helper is compiled for ARM64:
 
 ```bash
+cp .env.example .env
 ./scripts/build-image.sh
 ```
 
-Override the engine, source image, or output tag:
+Defaults:
+
+```text
+base image=docker.io/vllm/vllm-openai:qwen38-flash-next
+output image=vllm-qwen38-nvfp4-spark:latest
+container engine=docker
+```
+
+The build:
+
+1. Extracts only the ten touched Python files from the official ARM64 image.
+2. Verifies base SHA256 hashes.
+3. Applies patches `0003`, `0007`, `0008`, `0009`, and `0010` in order.
+4. Verifies final SHA256 hashes.
+5. Compiles `native/ple_pread.c` inside the ARM64 image with GCC/OpenMP.
+6. Produces a thin image on top of the official base.
+
+Override values when needed:
 
 ```bash
 CONTAINER_ENGINE=docker \
 BASE_IMAGE=docker.io/vllm/vllm-openai:qwen38-flash-next \
-OUTPUT_IMAGE=localhost/vllm-cmp170hx:qwen3.8-flash-next \
+OUTPUT_IMAGE=vllm-qwen38-nvfp4-spark:latest \
 ./scripts/build-image.sh
 ```
 
-The script performs these steps:
-
-1. Creates a stopped container from the official Qwen image.
-2. Copies only the fourteen source files touched by the patch series.
-3. Verifies their SHA-256 hashes against `manifests/base-qwen38-flash-next.sha256`.
-4. Applies `patches/*.patch` in lexical order.
-5. Verifies all fifteen final files against `manifests/final-qwen38-flash-next.sha256`.
-6. Builds a thin derived image containing the patched Python files and the small native PLE `pread` helper.
-
-To inspect or apply the patches without building a container:
-
-```bash
-./scripts/apply-patches.sh /path/to/extracted/source-tree
-```
-
-See [`patches/README.md`](patches/README.md) for the functional split.
-
 ## Model files
 
-Download `Qwen/Qwen3.8-Flash-Next-FP8` into the Hugging Face cache. The Compose
-files pass the explicit model ID `Qwen/Qwen3.8-Flash-Next-FP8` to vLLM and mount
-the cached repository at its standard Hugging Face hub path. `QWEN_MODEL_CACHE`
-points to the repository directory containing `snapshots/`, not to an individual
-safetensors file:
+Download the pinned revision into the Hugging Face cache, then set `.env` so `QWEN_MODEL_CACHE` points to the repository directory containing `snapshots/`:
 
 ```text
-/root/app/vllm/cache/huggingface/hub/
-└── models--Qwen--Qwen3.8-Flash-Next-FP8/
+/home/nvidia/.cache/huggingface/hub/
+└── models--RadixArk--Qwen3.8-Flash-Next-NVFP4/
     └── snapshots/
-        └── bcd9f01ddc9cff2316eb84281bebcd5b058bddce/
+        └── 7b719225242aacd3dbd3f9407468c2ee9a9d2594/
 ```
 
-Copy and edit the example environment:
+Do not copy or convert the PLE table. `VLLM_PLE_NVME_PATH` points directly to this original snapshot.
+
+## Run
 
 ```bash
-cp .env.example .env
-$EDITOR .env
+docker compose config
+docker compose up -d
+docker compose logs -f
 ```
 
-## Run the default MTP3 production configuration
-
-The repository default enables native Qwen MTP3 together with PP4, V2, 1M
-context, NVMe PLE, prefix caching, chunked prefill and structured outputs. The
-production scheduler allows 4,096 batched tokens, keeps up to 32 request slots,
-uses a 32-token prefix-match unit for fine-grained hybrid Mamba/QSA cache reuse,
-and leaves `long_prefill_token_threshold=0` so a lone long prefill can use the
-full available batch budget.
-
-```bash
-podman compose config
-podman compose up -d
-curl -H "Authorization: Bearer $VLLM_API_KEY" \
-  http://127.0.0.1:8000/health
-```
-
-The default MTP profile uses three recursive draft steps and moves three target
-layers away from PP3, which also owns the MTP layer, LM head, and sampler:
+The initial single-Spark profile enables all four ported features together:
 
 ```text
-VLLM_PP_LAYER_PARTITION=13,13,13,9
+TP1 x PP1
+text-only
+native 262,144-token context
+MTP3
+BF16 QSA KV cache
+BF16 Mamba recurrent state
+mamba-cache-mode=align
+prefix-match-unit=32
+prefix caching
+chunked prefill
+max_num_batched_tokens=4096
+max_num_seqs=4
+gpu_memory_utilization=0.90
+PLE native pread workers=16
+PLE next-chunk prefetch=enabled
 ```
 
-```json
-{"method":"mtp","num_speculative_tokens":3}
-```
-
-It also keeps the Mamba recurrent state in BF16 so target and MTP cache geometry
-matches across all four PP stages. The checkpoint has one MTP layer; MTP3 runs
-that same layer recursively rather than loading three copies. Acceptance beyond
-the first draft position is workload-dependent. The MTP1 benchmark results below
-remain historical reference measurements.
-
-## Run without MTP
-
-Use the explicit text-only no-MTP profile when speculative decoding is not
-wanted. It uses the balanced target-only `12,12,12,12` partition:
-
-```bash
-podman compose -f compose.no-mtp.yml config
-podman compose -f compose.no-mtp.yml up -d
-```
-
-## Enable multimodal MTP
-
-`compose.multimodal.yml` enables the vision tower together with MTP3. It accepts
-base64 `data:` media, rejects ordinary HTTP/HTTPS media URLs by allowing only the
-reserved `media-disabled.invalid` domain, and disables the RAM-backed multimodal
-processor cache. Local `file:` media remains disabled because no allowed local
-media path is configured.
-
-```bash
-podman compose -f compose.multimodal.yml config
-podman compose -f compose.multimodal.yml up -d
-```
-
-## PLE / n-gram disk offload
-
-The checkpoint's PLE table is approximately 47.68 GiB:
-
-```text
-320,001,536 rows x 160 FP8 values
-128 logical shards in 33 safetensors files
-```
-
-The following variables keep it in the original files and read only requested
-rows:
+The image contains all features in one build. For debugging only, next-chunk prefetch can be disabled without rebuilding:
 
 ```yaml
-VLLM_PLE_CPU_OFFLOAD: "1"
-VLLM_PLE_NVME_PATH: /root/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/<snapshot>
-VLLM_PLE_NVME_BACKEND: pread
-VLLM_PLE_NVME_PREAD_WORKERS: "48"
-VLLM_PLE_NEXT_CHUNK_PREFETCH: "1"
+VLLM_PLE_NEXT_CHUNK_PREFETCH: "0"
 ```
 
-Set `VLLM_PLE_NVME_BACKEND=mmap` to use the mmap backend. The production example
-uses 48 native `pread` workers because it performed best for random row access
-on the tested host.
+The synchronous NVMe reader remains active.
 
-Next-chunk prefetch is bounded to at most the current scheduler batch and stores
-only one future PLE result batch. It is enabled only on PP0, does not cache or
-copy the 47.68-GiB table, and does not modify the scheduler. A future result is
-used only when request IDs, absolute starts, token IDs, padded batch size, and
-n-gram contexts all match the actual next batch; otherwise the worker falls back
-to the normal synchronous gather. Mixed decode/prefill batches are not
-prefetched, avoiding additional disk work on the decode path.
+## Correctness checks
 
-For correctness testing only, set `VLLM_PLE_NEXT_CHUNK_VERIFY=1`. Every prefetch
-hit is then gathered synchronously a second time and compared byte-for-byte.
-This deliberately adds duplicate disk I/O and must be disabled for performance
-measurements and production.
+Before treating the port as validated, verify on the Spark:
 
-Prefetch telemetry separates candidate mismatches and uncovered eligible
-prefills from decode or mixed batches that are inherently ineligible. It reports
-candidate hit rate, eligible-prefill step coverage, and valid-token coverage;
-ineligible decode steps do not reduce these rates. Logs advance once per 128
-eligible prefill lookups rather than once per 128 total model forwards.
+1. The build selects an optimized SM121 NVFP4 Linear backend.
+2. The build selects an optimized SM121 NVFP4 MoE backend rather than emulation.
+3. All 128 PLE shards are discovered and total row count matches the config.
+4. Random PLE rows match `safetensors.safe_open` byte-for-byte.
+5. A deterministic text completion is coherent.
+6. Prefix caching works across repeated requests with MTP3 and `prefix-match-unit=32`.
+7. A long uncached prompt reports PLE prefetch hits with no verification failure.
+8. Startup and runtime logs contain no real OOM, worker death, or EngineCore failure.
 
-The NVMe path currently requires TP=1 and DP=1. PP=4 is supported; only PP0 owns
-the PLE layer, offload connector, and future-prompt state.
+For PLE verification only:
 
-## Long context
-
-The checkpoint natively declares 262,144 positions. The Compose files request
-approximately 1M using static YaRN:
-
-```json
-{
-  "rope_type": "yarn",
-  "factor": 4.0,
-  "original_max_position_embeddings": 262144,
-  "rope_theta": 10000000,
-  "partial_rotary_factor": 0.25,
-  "mrope_interleaved": true,
-  "mrope_section": [11, 11, 10]
-}
+```yaml
+VLLM_PLE_NEXT_CHUNK_VERIFY: "1"
 ```
 
-`VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is required because the requested length exceeds
-the native declaration.
+This duplicates successful prefetch reads and must be disabled for performance measurements.
 
-## Observed results
+## DGX Spark validation
 
-These numbers describe one PCIe-limited 4 x CMP 170HX host and are not universal.
-Decode results are aggregate output throughput in tok/s. The three rows correspond
-to `compose.yml`, `compose.no-mtp.yml`, and `compose.multimodal.yml` respectively.
+Validated on one NixOS DGX Spark (`aarch64`, GB10, SM121) with image:
+
+```text
+localhost/vllm-qwen38-nvfp4-spark:latest
+d3c91d8246f63ae47020d76bf325e7960635c40e9d3ba0783c0edfc0e18d126e
+```
+
+Observed startup/runtime state:
+
+```text
+V2 Model Runner
+quantization=modelopt_fp4
+NVFP4 MoE backend=FLASHINFER_CUTLASS
+resident model memory=78.1 GiB
+weights + non-torch after warmup=81.68 GiB
+CUDA Graph memory=0.95 GiB
+KV cache=26.44 GiB / 966,121 tokens
+262,144-token request concurrency=3.69x
+health=200
+restart count=0
+fatal errors=0
+```
+
+PLE validation:
+
+```text
+47.68 GiB
+320,001,536 rows × 160 bytes
+128 logical shards / 10 physical PLE files
+ARM64 native pread helper loaded
+128 random rows byte-equal to safetensors.safe_open
+next-chunk prefetch enabled
+candidate hit rate=91.7%
+prefill token coverage=93.7%
+```
+
+### Prefill throughput
+
+Uncached random token-ID prompts, `max_tokens=1`, `max_num_batched_tokens=4096`:
+
+| Workload | Runs | Throughput |
+| --- | --- | ---: |
+| Single 32K (first new-shape run) | 1 | 684.27 tok/s |
+| Single 32K (warmed) | 1 | 815.18 tok/s |
+| Single 128K | 3 | 773.07 / 771.18 / 772.27 tok/s |
+| 4 × 32K concurrent | 1 | 809.67 aggregate tok/s |
+
+All measured prefill responses reported `cached_tokens=0`.
 
 ### Decode throughput
 
-| Configuration | 1 concurrent | 2 concurrent | 4 concurrent | 8 concurrent | 16 concurrent | 32 concurrent |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| MTP3 | 93.42 | 189.02 | 240.21 | 421.79 | 629.72 | 846.13 |
-| No MTP | 55.15 | 100.64 | 160.48 | 260.77 | 417.66 | 631.01 |
-| Multimodal + MTP3 | 87.02 | 161.17 | 243.96 | 417.84 | 639.62 | 884.47 |
+Fixed short counting prompt, deterministic sampling, completion-token count divided by wall time:
 
-### Current prefill throughput
+| Concurrency | Output per request | Runs | Aggregate output throughput |
+| ---: | ---: | --- | ---: |
+| 1 | 512 | 3 | 23.65 / 23.34 / 24.24 tok/s |
+| 4 | 512 | 2 | 81.72 / 81.28 tok/s |
 
-These are strict uncached end-to-end prompt-processing results with the current
-production scheduler (`max_num_batched_tokens=4096` and
-`long_prefill_token_threshold=0`) and native PLE enabled.
+The benchmark accumulated 4,474 accepted MTP draft tokens out of 4,491 drafted tokens (`99.62%`). A deterministic completion and an OpenAI chat-completions request both returned coherent output.
 
-| Configuration | Result |
-| --- | ---: |
-| One 128K prompt | 8,789 tok/s |
-| Four independent 32K prompts, sequential | 7,683 aggregate tok/s |
-| Four independent 32K prompts, concurrent | 7,385 aggregate tok/s |
-| Prefix-cache hit observed | 4,896 tokens |
+Cold startup is long because the checkpoint contains 206 safetensors files and about 296,475 tensor entries. The measured target+MTP model loading phase was about 17.5 minutes, followed by compile, kernel warmup and graph capture. This is dominated by many small ModelOpt/NVFP4 tensor load operations rather than PCIe transfer alone.
 
-### Historical PLE optimization results
+## Safety
 
-The following strict-random tests use the earlier 1,024-token scheduler batch and
-are retained as an A/B record of the next-chunk prefetch optimization, not as the
-current production prefill ceiling.
-
-| Configuration | Result |
-| --- | ---: |
-| Native PLE random-row microbenchmark, 1,024-token batch | approximately 4,100–4,770 tok/s |
-| Strict random-token 128K prefill before next-chunk prefetch | 2,594 tok/s |
-| Strict random-token 128K prefill with next-chunk prefetch | 3,611–3,791 tok/s |
-| Four concurrent strict-random 32K prefills before next-chunk prefetch | 2,819 aggregate tok/s |
-| Four concurrent strict-random 32K prefills with next-chunk prefetch | 3,724 aggregate tok/s |
-
-The first request after a fresh build may trigger Triton JIT and is not a steady
-performance measurement.
-
-## Patch boundaries
-
-The final image replaces fifteen files:
-
-- Nine files for Qwen PP ownership, PLE NVMe offload, and bounded next-chunk prefetch.
-- Three files for Qwen MTP and V2 PP speculative feedback.
-- Three scheduler/cache files for hybrid Mamba block alignment and MTP-safe partial-tail reuse.
-
-It does **not** include the discarded profiling kernels, Humming experiments,
-BF16 linear pre-dequantization, activation quantization, zero-PLE diagnostics,
-or custom small-M MoE kernels.
-
-## Safety notes
-
-- Change `VLLM_API_KEY` before exposing the service.
-- Validate a new image with restart disabled before enabling an automatic restart loop.
-- A healthy HTTP process alone does not prove that EngineCore workers are alive;
-  monitor worker logs for fatal errors as well.
-- The example requests access to all NVIDIA CDI devices and is intended for a
-  dedicated four-GPU host.
+- Keep the model snapshot read-only in the container.
+- Change `VLLM_API_KEY` before exposing the API.
+- Keep `SAFETENSORS_FAST_GPU=0`; PLE must remain on NVMe.
+- Do not enable activation INT8/FP8 for the Marlin fallback path.
+- Do not delete or rewrite the original PLE safetensors files.
