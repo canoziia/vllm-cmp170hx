@@ -22,7 +22,7 @@ services:
     environment:
       LD_LIBRARY_PATH: /run/opengl-driver/lib:/usr/local/cuda/lib64
       HF_HUB_OFFLINE: "1"
-      VLLM_CACHE_ROOT: /root/.cache/vllm/clean-final-b8192-v1
+      VLLM_CACHE_ROOT: /root/.cache/vllm/decode-prefix-cache-v1
       VLLM_NVFP4_STAGE_EXPERTS: "1"
       VLLM_USE_V2_MODEL_RUNNER: "1"
       VLLM_PLE_CPU_OFFLOAD: "1"

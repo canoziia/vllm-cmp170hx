@@ -61,6 +61,23 @@ Reference fixed real-document decode was slower. Its runtime block832 also diffe
 from README's1600; published MTP2/util.85/seqs8 remain unmatched. Do not claim a full
 published-configuration reproduction or completed2900/45 target.
 
+## Generated-history caching follow-up
+
+Pi Responses multi-turn sessions showed cache hits stopping at the previous
+prompt checkpoint. Exact prompt+generated token IDs matched the next rendered
+history in64/256/1024-token probes: this was not an early tokenizer mismatch.
+0018 now saves accepted decode boundaries with bounded CoW retention and an async
+acceptance fence; no fictitious cached-token counters or future hash markers.
+Prototype tests reduced shared-history replay to42–57tokens after up to1500
+output tokens; tool-result and branch-specific answer checks passed. Added
+scheduler and CUDA normalization fixtures, plus multi-turn API regressions.
+A/B/A under identical scheduling yielded512 identical generated token IDs.
+Instrumented state checks verified all73 normalized/continued/restored tensors
+byte-equal. Long-prefill and decode-derived states themselves differ numerically;
+this limitation is documented, not misrepresented as cached/cold bitwise equality.
+The original repeated-prompt regression remains exact. Final deployment checks
+must rerun on a clean image without `/tmp` debug hooks.
+
 ## Operations
 
 Original model and PLE table remain read-only. No extra lossy quantization.

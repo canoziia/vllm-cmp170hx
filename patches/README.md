@@ -18,7 +18,9 @@ The patches are applied in lexical order to files extracted from the ARM64 varia
 | `0016-cpu-stage-nvfp4-experts.patch` | Bounded per-module CPU staging of original packed NVFP4 tensors/scales, using the original loader, then bulk transfer; TP1 and opt-out supported. |
 | `0017-cache-ple-headers.patch` | Avoid reparsing safetensors headers on cache hits. |
 
-Twelve patch files total. `0003/0007/0008/0009` were inherited from the CMP170HX branch; `0010`–`0017` were added during the Spark port. Native PLE and deterministic top-k source accompanies the patches. The vendored top-k is from an Apache-2.0 upstream commit; see `vendor/kernel-det/SOURCE.txt`.
+| `0018-decode-prefix-checkpoints.patch` | Preserve accepted decode states at fine prefix boundaries for V2 async PP1: fence unresolved MTP steps, normalize accepted recurrent state, register finalized KV boundaries and CoW bounded snapshots. This extends prompt-tail caching to multi-turn generated history. |
+
+Thirteen patch files total. `0003/0007/0008/0009` were inherited from the CMP170HX branch; `0010`–`0017` were added during the Spark port. Native PLE and deterministic top-k source accompanies the patches. The vendored top-k is from an Apache-2.0 upstream commit; see `vendor/kernel-det/SOURCE.txt`.
 
 PP4 ownership, PP capture barriers and PP speculative-feedback patches are deliberately omitted. The Spark target is TP1 x PP1.
 
