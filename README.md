@@ -51,7 +51,7 @@ API key before exposing the service. Never commit `.env`.
 TP1 PP1, V2 runner, text-only
 max_model_len=262144 (native; no YaRN or other context extension)
 max_num_batched_tokens=8192
-max_num_seqs=4
+max_num_seqs=32
 MTP=3
 gpu_memory_utilization=0.90
 KV=bfloat16, Mamba SSM=bfloat16, mamba-cache-mode=align
