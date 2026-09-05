@@ -132,8 +132,8 @@ The synchronous NVMe reader remains active.
 
 Before treating the port as validated, verify on the Spark:
 
-1. The build selects an optimized SM121 NVFP4 Linear backend.
-2. The build selects an optimized SM121 NVFP4 MoE backend rather than emulation.
+1. The checkpoint resolves as `modelopt_fp4` and its quantized routed experts select an optimized SM121 NVFP4 backend rather than emulation.
+2. The ignored BF16 components (attention, shared experts, LM head, embeddings, vision and MTP) remain unquantized as declared by the checkpoint.
 3. All 128 PLE shards are discovered and total row count matches the config.
 4. Random PLE rows match `safetensors.safe_open` byte-for-byte.
 5. A deterministic text completion is coherent.
@@ -207,9 +207,10 @@ Fixed short counting prompt, deterministic sampling, completion-token count divi
 | Concurrency | Output per request | Runs | Aggregate output throughput |
 | ---: | ---: | --- | ---: |
 | 1 | 512 | 3 | 23.65 / 23.34 / 24.24 tok/s |
+| 2 | 512 | 3 | 41.85 / 48.19 / 40.56 tok/s |
 | 4 | 512 | 2 | 81.72 / 81.28 tok/s |
 
-The benchmark accumulated 4,474 accepted MTP draft tokens out of 4,491 drafted tokens (`99.62%`). A deterministic completion and an OpenAI chat-completions request both returned coherent output.
+The main 1/4-concurrency benchmark accumulated 4,474 accepted MTP draft tokens out of 4,491 drafted tokens (`99.62%`). A deterministic completion and an OpenAI chat-completions request both returned coherent output.
 
 Cold startup is long because the checkpoint contains 206 safetensors files and about 296,475 tensor entries. The measured target+MTP model loading phase was about 17.5 minutes, followed by compile, kernel warmup and graph capture. This is dominated by many small ModelOpt/NVFP4 tensor load operations rather than PCIe transfer alone.
 
