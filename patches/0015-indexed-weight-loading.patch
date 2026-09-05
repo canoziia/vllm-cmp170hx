@@ -1,0 +1,87 @@
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import dataclasses
+ import glob
++import json
+ import os
+ import time
+ from collections.abc import Generator, Iterable
+@@ -330,7 +331,39 @@
+             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
+         )
+-        yield from self._get_weights_iterator(primary_weights)
++        # Qwen's standalone MTP consumes only a tiny subset of a very large
++        # expert checkpoint. Filter by its existing remap predicate BEFORE
++        # safe_open.get_tensor, preserving original names and file/key order.
++        index_path = os.path.join(model_config.model, SAFE_WEIGHTS_INDEX_NAME)
++        if (
++            type(model).__name__ == "Qwen3_8FlashNextMTP"
++            and os.path.isfile(index_path)
++            and not getattr(model, "secondary_weights", ())
++        ):
++            from safetensors import safe_open
++            from vllm.models.qwen3_8_flash_next.nvidia.mtp import (
++                _remap_mtp_weight_name,
++            )
++
++            with open(index_path) as handle:
++                weight_map = json.load(handle)["weight_map"]
++            selected = {
++                name: filename for name, filename in weight_map.items()
++                if _remap_mtp_weight_name(name) is not None
++            }
++            if not selected:
++                raise RuntimeError("Qwen MTP checkpoint filter selected no tensors")
++            files = sorted(set(selected.values()))
++            logger.info("Qwen MTP indexed load: %d tensors in %d files", len(selected), len(files))
++            if self.counter_before_loading_weights == 0.0:
++                self.counter_before_loading_weights = time.perf_counter()
++            for filename in files:
++                with safe_open(os.path.join(model_config.model, filename), framework="pt") as tensors:
++                    for name in tensors.keys():
++                        if name in selected and selected[name] == filename:
++                            yield name, tensors.get_tensor(name)
++        else:
++            yield from self._get_weights_iterator(primary_weights)
+ 
+         secondary_weights = cast(
+             Iterable[DefaultModelLoader.Source],
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -892,12 +892,30 @@
+         self, weights: Iterable[tuple[str, torch.Tensor]]
+     ) -> Iterable[str]:
+         expert_mapping = self.get_expert_mapping(include_fused=True)
++        # Preserve mapping order and all generic/fused aliases. Only narrow
++        # candidates when BOTH names identify an explicit numbered expert.
++        import re
++        _expert_pattern = re.compile(r"(?:^|\.)experts\.(\d+)\.")
++        _numbered = {}
++        _generic = []
++        for _ordinal, _entry in enumerate(expert_mapping):
++            _match = _expert_pattern.search(_entry[1])
++            if _match:
++                _numbered.setdefault(_match.group(1), []).append((_ordinal, _entry))
++            else:
++                _generic.append((_ordinal, _entry))
++        _candidates = {
++            key: [entry for _, entry in sorted(_generic + values, key=lambda x: x[0])]
++            for key, values in _numbered.items()
++        }
+         for expert_name, loaded_weight in weights:
+             qual_name = f"{self.layer_name}.{expert_name}"
+             # Fused expert weights can be identified by their 3D tensors
+             is_fused = loaded_weight.dim() == 3
+             matched = False
+-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
++            _match = _expert_pattern.search(qual_name) if not is_fused else None
++            _mapping = _candidates.get(_match.group(1), expert_mapping) if _match else expert_mapping
++            for param_name, weight_name, expert_id, shard_id in _mapping:
+                 if weight_name not in qual_name:
+                     if matched and is_fused:
+                         break

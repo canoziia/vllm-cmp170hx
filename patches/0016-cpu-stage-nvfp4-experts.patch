@@ -1,0 +1,52 @@
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -908,6 +908,17 @@
+             key: [entry for _, entry in sorted(_generic + values, key=lambda x: x[0])]
+             for key, values in _numbered.items()
+         }
++        # Stage one NVFP4 expert module's packed parameters on CPU using the
++        # SAME weight_loader and dtype, then copy each destination once. This
++        # avoids thousands of synchronous small H2D transfers per layer.
++        # Preserve original GPU parameter identities and initial/padded bytes.
++        import os
++        _stage_scales = (
++            type(self.quant_method).__name__ == "ModelOptNvFp4FusedMoE"
++            and os.getenv("VLLM_NVFP4_STAGE_EXPERTS", "1") == "1"
++            and self.moe_config.tp_size == 1
++        )
++        _scale_staging = {}
+         for expert_name, loaded_weight in weights:
+             qual_name = f"{self.layer_name}.{expert_name}"
+             # Fused expert weights can be identified by their 3D tensors
+@@ -939,6 +950,20 @@
+                         f"Layer {self.layer_name} has no parameter {param_name!r} "
+                         f"for checkpoint weight {qual_name!r}"
+                     )
++                if (
++                    _stage_scales
++                    and param.device.type == "cuda"
++                    and loaded_weight.device.type == "cpu"
++                ):
++                    if param_name not in _scale_staging:
++                        _cpu_param = torch.nn.Parameter(
++                            param.detach().to(device="cpu", copy=True),
++                            requires_grad=False,
++                        )
++                        _cpu_param.__dict__.update(param.__dict__)
++                        _cpu_param.weight_loader = param.weight_loader
++                        _scale_staging[param_name] = (param, _cpu_param)
++                    param = _scale_staging[param_name][1]
+                 if is_fused:
+                     quant_method = getattr(param, "quant_method", None)
+                     # Block scales share the weight's two-dimensional layout.
+@@ -993,6 +1018,9 @@
+                         )
+                         yield param_name
+ 
++        for _destination, _staged in _scale_staging.values():
++            _destination.data.copy_(_staged.data)
++
+     def get_expert_mapping(
+         self,
+         ckpt_gate_proj_name: str | None = None,
