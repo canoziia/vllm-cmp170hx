@@ -1,0 +1,23 @@
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -67,11 +67,19 @@
+ 
+         self.driver_worker.init_worker(all_kwargs=[kwargs])
+         self.driver_worker.init_device()
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            # MultiprocExecutor performs the same lifecycle calls in WorkerProc.
++            # UniProcExecutor must spawn the dedicated PLE process explicitly;
++            # otherwise TP1/PP1 registers a GPU connector with no server and
++            # hangs during initialization after CUDA Graph capture.
++            self.driver_worker.spawn_ple_offload()
+ 
+         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+             self.driver_worker.elastic_ep_execute("load_model")
+         else:
+             self.driver_worker.load_model()
++        if envs.VLLM_PLE_CPU_OFFLOAD:
++            self.driver_worker.wait_ple_offload_ready()
+         current_platform.update_block_size_for_backend(self.vllm_config)
+ 
+     def _distributed_args(self) -> tuple[str, int, int]:
