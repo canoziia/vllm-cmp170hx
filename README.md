@@ -17,8 +17,9 @@ side-layer conversion, FP8 KV, or extra weight quantization is enabled.
 
 ## Clean-final source
 
-This branch includes the twelve patches used by the tested `clean-final` image:
-`0003`, `0007`–`0017`. See [patches/README.md](patches/README.md).
+The original `clean-final` used twelve patches (`0003`, `0007`–`0017`).
+This branch additionally includes `0018`, the generated-history prefix-cache fix
+(thirteen patches total). See [patches/README.md](patches/README.md).
 They provide PLE offload/prefetch, Mamba correctness fixes, GB10 FLA/deterministic
 QSA fixes, and indexed/batched weight loading. Native PLE and licensed upstream
 QSA top-k sources are included. GEMV, B12x, reference mmap, expanded prefill graph,
@@ -63,7 +64,7 @@ restart=unless-stopped
 
 Batch8192 is the user's new deployment choice; historical clean-final performance
 below used batch4096. Do not present that table as a new batch8192 benchmark.
-The compile cache is isolated at `/root/.cache/vllm/clean-final-b8192-v1` under a
+The compile cache is isolated at `/root/.cache/vllm/decode-prefix-cache-v1` under a
 persistent host mount; experimental AOT caches must not be mixed into it.
 
 ```bash
@@ -115,6 +116,36 @@ Use `scripts/benchmark_vllm_decode.mjs` (Node18+, no dependencies) for reproduci
 SSE measurements, with `--uncached --seed 42 --json-output <file>` and optionally
 `--prompt-file`. Ensure no running/waiting requests before benchmarking. Do not
 use the server's ten-second average prompt throughput as request performance.
+
+## Multi-turn generated-history cache
+
+Patch0018 extends fine-grained prefix caching beyond the input prompt into
+accepted decode tokens (V2 async, PP1, align mode). MTP steps are clipped/fenced at
+hash boundaries; accepted conv/SSM state is normalized without changing dtype,
+and copy-on-write preserves the snapshot before the running slot is overwritten.
+Only finalized token hashes are indexed. Finished EOS/length-truncated steps are
+not registered, because their sampled count may differ from GPU advancement.
+Three recent decode CoW snapshots per producer are retained; older decode entries
+are retired without invalidating an in-use reader's storage. Prompt checkpoints
+are retained separately. MTP still drops one hash unit on lookup.
+
+A short follow-up after a 64–1500-token response should normally reprocess only
+~32–96 shared-history tokens plus the new message/template, not the entire prior
+answer. This assumes an unchanged token prefix and resident cache entries;
+changed history, branching before a retained boundary, or eviction can miss.
+`tests/test_multiturn_decode_cache.mjs` exercises Responses and concurrent chat
+continuations; `tests/test_decode_cache_tools.mjs` covers tool-return and branches.
+
+Correctness evidence distinguishes two different questions:
+- Same captured accepted-state vs CoW/resumed state: all73 GDN/PLE tensors matched
+  byte-for-byte in instrumented runs; synthetic normalization tests cover16
+  dtype/layout/acceptance combinations. Same-instance cache-on/off/on generation
+  produced identical512 token IDs with identical scheduler shape.
+- Decode-derived state is **not bitwise equal to long-prefill recomputation**;
+  BF16 recurrent/shape-dependent arithmetic differs, and greedy continuations
+  can diverge. Do not describe this as whole-model batch invariance. Prefix-only
+  repeated-prompt tests remain exact. Tests also check branch-specific factual
+  answers with/without cache rather than hiding this limitation.
 
 ## Operational safety
 
