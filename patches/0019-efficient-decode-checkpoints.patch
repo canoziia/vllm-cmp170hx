@@ -1,0 +1,275 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index a8a6c1c..0d2a60c 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -449,6 +449,7 @@ class BlockPool:
+         num_tokens: int,
+         kv_cache_group_id: int,
+         block_size: int,
++        preserve_earlier: bool = False,
+     ) -> BlockHashWithGroupId | None:
+         """Register a partial prefix-cache entry for an existing block.
+ 
+@@ -499,6 +500,7 @@ class BlockPool:
+         )
+         if (
+             not already_cached
++            and not preserve_earlier
+             and block.block_hash is not None
+             and block.block_hash_num_tokens is not None
+             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 44097c3..e62388c 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -841,17 +841,13 @@ class KVCacheManager:
+         self,
+     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+         """Drain pending copies and return their retained endpoints."""
+-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
++        copies: list[KVCacheBlockCopy] = []
++        retained_blocks: list[KVCacheBlock] = []
+         for mgr in self.coordinator.single_type_managers:
+-            pending_copies.extend(mgr.take_pending_cow_copies())
+-        copies = [
+-            KVCacheBlockCopy(
+-                src_block_id=source_block.block_id,
+-                dst_block_id=cow_block.block_id,
+-            )
+-            for source_block, cow_block in pending_copies
+-        ]
+-        retained_blocks = [block for pair in pending_copies for block in pair]
++            for source, destination in mgr.take_pending_cow_copies():
++                copies.append(KVCacheBlockCopy(source.block_id, destination.block_id,
++                                               mgr.kv_cache_group_id))
++                retained_blocks.extend((source, destination))
+         return copies, retained_blocks
+ 
+     def take_partial_tail_offloads(self) -> dict[str, list[tuple[int, int, int]]]:
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index f18707a..451026e 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -181,6 +181,7 @@ class KVCacheBlock:
+ class KVCacheBlockCopy(NamedTuple):
+     src_block_id: int
+     dst_block_id: int
++    kv_cache_group_id: int = -1
+ 
+ 
+ class FreeKVCacheBlockQueue:
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index cd69d50..a1be864 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -69,7 +69,6 @@ class AsyncScheduler(Scheduler):
+                 and self.use_v2_model_runner
+                 and not stopped  # EOS/length may trim sampled tokens after GPU state advanced.
+                 and self.parallel_config.pipeline_parallel_size == 1
+-                and request.num_in_flight_tokens == 0
+                 and request.num_computed_tokens > request.num_prompt_tokens
+             )
+             try:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 095ef9c..0bfd171 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -396,12 +396,14 @@ class Scheduler(SchedulerInterface):
+                 # Materialize accepted decode states at fine hash boundaries.
+                 # Never schedule past a boundary using unresolved placeholders:
+                 # the prior acceptance must be processed before CoW admission.
+-                unit = self.hash_block_size
++                unit = 128
+                 if request.num_in_flight_tokens and (
+-                    start % unit == 0 or start % unit + num_new_tokens >= unit
++                    start % unit <= self.num_spec_tokens
+                 ):
+                     return 0
+-                return min(num_new_tokens, unit - start % unit)
++                # Keep uniform target query length. The worker limits the
++                # accepted prefix at the boundary, not the verification shape.
++                return num_new_tokens
+             return num_new_tokens
+ 
+         block_size = self.block_size
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 2aff902..3fa753c 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -835,6 +835,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+             num_tokens=boundary_tokens,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
++            preserve_earlier=True,  # Attention KV is append-only inside this page.
+         )
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+@@ -1860,6 +1861,8 @@ class MambaManager(SingleTypeKVCacheManager):
+             else latest_prompt_hash_boundary
+         )
+         if getattr(request, '_cache_confirmed_decode', False):
++            if num_tokens % 128 != 0 or request.num_in_flight_tokens != 0:
++                return None
+             cacheable_prompt_boundary = num_tokens
+             self._decode_tail_boundaries[request.request_id] = num_tokens
+         if num_tokens != cacheable_prompt_boundary:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b1ac674..4d743f7 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -162,6 +162,25 @@ from vllm.v1.worker.workspace import use_workspace_lane
+ 
+ logger = init_logger(__name__)
+ 
++from vllm.triton_utils import triton, tl
++
++@triton.jit
++def _cap_decode_acceptance(idx_mapping, computed, qstart, prompt_len, sampled,
++                           rejected, UNIT: tl.constexpr):
++    row = tl.program_id(0)
++    slot = tl.load(idx_mapping + row)
++    if slot < 0:
++        return
++    start = tl.load(computed + slot)
++    prompt = tl.load(prompt_len + slot)
++    if start < prompt:
++        return
++    count = tl.load(sampled + row)
++    cap = UNIT - start % UNIT
++    keep = tl.minimum(count, cap)
++    tl.store(sampled + row, keep)
++    tl.store(rejected + row, tl.load(rejected + row) + count - keep)
++
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -1153,6 +1172,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.kv_caches,
+                 self.kv_cache_config.num_blocks,
+                 scheduler_output.kv_cache_block_copies,
++                kv_caches_by_group=[
++                    [self.compilation_config.static_forward_context[name].kv_cache
++                     for name in group.layer_names]
++                    for group in self.kv_cache_config.kv_cache_groups
++                ],
+             )
+ 
+     def gather_batch_req_state(
+@@ -1475,6 +1499,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.speculator.draft_logits,
+             )
+ 
++        if (
++            self.cache_config.enable_prefix_caching
++            and self.cache_config.mamba_cache_mode == 'align'
++            and self.cache_config.prefix_match_unit
++            and self.vllm_config.scheduler_config.async_scheduling
++            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
++            and input_batch.num_draft_tokens > 0
++        ):
++            _cap_decode_acceptance[(input_batch.num_reqs,)](
++                input_batch.idx_mapping,
++                self.req_states.num_computed_tokens.gpu,
++                input_batch.query_start_loc,
++                self.req_states.prompt_len.gpu,
++                sampler_output.num_sampled, sampler_output.num_rejected,
++                UNIT=128,
++            )
+         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+ 
+     def postprocess_sampled(
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 28c02d5..020571b 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -344,7 +344,7 @@ class MambaHybridModelState(DefaultModelState):
+                 num_computed_tokens,
+                 idx_mapping,
+                 decode_checkpoint_unit=(
+-                    (self.cache_config.prefix_match_unit or 0)
++                    128
+                     if (
+                         self.cache_config.enable_prefix_caching
+                         and self.vllm_config.scheduler_config.async_scheduling
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index d8f36b1..148dd3a 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -550,14 +550,68 @@ def bind_kv_cache(
+         forward_context[layer_name].bind_kv_cache(kv_cache)
+ 
+ 
++@triton.jit
++def _copy_cache_pages_kernel(descriptors, B: tl.constexpr):
++    row = tl.program_id(0)
++    tile = tl.program_id(1)
++    src = tl.load(descriptors + row * 3).to(tl.pointer_type(tl.uint64))
++    dst = tl.load(descriptors + row * 3 + 1).to(tl.pointer_type(tl.uint64))
++    size = tl.load(descriptors + row * 3 + 2)
++    off = tile * B + tl.arange(0, B)
++    value = tl.load(src + off, off < size, 0)
++    tl.store(dst + off, value, off < size)
++
++
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+     num_blocks: int,
+     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
++    kv_caches_by_group: list[list[torch.Tensor | list[torch.Tensor]]] | None = None,
+ ) -> None:
+     if not kv_cache_block_copies:
+         return
+ 
++    if kv_caches_by_group is not None:
++        # A group's CoW need not copy every other layer's unrelated page.
++        # Batched descriptors also avoid two advanced-index kernels per layer.
++        descriptions = []
++        seen = set()
++        sources = set()
++        destinations = set()
++        device = None
++        for copy in kv_cache_block_copies:
++            assert 0 <= copy.src_block_id < num_blocks
++            assert 0 <= copy.dst_block_id < num_blocks
++            if copy.src_block_id == copy.dst_block_id:
++                continue
++            group = copy.kv_cache_group_id
++            entries = kv_caches if group < 0 else kv_caches_by_group[group]
++            for entry in entries:
++                for tensor in (entry if isinstance(entry, (list, tuple)) else (entry,)):
++                    storage = tensor.untyped_storage()
++                    ptr, size = storage.data_ptr(), storage.nbytes()
++                    assert size % num_blocks == 0
++                    page = size // num_blocks
++                    assert page % 8 == 0 and ptr % 8 == 0
++                    src = ptr + copy.src_block_id * page
++                    dst = ptr + copy.dst_block_id * page
++                    key = (src, dst)
++                    if key in seen:
++                        continue
++                    seen.add(key)
++                    # Simultaneous CoW allocations must not form copy chains.
++                    assert src not in destinations and dst not in sources
++                    assert dst not in destinations
++                    sources.add(src)
++                    destinations.add(dst)
++                    descriptions.append((src, dst, page // 8))
++                    device = tensor.device
++        if descriptions:
++            desc = async_tensor_h2d(np.asarray(descriptions, dtype=np.int64), device=device)
++            largest = max(d[2] for d in descriptions)
++            _copy_cache_pages_kernel[(len(descriptions), triton.cdiv(largest, 1024))](desc, B=1024)
++        return
++
+     storage_tensors: list[torch.Tensor] = []
+     seen_storage: set[int] = set()
+     for entry in kv_caches:
+@@ -574,7 +628,7 @@ def copy_kv_cache_blocks_inplace(
+     if not storage_tensors:
+         return
+     device = storage_tensors[0].device
+-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
++    indices_np = np.array([(c.src_block_id, c.dst_block_id) for c in kv_cache_block_copies], dtype=np.int64)
+     indices = async_tensor_h2d(indices_np, device=device)
+     src_indices, dst_indices = indices.unbind(dim=1)
+ 

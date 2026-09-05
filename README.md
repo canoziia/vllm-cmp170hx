@@ -18,8 +18,8 @@ side-layer conversion, FP8 KV, or extra weight quantization is enabled.
 ## Clean-final source
 
 The original `clean-final` used twelve patches (`0003`, `0007`–`0017`).
-This branch additionally includes `0018`, the generated-history prefix-cache fix
-(thirteen patches total). See [patches/README.md](patches/README.md).
+This branch additionally includes `0018`/`0019`, the generated-history
+prefix-cache fix and its efficient scheduling/copy path (fourteen patches total). See [patches/README.md](patches/README.md).
 They provide PLE offload/prefetch, Mamba correctness fixes, GB10 FLA/deterministic
 QSA fixes, and indexed/batched weight loading. Native PLE and licensed upstream
 QSA top-k sources are included. GEMV, B12x, reference mmap, expanded prefill graph,
@@ -119,9 +119,11 @@ use the server's ten-second average prompt throughput as request performance.
 
 ## Multi-turn generated-history cache
 
-Patch0018 extends fine-grained prefix caching beyond the input prompt into
-accepted decode tokens (V2 async, PP1, align mode). MTP steps are clipped/fenced at
-hash boundaries; accepted conv/SSM state is normalized without changing dtype,
+Patches0018/0019 extend prefix caching beyond the input prompt into accepted
+decode tokens (V2 async, PP1, align mode). With the deployed prefix unit32,
+decode snapshots are taken every128 tokens. Target verification keeps its uniform
+shape; acceptance is capped at the snapshot boundary and the scheduler fences
+unresolved steps at that boundary. Accepted conv/SSM state is normalized without changing dtype,
 and copy-on-write preserves the snapshot before the running slot is overwritten.
 Only finalized token hashes are indexed. Finished EOS/length-truncated steps are
 not registered, because their sampled count may differ from GPU advancement.
@@ -129,9 +131,9 @@ Three recent decode CoW snapshots per producer are retained; older decode entrie
 are retired without invalidating an in-use reader's storage. Prompt checkpoints
 are retained separately. MTP still drops one hash unit on lookup.
 
-A short follow-up after a 64–1500-token response should normally reprocess only
-~32–96 shared-history tokens plus the new message/template, not the entire prior
-answer. This assumes an unchanged token prefix and resident cache entries;
+A short follow-up after a 64–1500-token response should normally reprocess at
+most about160 shared-history tokens (128 snapshot interval +32 MTP replay margin)
+plus the new message/template, not the entire prior answer. This assumes an unchanged token prefix and resident cache entries;
 changed history, branching before a retained boundary, or eviction can miss.
 `tests/test_multiturn_decode_cache.mjs` exercises Responses and concurrent chat
 continuations; `tests/test_decode_cache_tools.mjs` covers tool-return and branches.
@@ -139,13 +141,21 @@ continuations; `tests/test_decode_cache_tools.mjs` covers tool-return and branch
 Correctness evidence distinguishes two different questions:
 - Same captured accepted-state vs CoW/resumed state: all73 GDN/PLE tensors matched
   byte-for-byte in instrumented runs; synthetic normalization tests cover16
-  dtype/layout/acceptance combinations. Same-instance cache-on/off/on generation
+  dtype/layout/acceptance combinations. Group-scoped CoW copies only the affected
+  caches, with byte-equality tests that also check unrelated pages remain unchanged.
+  Same-instance cache-on/off/on generation
   produced identical512 token IDs with identical scheduler shape.
 - Decode-derived state is **not bitwise equal to long-prefill recomputation**;
   BF16 recurrent/shape-dependent arithmetic differs, and greedy continuations
   can diverge. Do not describe this as whole-model batch invariance. Prefix-only
   repeated-prompt tests remain exact. Tests also check branch-specific factual
   answers with/without cache rather than hiding this limitation.
+
+The initial every32-token snapshot prototype reduced32-way decode from ~413 to
+~295–303 tok/s in same-instance A/B/A. Group copies alone did not solve it.
+Preserving uniform verification and saving at128-token intervals recovered to
+~392 tok/s in the latest measurement; do not claim zero overhead or compare this
+single measurement as a rigorous performance median.
 
 ## Operational safety
 
