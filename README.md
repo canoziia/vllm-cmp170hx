@@ -119,6 +119,8 @@ use the server's ten-second average prompt throughput as request performance.
 
 ## Multi-turn generated-history cache
 
+Final deployed results and limitations: [CACHE-FIX-VALIDATION.md](CACHE-FIX-VALIDATION.md).
+
 Patches0018/0019 extend prefix caching beyond the input prompt into accepted
 decode tokens (V2 async, PP1, align mode). With the deployed prefix unit32,
 decode snapshots are taken every128 tokens. Target verification keeps its uniform
