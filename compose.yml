@@ -55,7 +55,10 @@ services:
       - --max-num-batched-tokens=4096
       - --max-num-seqs=64
       - --kv-cache-dtype=fp8_ds_mla
-      - --kv-cache-memory=8589934592
+      # PP6 rank 2 owns the largest weight shard plus Engram L14. Let vLLM
+      # profile the latest automatic CUDA Graph set and size KV from 94% of
+      # HBM instead of forcing the former 8-GiB-per-rank budget.
+      - --gpu-memory-utilization=0.94
       - --trust-remote-code
       - --disable-custom-all-reduce
       - --enable-prefix-caching
