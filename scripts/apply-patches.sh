@@ -23,14 +23,23 @@ actual=$(git -C "$SOURCE_TREE" rev-parse HEAD)
   exit 5
 }
 
-for patch in "$REPO_ROOT"/patches/*.patch; do
-  echo "Applying $(basename "$patch")"
-  git -C "$SOURCE_TREE" apply --check "$patch"
-  git -C "$SOURCE_TREE" apply "$patch"
-done
+while read -r patch; do
+  [[ -n "$patch" && $patch != \#* ]] || continue
+  patch_path="$REPO_ROOT/patches/$patch"
+  [[ -f "$patch_path" ]] || { echo "Missing series patch: $patch" >&2; exit 6; }
+  echo "Applying $patch"
+  git -C "$SOURCE_TREE" apply --check "$patch_path"
+  git -C "$SOURCE_TREE" apply "$patch_path"
+done <"$REPO_ROOT/patches/series"
+
+# The current pinned author revision has the formerly out-of-tree PP support.
+grep -q 'supports_aux_hidden_states_over_pp.*True' \
+  "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
+grep -q 'spec_decode_needs_target_embed(vllm_config)' \
+  "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
 
 git -C "$SOURCE_TREE" diff --check
 python3 -m py_compile \
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py" \
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
-echo "DeepSeek V4.1 patch series applied successfully."
+echo "Pinned DeepSeek V4.1 source validation completed successfully."

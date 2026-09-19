@@ -1,0 +1,3 @@
+# No active out-of-tree source patches.
+# d63af5a472dc76b12d7a73d50a5af142844c15d1 contains the DSpark+PP target
+# embedding and auxiliary-hidden-state relay support previously carried here.
