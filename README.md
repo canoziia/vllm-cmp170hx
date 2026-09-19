@@ -24,7 +24,7 @@ DSpark 5, local argmax reduction
 max_model_len=1,048,576
 max_num_batched_tokens=4096
 max_num_seqs=64
-KV=fp8_ds_mla, fixed 8 GiB per PP rank
+KV=fp8_ds_mla, profiled at gpu_memory_utilization=0.94
 CPU Engram offload, prefix caching
 NCCL Ring/Simple, P2P and IB disabled
 ```
@@ -103,6 +103,7 @@ podman exec deepseek-v41 nvidia-smi -L
 swapon --show
 ```
 
-Expected GPU KV capacity with the recorded fixed budget was 5,523,045 tokens.
-The fixed 8-GiB value is per PP rank, not a global allocation. `max_num_seqs=64`
-is an admission limit, not capacity for 64 one-million-token requests.
+KV capacity is profiled at startup after model and automatic CUDA Graph
+allocation. `max_num_seqs=64` is an admission limit, not capacity for 64
+one-million-token requests. Record the reported token capacity and PP2 free HBM
+for every new image because Graph coverage and model allocations can change it.
