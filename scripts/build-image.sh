@@ -38,6 +38,9 @@ LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx
       io.canoziia.patch="dspark-pp-aux-relay+last-rank-embedding"
 CONTAINERFILE
 
-"$ENGINE" build --format docker -t "$OUTPUT_IMAGE" \
-  -f "$WORKDIR/context/Containerfile" "$WORKDIR/context"
+build_args=(-t "$OUTPUT_IMAGE" -f "$WORKDIR/context/Containerfile")
+if [[ "$ENGINE" == podman ]]; then
+  build_args=(--format docker "${build_args[@]}")
+fi
+"$ENGINE" build "${build_args[@]}" "$WORKDIR/context"
 echo "Built $OUTPUT_IMAGE"
