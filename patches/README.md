@@ -5,14 +5,18 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Active series
 
-`patches/series` is intentionally empty. The pinned author revision now
-contains the two PP+DSpark features that this branch originally carried:
+1. `0001-prime-pp-communicators-before-kv-profile.patch`
+   - Initializes lazy two-rank PP NCCL send/recv communicators before KV memory
+     profiling, so their persistent buffers reduce the calculated KV budget.
+   - Retains the existing pre-warmup call as an idempotent ordering check.
+   - Fixes a reproduced startup OOM where communicator initialization happened
+     after KV allocation at both 0.94 and 0.90 utilization.
+
+The pinned author revision already contains the other two PP+DSpark features:
 
 - `DeepseekV4Model.supports_aux_hidden_states_over_pp = True`;
 - `spec_decode_needs_target_embed(vllm_config)`, which makes the last PP rank
   own and load the target embedding used by DSpark.
-
-The build validates both capabilities before creating the image.
 
 ## Upstreamed history
 

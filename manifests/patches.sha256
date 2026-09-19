@@ -1,2 +1,3 @@
+123103939cc612fd32a9aadf23d9a22c8e10854d5603ff142f89725331aab27f  patches/0001-prime-pp-communicators-before-kv-profile.patch
 13de390c3c4465735a0ab54d0dffd35cca5131f7fefd5ff1b277fb9f324c8d2d  patches/upstreamed/0001-deepseek-v41-aux-hidden-state-pp-relay.patch
 80d4e8e42848a1943518a0a7f380cc5126b46036700232570780bb16c3b121f7  patches/upstreamed/0002-dspark-pp-last-rank-embedding.patch
