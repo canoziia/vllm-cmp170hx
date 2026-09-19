@@ -1,0 +1,58 @@
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 3aadd2251..262850d71 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -536,6 +536,26 @@ class Worker(WorkerBase):
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def _prime_pp_communicators(self) -> None:
++        """Initialize lazy PP send/recv communicators before memory sizing.
++
++        ProcessGroupNCCL creates an unbatched two-rank communicator on first
++        send/recv. If that happens after KV allocation, its persistent device
++        buffers are absent from memory profiling and can OOM during warmup.
++        Calling this before profiling makes those buffers part of non-KV usage.
++        The later pre-capture call is intentionally retained as an idempotent
++        ordering check.
++        """
++        pp_group = get_pp_group()
++        if pp_group.world_size <= 1:
++            return
++        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
++        if not pp_group.is_first_rank:
++            pp_group.recv(primer.shape, primer.dtype)
++        if not pp_group.is_last_rank:
++            pp_group.send(primer)
++        torch.accelerator.synchronize()
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much
+@@ -549,6 +569,10 @@ class Worker(WorkerBase):
+             You may limit the usage of GPU memory
+             by adjusting the `gpu_memory_utilization` parameter.
+         """
++        # Account for PP communicator buffers in the non-KV budget. The
++        # communicator is lazy, while KV allocation happens before the normal
++        # compile/warmup phase that used to initialize it.
++        self._prime_pp_communicators()
+         maybe_apply_startup_plan(self)
+ 
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+@@ -821,14 +845,7 @@ class Worker(WorkerBase):
+         # and capture_model both drive decode steps under FULL cudagraph
+         # modes), communicator initialization invalidates the capture and the
+         # engine later dies on an async cudaErrorInvalidValue far from here.
+-        pp_group = get_pp_group()
+-        if pp_group.world_size > 1:
+-            primer = torch.zeros(1, dtype=torch.int32, device=self.device)
+-            if not pp_group.is_first_rank:
+-                pp_group.recv(primer.shape, primer.dtype)
+-            if not pp_group.is_last_rank:
+-                pp_group.send(primer)
+-            torch.accelerator.synchronize()
++        self._prime_pp_communicators()
+ 
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
