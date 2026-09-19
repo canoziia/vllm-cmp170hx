@@ -24,7 +24,7 @@ DSpark 5, local argmax reduction
 max_model_len=1,048,576
 max_num_batched_tokens=4096
 max_num_seqs=64
-KV=fp8_ds_mla, profiled at gpu_memory_utilization=0.94
+KV=fp8_ds_mla, profiled at gpu_memory_utilization=0.90
 CPU Engram offload, prefix caching
 NCCL Ring/Simple, P2P and IB disabled
 ```
