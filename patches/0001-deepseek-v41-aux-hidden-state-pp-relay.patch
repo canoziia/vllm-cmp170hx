@@ -1,0 +1,24 @@
+From 8468d428aaa720c65f5c954da02c32b612fc50d5 Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Sat, 19 Sep 2026 17:25:55 +0000
+Subject: [PATCH 1/2] deepseek_v4_1: allow auxiliary hidden-state relay over PP
+
+---
+ vllm/models/deepseek_v4_1/nvidia/model.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 085bedb..9cecb1d 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -413,6 +413,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+ 
+ class DeepseekV4Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp = True
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+-- 
+2.55.0
+
