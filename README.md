@@ -6,15 +6,15 @@ Reproducible minimal patches and a Podman Compose deployment for
 ## Source and image
 
 - Author source: `https://github.com/344303947/dsv41-flash-pp5-170hx.git`
-- Pinned source revision: `9d0f9181756ec3100e302bbf04e313baa3f54bbf`
+- Pinned source revision: `d63af5a472dc76b12d7a73d50a5af142844c15d1`
 - Pinned SM80 base image:
   `docker.io/lazymio/vllm-backport@sha256:8094fcbab905a04a480b327f2761255e3d17cd8d39470cac9d76450bbb567f7e`
-- Default output image: `localhost/dsv41-pp6-dspark-clean:9d0f918`
+- Default output image: `localhost/deepseek-v41-cmp170hx:latest`
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
-Engram tables use the author's exact-size pinned CPU offload path. This branch
-adds only the two PP+DSpark capabilities documented in
-[`patches/README.md`](patches/README.md).
+Engram tables use the author's exact-size pinned CPU offload path. The pinned
+author revision now includes native PP6+DSpark support; the former independent
+patches remain under [`patches/upstreamed/`](patches/README.md) for audit only.
 
 ## Runtime configuration
 
@@ -43,20 +43,21 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/dsv41-pp6-dspark-clean:9d0f918 \
+OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
 bash scripts/build-image.sh
 ```
 
 The build checks out the pinned author revision, verifies that it is clean,
-applies each patch with `git apply --check`, compiles both modified Python files,
-and copies the complete patched `vllm/` tree over the pinned SM80 base image.
+applies the active `patches/series` (currently empty because the required changes
+were upstreamed), validates the PP+DSpark capabilities, compiles the relevant
+Python files, and copies the complete pinned `vllm/` tree over the SM80 image.
 
 To inspect only the source result:
 
 ```bash
 git clone https://github.com/344303947/dsv41-flash-pp5-170hx.git /tmp/dsv41
 cd /tmp/dsv41
-git checkout 9d0f9181756ec3100e302bbf04e313baa3f54bbf
+git checkout d63af5a472dc76b12d7a73d50a5af142844c15d1
 /path/to/this/repo/scripts/apply-patches.sh /tmp/dsv41
 ```
 

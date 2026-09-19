@@ -1,6 +1,6 @@
 services:
   deepseek-v41:
-    image: ${VLLM_IMAGE:-localhost/dsv41-pp6-dspark-clean:9d0f918}
+    image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
     container_name: deepseek-v41
     restart: "no"
     network_mode: host
