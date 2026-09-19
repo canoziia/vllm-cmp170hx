@@ -6,7 +6,7 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 ## Active series
 
 1. `0001-prime-pp-communicators-before-kv-profile.patch`
-   - Initializes lazy two-rank PP NCCL send/recv communicators before KV memory
+   - Initializes both lazy two-rank PP communicators (vLLM PyNCCL and torch ProcessGroupNCCL) before KV memory
      profiling, so their persistent buffers reduce the calculated KV budget.
    - Retains the existing pre-warmup call as an idempotent ordering check.
    - Fixes a reproduced startup OOM where communicator initialization happened
