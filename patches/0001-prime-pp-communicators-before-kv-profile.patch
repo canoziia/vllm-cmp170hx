@@ -1,22 +1,26 @@
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 3aadd2251..993398d3c 100644
+index 3aadd2251..b89bee9d0 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -536,6 +536,28 @@ class Worker(WorkerBase):
+@@ -536,6 +536,41 @@ class Worker(WorkerBase):
          with set_current_vllm_config(self.vllm_config):
              self.model_runner.reload_weights(*args, **kwargs)
  
 +    def _prime_pp_communicators(self) -> None:
-+        """Initialize both lazy PP P2P communicators before memory sizing."""
++        """Initialize all lazy PP communicators before KV memory sizing."""
 +        pp_group = get_pp_group()
 +        if pp_group.world_size <= 1:
 +            return
 +        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
++
++        # vLLM/PyNCCL point-to-point communicator.
 +        if not pp_group.is_first_rank:
 +            pp_group.recv(primer.shape, primer.dtype)
 +        if not pp_group.is_last_rank:
 +            pp_group.send(primer)
 +        torch.accelerator.synchronize()
++
++        # torch ProcessGroupNCCL point-to-point edge communicator.
 +        rank = pp_group.rank_in_group
 +        if not pp_group.is_first_rank:
 +            torch.distributed.recv(
@@ -28,23 +32,32 @@ index 3aadd2251..993398d3c 100644
 +            )
 +        torch.accelerator.synchronize()
 +
++        # Dedicated sibling communicator used to broadcast sampled/draft tokens
++        # from the final PP rank back to all earlier ranks.
++        handler = getattr(self.model_runner, "pp_handler", None)
++        if handler is not None:
++            torch.distributed.broadcast(
++                primer, src=handler.last_rank, group=handler.broadcast_group
++            )
++            torch.accelerator.synchronize()
++
      @torch.inference_mode()
      def determine_available_memory(self) -> int:
          """Profiles the peak memory usage of the model to determine how much
-@@ -549,6 +571,12 @@ class Worker(WorkerBase):
+@@ -549,6 +584,12 @@ class Worker(WorkerBase):
              You may limit the usage of GPU memory
              by adjusting the `gpu_memory_utilization` parameter.
          """
 +        # Staged repack leaves large free blocks in the torch cache. Release
-+        # them before the lazy communicators allocate persistent RM buffers,
-+        # then let profiling count those buffers as non-KV memory.
++        # them before lazy PP communicators allocate persistent RM buffers, then
++        # let profiling count those buffers as non-KV memory.
 +        gc.collect()
 +        torch.accelerator.empty_cache()
 +        self._prime_pp_communicators()
          maybe_apply_startup_plan(self)
  
          if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-@@ -821,14 +849,7 @@ class Worker(WorkerBase):
+@@ -821,14 +862,7 @@ class Worker(WorkerBase):
          # and capture_model both drive decode steps under FULL cudagraph
          # modes), communicator initialization invalidates the capture and the
          # engine later dies on an async cudaErrorInvalidValue far from here.
