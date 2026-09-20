@@ -26,6 +26,8 @@ JSON
     echo "Enabled sampled timing: $CONTROL"
     ;;
   detail)
+    echo "Disabled: per-worker eager switching can desynchronize PP shapes; use enable/profile" >&2
+    exit 2
     session=${2:-$(date +%Y%m%d-%H%M%S)}
     samples=${3:-16}
     ranks=${4:-all}

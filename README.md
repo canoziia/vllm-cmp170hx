@@ -158,6 +158,13 @@ adaptive verification disabled. Combined-image runtime validation is pending.
 
 ## Optional hot performance diagnostics
 
+Safety update: `detail` is disabled, and the tracer rejects graph-changing and
+module-hook control options. Runtime sampling never changes target/draft graph
+dispatch. Use `enable` for asynchronous stage timing or bounded CPU `profile`.
+Trace records retain their original output path/session across delayed flushes.
+The historical detail examples below are not enabled in this revision.
+
+
 Default images contain no diagnostic runtime code or hot-path hooks. Build and
 deploy a separate image with `ENABLE_PERF_DEBUG=1` when diagnosis is needed.
 Within that diagnostic image the tracer is still disabled by default: disabled
