@@ -87,7 +87,7 @@ index 274cf1f54..2c0f99f5e 100644
              separate_decode_routine and bool(decode_mode) and self.varlen_decode
          )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 05bc6b8f5..bdc645655 100644
+index 05bc6b8f5..dcb33d628 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -19,8 +19,10 @@ instead of embedding feature-specific logic directly.
@@ -189,19 +189,39 @@ index 05bc6b8f5..bdc645655 100644
  
      def get_model(self) -> nn.Module:
          return self.model
-@@ -1611,6 +1672,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1573,6 +1634,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         context_len: int = 0,
+         valid_dummy_state_slots: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
++        tracer = self.perf_debug
++        timing = tracer is not None and tracer.step_active
++        stamp = tracer.cpu_start() if timing else 0
++        if timing:
++            tracer.set_meta(request_ids=list(scheduler_output.num_scheduled_tokens),
++                            scheduled_by_request=scheduler_output.num_scheduled_tokens,
++                            next_k=scheduler_output.num_spec_tokens_to_schedule)
+         if not dummy_run:
+             # Update the request states.
+             self.update_pp_decode_requests()
+@@ -1588,6 +1656,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     scheduler_output, empty_output
+                 )
+ 
++        if timing:
++            tracer.cpu_end("state_updates", stamp)
++            stamp = tracer.cpu_start()
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+@@ -1611,6 +1682,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
  
          skip_compiled = False
-+        debug_force_eager = (
-+            self.perf_debug is not None
-+            and self.perf_debug.step_active
-+            and self.perf_debug.force_eager
-+        )
++        debug_force_eager = False
          if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
              # Encoder-decoder models such as Whisper should run eager/non-compiled
              # when encoder inputs are scheduled, because this step updates
-@@ -1625,7 +1691,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1625,7 +1697,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.dp_size,
              self.dp_rank,
              max_query_len=max_query_len,
@@ -210,7 +230,32 @@ index 05bc6b8f5..bdc645655 100644
              num_active_loras=num_active_loras,
              parallel_config=self.parallel_config,
              allow_ubatching=(
-@@ -1836,6 +1902,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1639,6 +1711,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             empty_output = self.kv_connector.no_forward(scheduler_output)
+             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+ 
++        if timing:
++            tracer.cpu_end("gather_and_dispatch", stamp)
++            tracer.set_meta(batch_descriptor=str(batch_desc))
++            stamp = tracer.cpu_start()
+         cudagraph_stats = None
+         if not dummy_run:
+             # Common case.
+@@ -1649,7 +1725,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch = self.prepare_inputs(
+                 scheduler_output, batch_req_state, batch_desc
+             )
++            if timing:
++                tracer.cpu_end("prepare_inputs", stamp)
++                stamp = tracer.cpu_start()
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
++            if timing:
++                tracer.cpu_end("prepare_attn", stamp)
++                stamp = tracer.cpu_start()
+             # Mamba "align" pre-copy: migrate recurrent state across block
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+@@ -1836,7 +1918,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
          self.step_timing.forward_start()
@@ -228,13 +273,20 @@ index 05bc6b8f5..bdc645655 100644
 +        else:
 +            target_gpu = None
  
++        if timing:
++            tracer.cpu_end("metadata_and_model_inputs", stamp)
++            stamp = tracer.cpu_start()
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
-@@ -1844,7 +1923,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Use explicit cudagraph replay for FULL mode.
+@@ -1844,7 +1942,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # because they are already copied to the CUDA graph input buffers.
              assert self.cudagraph_manager is not None
              self.kv_connector.pre_forward(scheduler_output)
 -            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            if timing:
++                tracer.cpu_end("connector_pre_forward", stamp)
++                stamp = tracer.cpu_start()
 +            if debug_step:
 +                with self.perf_debug.scope("perf::target_forward"):
 +                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
@@ -243,7 +295,7 @@ index 05bc6b8f5..bdc645655 100644
          else:
              # For piecewise and eager mode, just call model().
              batch_descriptor = BatchDescriptor(
-@@ -1878,12 +1961,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1878,12 +1983,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      # cudagraph, chosen inside run_pw_graph). cg_mode is only
                      # PIECEWISE after the cudagraph manager exists.
                      assert self.cudagraph_manager is not None
@@ -268,12 +320,14 @@ index 05bc6b8f5..bdc645655 100644
 +                    else:
 +                        model_output = self.model(**model_inputs)
 +
++        if timing:
++            tracer.cpu_end("forward_dispatch", stamp)
 +        if debug_step:
 +            self.perf_debug.cuda_end(target_gpu)
  
          if self.is_last_pp_rank:
              if self.use_aux_hidden_state_outputs:
-@@ -1917,6 +2013,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1917,6 +2037,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              ec_connector_output=ec_connector_output,
              routed_experts=routed_experts,
              cudagraph_stats=cudagraph_stats,
@@ -282,7 +336,7 @@ index 05bc6b8f5..bdc645655 100644
          )
  
          if not self.is_last_pp_rank:
-@@ -1947,6 +2045,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1947,6 +2069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          ec_connector_output = self.execute_model_state.ec_connector_output
          routed_experts = self.execute_model_state.routed_experts
          cudagraph_stats = self.execute_model_state.cudagraph_stats
@@ -290,7 +344,7 @@ index 05bc6b8f5..bdc645655 100644
          self.execute_model_state = None
  
          if not self.is_last_pp_rank:
-@@ -1954,7 +2053,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1954,7 +2077,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # IntermediateTensors instead of final hidden states. Receive the
              # sampled tokens broadcast from the last rank and update local state.
              assert self.pp_handler is not None
@@ -302,7 +356,7 @@ index 05bc6b8f5..bdc645655 100644
              # Optimistically update num_computed_tokens for entire batch here.
              # Will be adjusted for rejections if necessary in update_requests.
              self.postprocess_num_computed_tokens(input_batch)
-@@ -1974,9 +2077,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1974,9 +2101,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.pcp_manager, hidden_states, input_batch
          )
  
@@ -326,7 +380,7 @@ index 05bc6b8f5..bdc645655 100644
  
          if self.pp_handler is not None:
              # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2041,6 +2155,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2041,6 +2179,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # ensuring that `copy_event` is recorded before calling postprocess.
          # This sequencing may slightly reduce latency as async D2H copy does not
          # need to wait for the postprocess to finish.
@@ -336,7 +390,7 @@ index 05bc6b8f5..bdc645655 100644
          self.postprocess_sampled(
              input_batch.idx_mapping,
              sampler_output.sampled_token_ids,
-@@ -2048,6 +2165,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2048,6 +2189,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_rejected,
              input_batch.query_start_loc,
          )
@@ -345,7 +399,7 @@ index 05bc6b8f5..bdc645655 100644
  
          if self.speculator is not None:
              assert self.sampler is not None
-@@ -2059,24 +2178,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2059,24 +2202,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                  spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
@@ -391,7 +445,7 @@ index 05bc6b8f5..bdc645655 100644
 +                        mm_inputs=mm_inputs,
 +                        **({"context_only": next_draft_k == 0}
 +                           if self._hot_dspark else {}),
-+                        is_profile=bool(debug_step and self.perf_debug.force_eager),
++                        is_profile=False,
 +                    )
 +            if debug_step:
 +                self.perf_debug.cuda_end(draft_gpu)
@@ -402,7 +456,7 @@ index 05bc6b8f5..bdc645655 100644
                  self.adaptive_verification.record_confidences(
                      self.speculator.draft_token_confidence_probs, input_batch
                  )
-@@ -2086,7 +2221,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2086,7 +2245,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # not have a speculator (i.e. self.speculator is None)
              self.draft_tokens_handler.set_draft_tokens(
                  input_batch,
@@ -411,7 +465,7 @@ index 05bc6b8f5..bdc645655 100644
              )
              if self.pp_handler is not None:
                  self.pp_handler.broadcast_drafts(
-@@ -2232,6 +2367,7 @@ class ExecuteModelState(NamedTuple):
+@@ -2232,6 +2391,7 @@ class ExecuteModelState(NamedTuple):
      ec_connector_output: ECConnectorOutput | None
      routed_experts: RoutedExpertsTensors | None
      cudagraph_stats: CUDAGraphStat | None
@@ -421,10 +475,10 @@ index 05bc6b8f5..bdc645655 100644
  class BatchReqState(NamedTuple):
 diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
 new file mode 100644
-index 000000000..61c555a07
+index 000000000..418550aac
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/perf_debug.py
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,382 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Hot-switchable, low-overhead GPU worker diagnostics.
 +
@@ -541,6 +595,12 @@ index 000000000..61c555a07
 +                logger.info("Perf debug disabled on rank %d", self.rank)
 +            return
 +
++        if config.get("force_eager") or config.get("module_detail"):
++            logger.warning("Ignoring unsafe graph-changing/module-hook debug options")
++            config["force_eager"] = False
++            config["module_detail"] = False
++        self._drain_ready()
++        self._flush()
 +        self._config = config
 +        output_dir = Path(config.get("output_dir") or self.control_path.parent)
 +        output_dir.mkdir(parents=True, exist_ok=True)
@@ -656,7 +716,9 @@ index 000000000..61c555a07
 +            return False
 +        self._sample_seq += 1
 +        self._current = {
-+            "schema": 1,
++            "schema": 2,
++            "session": self._config.get("session"),
++            "_output_path": str(self._output_path),
 +            "rank": self.rank,
 +            "pid": os.getpid(),
 +            "step": self._step_seq,
@@ -776,9 +838,13 @@ index 000000000..61c555a07
 +    def _flush(self) -> None:
 +        if not self._write_buffer or self._output_path is None:
 +            return
-+        with self._output_path.open("a", encoding="utf-8") as output:
-+            for record in self._write_buffer:
-+                output.write(json.dumps(record, separators=(",", ":")) + "\n")
++        paths: dict[str, list[dict[str, Any]]] = defaultdict(list)
++        for record in self._write_buffer:
++            paths[record.pop("_output_path")].append(record)
++        for path, records in paths.items():
++            with Path(path).open("a", encoding="utf-8") as output:
++                for record in records:
++                    output.write(json.dumps(record, separators=(",", ":")) + "\n")
 +        self._write_buffer.clear()
 +
 +
@@ -901,27 +967,65 @@ index 8c65a23ef..d9e9a5126 100644
 +            if debug_step:
 +                self.perf_debug.cuda_end(feedback_broadcast, self.broadcast_stream)
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index a3e8df792..7f5d6d526 100644
+index a3e8df792..b47d85400 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-@@ -346,6 +346,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -6,6 +6,7 @@ from typing import Any
+ 
+ import numpy as np
+ import torch
++from vllm.v1.worker.gpu.perf_debug import get_perf_debug
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, replace
+@@ -346,7 +347,12 @@ class DFlashSpeculator(DraftModelSpeculator):
          skip_attn_for_dummy_run: bool = False,
          mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
          is_profile: bool = False,
 +        context_only: bool = False,
      ) -> torch.Tensor:
++        tracer = get_perf_debug()
++        timing = tracer is not None and tracer.step_active
++        stamp = tracer.cpu_start() if timing else 0
++        span = tracer.cuda_begin("draft_context_total") if timing else None
          num_reqs = input_batch.num_reqs
          num_target_tokens = input_batch.num_tokens
-@@ -443,6 +444,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+         num_query_tokens = num_reqs * self.num_query_per_req
+@@ -443,6 +449,13 @@ class DFlashSpeculator(DraftModelSpeculator):
              context_slots,
          )
  
++        if timing:
++            tracer.cuda_end(span)
++            tracer.cpu_end("draft_context_prepare", stamp)
++            stamp = tracer.cpu_start()
 +        if context_only:
 +            return self.draft_tokens[:num_reqs, :0]
 +
          batch_sync, num_batch_tokens = (
              self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
              if dp_sync is not None
+@@ -484,6 +497,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # so the real token count is num_query_tokens.
+         self._prepare_eplb_forward(num_query_tokens)
+ 
++        if timing:
++            tracer.cpu_end("draft_metadata", stamp)
++            stamp = tracer.cpu_start()
++            span = tracer.cuda_begin("draft_query_and_markov")
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             assert self.query_cudagraph_manager is not None
+             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+@@ -497,6 +514,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 cudagraph_runtime_mode=batch_desc.cg_mode,
+             )
+ 
++        if timing:
++            tracer.cuda_end(span)
++            tracer.cpu_end("draft_query_dispatch", stamp)
+         return self.draft_tokens[:num_reqs]
+ 
+ 
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
 index 6c8dda74a..9d4ae4936 100644
 --- a/vllm/v1/worker/gpu_worker.py
