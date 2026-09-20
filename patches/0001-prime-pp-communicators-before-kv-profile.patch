@@ -1,26 +1,31 @@
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 3aadd2251..b89bee9d0 100644
+index 3aadd2251..0fe316de0 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -536,6 +536,41 @@ class Worker(WorkerBase):
-         with set_current_vllm_config(self.vllm_config):
-             self.model_runner.reload_weights(*args, **kwargs)
+@@ -499,10 +499,43 @@ class Worker(WorkerBase):
+ 
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+ 
++        # Create all lazy PP communicators while HBM and host memory are still
++        # empty. CPU Engram later locks ~189 GiB, after which NVIDIA RM may be
++        # unable to allocate communicator system memory on this VFIO host.
++        self._prime_pp_communicators()
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
  
 +    def _prime_pp_communicators(self) -> None:
-+        """Initialize all lazy PP communicators before KV memory sizing."""
++        """Initialize all lazy PP communicators before model/KV allocation."""
 +        pp_group = get_pp_group()
 +        if pp_group.world_size <= 1:
 +            return
 +        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
-+
-+        # vLLM/PyNCCL point-to-point communicator.
 +        if not pp_group.is_first_rank:
 +            pp_group.recv(primer.shape, primer.dtype)
 +        if not pp_group.is_last_rank:
 +            pp_group.send(primer)
 +        torch.accelerator.synchronize()
-+
-+        # torch ProcessGroupNCCL point-to-point edge communicator.
 +        rank = pp_group.rank_in_group
 +        if not pp_group.is_first_rank:
 +            torch.distributed.recv(
@@ -31,9 +36,6 @@ index 3aadd2251..b89bee9d0 100644
 +                primer, dst=pp_group.ranks[rank + 1], group=pp_group.device_group
 +            )
 +        torch.accelerator.synchronize()
-+
-+        # Dedicated sibling communicator used to broadcast sampled/draft tokens
-+        # from the final PP rank back to all earlier ranks.
 +        handler = getattr(self.model_runner, "pp_handler", None)
 +        if handler is not None:
 +            torch.distributed.broadcast(
@@ -41,23 +43,10 @@ index 3aadd2251..b89bee9d0 100644
 +            )
 +            torch.accelerator.synchronize()
 +
-     @torch.inference_mode()
-     def determine_available_memory(self) -> int:
-         """Profiles the peak memory usage of the model to determine how much
-@@ -549,6 +584,12 @@ class Worker(WorkerBase):
-             You may limit the usage of GPU memory
-             by adjusting the `gpu_memory_utilization` parameter.
-         """
-+        # Staged repack leaves large free blocks in the torch cache. Release
-+        # them before lazy PP communicators allocate persistent RM buffers, then
-+        # let profiling count those buffers as non-KV memory.
-+        gc.collect()
-+        torch.accelerator.empty_cache()
-+        self._prime_pp_communicators()
-         maybe_apply_startup_plan(self)
- 
-         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-@@ -821,14 +862,7 @@ class Worker(WorkerBase):
+     def handle_ft_command(self, ft_request):
+         assert self.worker_sentinel is not None
+         return self.worker_sentinel.handle_command(ft_request)
+@@ -821,14 +854,7 @@ class Worker(WorkerBase):
          # and capture_model both drive decode steps under FULL cudagraph
          # modes), communicator initialization invalidates the capture and the
          # engine later dies on an async cudaErrorInvalidValue far from here.
