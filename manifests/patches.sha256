@@ -1,1 +1,2 @@
-743ef501bfc026b3ce090eff4fa2b9ee46598eb13e6f0b1628be5787a6131330  patches/0001-prime-pp-communicators-and-hot-perf-debug.patch
+16d8b755470052a7e939a10c97e6877396b55d06b24b548c166c7e5974dd5af7  patches/0001-prime-pp-communicators-before-model-load.patch
+2d3e31ca6d3ae5fdcbdaa534ec55da5f427ad1a121bbcc5654e11063bcc38dd1  patches/optional/0002-hot-perf-debug.patch

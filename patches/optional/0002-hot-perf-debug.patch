@@ -760,7 +760,7 @@ index 8c65a23ef..d9e9a5126 100644
 +            if debug_step:
 +                self.perf_debug.cuda_end(feedback_broadcast, self.broadcast_stream)
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 3aadd2251..9d4ae4936 100644
+index 6c8dda74a..9d4ae4936 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -96,6 +96,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
@@ -813,78 +813,7 @@ index 3aadd2251..9d4ae4936 100644
          # DSpark target and draft CUDA graphs retain workspace views concurrently.
          num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
          init_workspace_manager(
-@@ -499,10 +513,54 @@ class Worker(WorkerBase):
- 
-             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
- 
-+        # Initialize persistent PP communication resources before model and
-+        # KV allocation. This makes first-use NCCL allocations deterministic
-+        # and lets later memory profiling account for their steady-state cost.
-+        self._prime_pp_communicators()
-+
-         if self.rank == 0:
-             # If usage stat is enabled, collect relevant info.
-             report_usage_stats(self.vllm_config)
- 
-+    def _prime_pp_communicators(self) -> None:
-+        """Initialize all lazy PP communicators before model/KV allocation."""
-+        if getattr(self, "_pp_communicators_primed", False):
-+            return
-+        pp_group = get_pp_group()
-+        if pp_group.world_size <= 1:
-+            self._pp_communicators_primed = True
-+            return
-+        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
-+
-+        # vLLM/PyNCCL point-to-point communicator.
-+        if not pp_group.is_first_rank:
-+            pp_group.recv(primer.shape, primer.dtype)
-+        if not pp_group.is_last_rank:
-+            pp_group.send(primer)
-+        torch.accelerator.synchronize()
-+
-+        # torch ProcessGroupNCCL point-to-point edge communicators.
-+        rank = pp_group.rank_in_group
-+        if not pp_group.is_first_rank:
-+            torch.distributed.recv(
-+                primer, src=pp_group.ranks[rank - 1], group=pp_group.device_group
-+            )
-+        if not pp_group.is_last_rank:
-+            torch.distributed.send(
-+                primer, dst=pp_group.ranks[rank + 1], group=pp_group.device_group
-+            )
-+        torch.accelerator.synchronize()
-+
-+        # Sibling communicator used to broadcast sampled/draft tokens from
-+        # the last PP rank back to the earlier ranks.
-+        handler = getattr(self.model_runner, "pp_handler", None)
-+        if handler is not None:
-+            torch.distributed.broadcast(
-+                primer, src=handler.last_rank, group=handler.broadcast_group
-+            )
-+            torch.accelerator.synchronize()
-+        self._pp_communicators_primed = True
-+
-     def handle_ft_command(self, ft_request):
-         assert self.worker_sentinel is not None
-         return self.worker_sentinel.handle_command(ft_request)
-@@ -821,14 +879,7 @@ class Worker(WorkerBase):
-         # and capture_model both drive decode steps under FULL cudagraph
-         # modes), communicator initialization invalidates the capture and the
-         # engine later dies on an async cudaErrorInvalidValue far from here.
--        pp_group = get_pp_group()
--        if pp_group.world_size > 1:
--            primer = torch.zeros(1, dtype=torch.int32, device=self.device)
--            if not pp_group.is_first_rank:
--                pp_group.recv(primer.shape, primer.dtype)
--            if not pp_group.is_last_rank:
--                pp_group.send(primer)
--            torch.accelerator.synchronize()
-+        self._prime_pp_communicators()
- 
-         # Warmup and tune the kernels used during model execution before
-         # cuda graph capture.
-@@ -1154,23 +1205,42 @@ class Worker(WorkerBase):
+@@ -1191,23 +1205,42 @@ class Worker(WorkerBase):
      def sample_tokens(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -930,7 +859,7 @@ index 3aadd2251..9d4ae4936 100644
          all_gather_tensors = {}
          compilation_config = self.vllm_config.compilation_config
          parallel_config = self.vllm_config.parallel_config
-@@ -1205,23 +1275,35 @@ class Worker(WorkerBase):
+@@ -1242,23 +1275,35 @@ class Worker(WorkerBase):
              }
  
          if forward_pass and not get_pp_group().is_first_rank:
@@ -969,7 +898,7 @@ index 3aadd2251..9d4ae4936 100644
              if (
                  self.use_v2_model_runner
                  and self.model_runner.is_pooling_model
-@@ -1243,11 +1325,14 @@ class Worker(WorkerBase):
+@@ -1280,11 +1325,14 @@ class Worker(WorkerBase):
          # Non-blocking send of the intermediate tensors. The metadata handle
          # is reaped lazily by the GroupCoordinator; the device handles are
          # waited at the top of the next step.

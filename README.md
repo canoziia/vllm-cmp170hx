@@ -13,9 +13,11 @@ Reproducible minimal patches and a Podman Compose deployment for
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
 Engram tables use the author's exact-size pinned CPU offload path. The pinned
-author revision includes native PP6+DSpark support. The sole active patch primes
-all persistent PP communicators before model and KV allocation so first-use NCCL
-resource creation is deterministic and included in memory accounting.
+author revision includes native PP6+DSpark support. The sole default patch
+primes all persistent PP communicators before model and KV allocation so
+first-use NCCL resource creation is deterministic and included in memory
+accounting. Performance-debug runtime code is optional and is not included in
+default images.
 
 ## Runtime configuration
 
@@ -48,10 +50,19 @@ OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
 bash scripts/build-image.sh
 ```
 
+The default build applies only `patches/series` and does **not** include the
+hot performance-debug runtime. Build a separate diagnostic image explicitly:
+
+```bash
+ENABLE_PERF_DEBUG=1 \
+OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:debug \
+bash scripts/build-image.sh
+```
+
 The build checks out the pinned author revision, verifies that it is clean,
-applies the sole active `patches/series` entry, validates the PP+DSpark and early
-communicator-primer capabilities, compiles the relevant Python files, and copies
-the complete pinned `vllm/` tree over the SM80 image.
+applies the default early-communicator patch and, only when requested, the
+optional debug series. It validates and compiles the resulting Python files,
+then copies the complete pinned `vllm/` tree over the SM80 image.
 
 To inspect only the source result:
 
@@ -93,12 +104,14 @@ podman rm deepseek-v41
 
 The ten-minute grace period is also encoded in Compose.
 
-## Hot performance diagnostics
+## Optional hot performance diagnostics
 
-The image includes a disabled-by-default diagnostic tracer. Disabled workers do
-not create CUDA events, synchronize streams, copy timing tensors, read control
-files, or write logs. Runtime control uses a shared JSON file plus `SIGUSR2`, so
-no model restart is required.
+Default images contain no diagnostic runtime code or hot-path hooks. Build and
+deploy a separate image with `ENABLE_PERF_DEBUG=1` when diagnosis is needed.
+Within that diagnostic image the tracer is still disabled by default: disabled
+workers do not create CUDA events, synchronize streams, copy timing tensors,
+read control files, or write logs. Runtime control uses a shared JSON file plus
+`SIGUSR2`, so subsequent enable/disable cycles do not require another restart.
 
 Sample asynchronous timings on every tenth step, up to 256 samples on all PP
 ranks:
