@@ -93,6 +93,42 @@ podman rm deepseek-v41
 
 The ten-minute grace period is also encoded in Compose.
 
+## Hot performance diagnostics
+
+The image includes a disabled-by-default diagnostic tracer. Disabled workers do
+not create CUDA events, synchronize streams, copy timing tensors, read control
+files, or write logs. Runtime control uses a shared JSON file plus `SIGUSR2`, so
+no model restart is required.
+
+Sample asynchronous timings on every tenth step, up to 256 samples on all PP
+ranks:
+
+```bash
+bash scripts/perf-debug-control.sh enable decode-ab 10 256 all
+# Run the benchmark, then inspect or explicitly stop early:
+bash scripts/perf-debug-control.sh status
+bash scripts/perf-debug-control.sh disable
+python3 scripts/summarize-perf-debug.py \
+  /root/app/deepseek-v41/cache/vllm-perf-debug/steps-decode-ab-rank*.jsonl
+```
+
+Captured JSONL includes PP rank, real/padded tokens, graph dispatch mode,
+request/cohort sizes, CPU PP waits/enqueues, asynchronous GPU target/sampler/
+draft/postprocess timings, feedback-broadcast timings, and per-request accepted
+and rejected token counts.
+
+For kernel-level analysis, request a deliberately short and intrusive
+`torch.profiler` window, normally on the last PP rank where DSpark runs:
+
+```bash
+bash scripts/perf-debug-control.sh profile dspark-kernels 8 5
+# Produces torch-dspark-kernels-rank5.json after eight sampled steps.
+```
+
+Only the explicit `profile` window is expected to perturb performance. Use the
+sampled JSONL mode for low-overhead online comparisons. The control directory is
+inside the existing cache mount at `/root/.cache/vllm-perf-debug`.
+
 ## Validation gates
 
 After startup, verify:

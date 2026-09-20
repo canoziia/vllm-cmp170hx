@@ -5,7 +5,7 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Active series
 
-1. `0001-prime-pp-communicators-before-model-load.patch`
+1. `0001-prime-pp-communicators-and-hot-perf-debug.patch`
    - Initializes all persistent PP communication resources immediately after
      `GPUModelRunner` and `PPHandler` construction, before model, CPU Engram,
      and KV allocation.
@@ -16,6 +16,10 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
      check becomes a no-op after successful early initialization.
    - Makes later memory accounting include communicator resources and avoids
      first-use NCCL allocation failures under tight HBM budgets.
+   - Adds a disabled-by-default, SIGUSR2-controlled diagnostic tracer. Sampled
+     mode uses asynchronous CUDA Events and deferred pinned D2H copies without
+     stream synchronization; an optional bounded torch-profiler mode provides
+     intrusive kernel-level traces only when explicitly requested.
 
 The pinned author revision already contains native PP6+DSpark support, including
 auxiliary hidden-state relay capability and last-rank target-embedding sharing.

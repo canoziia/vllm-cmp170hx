@@ -42,10 +42,17 @@ grep -q '_pp_communicators_primed' \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 grep -q 'handler.broadcast_group' \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+grep -q 'signal.SIGUSR2' \
+  "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
+grep -q 'if not self.enabled and not self._reload_requested' \
+  "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
 
 git -C "$SOURCE_TREE" diff --check
 python3 -m py_compile \
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py" \
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py" \
+  "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py" \
+  "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py" \
+  "$SOURCE_TREE/vllm/v1/worker/gpu/pp_utils.py" \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 echo "Pinned DeepSeek V4.1 source validation completed successfully."

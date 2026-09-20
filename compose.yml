@@ -39,6 +39,9 @@ services:
       NCCL_IB_DISABLE: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
+      # Disabled by default; scripts/perf-debug-control.sh writes the shared
+      # control file and signals workers when online diagnostics are requested.
+      VLLM_PERF_DEBUG_DIR: /root/.cache/vllm-perf-debug
 
     volumes:
       - ${MODEL_ROOT:-/root/app/models}:/models:ro
