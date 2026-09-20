@@ -18,8 +18,11 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
      first-use NCCL allocation failures under tight HBM budgets.
    - Adds a disabled-by-default, SIGUSR2-controlled diagnostic tracer. Sampled
      mode uses asynchronous CUDA Events and deferred pinned D2H copies without
-     stream synchronization; an optional bounded torch-profiler mode provides
-     intrusive kernel-level traces only when explicitly requested.
+     stream synchronization. A bounded detailed mode temporarily selects eager
+     dispatch and dynamically installs per-module hooks, then removes them and
+     restores normal Graph dispatch without restart. An optional torch-profiler
+     window records CPU/dispatch activity (CMP 170HX does not expose CUPTI CUDA
+     kernel activities).
 
 The pinned author revision already contains native PP6+DSpark support, including
 auxiliary hidden-state relay capability and last-rank target-embedding sharing.

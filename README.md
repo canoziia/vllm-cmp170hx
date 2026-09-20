@@ -117,17 +117,27 @@ request/cohort sizes, CPU PP waits/enqueues, asynchronous GPU target/sampler/
 draft/postprocess timings, feedback-broadcast timings, and per-request accepted
 and rejected token counts.
 
-For kernel-level analysis, request a deliberately short and intrusive
-`torch.profiler` window, normally on the last PP rank where DSpark runs:
+CMP 170HX does not expose CUPTI CUDA kernel activities. For detailed GPU timing,
+request a short diagnostic window that temporarily dispatches sampled steps
+eagerly and installs per-module CUDA Event hooks:
 
 ```bash
-bash scripts/perf-debug-control.sh profile dspark-kernels 8 5
-# Produces torch-dspark-kernels-rank5.json after eight sampled steps.
+bash scripts/perf-debug-control.sh detail dspark-detail 16 all
 ```
 
-Only the explicit `profile` window is expected to perturb performance. Use the
-sampled JSONL mode for low-overhead online comparisons. The control directory is
-inside the existing cache mount at `/root/.cache/vllm-perf-debug`.
+This reports per-layer target Engram, attention, MoE, ShadowSource, and last-rank
+draft-module timing. Hooks are removed automatically when the sample limit is
+reached and normal CUDA Graph dispatch resumes without restart. A bounded CPU
+and dispatch `torch.profiler` trace is also available:
+
+```bash
+bash scripts/perf-debug-control.sh profile dspark-cpu 8 5
+```
+
+Both `detail` and `profile` are intentionally intrusive. Use ordinary `enable`
+for low-overhead measurements in the production Graph path. The control
+directory is inside the existing cache mount at
+`/root/.cache/vllm-perf-debug`.
 
 ## Validation gates
 
