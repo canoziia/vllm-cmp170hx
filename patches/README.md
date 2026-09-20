@@ -26,7 +26,10 @@ Default builds include no performance-debug runtime code.
 `ENABLE_PERF_DEBUG=1` additionally applies:
 
 1. `optional/0002-hot-perf-debug.patch`
-   - Adds a disabled-by-default, SIGUSR2-controlled diagnostic tracer.
+   - Includes both the DSpark compute toggle and a disabled-by-default,
+     SIGUSR2-controlled diagnostic tracer. No separate hot-DSpark build flag.
+   - The toggle uses a scheduler control file, per-batch K, K0/K5 target graphs,
+     and context-only draft updates while off to preserve restart-free re-enable.
    - Sampled mode uses asynchronous CUDA Events and deferred pinned D2H copies
      without stream synchronization.
    - Detailed mode temporarily selects eager dispatch and dynamically installs
