@@ -35,7 +35,7 @@ COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \\
       org.opencontainers.image.revision="$SOURCE_COMMIT" \\
       io.canoziia.upstream="$SOURCE_REPO@$SOURCE_COMMIT" \\
-      io.canoziia.patch="upstream-native-dspark-pp"
+      io.canoziia.patch="early-pp-communicator-primer"
 CONTAINERFILE
 
 build_args=(-t "$OUTPUT_IMAGE" -f "$WORKDIR/context/Containerfile")

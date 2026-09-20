@@ -13,8 +13,9 @@ Reproducible minimal patches and a Podman Compose deployment for
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
 Engram tables use the author's exact-size pinned CPU offload path. The pinned
-author revision now includes native PP6+DSpark support; the former independent
-patches remain under [`patches/upstreamed/`](patches/README.md) for audit only.
+author revision includes native PP6+DSpark support. The sole active patch primes
+all persistent PP communicators before model and KV allocation so first-use NCCL
+resource creation is deterministic and included in memory accounting.
 
 ## Runtime configuration
 
@@ -23,8 +24,8 @@ TP1 x PP6, partition 7,7,7,7,7,5
 DSpark 5, local argmax reduction
 max_model_len=1,048,576
 max_num_batched_tokens=4096
-max_num_seqs=64
-KV=fp8_ds_mla, profiled at gpu_memory_utilization=0.90
+max_num_seqs=32
+KV=fp8_ds_mla, fixed at 8 GiB per rank
 CPU Engram offload, prefix caching
 NCCL Ring/Simple, P2P and IB disabled
 ```
@@ -48,9 +49,9 @@ bash scripts/build-image.sh
 ```
 
 The build checks out the pinned author revision, verifies that it is clean,
-applies the active `patches/series` (currently empty because the required changes
-were upstreamed), validates the PP+DSpark capabilities, compiles the relevant
-Python files, and copies the complete pinned `vllm/` tree over the SM80 image.
+applies the sole active `patches/series` entry, validates the PP+DSpark and early
+communicator-primer capabilities, compiles the relevant Python files, and copies
+the complete pinned `vllm/` tree over the SM80 image.
 
 To inspect only the source result:
 
@@ -103,7 +104,7 @@ podman exec deepseek-v41 nvidia-smi -L
 swapon --show
 ```
 
-KV capacity is profiled at startup after model and automatic CUDA Graph
-allocation. `max_num_seqs=64` is an admission limit, not capacity for 64
-one-million-token requests. Record the reported token capacity and PP2 free HBM
-for every new image because Graph coverage and model allocations can change it.
+KV cache memory is fixed at 8 GiB per rank. `max_num_seqs=32` is an admission
+limit, not capacity for 32 one-million-token requests. Record the reported token
+capacity and PP2 free HBM for every new image because Graph coverage and model
+allocations can change the runtime headroom.
