@@ -29,12 +29,15 @@ JSON
     session=${2:-$(date +%Y%m%d-%H%M%S)}
     samples=${3:-16}
     ranks=${4:-all}
-    if [[ $ranks == all ]]; then ranks_json='"all"'; else ranks_json="[$ranks]"; fi
+    [[ $ranks == all ]] || {
+      echo "detail changes PP execution shape and must run on all PP ranks" >&2
+      exit 2
+    }
     cat >"$CONTROL" <<JSON
-{"enabled":true,"session":"$session","sample_every":1,"max_samples":$samples,"max_pending":128,"flush_every":1,"ranks":$ranks_json,"force_eager":true,"module_detail":true,"torch_profile_steps":0}
+{"enabled":true,"session":"$session","sample_every":1,"max_samples":$samples,"max_pending":128,"flush_every":1,"ranks":"all","force_eager":true,"module_detail":true,"torch_profile_steps":0}
 JSON
     signal_workers
-    echo "Enabled $samples detailed eager samples on PP ranks $ranks: $CONTROL"
+    echo "Enabled $samples detailed eager samples on all PP ranks: $CONTROL"
     ;;
   profile)
     session=${2:-$(date +%Y%m%d-%H%M%S)}
@@ -61,7 +64,7 @@ JSON
     cat >&2 <<'USAGE'
 Usage:
   perf-debug-control.sh enable [session] [sample_every=10] [max_samples=256] [ranks=all|0,2,5]
-  perf-debug-control.sh detail [session] [samples=16] [ranks=all|0,2,5]
+  perf-debug-control.sh detail [session] [samples=16] [ranks=all]
   perf-debug-control.sh profile [session] [steps=8] [rank=5]
   perf-debug-control.sh disable
   perf-debug-control.sh status

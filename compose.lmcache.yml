@@ -1,3 +1,6 @@
+x-podman:
+  in_pod: false
+
 services:
   deepseek-v41:
     image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}

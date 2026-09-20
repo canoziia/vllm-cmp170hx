@@ -112,10 +112,14 @@ image. It reserves a 16 GB L1 CPU cache, uses 1024-token chunks, separate object
 groups, LRU and no disk L2. Both services use host IPC and the same six CDI GPUs.
 LMCache binds its RPC and HTTP ports to loopback (5556 and 18556). Its healthcheck
 checks both listening sockets; cache correctness still requires request testing.
+The explicit Podman argument is required with the container's podman-compose
+provider: its automatic pod path otherwise ignores Compose `ipc: host` and gives
+each container only 63 MiB `/dev/shm`.
 The pinned image must include the author's compatible LMCache fork.
 
 ```bash
-podman compose -f compose.lmcache.yml -f compose.debug.yml up -d
+podman compose --podman-run-args=--ipc=host \
+  -f compose.lmcache.yml -f compose.debug.yml up -d
 ```
 
 Use `compose.debug.yml` only with a debug-enabled image. Performance tracing
@@ -187,7 +191,9 @@ bash scripts/perf-debug-control.sh detail dspark-detail 16 all
 ```
 
 This reports per-layer target Engram, attention, MoE, ShadowSource, and last-rank
-draft-module timing. Hooks are removed automatically when the sample limit is
+draft-module timing. Detailed eager mode must select all PP ranks; selecting a
+subset changes target padding on only part of the pipeline and is rejected by
+the control script. Hooks are removed automatically when the sample limit is
 reached and normal CUDA Graph dispatch resumes without restart. A bounded CPU
 and dispatch `torch.profiler` trace is also available:
 
