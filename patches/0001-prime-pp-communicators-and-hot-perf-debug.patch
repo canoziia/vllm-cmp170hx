@@ -1,17 +1,18 @@
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 05bc6b8f5..cfecf73a4 100644
+index 05bc6b8f5..56b2092d4 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -20,7 +20,7 @@ instead of embedding feature-specific logic directly.
+@@ -20,7 +20,8 @@ instead of embedding feature-specific logic directly.
  import functools
  import gc
  import time
 -from contextlib import AbstractContextManager
++from collections import defaultdict
 +from contextlib import AbstractContextManager, nullcontext
  from copy import deepcopy
  from typing import Any, NamedTuple
  
-@@ -137,6 +137,7 @@ from vllm.v1.worker.gpu.lora_utils import (
+@@ -137,6 +138,7 @@ from vllm.v1.worker.gpu.lora_utils import (
  from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
  from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
  from vllm.v1.worker.gpu.model_states import init_model_state
@@ -19,15 +20,99 @@ index 05bc6b8f5..cfecf73a4 100644
  from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
  from vllm.v1.worker.gpu.pp_utils import PPHandler
  from vllm.v1.worker.gpu.sample.batch_shard import (
-@@ -305,6 +306,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -305,6 +307,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
  
          self.step_timing = StepTimingCollector()
 +        self.perf_debug = get_perf_debug()
++        self._perf_debug_hook_handles: list[Any] = []
  
          # General request states.
          self.req_states = RequestState(
-@@ -1836,6 +1838,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -516,6 +520,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+ 
+         get_offloader().post_init()
++        if self.perf_debug is not None:
++            self.perf_debug.set_module_hook_manager(self._set_perf_debug_module_hooks)
++
++    def _set_perf_debug_module_hooks(self, enabled: bool) -> None:
++        for handle in self._perf_debug_hook_handles:
++            handle.remove()
++        self._perf_debug_hook_handles.clear()
++        if not enabled or self.perf_debug is None:
++            return
++
++        active: dict[int, list[Any]] = defaultdict(list)
++
++        def attach(root_name: str, root: nn.Module) -> None:
++            for module_name, module in root.named_modules():
++                cls = type(module).__name__
++                selected = (
++                    cls == "DeepseekV4DecoderLayer"
++                    or cls == "Engram"
++                    or cls == "ShadowSource"
++                    or module_name.endswith(".attn")
++                    or module_name.endswith(".ffn")
++                    or (root_name == "draft" and module_name == "model")
++                )
++                if not selected:
++                    continue
++                label = f"module.{root_name}.{module_name or cls}"
++                key = id(module)
++
++                def before(_module, _args, *, _key=key, _label=label):
++                    tracer = self.perf_debug
++                    if tracer is not None and tracer.step_active:
++                        active[_key].append(tracer.cuda_begin(_label))
++
++                def after(_module, _args, _output, *, _key=key):
++                    tracer = self.perf_debug
++                    stack = active.get(_key)
++                    if tracer is not None and tracer.step_active and stack:
++                        tracer.cuda_end(stack.pop())
++
++                self._perf_debug_hook_handles.append(
++                    module.register_forward_pre_hook(before)
++                )
++                self._perf_debug_hook_handles.append(
++                    module.register_forward_hook(after)
++                )
++
++        attach("target", self.model)
++        draft = self.get_draft_model()
++        if draft is not None:
++            attach("draft", draft)
++        logger.info(
++            "Perf debug installed %d module hooks on rank %d",
++            len(self._perf_debug_hook_handles),
++            get_pp_group().rank_in_group,
++        )
+ 
+     def get_model(self) -> nn.Module:
+         return self.model
+@@ -1611,6 +1670,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+ 
+         skip_compiled = False
++        debug_force_eager = (
++            self.perf_debug is not None
++            and self.perf_debug.step_active
++            and self.perf_debug.force_eager
++        )
+         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+             # Encoder-decoder models such as Whisper should run eager/non-compiled
+             # when encoder inputs are scheduled, because this step updates
+@@ -1625,7 +1689,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.dp_size,
+             self.dp_rank,
+             max_query_len=max_query_len,
+-            need_eager=is_profile or skip_compiled,
++            need_eager=is_profile or skip_compiled or debug_force_eager,
+             num_active_loras=num_active_loras,
+             parallel_config=self.parallel_config,
+             allow_ubatching=(
+@@ -1836,6 +1900,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
          self.step_timing.forward_start()
@@ -39,6 +124,7 @@ index 05bc6b8f5..cfecf73a4 100644
 +                padded_tokens=input_batch.num_tokens_after_padding,
 +                model_reqs=input_batch.num_reqs,
 +                uniform_tokens=uniform_tok_count,
++                debug_force_eager=debug_force_eager,
 +            )
 +            target_gpu = self.perf_debug.cuda_begin("target_forward")
 +        else:
@@ -46,7 +132,7 @@ index 05bc6b8f5..cfecf73a4 100644
  
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
-@@ -1844,7 +1858,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1844,7 +1921,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # because they are already copied to the CUDA graph input buffers.
              assert self.cudagraph_manager is not None
              self.kv_connector.pre_forward(scheduler_output)
@@ -59,7 +145,7 @@ index 05bc6b8f5..cfecf73a4 100644
          else:
              # For piecewise and eager mode, just call model().
              batch_descriptor = BatchDescriptor(
-@@ -1878,12 +1896,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1878,12 +1959,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      # cudagraph, chosen inside run_pw_graph). cg_mode is only
                      # PIECEWISE after the cudagraph manager exists.
                      assert self.cudagraph_manager is not None
@@ -89,7 +175,7 @@ index 05bc6b8f5..cfecf73a4 100644
  
          if self.is_last_pp_rank:
              if self.use_aux_hidden_state_outputs:
-@@ -1954,7 +1985,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1954,7 +2048,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # IntermediateTensors instead of final hidden states. Receive the
              # sampled tokens broadcast from the last rank and update local state.
              assert self.pp_handler is not None
@@ -101,7 +187,7 @@ index 05bc6b8f5..cfecf73a4 100644
              # Optimistically update num_computed_tokens for entire batch here.
              # Will be adjusted for rejections if necessary in update_requests.
              self.postprocess_num_computed_tokens(input_batch)
-@@ -1974,9 +2009,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1974,9 +2072,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.pcp_manager, hidden_states, input_batch
          )
  
@@ -125,7 +211,7 @@ index 05bc6b8f5..cfecf73a4 100644
  
          if self.pp_handler is not None:
              # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2041,6 +2087,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2041,6 +2150,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # ensuring that `copy_event` is recorded before calling postprocess.
          # This sequencing may slightly reduce latency as async D2H copy does not
          # need to wait for the postprocess to finish.
@@ -135,7 +221,7 @@ index 05bc6b8f5..cfecf73a4 100644
          self.postprocess_sampled(
              input_batch.idx_mapping,
              sampler_output.sampled_token_ids,
-@@ -2048,6 +2097,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2048,6 +2160,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_rejected,
              input_batch.query_start_loc,
          )
@@ -144,7 +230,7 @@ index 05bc6b8f5..cfecf73a4 100644
  
          if self.speculator is not None:
              assert self.sampler is not None
-@@ -2059,22 +2110,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2059,22 +2173,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                  spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
@@ -194,10 +280,10 @@ index 05bc6b8f5..cfecf73a4 100644
                  self.adaptive_verification.record_confidences(
 diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
 new file mode 100644
-index 000000000..614837fad
+index 000000000..61c555a07
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/perf_debug.py
-@@ -0,0 +1,349 @@
+@@ -0,0 +1,370 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Hot-switchable, low-overhead GPU worker diagnostics.
 +
@@ -220,7 +306,7 @@ index 000000000..614837fad
 +import time
 +from collections import defaultdict, deque
 +from pathlib import Path
-+from typing import Any
++from typing import Any, Callable
 +
 +import torch
 +
@@ -249,6 +335,7 @@ index 000000000..614837fad
 +        self._profile_remaining = 0
 +        self._profile_path: Path | None = None
 +        self._dropped = 0
++        self._module_hook_manager: Callable[[bool], None] | None = None
 +        self._accept_sampled_pool: torch.Tensor | None = None
 +        self._accept_rejected_pool: torch.Tensor | None = None
 +        self._accept_pool_index = 0
@@ -305,6 +392,8 @@ index 000000000..614837fad
 +        if not enabled:
 +            self._drain_ready()
 +            self.enabled = False
++            if self._module_hook_manager is not None:
++                self._module_hook_manager(False)
 +            self._stop_profiler()
 +            self._flush()
 +            if old_enabled:
@@ -327,11 +416,16 @@ index 000000000..614837fad
 +            self._accept_sampled_pool, pin_memory=True
 +        )
 +        self.enabled = True
++        if self._module_hook_manager is not None:
++            self._module_hook_manager(self.module_detail)
 +        self._stop_profiler()
 +        profile_steps = max(0, int(config.get("torch_profile_steps", 0)))
 +        if profile_steps and self._rank_selected(config.get("profile_ranks", [self.rank])):
 +            activities = [torch.profiler.ProfilerActivity.CPU]
-+            if torch.cuda.is_available():
++            # CMP 170HX does not expose CUPTI CUDA activities. CUDA timing is
++            # provided by the asynchronous Event tracer; opt in explicitly on
++            # hardware where CUPTI is supported.
++            if config.get("profile_cuda", False) and torch.cuda.is_available():
 +                activities.append(torch.profiler.ProfilerActivity.CUDA)
 +            self._profiler = torch.profiler.profile(
 +                activities=activities,
@@ -352,6 +446,17 @@ index 000000000..614837fad
 +            self._output_path,
 +            profile_steps,
 +        )
++
++    @property
++    def force_eager(self) -> bool:
++        return bool(self._config.get("force_eager", False))
++
++    @property
++    def module_detail(self) -> bool:
++        return bool(self._config.get("module_detail", False))
++
++    def set_module_hook_manager(self, callback: Callable[[bool], None]) -> None:
++        self._module_hook_manager = callback
 +
 +    @property
 +    def sample_every(self) -> int:
@@ -397,6 +502,8 @@ index 000000000..614837fad
 +            if not self._pending:
 +                self._flush()
 +                self.enabled = False
++                if self._module_hook_manager is not None:
++                    self._module_hook_manager(False)
 +                logger.info(
 +                    "Perf debug rank %d completed %d samples and auto-disabled",
 +                    self.rank,

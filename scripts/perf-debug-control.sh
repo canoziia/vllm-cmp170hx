@@ -25,6 +25,17 @@ JSON
     signal_workers
     echo "Enabled sampled timing: $CONTROL"
     ;;
+  detail)
+    session=${2:-$(date +%Y%m%d-%H%M%S)}
+    samples=${3:-16}
+    ranks=${4:-all}
+    if [[ $ranks == all ]]; then ranks_json='"all"'; else ranks_json="[$ranks]"; fi
+    cat >"$CONTROL" <<JSON
+{"enabled":true,"session":"$session","sample_every":1,"max_samples":$samples,"max_pending":128,"flush_every":1,"ranks":$ranks_json,"force_eager":true,"module_detail":true,"torch_profile_steps":0}
+JSON
+    signal_workers
+    echo "Enabled $samples detailed eager samples on PP ranks $ranks: $CONTROL"
+    ;;
   profile)
     session=${2:-$(date +%Y%m%d-%H%M%S)}
     steps=${3:-8}
@@ -33,7 +44,7 @@ JSON
 {"enabled":true,"session":"$session","sample_every":1,"max_samples":$steps,"max_pending":64,"flush_every":1,"ranks":[$rank],"torch_profile_steps":$steps,"profile_ranks":[$rank],"profile_record_shapes":false,"profile_memory":false,"profile_with_stack":false}
 JSON
     signal_workers
-    echo "Enabled $steps-step torch/CUDA profile on PP rank $rank: $CONTROL"
+    echo "Enabled $steps-step CPU/dispatch torch profile on PP rank $rank: $CONTROL"
     ;;
   disable)
     printf '%s\n' '{"enabled":false}' >"$CONTROL"
@@ -50,13 +61,17 @@ JSON
     cat >&2 <<'USAGE'
 Usage:
   perf-debug-control.sh enable [session] [sample_every=10] [max_samples=256] [ranks=all|0,2,5]
+  perf-debug-control.sh detail [session] [samples=16] [ranks=all|0,2,5]
   perf-debug-control.sh profile [session] [steps=8] [rank=5]
   perf-debug-control.sh disable
   perf-debug-control.sh status
 
-Sampled timing is asynchronous and does not synchronize CUDA streams. `profile`
-uses torch.profiler for a short, explicit window and is intentionally intrusive.
-The container must mount VLLM_CACHE at /root/.cache (the production Compose does).
+Sampled timing is asynchronous and does not synchronize CUDA streams. `detail`
+temporarily dispatches sampled steps eagerly and installs module hooks for
+per-layer Engram/attention/MoE/shadow/draft GPU timing; it is intentionally
+intrusive but auto-removes the hooks. `profile` provides CPU/dispatch traces;
+CMP 170HX does not expose CUPTI CUDA kernel activities. The container must mount
+VLLM_CACHE at /root/.cache (the production Compose does).
 USAGE
     exit 2
     ;;
