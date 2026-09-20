@@ -104,6 +104,25 @@ podman rm deepseek-v41
 
 The ten-minute grace period is also encoded in Compose.
 
+## Optional LMCache deployment
+
+`compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6,
+seq32, 6 GiB GPU KV per rank, and a companion LMCache MP server using the same
+image. It reserves a 16 GB L1 CPU cache, uses 1024-token chunks, separate object
+groups, LRU and no disk L2. Both services use host IPC and the same six CDI GPUs.
+LMCache binds its RPC and HTTP ports to loopback (5556 and 18556). Its healthcheck
+checks both listening sockets; cache correctness still requires request testing.
+The pinned image must include the author's compatible LMCache fork.
+
+```bash
+podman compose -f compose.lmcache.yml -f compose.debug.yml up -d
+```
+
+Use `compose.debug.yml` only with a debug-enabled image. Performance tracing
+remains off initially. This deployment is experimental: added retention and
+transfer resources need runtime memory/correctness validation. Neither LMCache
+nor debug is enabled by the default Compose file.
+
 ## Combined optional debug package: DSpark compute toggle
 
 ```bash
