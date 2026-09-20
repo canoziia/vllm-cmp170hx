@@ -32,14 +32,20 @@ while read -r patch; do
   git -C "$SOURCE_TREE" apply "$patch_path"
 done <"$REPO_ROOT/patches/series"
 
-# The current pinned author revision has the formerly out-of-tree PP support.
+# The pinned author revision provides native PP6+DSpark; the local patch adds
+# the early, idempotent PP communicator primer.
 grep -q 'supports_aux_hidden_states_over_pp.*True' \
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
 grep -q 'spec_decode_needs_target_embed(vllm_config)' \
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
+grep -q '_pp_communicators_primed' \
+  "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+grep -q 'handler.broadcast_group' \
+  "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 
 git -C "$SOURCE_TREE" diff --check
 python3 -m py_compile \
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py" \
-  "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
+  "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py" \
+  "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 echo "Pinned DeepSeek V4.1 source validation completed successfully."

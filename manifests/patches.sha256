@@ -1,3 +1,1 @@
-8e317825c32b161adeb0c55173b17db6226dbfaea7751d1108229b19804630ce  patches/0001-prime-pp-communicators-before-kv-profile.patch
-13de390c3c4465735a0ab54d0dffd35cca5131f7fefd5ff1b277fb9f324c8d2d  patches/upstreamed/0001-deepseek-v41-aux-hidden-state-pp-relay.patch
-80d4e8e42848a1943518a0a7f380cc5126b46036700232570780bb16c3b121f7  patches/upstreamed/0002-dspark-pp-last-rank-embedding.patch
+16d8b755470052a7e939a10c97e6877396b55d06b24b548c166c7e5974dd5af7  patches/0001-prime-pp-communicators-before-model-load.patch

@@ -53,12 +53,11 @@ services:
       - --tensor-parallel-size=1
       - --max-model-len=1048576
       - --max-num-batched-tokens=4096
-      - --max-num-seqs=64
+      - --max-num-seqs=32
       - --kv-cache-dtype=fp8_ds_mla
-      # Profile KV after model/Graph accounting. On this six-GPU VFIO host,
-      # 0.94 exhausted HBM while sparse-MLA mixed warmup initialized its PP/NCCL
-      # buffers; 0.90 leaves roughly another 2.5 GiB per rank for warmup/runtime.
-      - --gpu-memory-utilization=0.90
+      # Keep the validated 8-GiB-per-rank KV budget. With max_num_seqs=32,
+      # automatic CUDA Graph capture leaves sufficient HBM on the largest rank.
+      - --kv-cache-memory=8589934592
       - --trust-remote-code
       - --disable-custom-all-reduce
       - --enable-prefix-caching
