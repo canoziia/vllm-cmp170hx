@@ -1,0 +1,4 @@
+services:
+  deepseek-v41:
+    environment:
+      VLLM_DSPARK_CONTROL_FILE: /root/.cache/dspark-enabled

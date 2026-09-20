@@ -104,6 +104,33 @@ podman rm deepseek-v41
 
 The ten-minute grace period is also encoded in Compose.
 
+## Optional DSpark compute toggle
+
+```bash
+ENABLE_HOT_DSPARK_TOGGLE=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:hot-dspark bash scripts/build-image.sh
+```
+
+Use that image with `compose.yml` plus `compose.hot-dspark.yml`. These options
+must be present at startup to capture both K=0 and K=5 target graphs. Do not
+combine this prototype with `ENABLE_PERF_DEBUG=1`.
+
+Write `0` (off) or `1` (on) atomically to `dspark-enabled` in the host cache
+mount. The scheduler polls at most once per second; in-flight batches finish
+under their original settings. Missing/invalid files retain the current mode
+(initially on). No signal or restart is needed after startup.
+
+```bash
+printf '0\n' > "$VLLM_CACHE/dspark-enabled.tmp"
+mv "$VLLM_CACHE/dspark-enabled.tmp" "$VLLM_CACHE/dspark-enabled"
+# Repeat with 1 to enable.
+```
+
+Off skips draft backbone/Markov sampling/graph replay, but continues draft
+context-KV maintenance so ongoing requests can safely resume drafting. Weights,
+aux outputs, fixed-shape PP feedback and draft caches stay resident. This is
+not a zero-overhead non-speculative baseline. Requires MRV2 DSpark, DP=1 and
+adaptive verification disabled. Runtime PP6 validation is still pending.
+
 ## Optional hot performance diagnostics
 
 Default images contain no diagnostic runtime code or hot-path hooks. Build and

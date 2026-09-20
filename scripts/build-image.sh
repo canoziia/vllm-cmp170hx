@@ -8,6 +8,8 @@ ENGINE=${CONTAINER_ENGINE:-podman}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
 ENABLE_PERF_DEBUG=${ENABLE_PERF_DEBUG:-0}
+ENABLE_HOT_DSPARK_TOGGLE=${ENABLE_HOT_DSPARK_TOGGLE:-0}
+[[ $ENABLE_HOT_DSPARK_TOGGLE == 0 || $ENABLE_HOT_DSPARK_TOGGLE == 1 ]] || exit 2
 [[ $ENABLE_PERF_DEBUG == 0 || $ENABLE_PERF_DEBUG == 1 ]] || {
   echo "ENABLE_PERF_DEBUG must be 0 or 1" >&2
   exit 2
@@ -15,6 +17,9 @@ ENABLE_PERF_DEBUG=${ENABLE_PERF_DEBUG:-0}
 PATCH_LABEL=early-pp-communicator-primer
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
   PATCH_LABEL=early-pp-primer+hot-perf-debug
+fi
+if [[ $ENABLE_HOT_DSPARK_TOGGLE == 1 ]]; then
+  PATCH_LABEL=early-pp-primer+hot-dspark
 fi
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/dsv41-pp6-build.XXXXXX")
 cleanup() {
@@ -34,7 +39,7 @@ git -C "$WORKDIR/source" init -q
 git -C "$WORKDIR/source" remote add origin "$SOURCE_REPO"
 git -C "$WORKDIR/source" fetch --depth=1 origin "$SOURCE_COMMIT"
 git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
-ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG \
+ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG ENABLE_HOT_DSPARK_TOGGLE=$ENABLE_HOT_DSPARK_TOGGLE \
   "$REPO_ROOT/scripts/apply-patches.sh" "$WORKDIR/source"
 
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
@@ -46,7 +51,8 @@ LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx
       org.opencontainers.image.revision="$SOURCE_COMMIT" \\
       io.canoziia.upstream="$SOURCE_REPO@$SOURCE_COMMIT" \\
       io.canoziia.patch="$PATCH_LABEL" \
-      io.canoziia.perf-debug="$ENABLE_PERF_DEBUG"
+      io.canoziia.perf-debug="$ENABLE_PERF_DEBUG" \
+      io.canoziia.hot-dspark="$ENABLE_HOT_DSPARK_TOGGLE"
 CONTAINERFILE
 
 build_args=(-t "$OUTPUT_IMAGE" -f "$WORKDIR/context/Containerfile")

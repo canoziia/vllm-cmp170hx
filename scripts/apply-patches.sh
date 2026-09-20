@@ -35,7 +35,14 @@ apply_series() {
   done <"$series"
 }
 
+if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} == 1 && ${ENABLE_PERF_DEBUG:-0} == 1 ]]; then
+  echo "Build hot DSpark and perf debug separately" >&2
+  exit 2
+fi
 apply_series "$REPO_ROOT/patches/series"
+if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} == 1 ]]; then
+  apply_series "$REPO_ROOT/patches/optional/series.hot-dspark"
+fi
 if [[ ${ENABLE_PERF_DEBUG:-0} == 1 ]]; then
   apply_series "$REPO_ROOT/patches/optional/series.perf-debug"
 fi
@@ -71,6 +78,14 @@ else
   ! grep -q 'perf_debug' "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 fi
 
+if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} == 1 ]]; then
+  compile_files+=(
+    "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/cudagraph_utils.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+  )
+fi
 git -C "$SOURCE_TREE" diff --check
 python3 -m py_compile "${compile_files[@]}"
 echo "Pinned DeepSeek V4.1 source validation completed successfully."
