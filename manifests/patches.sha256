@@ -1,3 +1,2 @@
 16d8b755470052a7e939a10c97e6877396b55d06b24b548c166c7e5974dd5af7  patches/0001-prime-pp-communicators-before-model-load.patch
-2d3e31ca6d3ae5fdcbdaa534ec55da5f427ad1a121bbcc5654e11063bcc38dd1  patches/optional/0002-hot-perf-debug.patch
-3d53fe8feaf5ad73931db65eac5b9e0a995b48910ad487db6e85ee0fa77e3d1e  patches/optional/0003-hot-dspark-toggle.patch
+4bfdfd775b2e77125a9771a5179ab05cb12aa68b271ff01a59ee27ab4ef79aac  patches/optional/0002-hot-perf-debug.patch
