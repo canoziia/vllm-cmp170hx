@@ -116,7 +116,7 @@ services:
       - --eviction-policy=LRU
       - --max-workers=8
     healthcheck:
-      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1',5556),3).close(); socket.create_connection(('127.0.0.1',18556),3).close()"]
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',5556),3).close(); socket.create_connection(('127.0.0.1',18556),3).close()\""]
       interval: 10s
       timeout: 5s
       start_period: 2m
