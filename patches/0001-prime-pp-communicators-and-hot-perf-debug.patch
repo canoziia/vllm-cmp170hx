@@ -1,0 +1,879 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 05bc6b8f5..cfecf73a4 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -20,7 +20,7 @@ instead of embedding feature-specific logic directly.
+ import functools
+ import gc
+ import time
+-from contextlib import AbstractContextManager
++from contextlib import AbstractContextManager, nullcontext
+ from copy import deepcopy
+ from typing import Any, NamedTuple
+ 
+@@ -137,6 +137,7 @@ from vllm.v1.worker.gpu.lora_utils import (
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+ from vllm.v1.worker.gpu.model_states import init_model_state
++from vllm.v1.worker.gpu.perf_debug import get_perf_debug
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+ from vllm.v1.worker.gpu.pp_utils import PPHandler
+ from vllm.v1.worker.gpu.sample.batch_shard import (
+@@ -305,6 +306,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+         self.step_timing = StepTimingCollector()
++        self.perf_debug = get_perf_debug()
+ 
+         # General request states.
+         self.req_states = RequestState(
+@@ -1836,6 +1838,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+         )
+         self.step_timing.forward_start()
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        if debug_step:
++            self.perf_debug.set_meta(
++                graph_mode=batch_desc.cg_mode.name,
++                real_tokens=input_batch.num_tokens,
++                padded_tokens=input_batch.num_tokens_after_padding,
++                model_reqs=input_batch.num_reqs,
++                uniform_tokens=uniform_tok_count,
++            )
++            target_gpu = self.perf_debug.cuda_begin("target_forward")
++        else:
++            target_gpu = None
+ 
+         # Run model.
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+@@ -1844,7 +1858,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # because they are already copied to the CUDA graph input buffers.
+             assert self.cudagraph_manager is not None
+             self.kv_connector.pre_forward(scheduler_output)
+-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            if debug_step:
++                with self.perf_debug.scope("perf::target_forward"):
++                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            else:
++                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+         else:
+             # For piecewise and eager mode, just call model().
+             batch_descriptor = BatchDescriptor(
+@@ -1878,12 +1896,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                     # PIECEWISE after the cudagraph manager exists.
+                     assert self.cudagraph_manager is not None
+-                    model_output = self.cudagraph_manager.run_pw_graph(
+-                        self.model, model_inputs
+-                    )
++                    if debug_step:
++                        with self.perf_debug.scope("perf::target_forward"):
++                            model_output = self.cudagraph_manager.run_pw_graph(
++                                self.model, model_inputs
++                            )
++                    else:
++                        model_output = self.cudagraph_manager.run_pw_graph(
++                            self.model, model_inputs
++                        )
+                 else:
+                     # Eager (NONE): call the raw model directly.
+-                    model_output = self.model(**model_inputs)
++                    if debug_step:
++                        with self.perf_debug.scope("perf::target_forward"):
++                            model_output = self.model(**model_inputs)
++                    else:
++                        model_output = self.model(**model_inputs)
++
++        if debug_step:
++            self.perf_debug.cuda_end(target_gpu)
+ 
+         if self.is_last_pp_rank:
+             if self.use_aux_hidden_state_outputs:
+@@ -1954,7 +1985,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
++            debug_step = self.perf_debug is not None and self.perf_debug.step_active
++            pp_recv_start = self.perf_debug.cpu_start() if debug_step else 0
+             all_decode_next = self.pp_handler.receive(input_batch)
++            if debug_step:
++                self.perf_debug.cpu_end("feedback_receive_enqueue", pp_recv_start)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -1974,9 +2009,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.pcp_manager, hidden_states, input_batch
+         )
+ 
+-        sampler_output, num_sampled, num_rejected = self.sample(
+-            hidden_states, input_batch, grammar_output
+-        )
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        sample_gpu = self.perf_debug.cuda_begin("target_sampling") if debug_step else None
++        if debug_step:
++            with self.perf_debug.scope("perf::target_sampling"):
++                sampler_output, num_sampled, num_rejected = self.sample(
++                    hidden_states, input_batch, grammar_output
++                )
++        else:
++            sampler_output, num_sampled, num_rejected = self.sample(
++                hidden_states, input_batch, grammar_output
++            )
++        if debug_step:
++            self.perf_debug.cuda_end(sample_gpu)
++            self.perf_debug.capture_acceptance(num_sampled, num_rejected)
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+@@ -2041,6 +2087,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # ensuring that `copy_event` is recorded before calling postprocess.
+         # This sequencing may slightly reduce latency as async D2H copy does not
+         # need to wait for the postprocess to finish.
++        post_gpu = (
++            self.perf_debug.cuda_begin("target_postprocess") if debug_step else None
++        )
+         self.postprocess_sampled(
+             input_batch.idx_mapping,
+             sampler_output.sampled_token_ids,
+@@ -2048,6 +2097,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_rejected,
+             input_batch.query_start_loc,
+         )
++        if debug_step:
++            self.perf_debug.cuda_end(post_gpu)
+ 
+         if self.speculator is not None:
+             assert self.sampler is not None
+@@ -2059,22 +2110,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            draft_gpu = (
++                self.perf_debug.cuda_begin("draft_propose") if debug_step else None
++            )
+             with use_workspace_lane(self._draft_workspace_lane):
+-                draft_tokens = self.speculator.propose(
+-                    input_batch,
+-                    attn_metadata,
+-                    slot_mappings_by_layer,
+-                    spec_hidden_states,
+-                    aux_hidden_states,
+-                    num_sampled,
+-                    num_rejected,
+-                    self.req_states.last_sampled_tokens,
+-                    self.req_states.next_prefill_tokens,
+-                    self.sampler.sampling_states.temperature.gpu,
+-                    self.sampler.sampling_states.seeds.gpu,
+-                    dp_sync=dp_sync,
+-                    mm_inputs=mm_inputs,
++                draft_scope = (
++                    self.perf_debug.scope("perf::draft_propose")
++                    if debug_step
++                    else nullcontext()
+                 )
++                with draft_scope:
++                    draft_tokens = self.speculator.propose(
++                        input_batch,
++                        attn_metadata,
++                        slot_mappings_by_layer,
++                        spec_hidden_states,
++                        aux_hidden_states,
++                        num_sampled,
++                        num_rejected,
++                        self.req_states.last_sampled_tokens,
++                        self.req_states.next_prefill_tokens,
++                        self.sampler.sampling_states.temperature.gpu,
++                        self.sampler.sampling_states.seeds.gpu,
++                        dp_sync=dp_sync,
++                        mm_inputs=mm_inputs,
++                    )
++            if debug_step:
++                self.perf_debug.cuda_end(draft_gpu)
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
+new file mode 100644
+index 000000000..614837fad
+--- /dev/null
++++ b/vllm/v1/worker/gpu/perf_debug.py
+@@ -0,0 +1,349 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Hot-switchable, low-overhead GPU worker diagnostics.
++
++Disabled by default. A worker only reads the control file after SIGUSR2. When
++inactive, hot-path calls reduce to a boolean branch and never create CUDA
++Events, synchronize a stream, copy tensors, or write output.
++
++Enabled sampled steps use asynchronous CUDA Events and pinned D2H copies. Event
++results are polled on later steps and written in batches, without synchronizing
++the model stream. Optional torch-profiler capture is deliberately intrusive but
++is bounded to an explicit number of steps and can be enabled without restart.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import os
++import signal
++import time
++from collections import defaultdict, deque
++from pathlib import Path
++from typing import Any
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_DEFAULT_DIR = "/root/.cache/vllm-perf-debug"
++
++
++class PerfDebugTracer:
++    def __init__(self, rank: int, device: torch.device, max_num_reqs: int):
++        self.rank = rank
++        self.device = device
++        self.max_num_reqs = max_num_reqs
++        self.enabled = False
++        self._reload_requested = False
++        self._step_seq = 0
++        self._sample_seq = 0
++        self._config: dict[str, Any] = {}
++        self._current: dict[str, Any] | None = None
++        self._pending: deque[dict[str, Any]] = deque()
++        self._write_buffer: list[dict[str, Any]] = []
++        self._output_path: Path | None = None
++        self._profiler = None
++        self._profile_remaining = 0
++        self._profile_path: Path | None = None
++        self._dropped = 0
++        self._accept_sampled_pool: torch.Tensor | None = None
++        self._accept_rejected_pool: torch.Tensor | None = None
++        self._accept_pool_index = 0
++        signal.signal(signal.SIGUSR2, self._request_reload)
++
++    def _request_reload(self, _signum, _frame) -> None:
++        # Signal handlers must not perform file or CUDA operations.
++        self._reload_requested = True
++
++    @property
++    def control_path(self) -> Path:
++        return Path(
++            os.getenv(
++                "VLLM_PERF_DEBUG_CONTROL",
++                f"{os.getenv('VLLM_PERF_DEBUG_DIR', _DEFAULT_DIR)}/control.json",
++            )
++        )
++
++    def _rank_selected(self, value: Any) -> bool:
++        if value in (None, "all", "*"):
++            return True
++        if isinstance(value, int):
++            return self.rank == value
++        return self.rank in value
++
++    def _stop_profiler(self) -> None:
++        if self._profiler is None:
++            return
++        profiler, self._profiler = self._profiler, None
++        try:
++            profiler.stop()
++            assert self._profile_path is not None
++            profiler.export_chrome_trace(str(self._profile_path))
++            logger.info("Perf debug rank %d wrote torch trace %s", self.rank, self._profile_path)
++        except Exception:
++            logger.exception("Perf debug rank %d failed to stop/export profiler", self.rank)
++        self._profile_remaining = 0
++        self._profile_path = None
++
++    def _load_control(self) -> None:
++        self._reload_requested = False
++        old_enabled = self.enabled
++        try:
++            config = json.loads(self.control_path.read_text())
++        except FileNotFoundError:
++            config = {"enabled": False}
++        except Exception:
++            logger.exception("Perf debug rank %d could not read %s", self.rank, self.control_path)
++            return
++
++        enabled = bool(config.get("enabled", False)) and self._rank_selected(
++            config.get("ranks", "all")
++        )
++        if not enabled:
++            self._drain_ready()
++            self.enabled = False
++            self._stop_profiler()
++            self._flush()
++            if old_enabled:
++                logger.info("Perf debug disabled on rank %d", self.rank)
++            return
++
++        self._config = config
++        output_dir = Path(config.get("output_dir") or self.control_path.parent)
++        output_dir.mkdir(parents=True, exist_ok=True)
++        session = str(config.get("session") or time.strftime("%Y%m%d-%H%M%S"))
++        self._output_path = output_dir / f"steps-{session}-rank{self.rank}.jsonl"
++        self._sample_seq = 0
++        self._dropped = 0
++        self._accept_pool_index = 0
++        pool_rows = self.max_pending
++        self._accept_sampled_pool = torch.empty(
++            (pool_rows, self.max_num_reqs), dtype=torch.int32, pin_memory=True
++        )
++        self._accept_rejected_pool = torch.empty_like(
++            self._accept_sampled_pool, pin_memory=True
++        )
++        self.enabled = True
++        self._stop_profiler()
++        profile_steps = max(0, int(config.get("torch_profile_steps", 0)))
++        if profile_steps and self._rank_selected(config.get("profile_ranks", [self.rank])):
++            activities = [torch.profiler.ProfilerActivity.CPU]
++            if torch.cuda.is_available():
++                activities.append(torch.profiler.ProfilerActivity.CUDA)
++            self._profiler = torch.profiler.profile(
++                activities=activities,
++                record_shapes=bool(config.get("profile_record_shapes", False)),
++                profile_memory=bool(config.get("profile_memory", False)),
++                with_stack=bool(config.get("profile_with_stack", False)),
++                with_modules=True,
++            )
++            self._profiler.start()
++            self._profile_remaining = profile_steps
++            self._profile_path = output_dir / f"torch-{session}-rank{self.rank}.json"
++        logger.info(
++            "Perf debug enabled rank=%d sample_every=%d max_samples=%d output=%s "
++            "torch_profile_steps=%d",
++            self.rank,
++            self.sample_every,
++            self.max_samples,
++            self._output_path,
++            profile_steps,
++        )
++
++    @property
++    def sample_every(self) -> int:
++        return max(1, int(self._config.get("sample_every", 1)))
++
++    @property
++    def max_samples(self) -> int:
++        return max(0, int(self._config.get("max_samples", 256)))
++
++    @property
++    def max_pending(self) -> int:
++        return max(8, int(self._config.get("max_pending", 512)))
++
++    @property
++    def flush_every(self) -> int:
++        return max(1, int(self._config.get("flush_every", 16)))
++
++    @property
++    def armed(self) -> bool:
++        """One disabled-path check before constructing per-step metadata."""
++        return self.enabled or self._reload_requested
++
++    @property
++    def step_active(self) -> bool:
++        return self._current is not None
++
++    def begin_step(self, metadata: dict[str, Any]) -> bool:
++        # Critical disabled path: one predictable branch, no CUDA/file calls.
++        if not self.enabled and not self._reload_requested:
++            return False
++        if self._reload_requested:
++            self._load_control()
++        if not self.enabled:
++            return False
++        self._drain_ready()
++        if self._current is not None:
++            # Preserve diagnostics even if an unusual call path skipped sample_tokens.
++            self.finish_step(incomplete=True)
++        self._step_seq += 1
++        if self._profiler is None and self._step_seq % self.sample_every:
++            return False
++        if self.max_samples and self._sample_seq >= self.max_samples:
++            if not self._pending:
++                self._flush()
++                self.enabled = False
++                logger.info(
++                    "Perf debug rank %d completed %d samples and auto-disabled",
++                    self.rank,
++                    self._sample_seq,
++                )
++            return False
++        if len(self._pending) >= self.max_pending:
++            self._dropped += 1
++            return False
++        self._sample_seq += 1
++        self._current = {
++            "schema": 1,
++            "rank": self.rank,
++            "pid": os.getpid(),
++            "step": self._step_seq,
++            "sample": self._sample_seq,
++            "wall_start_ns": time.time_ns(),
++            "cpu_start_ns": time.perf_counter_ns(),
++            "meta": dict(metadata),
++            "cpu_ms": defaultdict(float),
++            "gpu_events": [],
++            "deferred": [],
++        }
++        return True
++
++    def set_meta(self, **metadata: Any) -> None:
++        if self._current is not None:
++            self._current["meta"].update(metadata)
++
++    def cpu_start(self) -> int:
++        return time.perf_counter_ns() if self._current is not None else 0
++
++    def cpu_end(self, name: str, start_ns: int) -> None:
++        if start_ns and self._current is not None:
++            self._current["cpu_ms"][name] += (time.perf_counter_ns() - start_ns) / 1e6
++
++    def cuda_begin(self, name: str, stream=None):
++        if self._current is None:
++            return None
++        event = torch.cuda.Event(enable_timing=True)
++        event.record(stream)
++        return name, event
++
++    def cuda_end(self, token, stream=None) -> None:
++        if token is None or self._current is None:
++            return
++        name, start = token
++        end = torch.cuda.Event(enable_timing=True)
++        end.record(stream)
++        self._current["gpu_events"].append((name, start, end))
++
++    def capture_acceptance(
++        self, num_sampled: torch.Tensor, num_rejected: torch.Tensor
++    ) -> None:
++        if self._current is None:
++            return
++        assert self._accept_sampled_pool is not None
++        assert self._accept_rejected_pool is not None
++        n = num_sampled.numel()
++        row = self._accept_pool_index % self._accept_sampled_pool.shape[0]
++        self._accept_pool_index += 1
++        sampled = self._accept_sampled_pool[row, :n]
++        rejected = self._accept_rejected_pool[row, :n]
++        sampled.copy_(num_sampled.reshape(-1), non_blocking=True)
++        rejected.copy_(num_rejected.reshape(-1), non_blocking=True)
++        done = torch.cuda.Event()
++        done.record()
++        self._current["deferred"].append(("acceptance", done, sampled, rejected))
++
++    def scope(self, name: str):
++        if self._profiler is None:
++            return contextlib.nullcontext()
++        return torch.profiler.record_function(name)
++
++    def finish_step(self, *, incomplete: bool = False) -> None:
++        current, self._current = self._current, None
++        if current is None:
++            return
++        current["cpu_total_ms"] = (
++            time.perf_counter_ns() - current.pop("cpu_start_ns")
++        ) / 1e6
++        current["wall_end_ns"] = time.time_ns()
++        if incomplete:
++            current["incomplete"] = True
++        current["cpu_ms"] = dict(current["cpu_ms"])
++        self._pending.append(current)
++        if self._profiler is not None:
++            self._profiler.step()
++            self._profile_remaining -= 1
++            if self._profile_remaining <= 0:
++                self._stop_profiler()
++        self._drain_ready()
++
++    def _record_ready(self, record: dict[str, Any]) -> bool:
++        return all(end.query() for _, _, end in record["gpu_events"]) and all(
++            done.query() for _, done, *_ in record["deferred"]
++        )
++
++    def _materialize(self, record: dict[str, Any]) -> dict[str, Any]:
++        gpu_ms: dict[str, float] = defaultdict(float)
++        gpu_counts: dict[str, int] = defaultdict(int)
++        for name, start, end in record.pop("gpu_events"):
++            gpu_ms[name] += start.elapsed_time(end)
++            gpu_counts[name] += 1
++        record["gpu_ms"] = dict(gpu_ms)
++        record["gpu_span_counts"] = dict(gpu_counts)
++        for kind, _done, first, second in record.pop("deferred"):
++            if kind == "acceptance":
++                sampled = first.tolist()
++                rejected = second.tolist()
++                record["acceptance"] = {
++                    "num_sampled": sampled,
++                    "num_rejected": rejected,
++                    "sampled_sum": int(sum(sampled)),
++                    "rejected_sum": int(sum(rejected)),
++                    "sampled_mean": float(sum(sampled) / len(sampled)) if sampled else 0.0,
++                }
++        if self._dropped:
++            record["dropped_samples"] = self._dropped
++            self._dropped = 0
++        return record
++
++    def _drain_ready(self) -> None:
++        while self._pending and self._record_ready(self._pending[0]):
++            self._write_buffer.append(self._materialize(self._pending.popleft()))
++        if len(self._write_buffer) >= self.flush_every:
++            self._flush()
++
++    def _flush(self) -> None:
++        if not self._write_buffer or self._output_path is None:
++            return
++        with self._output_path.open("a", encoding="utf-8") as output:
++            for record in self._write_buffer:
++                output.write(json.dumps(record, separators=(",", ":")) + "\n")
++        self._write_buffer.clear()
++
++
++_TRACER: PerfDebugTracer | None = None
++
++
++def init_perf_debug(
++    rank: int, device: torch.device, max_num_reqs: int
++) -> PerfDebugTracer:
++    global _TRACER
++    _TRACER = PerfDebugTracer(rank, device, max_num_reqs)
++    return _TRACER
++
++
++def get_perf_debug() -> PerfDebugTracer | None:
++    return _TRACER
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 8c65a23ef..d9e9a5126 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -13,6 +13,7 @@ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.perf_debug import get_perf_debug
+ 
+ 
+ @dataclass
+@@ -67,6 +68,7 @@ class PPHandler:
+         self.device = device
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
++        self.perf_debug = get_perf_debug()
+ 
+         # On non-last ranks, a FIFO with one entry per in-flight step: the entry
+         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
+@@ -140,7 +142,15 @@ class PPHandler:
+             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+ 
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        feedback_wait = (
++            self.perf_debug.cuda_begin("feedback_consume_wait", self.main_stream)
++            if debug_step
++            else None
++        )
+         self.main_stream.wait_event(slot.event)
++        if debug_step:
++            self.perf_debug.cuda_end(feedback_wait, self.main_stream)
+         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+             draft_tokens = slot.draft_tokens
+             draft_idx_mapping = slot.idx_mapping
+@@ -167,8 +177,14 @@ class PPHandler:
+         assert self.is_last_rank
+         if compute_need_sampled_mask(input_batch) is None:
+             return
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        draft_broadcast = None
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            if debug_step:
++                draft_broadcast = self.perf_debug.cuda_begin(
++                    "feedback_draft_broadcast", self.broadcast_stream
++                )
+             send = draft_tokens[input_batch.idx_mapping].contiguous()
+             # Must record the idx_mapping tensor since it was allocated
+             # on the main stream.
+@@ -176,6 +192,8 @@ class PPHandler:
+             torch.distributed.broadcast(
+                 send, src=self.last_rank, group=self.broadcast_group
+             )
++            if debug_step:
++                self.perf_debug.cuda_end(draft_broadcast, self.broadcast_stream)
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+@@ -191,8 +209,14 @@ class PPHandler:
+         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+ 
+         num_reqs = input_batch.num_reqs
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        feedback_receive = None
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            if debug_step:
++                feedback_receive = self.perf_debug.cuda_begin(
++                    "feedback_receive", self.broadcast_stream
++                )
+             sampled_tokens = torch.empty(
+                 num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+             )
+@@ -215,6 +239,8 @@ class PPHandler:
+                     draft_tokens, src=self.last_rank, group=self.broadcast_group
+                 )
+             event = self.broadcast_stream.record_event()
++            if debug_step:
++                self.perf_debug.cuda_end(feedback_receive, self.broadcast_stream)
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+@@ -252,8 +278,14 @@ class PPHandler:
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+ 
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        feedback_broadcast = None
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
++            if debug_step:
++                feedback_broadcast = self.perf_debug.cuda_begin(
++                    "feedback_sample_broadcast", self.broadcast_stream
++                )
+             send_tokens = torch.nn.functional.pad(
+                 sampled_token_ids,
+                 (0, self.max_sample_len - sampled_token_ids.shape[-1]),
+@@ -269,3 +301,5 @@ class PPHandler:
+             )
+             for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                 tensor.record_stream(self.broadcast_stream)
++            if debug_step:
++                self.perf_debug.cuda_end(feedback_broadcast, self.broadcast_stream)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 3aadd2251..9d4ae4936 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -96,6 +96,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+ from vllm.v1.worker.workspace import init_workspace_manager
+ 
+ from ...model_executor.model_loader import TensorizerLoader
++from .gpu.perf_debug import init_perf_debug
+ from .gpu.warmup import warmup_kernels
+ from .utils import request_memory
+ 
+@@ -152,21 +153,26 @@ class AsyncIntermediateTensors(IntermediateTensors):
+         tensors: dict[str, torch.Tensor],
+         comm_handles: list[Handle] | None = None,
+         comm_postprocess: list[Callable[[], None]] | None = None,
++        perf_debug=None,
+     ) -> None:
+         super().__init__(tensors)
+         self._comm_handles = comm_handles
+         self._comm_postprocess = comm_postprocess
+         self._comm_waited = False
++        self._perf_debug = perf_debug
+ 
+     def wait_for_comm(self) -> None:
+         if self._comm_waited:
+             return
++        start = self._perf_debug.cpu_start() if self._perf_debug is not None else 0
+         if self._comm_handles:
+             for handle in self._comm_handles:
+                 handle.wait()
+         if self._comm_postprocess:
+             for fn in self._comm_postprocess:
+                 fn()
++        if self._perf_debug is not None:
++            self._perf_debug.cpu_end("pp_receive_wait", start)
+         self._comm_waited = True
+ 
+     def __getattribute__(self, name: str):
+@@ -469,6 +475,14 @@ class Worker(WorkerBase):
+         else:
+             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
+ 
++        # Disabled until SIGUSR2 requests a control-file reload. Inactive calls
++        # never create CUDA events, synchronize streams, or write diagnostics.
++        self.perf_debug = init_perf_debug(
++            self.rank,
++            self.device,
++            self.vllm_config.scheduler_config.max_num_seqs,
++        )
++
+         # DSpark target and draft CUDA graphs retain workspace views concurrently.
+         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+         init_workspace_manager(
+@@ -499,10 +513,54 @@ class Worker(WorkerBase):
+ 
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+ 
++        # Initialize persistent PP communication resources before model and
++        # KV allocation. This makes first-use NCCL allocations deterministic
++        # and lets later memory profiling account for their steady-state cost.
++        self._prime_pp_communicators()
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+ 
++    def _prime_pp_communicators(self) -> None:
++        """Initialize all lazy PP communicators before model/KV allocation."""
++        if getattr(self, "_pp_communicators_primed", False):
++            return
++        pp_group = get_pp_group()
++        if pp_group.world_size <= 1:
++            self._pp_communicators_primed = True
++            return
++        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
++
++        # vLLM/PyNCCL point-to-point communicator.
++        if not pp_group.is_first_rank:
++            pp_group.recv(primer.shape, primer.dtype)
++        if not pp_group.is_last_rank:
++            pp_group.send(primer)
++        torch.accelerator.synchronize()
++
++        # torch ProcessGroupNCCL point-to-point edge communicators.
++        rank = pp_group.rank_in_group
++        if not pp_group.is_first_rank:
++            torch.distributed.recv(
++                primer, src=pp_group.ranks[rank - 1], group=pp_group.device_group
++            )
++        if not pp_group.is_last_rank:
++            torch.distributed.send(
++                primer, dst=pp_group.ranks[rank + 1], group=pp_group.device_group
++            )
++        torch.accelerator.synchronize()
++
++        # Sibling communicator used to broadcast sampled/draft tokens from
++        # the last PP rank back to the earlier ranks.
++        handler = getattr(self.model_runner, "pp_handler", None)
++        if handler is not None:
++            torch.distributed.broadcast(
++                primer, src=handler.last_rank, group=handler.broadcast_group
++            )
++            torch.accelerator.synchronize()
++        self._pp_communicators_primed = True
++
+     def handle_ft_command(self, ft_request):
+         assert self.worker_sentinel is not None
+         return self.worker_sentinel.handle_command(ft_request)
+@@ -821,14 +879,7 @@ class Worker(WorkerBase):
+         # and capture_model both drive decode steps under FULL cudagraph
+         # modes), communicator initialization invalidates the capture and the
+         # engine later dies on an async cudaErrorInvalidValue far from here.
+-        pp_group = get_pp_group()
+-        if pp_group.world_size > 1:
+-            primer = torch.zeros(1, dtype=torch.int32, device=self.device)
+-            if not pp_group.is_first_rank:
+-                pp_group.recv(primer.shape, primer.dtype)
+-            if not pp_group.is_last_rank:
+-                pp_group.send(primer)
+-            torch.accelerator.synchronize()
++        self._prime_pp_communicators()
+ 
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
+@@ -1154,23 +1205,42 @@ class Worker(WorkerBase):
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+-        return self.model_runner.sample_tokens(grammar_output)
++        if not self.perf_debug.step_active:
++            return self.model_runner.sample_tokens(grammar_output)
++        start = self.perf_debug.cpu_start()
++        try:
++            with self.perf_debug.scope("perf::sample_tokens"):
++                return self.model_runner.sample_tokens(grammar_output)
++        finally:
++            self.perf_debug.cpu_end("sample_tokens", start)
++            self.perf_debug.finish_step()
+ 
+     @torch.inference_mode()
+     @with_gpu_sync_check
+     def execute_model(
+         self, scheduler_output: "SchedulerOutput"
+     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
++        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        debug_step = self.perf_debug.armed and self.perf_debug.begin_step(
++            {
++                "num_reqs": len(scheduler_output.num_scheduled_tokens),
++                "scheduled_tokens": num_scheduled_tokens,
++                "spec_reqs": len(scheduler_output.scheduled_spec_decode_tokens),
++            }
++        )
++
+         # Wait for the previous step's sends so this forward pass cannot
+         # overwrite buffers they are still reading.
++        wait_start = self.perf_debug.cpu_start() if debug_step else 0
+         if self._pp_send_work:
+             for handle in self._pp_send_work:
+                 handle.wait()
+             self._pp_send_work = []
++        if debug_step:
++            self.perf_debug.cpu_end("pp_previous_send_wait", wait_start)
+ 
+         intermediate_tensors = None
+-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        forward_pass = num_scheduled_tokens > 0
+         all_gather_tensors = {}
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
+@@ -1205,23 +1275,35 @@ class Worker(WorkerBase):
+             }
+ 
+         if forward_pass and not get_pp_group().is_first_rank:
++            recv_start = self.perf_debug.cpu_start() if debug_step else 0
+             tensor_dict, comm_handles, comm_postprocess = (
+                 get_pp_group().irecv_tensor_dict(
+                     all_gather_group=get_tp_group(),
+                     all_gather_tensors=all_gather_tensors,
+                 )
+             )
++            if debug_step:
++                self.perf_debug.cpu_end("pp_irecv_enqueue", recv_start)
+             assert tensor_dict is not None
+             intermediate_tensors = AsyncIntermediateTensors(
+                 tensor_dict,
+                 comm_handles=comm_handles,
+                 comm_postprocess=comm_postprocess,
++                perf_debug=self.perf_debug if debug_step else None,
+             )
+ 
++        execute_start = self.perf_debug.cpu_start() if debug_step else 0
+         with self.annotate_profile(scheduler_output):
+-            output = self.model_runner.execute_model(
+-                scheduler_output, intermediate_tensors
+-            )
++            if debug_step:
++                with self.perf_debug.scope("perf::execute_model"):
++                    output = self.model_runner.execute_model(
++                        scheduler_output, intermediate_tensors
++                    )
++                self.perf_debug.cpu_end("execute_model", execute_start)
++            else:
++                output = self.model_runner.execute_model(
++                    scheduler_output, intermediate_tensors
++                )
+             if (
+                 self.use_v2_model_runner
+                 and self.model_runner.is_pooling_model
+@@ -1243,11 +1325,14 @@ class Worker(WorkerBase):
+         # Non-blocking send of the intermediate tensors. The metadata handle
+         # is reaped lazily by the GroupCoordinator; the device handles are
+         # waited at the top of the next step.
++        send_start = self.perf_debug.cpu_start() if debug_step else 0
+         handles = get_pp_group().isend_tensor_dict(
+             output.tensors,
+             all_gather_group=get_tp_group(),
+             all_gather_tensors=all_gather_tensors,
+         )
++        if debug_step:
++            self.perf_debug.cpu_end("pp_isend_enqueue", send_start)
+         self._pp_send_work = handles[1:]
+ 
+         return None
