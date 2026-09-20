@@ -158,11 +158,13 @@ adaptive verification disabled. Combined-image runtime validation is pending.
 
 ## Optional hot performance diagnostics
 
-Safety update: `detail` is disabled, and the tracer rejects graph-changing and
-module-hook control options. Runtime sampling never changes target/draft graph
-dispatch. Use `enable` for asynchronous stage timing or bounded CPU `profile`.
-Trace records retain their original output path/session across delayed flushes.
-The historical detail examples below are not enabled in this revision.
+Safety update: `detail` and hot `profile` are disabled. The tracer rejects
+graph-changing/module-hook options and ignores `torch_profile_steps` even when
+written directly to the control file. Runtime sampling never changes
+target/draft graph dispatch. Use `enable` for asynchronous stage timing;
+external process sampling can capture CPU stacks. Trace records retain their
+original output path/session across delayed flushes. Historical `detail` and
+`profile` examples below are not enabled in this revision.
 
 
 Default images contain no diagnostic runtime code or hot-path hooks. Build and

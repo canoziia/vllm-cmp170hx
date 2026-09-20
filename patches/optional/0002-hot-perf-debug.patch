@@ -475,10 +475,10 @@ index 05bc6b8f5..dcb33d628 100644
  class BatchReqState(NamedTuple):
 diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
 new file mode 100644
-index 000000000..418550aac
+index 000000000..54b01a310
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/perf_debug.py
-@@ -0,0 +1,382 @@
+@@ -0,0 +1,389 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Hot-switchable, low-overhead GPU worker diagnostics.
 +
@@ -621,6 +621,13 @@ index 000000000..418550aac
 +            self._module_hook_manager(self.module_detail)
 +        self._stop_profiler()
 +        profile_steps = max(0, int(config.get("torch_profile_steps", 0)))
++        if profile_steps:
++            logger.warning(
++                "Ignoring torch_profile_steps=%d: runtime CPU profiler start/stop "
++                "is unsafe in this PP deployment; use external process sampling",
++                profile_steps,
++            )
++        profile_steps = 0
 +        if profile_steps and self._rank_selected(config.get("profile_ranks", [self.rank])):
 +            activities = [torch.profiler.ProfilerActivity.CPU]
 +            # CMP 170HX does not expose CUPTI CUDA activities. CUDA timing is

@@ -42,6 +42,8 @@ JSON
     echo "Enabled $samples detailed eager samples on all PP ranks: $CONTROL"
     ;;
   profile)
+    echo "Disabled: repeated hot CPU profiler start/stop caused PP worker hangs; use async enable or external py-spy" >&2
+    exit 2
     session=${2:-$(date +%Y%m%d-%H%M%S)}
     steps=${3:-8}
     rank=${4:-5}
