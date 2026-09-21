@@ -475,10 +475,10 @@ index 05bc6b8f5..dcb33d628 100644
  class BatchReqState(NamedTuple):
 diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
 new file mode 100644
-index 000000000..54b01a310
+index 000000000..e0b83a680
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/perf_debug.py
-@@ -0,0 +1,389 @@
+@@ -0,0 +1,393 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Hot-switchable, low-overhead GPU worker diagnostics.
 +
@@ -703,6 +703,10 @@ index 000000000..54b01a310
 +        if self._current is not None:
 +            # Preserve diagnostics even if an unusual call path skipped sample_tokens.
 +            self.finish_step(incomplete=True)
++        # Idle PP callbacks are frequent and must not consume the bounded
++        # diagnostic window or distort the interval between real decode steps.
++        if metadata.get("scheduled_tokens", 0) == 0:
++            return False
 +        self._step_seq += 1
 +        if self._profiler is None and self._step_seq % self.sample_every:
 +            return False

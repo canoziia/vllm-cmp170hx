@@ -51,6 +51,10 @@ The original c32 trace (`/tmp/decode-traces/steps-decode-trace-seq32-20260920-14
 
 Important probe effect: c6 uninstrumented warmup 445.0/423.2 Full/Output, trace 370.5/352.2, post-trace uninstrumented 423.7/404.1 and 424.2/405.9. For c11 uninstrumented runs varied 558–751 Full, trace 507 Full. Dense `sample_every=1` Event probes on all six ranks materially perturb c6/c11, so the 30–47ms spans cannot be uncritically assigned to production without lower-rate A/B. External 120Hz nonblocking py-spy `pp2-c11-gil.raw` during an uninstrumented c11 750.75 Full run had few active main-thread samples and showed metadata builders and PP waits but no persistent Engram frame. No single-factor Engram/L14/L20/LMCache change has yet been made.
 
+## Sampling admission fix for the next debug image
+
+`PerfDebugTracer.begin_step` in the committed optional patch is being updated so callbacks with zero scheduled tokens do not advance the sampling interval nor consume bounded samples. A synthetic 4000-idle/20-real-step test on the fixed image, `sample_every=10`, samples exactly real steps 10 and 20. Fresh pinned-source patch application and syntax checks pass. This is **not live-validated on the full model**: a second fixture attempted while the full model occupied GPUs 0–5 failed in NCCL initialization with CUDA memory exhaustion; the production container stayed healthy. Never restart it just to test the fixture. Dense-trace conclusions above remain marked as probe-perturbed.
+
 ## Unfinished gates
 
 1. Plain A under **same** CPU Engram/LMCache/PP6/Graph and prompt needs a separate full model load or a verified in-place mechanism; cannot claim 41→31.8 attribution from Zero-Clean historical baseline.
