@@ -59,6 +59,10 @@ Further same-instance c11 probes `steps-full-c11-every3-rank*.jsonl` and `steps-
 
 `PerfDebugTracer.begin_step` in the committed optional patch is being updated so callbacks with zero scheduled tokens do not advance the sampling interval nor consume bounded samples. A synthetic 4000-idle/20-real-step test on the fixed image, `sample_every=10`, samples exactly real steps 10 and 20. Fresh pinned-source patch application and syntax checks pass. This is **not live-validated on the full model**: a second fixture attempted while the full model occupied GPUs 0–5 failed in NCCL initialization with CUDA memory exhaustion; the production container stayed healthy. Never restart it just to test the fixture. Dense-trace conclusions above remain marked as probe-perturbed.
 
+## Reversible PP2 host-affinity A/B (2026-09-21 03:03–03:08 UTC)
+
+Same full-model container, debug off, DSpark ON, c32, 53 API prompt tokens and 1000 completion tokens/request. Only PP2 main thread (PID 710438) was changed from unrestricted CPU 0–39 (A) to NUMA-node-1 CPU 12–19 (B) and back to 0–39 (A2), with separate per-phase warmups. The script trap restored the original affinity and the container remained healthy. Measured Full-batch/Output tok/s: A 1112.10/1037.11 and 906.62/861.04; B 827.99/784.27 and 1129.64/1061.77; A2 908.94/859.01 and 940.04/858.36. The B range overlaps A and A2; **no reproducible affinity optimization** is demonstrated. This intervention did not move pinned Engram allocations and cannot isolate UVA Engram versus L14/L20 source or GPU synchronization. Raw runs are in `/root/app/deepseek-v41/bench/full-fixed-73d0be8/pp2-affinity/`.
+
 ## Unfinished gates
 
 1. Plain A under **same** CPU Engram/LMCache/PP6/Graph and prompt needs a separate full model load or a verified in-place mechanism; cannot claim 41→31.8 attribution from Zero-Clean historical baseline.
