@@ -87,7 +87,7 @@ index 274cf1f54..2c0f99f5e 100644
              separate_decode_routine and bool(decode_mode) and self.varlen_decode
          )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 05bc6b8f5..498889ea7 100644
+index 05bc6b8f5..bf44be30c 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -19,8 +19,10 @@ instead of embedding feature-specific logic directly.
@@ -255,7 +255,74 @@ index 05bc6b8f5..498889ea7 100644
              # Mamba "align" pre-copy: migrate recurrent state across block
              # boundaries before the forward. Runs only on real batches, and
              # before model_state.prepare_attn gathers num_accepted_tokens so the
-@@ -1836,7 +1918,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1731,9 +1813,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         elif not (dummy_run and skip_attn_for_dummy_run):
+             assert slot_mappings is not None
++            fine_stamp = tracer.cpu_start() if timing else 0
+             slot_mappings_by_layer = build_slot_mappings_by_layer(
+                 slot_mappings, self.kv_cache_config
+             )
++            if timing:
++                tracer.cpu_end("build_slot_mappings_by_layer", fine_stamp)
+             assert block_tables is not None
+             attn_groups = self.attn_groups
+             if dummy_run and is_profile:
+@@ -1743,6 +1828,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+                     for groups in attn_groups
+                 ]
++            fine_stamp = tracer.cpu_start() if timing else 0
+             attn_metadata = self.model_state.prepare_attn(
+                 input_batch,
+                 batch_desc.cg_mode,
+@@ -1755,6 +1841,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # indices from the previous real batch.
+                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             )
++            if timing:
++                tracer.cpu_end("model_state_prepare_attn", fine_stamp)
+ 
+         input_ids = input_batch.input_ids
+         inputs_embeds = None
+@@ -1787,6 +1875,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
+                 input_ids = None
+ 
++        fine_stamp = tracer.cpu_start() if timing else 0
++        model_state_inputs = self.model_state.prepare_inputs(input_batch, self.req_states)
++        if timing:
++            tracer.cpu_end("model_state_prepare_inputs", fine_stamp)
+         model_inputs = {
+             "input_ids": input_ids,
+             "positions": input_batch.positions,
+@@ -1794,7 +1886,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             "intermediate_tensors": None,
+             # NOTE: Values returned by `prepare_inputs` will override the default
+             # values above.
+-            **self.model_state.prepare_inputs(input_batch, self.req_states),
++            **model_state_inputs,
+         }
+         if not self.is_first_pp_rank:
+             # Update for non-first PP ranks.
+@@ -1811,6 +1903,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             assert intermediate_tensors is not None
+             assert self.intermediate_tensors is not None
+             n = input_batch.num_tokens_after_padding
++            fine_stamp = tracer.cpu_start() if timing else 0
+             new_tensors = {}
+             for k, v in self.intermediate_tensors.tensors.items():
+                 recv = intermediate_tensors.tensors[k]
+@@ -1825,6 +1918,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 new_tensors[k] = v[:n] if dummy_run else v[:n].copy_(recv[:n])
+             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+             del intermediate_tensors
++            if timing:
++                tracer.cpu_end("pp_intermediate_copy_enqueue", fine_stamp)
+ 
+         # Update the EPLB meta.
+         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+@@ -1836,7 +1931,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
          self.step_timing.forward_start()
@@ -279,7 +346,7 @@ index 05bc6b8f5..498889ea7 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1844,7 +1942,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1844,7 +1955,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # because they are already copied to the CUDA graph input buffers.
              assert self.cudagraph_manager is not None
              self.kv_connector.pre_forward(scheduler_output)
@@ -295,7 +362,7 @@ index 05bc6b8f5..498889ea7 100644
          else:
              # For piecewise and eager mode, just call model().
              batch_descriptor = BatchDescriptor(
-@@ -1878,12 +1983,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1878,12 +1996,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      # cudagraph, chosen inside run_pw_graph). cg_mode is only
                      # PIECEWISE after the cudagraph manager exists.
                      assert self.cudagraph_manager is not None
@@ -327,7 +394,7 @@ index 05bc6b8f5..498889ea7 100644
  
          if self.is_last_pp_rank:
              if self.use_aux_hidden_state_outputs:
-@@ -1917,6 +2037,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1917,6 +2050,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              ec_connector_output=ec_connector_output,
              routed_experts=routed_experts,
              cudagraph_stats=cudagraph_stats,
@@ -336,7 +403,7 @@ index 05bc6b8f5..498889ea7 100644
          )
  
          if not self.is_last_pp_rank:
-@@ -1947,6 +2069,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1947,6 +2082,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          ec_connector_output = self.execute_model_state.ec_connector_output
          routed_experts = self.execute_model_state.routed_experts
          cudagraph_stats = self.execute_model_state.cudagraph_stats
@@ -344,7 +411,7 @@ index 05bc6b8f5..498889ea7 100644
          self.execute_model_state = None
  
          if not self.is_last_pp_rank:
-@@ -1954,7 +2077,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1954,7 +2090,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # IntermediateTensors instead of final hidden states. Receive the
              # sampled tokens broadcast from the last rank and update local state.
              assert self.pp_handler is not None
@@ -359,7 +426,7 @@ index 05bc6b8f5..498889ea7 100644
              # Optimistically update num_computed_tokens for entire batch here.
              # Will be adjusted for rejections if necessary in update_requests.
              self.postprocess_num_computed_tokens(input_batch)
-@@ -1974,9 +2103,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1974,9 +2116,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.pcp_manager, hidden_states, input_batch
          )
  
@@ -383,7 +450,7 @@ index 05bc6b8f5..498889ea7 100644
  
          if self.pp_handler is not None:
              # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2041,6 +2181,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2041,6 +2194,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # ensuring that `copy_event` is recorded before calling postprocess.
          # This sequencing may slightly reduce latency as async D2H copy does not
          # need to wait for the postprocess to finish.
@@ -393,7 +460,7 @@ index 05bc6b8f5..498889ea7 100644
          self.postprocess_sampled(
              input_batch.idx_mapping,
              sampler_output.sampled_token_ids,
-@@ -2048,6 +2191,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2048,6 +2204,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_rejected,
              input_batch.query_start_loc,
          )
@@ -402,7 +469,7 @@ index 05bc6b8f5..498889ea7 100644
  
          if self.speculator is not None:
              assert self.sampler is not None
-@@ -2059,24 +2204,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2059,24 +2217,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                  spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
@@ -459,7 +526,7 @@ index 05bc6b8f5..498889ea7 100644
                  self.adaptive_verification.record_confidences(
                      self.speculator.draft_token_confidence_probs, input_batch
                  )
-@@ -2086,9 +2247,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2086,9 +2260,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # not have a speculator (i.e. self.speculator is None)
              self.draft_tokens_handler.set_draft_tokens(
                  input_batch,
@@ -471,7 +538,7 @@ index 05bc6b8f5..498889ea7 100644
                  self.pp_handler.broadcast_drafts(
                      self.req_states.draft_tokens, input_batch
                  )
-@@ -2232,6 +2393,7 @@ class ExecuteModelState(NamedTuple):
+@@ -2232,6 +2406,7 @@ class ExecuteModelState(NamedTuple):
      ec_connector_output: ECConnectorOutput | None
      routed_experts: RoutedExpertsTensors | None
      cudagraph_stats: CUDAGraphStat | None
