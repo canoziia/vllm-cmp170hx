@@ -45,6 +45,12 @@ Async OFF trace `/root/app/deepseek-v41/cache/vllm-perf-debug/steps-full-off-pha
 
 A short subsequent generation verified file restoration and scheduler logged K=5 at 01:35:07 UTC; vLLM container ID unchanged, healthy, debug disabled.
 
+## PP2 spike reproduced with actual aligned cohort, and tracer perturbation
+
+The original c32 trace (`/tmp/decode-traces/steps-decode-trace-seq32-20260920-143918-c32-rank*.jsonl`) at actual 6/11/15 cohorts showed PP2 execute ~30.34/30.51/28.04ms while adjacent ranks were ~7–17ms, and PP2 GPU target 13.10/20.77/20.84ms. The new c6 request settles into 1/5 cohorts, not exactly six: at cohort 5 PP2 execute 30.89ms (median 29.52) versus PP0/1/3/4/5 24.43/17.15/16.70/19.14/18.46ms; PP2 `metadata_and_model_inputs` 12.01ms, `forward_dispatch` 14.85ms, GPU target 12.26ms. This is not just Engram host lookup: other ranks' forward dispatch also rose to ~9–11ms, though PP2 was highest. c11 trace with all 11 concurrent shows PP2 execute 47.50ms, metadata 37.53ms, forward only 0.59ms, GPU target 18.54ms vs PP3/4 20.53/21.32ms; PP3/4 receive enqueue 84.9/94.0ms. A repeat c11 settled into 5/6 cohorts: PP2 cohort 5 execute 21.04ms, cohort 6 10.39ms; no blanket PP2 30ms. Full per-rank records remain on VM under `steps-full-cohort6-*`, `steps-full-cohort11-*` and `steps-full-cohort11-repeat-*`.
+
+Important probe effect: c6 uninstrumented warmup 445.0/423.2 Full/Output, trace 370.5/352.2, post-trace uninstrumented 423.7/404.1 and 424.2/405.9. For c11 uninstrumented runs varied 558–751 Full, trace 507 Full. Dense `sample_every=1` Event probes on all six ranks materially perturb c6/c11, so the 30–47ms spans cannot be uncritically assigned to production without lower-rate A/B. External 120Hz nonblocking py-spy `pp2-c11-gil.raw` during an uninstrumented c11 750.75 Full run had few active main-thread samples and showed metadata builders and PP waits but no persistent Engram frame. No single-factor Engram/L14/L20/LMCache change has yet been made.
+
 ## Unfinished gates
 
 1. Plain A under **same** CPU Engram/LMCache/PP6/Graph and prompt needs a separate full model load or a verified in-place mechanism; cannot claim 41→31.8 attribution from Zero-Clean historical baseline.
