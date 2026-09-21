@@ -154,7 +154,8 @@ Off skips draft backbone/Markov sampling/graph replay, but continues draft
 context-KV maintenance so ongoing requests can safely resume drafting. Weights,
 aux outputs, fixed-shape PP feedback and draft caches stay resident. This is
 not a zero-overhead non-speculative baseline. Requires MRV2 DSpark, DP=1 and
-adaptive verification disabled. Combined-image runtime validation is pending.
+adaptive verification disabled. The combined image has been live-validated with ON→OFF→ON transitions; see
+`INVESTIGATION-20260921.md` for throughput ranges and limits.
 
 ## Optional hot performance diagnostics
 
@@ -163,8 +164,7 @@ graph-changing/module-hook options and ignores `torch_profile_steps` even when
 written directly to the control file. Runtime sampling never changes
 target/draft graph dispatch. Use `enable` for asynchronous stage timing;
 external process sampling can capture CPU stacks. Trace records retain their
-original output path/session across delayed flushes. Historical `detail` and
-`profile` examples below are not enabled in this revision.
+original output path/session across delayed flushes.
 
 
 Default images contain no diagnostic runtime code or hot-path hooks. Build and
@@ -174,8 +174,9 @@ workers do not create CUDA events, synchronize streams, copy timing tensors,
 read control files, or write logs. Runtime control uses a shared JSON file plus
 `SIGUSR2`, so subsequent enable/disable cycles do not require another restart.
 
-Sample asynchronous timings on every tenth step, up to 256 samples on all PP
-ranks:
+Sample asynchronous timings on every tenth **scheduled** step, up to 256
+samples on all PP ranks (the real-step filter is in the next image build, not
+the older running `73d0be8-debug-eventfix` instance):
 
 ```bash
 bash scripts/perf-debug-control.sh enable decode-ab 10 256 all
@@ -191,29 +192,13 @@ request/cohort sizes, CPU PP waits/enqueues, asynchronous GPU target/sampler/
 draft/postprocess timings, feedback-broadcast timings, and per-request accepted
 and rejected token counts.
 
-CMP 170HX does not expose CUPTI CUDA kernel activities. For detailed GPU timing,
-request a short diagnostic window that temporarily dispatches sampled steps
-eagerly and installs per-module CUDA Event hooks:
-
-```bash
-bash scripts/perf-debug-control.sh detail dspark-detail 16 all
-```
-
-This reports per-layer target Engram, attention, MoE, ShadowSource, and last-rank
-draft-module timing. Detailed eager mode must select all PP ranks; selecting a
-subset changes target padding on only part of the pipeline and is rejected by
-the control script. Hooks are removed automatically when the sample limit is
-reached and normal CUDA Graph dispatch resumes without restart. A bounded CPU
-and dispatch `torch.profiler` trace is also available:
-
-```bash
-bash scripts/perf-debug-control.sh profile dspark-cpu 8 5
-```
-
-Both `detail` and `profile` are intentionally intrusive. Use ordinary `enable`
-for low-overhead measurements in the production Graph path. The control
-directory is inside the existing cache mount at
-`/root/.cache/vllm-perf-debug`.
+CMP 170HX does not expose CUPTI CUDA kernel activities. `detail`/`profile`
+commands are refused: detailed eager tracing can desynchronize PP graph shapes,
+and hot CPU profiling reproduced worker stalls. For lower overhead, increase
+`sample_every` and compare uninstrumented-before → sparse trace →
+uninstrumented-after under the **same actual cohort**. Even asynchronous
+CUDA Events can perturb high-concurrency throughput. The control directory is
+inside the existing cache mount at `/root/.cache/vllm-perf-debug`.
 
 ## Validation gates
 
