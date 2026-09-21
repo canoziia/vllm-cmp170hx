@@ -87,7 +87,7 @@ index 274cf1f54..2c0f99f5e 100644
              separate_decode_routine and bool(decode_mode) and self.varlen_decode
          )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 05bc6b8f5..dcb33d628 100644
+index 05bc6b8f5..498889ea7 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -19,8 +19,10 @@ instead of embedding feature-specific logic directly.
@@ -344,19 +344,22 @@ index 05bc6b8f5..dcb33d628 100644
          self.execute_model_state = None
  
          if not self.is_last_pp_rank:
-@@ -1954,7 +2077,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1954,7 +2077,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # IntermediateTensors instead of final hidden states. Receive the
              # sampled tokens broadcast from the last rank and update local state.
              assert self.pp_handler is not None
+-            all_decode_next = self.pp_handler.receive(input_batch)
 +            debug_step = self.perf_debug is not None and self.perf_debug.step_active
 +            pp_recv_start = self.perf_debug.cpu_start() if debug_step else 0
-             all_decode_next = self.pp_handler.receive(input_batch)
++            all_decode_next = self.pp_handler.receive(
++                input_batch, receive_drafts=next_draft_k > 0
++            )
 +            if debug_step:
 +                self.perf_debug.cpu_end("feedback_receive_enqueue", pp_recv_start)
              # Optimistically update num_computed_tokens for entire batch here.
              # Will be adjusted for rejections if necessary in update_requests.
              self.postprocess_num_computed_tokens(input_batch)
-@@ -1974,9 +2101,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1974,9 +2103,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.pcp_manager, hidden_states, input_batch
          )
  
@@ -380,7 +383,7 @@ index 05bc6b8f5..dcb33d628 100644
  
          if self.pp_handler is not None:
              # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2041,6 +2179,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2041,6 +2181,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # ensuring that `copy_event` is recorded before calling postprocess.
          # This sequencing may slightly reduce latency as async D2H copy does not
          # need to wait for the postprocess to finish.
@@ -390,7 +393,7 @@ index 05bc6b8f5..dcb33d628 100644
          self.postprocess_sampled(
              input_batch.idx_mapping,
              sampler_output.sampled_token_ids,
-@@ -2048,6 +2189,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2048,6 +2191,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_rejected,
              input_batch.query_start_loc,
          )
@@ -399,7 +402,7 @@ index 05bc6b8f5..dcb33d628 100644
  
          if self.speculator is not None:
              assert self.sampler is not None
-@@ -2059,24 +2202,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2059,24 +2204,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                  spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
@@ -456,16 +459,19 @@ index 05bc6b8f5..dcb33d628 100644
                  self.adaptive_verification.record_confidences(
                      self.speculator.draft_token_confidence_probs, input_batch
                  )
-@@ -2086,7 +2245,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2086,9 +2247,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # not have a speculator (i.e. self.speculator is None)
              self.draft_tokens_handler.set_draft_tokens(
                  input_batch,
 -                self.req_states.draft_tokens[input_batch.idx_mapping],
 +                self.req_states.draft_tokens[input_batch.idx_mapping, :next_draft_k],
              )
-             if self.pp_handler is not None:
+-            if self.pp_handler is not None:
++            if self.pp_handler is not None and next_draft_k:
                  self.pp_handler.broadcast_drafts(
-@@ -2232,6 +2391,7 @@ class ExecuteModelState(NamedTuple):
+                     self.req_states.draft_tokens, input_batch
+                 )
+@@ -2232,6 +2393,7 @@ class ExecuteModelState(NamedTuple):
      ec_connector_output: ECConnectorOutput | None
      routed_experts: RoutedExpertsTensors | None
      cudagraph_stats: CUDAGraphStat | None
@@ -873,7 +879,7 @@ index 000000000..e0b83a680
 +def get_perf_debug() -> PerfDebugTracer | None:
 +    return _TRACER
 diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
-index 8c65a23ef..d9e9a5126 100644
+index 8c65a23ef..8ac0625d2 100644
 --- a/vllm/v1/worker/gpu/pp_utils.py
 +++ b/vllm/v1/worker/gpu/pp_utils.py
 @@ -13,6 +13,7 @@ from vllm.platforms import current_platform
@@ -923,16 +929,28 @@ index 8c65a23ef..d9e9a5126 100644
              send = draft_tokens[input_batch.idx_mapping].contiguous()
              # Must record the idx_mapping tensor since it was allocated
              # on the main stream.
-@@ -176,6 +192,8 @@ class PPHandler:
+@@ -176,10 +192,17 @@ class PPHandler:
              torch.distributed.broadcast(
                  send, src=self.last_rank, group=self.broadcast_group
              )
 +            if debug_step:
 +                self.perf_debug.cuda_end(draft_broadcast, self.broadcast_stream)
++
++    def receive(self, input_batch: InputBatch, *, receive_drafts: bool = True) -> bool:
++        """Receive feedback for this target step.
  
-     def receive(self, input_batch: InputBatch) -> bool:
-         """Returns True iff sampled tokens need to be gathered from *all*
-@@ -191,8 +209,14 @@ class PPHandler:
+-    def receive(self, input_batch: InputBatch) -> bool:
+-        """Returns True iff sampled tokens need to be gathered from *all*
+-        requests in the batch."""
++        ``receive_drafts=False`` is the hot-K0 path. Sampled target tokens and
++        acceptance counts are still required by every PP stage, but a zero-K
++        step has no draft proposal to consume. All ranks derive the flag from
++        the same scheduler output, so skipping this collective is symmetric.
++        """
+         assert not self.is_last_rank
+         need_sampled_mask = compute_need_sampled_mask(input_batch)
+         if need_sampled_mask is None:
+@@ -191,8 +214,14 @@ class PPHandler:
          gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
  
          num_reqs = input_batch.num_reqs
@@ -947,7 +965,16 @@ index 8c65a23ef..d9e9a5126 100644
              sampled_tokens = torch.empty(
                  num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
              )
-@@ -215,6 +239,8 @@ class PPHandler:
+@@ -204,7 +233,7 @@ class PPHandler:
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
+             draft_tokens = None
+-            if self.num_speculative_steps > 0:
++            if self.num_speculative_steps > 0 and receive_drafts:
+                 draft_tokens = torch.empty(
+                     num_reqs,
+                     self.num_speculative_steps,
+@@ -215,6 +244,8 @@ class PPHandler:
                      draft_tokens, src=self.last_rank, group=self.broadcast_group
                  )
              event = self.broadcast_stream.record_event()
@@ -956,7 +983,7 @@ index 8c65a23ef..d9e9a5126 100644
              num_sampled, num_rejected = combined.unbind(dim=0)
              # Must record_stream since these were allocated on broadcast stream but
              # later used on the main stream.
-@@ -252,8 +278,14 @@ class PPHandler:
+@@ -252,8 +283,14 @@ class PPHandler:
          if current_platform.is_xpu():
              self.main_stream.synchronize()
  
@@ -971,7 +998,7 @@ index 8c65a23ef..d9e9a5126 100644
              send_tokens = torch.nn.functional.pad(
                  sampled_token_ids,
                  (0, self.max_sample_len - sampled_token_ids.shape[-1]),
-@@ -269,3 +301,5 @@ class PPHandler:
+@@ -269,3 +306,5 @@ class PPHandler:
              )
              for tensor in (sampled_token_ids, num_sampled, num_rejected):
                  tensor.record_stream(self.broadcast_stream)
