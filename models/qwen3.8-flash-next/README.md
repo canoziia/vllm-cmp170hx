@@ -65,7 +65,7 @@ mamba_cache_mode=align
 prefix_cache_retention_interval=1,600
 CUDA Graph=FULL_AND_PIECEWISE
 PLE backend=pread, 48 workers, next-chunk prefetch
-LMCache chunk=1,600, L1=4 GiB, buffered native-FS L2
+LMCache chunk=1,600, L1=64 GiB by default, buffered native-FS L2
 ```
 
 A 1M configured maximum is not by itself proof that a 1M request is stable.
