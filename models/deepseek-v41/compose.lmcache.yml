@@ -91,7 +91,7 @@ services:
 
   lmcache:
     # Built from the digest-pinned official LMCache image by
-    # scripts/build-lmcache-images.sh. Keep client/server on the same payload.
+    # scripts/build-deepseek-v41-lmcache-images.sh. Keep client/server on the same payload.
     image: ${LMCACHE_IMAGE:-localhost/deepseek-v41-lmcache:official-v0.5.5-patched}
     container_name: deepseek-v41-lmcache
     entrypoint: ["lmcache", "server"]

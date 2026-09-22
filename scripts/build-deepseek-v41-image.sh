@@ -3,7 +3,8 @@ set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
-source "$REPO_ROOT/manifests/source.env"
+MODEL_DIR="$REPO_ROOT/models/deepseek-v41"
+source "$MODEL_DIR/manifests/source.env"
 ENGINE=${CONTAINER_ENGINE:-podman}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
@@ -39,7 +40,7 @@ git -C "$WORKDIR/source" remote add origin "$SOURCE_REPO"
 git -C "$WORKDIR/source" fetch --depth=1 origin "$SOURCE_COMMIT"
 git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
 ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG \
-  "$REPO_ROOT/scripts/apply-patches.sh" "$WORKDIR/source"
+  "$REPO_ROOT/scripts/apply-deepseek-v41-patches.sh" "$WORKDIR/source"
 
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
@@ -53,7 +54,7 @@ if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
     echo "Base LMCache event_ipc.py hash mismatch: $actual_lmcache_sha" >&2
     exit 7
   }
-  (cd "$WORKDIR/context" && patch -p1 < "$REPO_ROOT/patches/optional/0003-lmcache-event-capability-cache.patch")
+  (cd "$WORKDIR/context" && patch -p1 < "$MODEL_DIR/patches/optional/0003-lmcache-event-capability-cache.patch")
   python3 -m py_compile "$WORKDIR/context/lmcache/v1/platform/base/event_ipc.py"
 fi
 cat >"$WORKDIR/context/Containerfile" <<CONTAINERFILE
