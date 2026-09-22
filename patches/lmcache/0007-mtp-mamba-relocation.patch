@@ -1,0 +1,113 @@
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -351,26 +351,6 @@
+             f"max_num_batched_tokens={max_batched}, block_size={block_size}. "
+             f"Set --max-num-batched-tokens to at least {block_size}."
+         )
+-    # Speculative decoding (MTP) breaks the store path when a prefill step can
+-    # advance more than one block: chunks stored from such steps deterministically
+-    # corrupt later prefix hits (verified on Qwen3.8-Flash-Next FP8: with
+-    # max_num_batched_tokens in (block_size, 2*block_size], hits of certain
+-    # depths resume from a wrong recurrent state and generate garbage, while
+-    # max_num_batched_tokens == block_size is correct for the same prompts).
+-    # Fail closed until the snapshot/store interaction is fixed.
+-    if (
+-        getattr(vllm_config, "speculative_config", None) is not None
+-        and max_batched > block_size
+-    ):
+-        raise ValueError(
+-            f"Mamba-hybrid models with LMCache and speculative decoding "
+-            f"require max_num_batched_tokens == block_size ({block_size}); "
+-            f"got {max_batched}. Larger values let a prefill step advance "
+-            f"more than one block, and the recurrent-state chunks stored "
+-            f"from such steps corrupt later prefix-cache hits. "
+-            f"Set --max-num-batched-tokens {block_size}, or disable "
+-            f"speculative decoding to use a larger step."
+-        )
+ 
+ 
+ def validate_dcp_support(
+@@ -529,6 +509,7 @@
+                 "lmcache.mp.eager_prefetch", False
+             )
+         )
++        self._mamba_relocation_window = 0
+ 
+         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
+         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
+@@ -627,6 +608,15 @@
+                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
+             )
+             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
++            spec_config = getattr(vllm_config, "speculative_config", None)
++            if (
++                getattr(vllm_config.cache_config, "mamba_cache_mode", "none")
++                == "align"
++                and spec_config is not None
++            ):
++                self._mamba_relocation_window = int(
++                    getattr(spec_config, "num_speculative_tokens", 0) or 0
++                )
+ 
+             # GPU block pool reference
+             self._gpu_block_pool: "BlockPool | None" = None
+@@ -1215,7 +1205,9 @@
+             existing = existing_counts.get(engine_group_idx, 0)
+             new_block_ids.append(list(group_blocks[existing:]))
+         if any(new_block_ids):
+-            tracker.append_block_ids(tuple(new_block_ids))
++            tracker.append_block_ids(
++                tuple(new_block_ids), self._mamba_relocation_window
++            )
+ 
+         # Update the state of the tracker
+         if tracker.state == LMCacheMPRequestState.BYPASS_LMCACHE:
+@@ -1520,7 +1512,9 @@
+             # Update block ids
+             new_block_ids = cached_reqs.new_block_ids[idx] or ()
+             if request_id not in cached_reqs.resumed_req_ids:
+-                request_tracker.append_block_ids(new_block_ids)
++                request_tracker.append_block_ids(
++                    new_block_ids, self._mamba_relocation_window
++                )
+ 
+             # Use the incremental num_scheduled_tokens to
+             # stay consistent with _process_new_requests.
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -132,15 +132,28 @@
+     def append_block_ids(
+         self,
+         new_block_ids: tuple[list[int], ...],
+-    ):
+-        """Update the block ids for the current request
+-        This function will be called when processing the cached requests.
++        relocation_window: int = 0,
++    ) -> None:
++        """Append blocks and retire speculative slots relocated by vLLM.
++
++        Align-mode Mamba can move a speculative tail block to a newly appended
++        position while replacing its old slot with the null block. vLLM reports
++        the appended id but not the replacement, so mirror that relocation in
++        the tracker before generating store metadata.
+         """
+         for engine_group_idx, group_block_ids in enumerate(new_block_ids):
+-            if group_block_ids:
+-                self.allocated_block_ids.setdefault(engine_group_idx, []).extend(
+-                    group_block_ids
+-                )
++            if not group_block_ids:
++                continue
++            block_ids = self.allocated_block_ids.setdefault(engine_group_idx, [])
++            previous_length = len(block_ids)
++            window_start = max(0, previous_length - relocation_window)
++            for block_id in group_block_ids:
++                if relocation_window and block_id:
++                    for slot in range(window_start, previous_length):
++                        if block_ids[slot] == block_id:
++                            block_ids[slot] = 0
++                            break
++                block_ids.append(block_id)
+ 
+     def num_allocated_blocks(self) -> dict[int, int]:
+         return {

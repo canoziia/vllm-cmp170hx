@@ -8,30 +8,35 @@ This `main` branch separates shared infrastructure from model-specific files:
 .
 ├── manifests/                  # pinned shared dependency/image metadata
 ├── patches/
-│   └── lmcache/                # shared LMCache patch series
+│   ├── lmcache/                # shared LMCache patch series
+│   └── vllm/                   # shared vLLM runtime fixes
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
 │   ├── build-deepseek-v41-lmcache-images.sh
+│   ├── build-qwen38-image.sh
 │   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
 │   └── test-lmcache-patches.py
 └── models/
-    └── deepseek-v41/
-        ├── compose*.yml
-        ├── manifests/          # pinned DeepSeek source/base image
-        ├── patches/            # DeepSeek-only vLLM patches
-        ├── scripts/            # DeepSeek-only diagnostics
-        └── docs/
+    ├── deepseek-v41/
+    │   ├── compose*.yml
+    │   ├── manifests/          # pinned DeepSeek source/base image
+    │   ├── patches/            # DeepSeek-only vLLM patches
+    │   ├── scripts/            # DeepSeek-only diagnostics
+    │   └── docs/
+    └── qwen3.8-flash-next/
+        ├── compose.yml
+        ├── manifests/          # pinned Qwen source/base image
+        ├── patches/            # Qwen-only PLE/NVMe implementation
+        └── native/
 ```
-
-Only DeepSeek V4.1 is promoted into `main` for now. Qwen branches remain
-separate until their LMCache/runtime integration is fully validated.
 
 ## Shared versus model-specific changes
 
 Put a change in root `patches/` when the same source patch is intended for all
-models using that component. The current shared series patches official LMCache
-v0.5.5 and is listed in `patches/lmcache/series`.
+models using that component. Shared official LMCache patches are listed in
+`patches/lmcache/series`; shared vLLM runtime fixes are listed in
+`patches/vllm/series`.
 
 Put model implementation patches, Compose files, source pins, and diagnostics
 under `models/<model>/`. DeepSeek's vLLM patch series is therefore under
@@ -75,6 +80,17 @@ podman compose --podman-run-args=--ipc=host \
 
 Never commit `.env`, API keys, model weights, benchmark results, or host disk
 UUIDs.
+
+## Qwen3.8 Flash Next
+
+See [`models/qwen3.8-flash-next/README.md`](models/qwen3.8-flash-next/README.md).
+The complete image is built reproducibly from the same pinned author source,
+the shared vLLM and LMCache series, and Qwen's model-specific process-isolated
+NVMe PLE patch:
+
+```bash
+bash scripts/build-qwen38-image.sh
+```
 
 ## Benchmark client
 

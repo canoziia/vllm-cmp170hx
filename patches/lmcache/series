@@ -4,3 +4,4 @@
 0004-vllm-unified-kv-compatibility.patch
 0005-registration-heartbeat-lifecycle.patch
 0006-adopt-existing-native-fs.patch
+0007-mtp-mamba-relocation.patch

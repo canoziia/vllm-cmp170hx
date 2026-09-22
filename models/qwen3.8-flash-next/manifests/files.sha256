@@ -1,0 +1,5 @@
+23bfc030ec33b739c186746b59f57720ca5899e3812e19747b7ba82bac10c692  models/qwen3.8-flash-next/Containerfile
+eaf6d68541595e7aef66eefb2cf21fbb6622e0afcbc27d48270cf217f7789a92  models/qwen3.8-flash-next/native/ple_pread.c
+eef8dcb2356037d8c9cfc1535e663eeb1120d3e287b293d07b06c550acfd282a  models/qwen3.8-flash-next/patches/0001-process-isolated-nvme-ple.patch
+b18c0834c5379b5df5a982cf94ecc0a3ea0beba62000cdbb739ce298802056d3  models/qwen3.8-flash-next/patches/series
+4aa036ee93aa62013fc543cc578f10b1d93d62426e211e7a22b827dbd2e4f708  models/qwen3.8-flash-next/scripts/lmcache

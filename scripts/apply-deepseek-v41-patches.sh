@@ -43,6 +43,7 @@ if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} != 0 ]]; then
   exit 2
 fi
 apply_series "$MODEL_DIR/patches/series"
+"$REPO_ROOT/scripts/apply-vllm-common-patches.sh" "$SOURCE_TREE"
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
   apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
 fi

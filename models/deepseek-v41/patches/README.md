@@ -5,7 +5,9 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Default active series
 
-`models/deepseek-v41/patches/series` contains exactly one patch:
+The model-specific `models/deepseek-v41/patches/series` contains exactly one
+patch. The build then applies the shared runtime fixes in
+`patches/vllm/series`:
 
 1. `0001-prime-pp-communicators-before-model-load.patch`
    - Initializes persistent PP communication resources immediately after
@@ -18,6 +20,11 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
      check becomes a no-op after successful early initialization.
    - Makes later memory accounting include communicator resources and avoids
      first-use NCCL allocation failures under tight HBM budgets.
+
+The shared series adds async-PP Mamba state reclamation and resolved-cache
+geometry restoration; both are also used by Qwen. The communicator primer
+stays DeepSeek-specific because it explicitly primes the DSpark PP feedback
+broadcast group and has not been validated as part of Qwen's final source.
 
 Default builds include no performance-debug runtime code.
 
