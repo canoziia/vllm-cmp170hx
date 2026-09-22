@@ -3,7 +3,9 @@ x-podman:
 
 services:
   deepseek-v41:
-    image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
+    # DeepSeek author code plus the exact same patched official LMCache payload
+    # used by the standalone server image below.
+    image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched}
     container_name: deepseek-v41
     restart: "no"
     network_mode: host
@@ -23,6 +25,7 @@ services:
 
     security_opt:
       - label=disable
+      - apparmor=unconfined
 
     ulimits:
       nofile:
@@ -41,7 +44,6 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       NCCL_ALGO: "Ring"
       NCCL_PROTO: "Simple"
-      NCCL_P2P_DISABLE: "1"
       NCCL_IB_DISABLE: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
@@ -88,7 +90,9 @@ services:
       retries: 3
 
   lmcache:
-    image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
+    # Built from the digest-pinned official LMCache image by
+    # scripts/build-lmcache-images.sh. Keep client/server on the same payload.
+    image: ${LMCACHE_IMAGE:-localhost/deepseek-v41-lmcache:official-v0.5.5-patched}
     container_name: deepseek-v41-lmcache
     entrypoint: ["lmcache", "server"]
     restart: "no"
@@ -104,10 +108,13 @@ services:
       - nvidia.com/gpu=5
     security_opt:
       - label=disable
+      - apparmor=unconfined
     environment:
       CUDA_DEVICE_ORDER: "PCI_BUS_ID"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:-/mnt/lmcache-sda/deepseek-v41}:/lmcache-l2
     command:
       - --host=127.0.0.1
       - --port=5556
@@ -118,6 +125,7 @@ services:
       - --l1-size-gb=16
       - --eviction-policy=LRU
       - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":500,"adopt_existing":true}'
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',5556),3).close(); socket.create_connection(('127.0.0.1',18556),3).close()\""]
       interval: 10s

@@ -1,0 +1,185 @@
+diff --git a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+index 0699509..2030097 100644
+--- a/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py
+@@ -23,6 +23,8 @@ from __future__ import annotations
+ # Standard
+ from collections import defaultdict
+ from typing import Any
++import dataclasses
++import hashlib
+ import select
+ import threading
+ 
+@@ -59,13 +61,19 @@ def _object_key_to_string(key: ObjectKey) -> str:
+ 
+         <model_name>@<kv_rank_hex>@<object_group_id_hex>@<chunk_hash_hex>@<cache_salt>
+     """
+-    base = (
++    # The v0.5.5 native FS connector accepts at most four fields. Fold the
++    # salt into the 256-bit content identity so salted namespaces remain
++    # isolated while every native backend receives the supported grammar.
++    chunk_hash = key.chunk_hash
++    if key.cache_salt:
++        chunk_hash = hashlib.blake2b(
++            chunk_hash + b"\0" + key.cache_salt.encode("utf-8"),
++            digest_size=32,
++        ).digest()
++    return (
+         f"{key.model_name}{_KEY_SEP}{key.kv_rank:08x}"
+-        f"{_KEY_SEP}{key.object_group_id:x}{_KEY_SEP}{key.chunk_hash.hex()}"
++        f"{_KEY_SEP}{key.object_group_id:x}{_KEY_SEP}{chunk_hash.hex()}"
+     )
+-    if key.cache_salt:
+-        return f"{base}{_KEY_SEP}{key.cache_salt}"
+-    return base
+ 
+ 
+ def _obj_to_memoryview(
+@@ -81,6 +89,14 @@ def _obj_to_memoryview(
+     return obj.byte_array  # type: ignore[return-value]
+ 
+ 
++@dataclasses.dataclass
++class _PendingStoreTask:
++    """Aggregate one logical store split into uniform-size native batches."""
++    remaining: int
++    ok: bool = True
++    bytes_stored: int = 0
++
++
+ class NativeConnectorL2Adapter(L2AdapterInterface):
+     """
+     Wraps a pybind-wrapped C++ IStorageConnector to
+@@ -130,6 +146,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+             tuple[str, L2TaskId, int, list[ObjectKey] | None],
+         ] = {}
+ 
++        # Logical store task aggregation across size-homogeneous native futures.
++        self._pending_store_tasks: dict[L2TaskId, _PendingStoreTask] = {}
++
+         # Completed results (same pattern as MockL2Adapter)
+         self._completed_stores: dict[L2TaskId, L2StoreResult] = {}
+         self._completed_lookups: dict[L2TaskId, Bitmap] = {}
+@@ -195,19 +214,43 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+         memviews = [_obj_to_memoryview(obj) for obj in objects]
+         per_key_sizes = [obj.get_size() for obj in objects]
+ 
+-        # Register pending op BEFORE submit to avoid race
+-        # with demux thread. The native submit is
+-        # non-blocking so holding the lock is brief.
++        # Native connectors infer one byte length from the first buffer in a
++        # batch. Split by the actual exported memoryview length; object-group
++        # identity alone is insufficient because one group may contain several
++        # physical object sizes.
++        size_groups: dict[int, list[int]] = {}
++        for idx, memview in enumerate(memviews):
++            size_groups.setdefault(memview.nbytes, []).append(idx)
++        index_groups = list(size_groups.values()) or [[]]
++
+         with self._lock:
+             task_id = self._get_next_task_id()
+-            future_id = int(self._client.submit_batch_set(key_strings, memviews))
+-            self._pending_ops[future_id] = (
+-                self._OP_STORE,
+-                task_id,
+-                len(keys),
+-                None,
++            self._pending_store_tasks[task_id] = _PendingStoreTask(
++                remaining=len(index_groups)
+             )
+-            self._pending_store_sizes[future_id] = (list(keys), per_key_sizes)
++            submitted = 0
++            try:
++                for indices in index_groups:
++                    future_id = int(self._client.submit_batch_set(
++                        [key_strings[i] for i in indices],
++                        [memviews[i] for i in indices],
++                    ))
++                    self._pending_ops[future_id] = (
++                        self._OP_STORE, task_id, len(indices), None
++                    )
++                    self._pending_store_sizes[future_id] = (
++                        [keys[i] for i in indices],
++                        [per_key_sizes[i] for i in indices],
++                    )
++                    submitted += 1
++            except Exception:
++                if submitted == 0:
++                    self._pending_store_tasks.pop(task_id, None)
++                else:
++                    state = self._pending_store_tasks[task_id]
++                    state.remaining = submitted
++                    state.ok = False
++                raise
+ 
+         return task_id
+ 
+@@ -451,27 +494,34 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
+ 
+                     if op_type == self._OP_STORE:
+                         store_info = self._pending_store_sizes.pop(fid, None)
+-                        task_bytes = 0
++                        state = self._pending_store_tasks.get(task_id)
++                        if state is None:
++                            state = _PendingStoreTask(remaining=1)
++                            self._pending_store_tasks[task_id] = state
++                        if not ok:
++                            state.ok = False
++                            logger.error(
++                                "Native L2 store sub-batch failed: future_id=%d keys=%d error=%r",
++                                fid, num_keys, error,
++                            )
+                         if ok and store_info is not None:
+                             store_keys, sizes = store_info
+                             for key, size in zip(store_keys, sizes, strict=True):
+-                                # First-store wins for byte accounting:
+-                                # a re-store of an existing key adds 0
+-                                # bytes (the backend already holds it).
+-                                # We still notify the listener for every
+-                                # store so LRU policies can ``move_to_end``
+-                                # on re-store — passing size=0 in that
+-                                # case is a no-op for the base counters.
+                                 if key not in self._key_sizes:
+                                     self._key_sizes[key] = size
+                                     keys_stored.append(key)
+                                     sizes_stored.append(size)
+-                                    task_bytes += size
++                                    state.bytes_stored += size
+                                 else:
+                                     keys_stored.append(key)
+                                     sizes_stored.append(0)
+-                        self._completed_stores[task_id] = L2StoreResult(ok, task_bytes)
+-                        self._store_efd.notify()
++                        state.remaining -= 1
++                        if state.remaining <= 0:
++                            self._pending_store_tasks.pop(task_id, None)
++                            self._completed_stores[task_id] = L2StoreResult(
++                                state.ok, state.bytes_stored
++                            )
++                            self._store_efd.notify()
+ 
+                     elif op_type == self._OP_LOOKUP:
+                         bitmap = Bitmap(num_keys)
+diff --git a/lmcache/v1/distributed/storage_controllers/store_controller.py b/lmcache/v1/distributed/storage_controllers/store_controller.py
+index fc5447a..e7e5b3a 100644
+--- a/lmcache/v1/distributed/storage_controllers/store_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/store_controller.py
+@@ -53,14 +53,12 @@ def _group_keys_by_shape(
+ 
+     Each bucket shares a single ``(shape, dtype)``, so each bucket can be
+     submitted as one ``submit_store_task`` call. Today the shape is pinned
+-    by ``(model_name, kv_rank)`` — ``kv_rank`` packs ``world_size`` and
+-    parallelism config, so different TP/PP setups land in different
+-    buckets. Extend the grouping tuple when a new shape-affecting field is
+-    added to ``ObjectKey``.
++    by ``(model_name, kv_rank, object_group_id)``. ``kv_rank`` packs the
++    parallel setup, while object groups can have different physical layouts.
+     """
+     groups: dict[tuple, list[ObjectKey]] = defaultdict(list)
+     for key in keys:
+-        groups[(key.model_name, key.kv_rank)].append(key)
++        groups[(key.model_name, key.kv_rank, key.object_group_id)].append(key)
+     return groups
+ 
+ 

@@ -1,0 +1,38 @@
+diff --git a/lmcache/integration/vllm/vllm_multi_process_adapter.py b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+index b319784..13b7c55 100644
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -753,10 +753,10 @@ class LMCacheMPSchedulerAdapter:
+ 
+     def _ensure_heartbeat_started(self) -> None:
+         """Lazily start the heartbeat thread on first use."""
+-        if self._heartbeats is not None:
++        if self._heartbeats:
+             return
+         with self._heartbeat_lock:
+-            if self._heartbeats is not None:
++            if self._heartbeats:
+                 return
+             for url, client in self.req_clients.items():
+                 hb = HeartbeatThread(
+@@ -1442,6 +1442,9 @@ class LMCacheMPWorkerAdapter:
+             layout_hints if layout_hints is not None else vllm_layout_hints()
+         )
+         self._send_register_kv_caches_request(kv_caches)
++        # Registration may precede the first request by more than the server's
++        # grace interval. Keep this live worker registered even while idle.
++        self._ensure_heartbeat_started()
+ 
+     def _block_ids_per_group(self, op: LoadStoreOp) -> list[list[int]]:
+         return expand_engine_block_ids(self.engine_group_infos, op.block_ids)
+@@ -1464,7 +1467,9 @@ class LMCacheMPWorkerAdapter:
+         """
+         self.kv_caches = kv_caches
+         transfer_ctx = create_transfer_context(kv_caches, mode=self._mp_transfer_mode)
+-        layout_hints = self._layout_hints
++        layout_hints = dict(self._layout_hints or {})
++        # Do not infer a logical PP rank from CUDA_VISIBLE_DEVICES ordering.
++        layout_hints["mp_worker_rank"] = self.worker_id
+         self.transfer_ctx = transfer_ctx
+         try:
+             # Register on the local, not self.transfer_ctx: a concurrent

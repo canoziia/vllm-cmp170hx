@@ -106,26 +106,35 @@ The ten-minute grace period is also encoded in Compose.
 
 ## Optional LMCache deployment
 
-`compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6,
-seq32, 6 GiB GPU KV per rank, and a companion LMCache MP server using the same
-image. It reserves a 16 GB L1 CPU cache, uses 1024-token chunks, separate object
-groups, LRU and no disk L2. Both services use host IPC and the same six CDI GPUs.
-LMCache binds its RPC and HTTP ports to loopback (5556 and 18556). Its healthcheck
-checks both listening sockets; cache correctness still requires request testing.
-The explicit Podman argument is required with the container's podman-compose
-provider: its automatic pod path otherwise ignores Compose `ipc: host` and gives
-each container only 63 MiB `/dev/shm`.
-The pinned image must include the author's compatible LMCache fork.
+`compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6
+`7,7,7,7,7,5`, seq32, 6 GiB GPU KV per rank, and a separate LMCache MP server.
+It reserves a 16 GiB L1 CPU cache, uses 1024-token chunks, separate object
+groups, LRU, and a 500 GiB buffered native-FS L2. Set `LMCACHE_L2_PATH` to the
+dedicated host filesystem; `/dev/sdb` must not be used by this deployment.
+Both services use host IPC and the same six CDI GPUs. LMCache binds RPC/HTTP to
+loopback ports 5556/18556. Socket health is not a cache-correctness test.
+
+LMCache no longer comes from the third-party DeepSeek image. Build both images
+from the digest-pinned official LMCache v0.5.5 CUDA 13.0 payload:
 
 ```bash
+# First build the normal/debug DeepSeek image on this branch, then inject the
+# same patched official LMCache package into both client and server images.
+DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
+  scripts/build-lmcache-images.sh
+
+export VLLM_IMAGE=localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched
+export LMCACHE_IMAGE=localhost/deepseek-v41-lmcache:official-v0.5.5-patched
+export LMCACHE_L2_PATH=/mnt/lmcache-sda/deepseek-v41
 podman compose --podman-run-args=--ipc=host \
   -f compose.lmcache.yml -f compose.debug.yml up -d
 ```
 
-Use `compose.debug.yml` only with a debug-enabled image. Performance tracing
-remains off initially. This deployment is experimental: added retention and
-transfer resources need runtime memory/correctness validation. Neither LMCache
-nor debug is enabled by the default Compose file.
+The explicit Podman argument is required: the automatic pod path can ignore
+Compose `ipc: host` and expose only 63 MiB `/dev/shm`. The complete official
+LMCache manifest, patch rationale, and build details are in
+`patches/lmcache/README.md`. Use `compose.debug.yml` only with a debug-enabled
+DeepSeek base. Do not promote a build without real store/evict/L2-restore tests.
 
 ## Combined optional debug package: DSpark compute toggle
 

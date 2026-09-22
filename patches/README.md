@@ -38,15 +38,13 @@ Default builds include no performance-debug runtime code.
      CMP 170HX does not expose CUPTI CUDA kernel activities.
    - Runtime sampling stays on the production Graph dispatch/padding path.
 
-An additional **image-layer-only** LMCache fork adjustment is recorded as
-`optional/0003-lmcache-event-capability-cache.patch`. It applies to
-`lmcache/v1/platform/base/event_ipc.py` in the installed base image, not to the
-pinned vLLM git checkout and is not part of `series.perf-debug`. It caches the
-validated Event class identity after the initial fail-closed capability check,
-avoiding repeated `inspect.signature` on every KV-store Future. To reproduce
-image `73d0be8-debug-eventfix`, apply it to the LMCache source in the base
-image as a separate layer; verify its source hash before applying. The
-fixture's hot-profiler failure was not fixed by this alone.
+The legacy debug image `73d0be8-debug-eventfix` used the **image-layer-only**
+`optional/0003-lmcache-event-capability-cache.patch` against the third-party
+base image's bundled LMCache. Keep it only to reproduce that historical
+DeepSeek base. New LMCache deployments use the digest-pinned official package
+and the auditable series under `patches/lmcache/`; its canonical equivalent is
+`patches/lmcache/0003-event-capability-cache.patch`. Do not apply both to the
+same package.
 
 The pinned author revision already contains native PP6+DSpark support, including
 auxiliary hidden-state relay capability and last-rank target-embedding sharing.
