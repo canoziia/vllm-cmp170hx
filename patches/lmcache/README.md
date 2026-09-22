@@ -67,6 +67,12 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
    - makes the configured `adopt_existing=true` meaningful instead of leaving
      old files unaccounted.
 
+7. `0007-mtp-mamba-relocation.patch`
+   - mirrors vLLM align-mode Mamba speculative-block relocation in LMCache's
+     request tracker and nulls the old slot;
+   - permits multi-block prefill with MTP after fixing its store metadata,
+     instead of requiring `max_num_batched_tokens == block_size`.
+
 The server-image build runs `scripts/test-lmcache-patches.py` once. It checks
 native extension ABI, salt isolation, mixed-size native-FS round trips,
 six-rank layout lifetime, and existing-file adoption. The client-image build

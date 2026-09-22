@@ -5,6 +5,8 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SOURCE_DIR=${1:?usage: apply-lmcache-patches.sh SOURCE_DIR}
 SERIES="$REPO_ROOT/patches/lmcache/series"
 
+(cd "$REPO_ROOT" && sha256sum -c manifests/patches.sha256 >/dev/null)
+
 [[ -f "$SOURCE_DIR/lmcache/__init__.py" ]] || {
   echo "Not an LMCache source/payload root: $SOURCE_DIR" >&2
   exit 2

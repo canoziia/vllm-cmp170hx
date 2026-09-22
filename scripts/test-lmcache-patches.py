@@ -15,6 +15,7 @@ import lmcache.cuda_ops  # Explicitly check native ABI, not just import lmcache.
 import lmcache.lmcache_fs
 import lmcache.lmcache_native
 from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector  # noqa: F401
+from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPRequestTracker
 from lmcache.v1.distributed.api import AttnWindowDesc, MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.l2_adapters.native_connector_l2_adapter import (
     NativeConnectorL2Adapter, _object_key_to_string,
@@ -42,6 +43,17 @@ def wait_for(fn):
 
 
 class RegressionTests(unittest.TestCase):
+    def test_mtp_mamba_relocation(self):
+        tracker = object.__new__(LMCacheMPRequestTracker)
+        tracker.allocated_block_ids = {}
+        tracker.append_block_ids(([10, 11, 12, 13, 14],), relocation_window=4)
+        tracker.append_block_ids(([15],), relocation_window=4)
+        tracker.append_block_ids(([12, 16],), relocation_window=4)
+        self.assertEqual(
+            tracker.allocated_block_ids[0],
+            [10, 11, 0, 13, 14, 15, 12, 16],
+        )
+
     def test_salt_and_shape_boundaries(self):
         a = key(1)
         self.assertEqual(len(_object_key_to_string(a).split("@")), 4)

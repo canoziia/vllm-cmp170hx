@@ -13,11 +13,11 @@ Reproducible minimal patches and a Podman Compose deployment for
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
 Engram tables use the author's exact-size pinned CPU offload path. The pinned
-author revision includes native PP6+DSpark support. The sole default patch
-primes all persistent PP communicators before model and KV allocation so
-first-use NCCL resource creation is deterministic and included in memory
-accounting. Performance-debug runtime code is optional and is not included in
-default images.
+author revision includes native PP6+DSpark support. The DeepSeek-specific
+patch primes all persistent PP communicators before model and KV allocation;
+the shared vLLM series fixes asynchronous-PP Mamba reclamation and resumed
+state geometry. Performance-debug runtime code is optional and is not included
+in default images.
 
 ## Runtime configuration
 
@@ -50,8 +50,9 @@ OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
-The default build applies only `models/deepseek-v41/patches/series` and does **not** include the
-hot performance-debug runtime. Build a separate diagnostic image explicitly:
+The default build applies `models/deepseek-v41/patches/series` followed by
+`patches/vllm/series`, and does **not** include the hot performance-debug
+runtime. Build a separate diagnostic image explicitly:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
@@ -60,8 +61,8 @@ bash scripts/build-deepseek-v41-image.sh
 ```
 
 The build checks out the pinned author revision, verifies that it is clean,
-applies the default early-communicator patch and, only when requested, the
-optional debug series. It validates and compiles the resulting Python files,
+applies the DeepSeek-specific and shared vLLM series and, only when requested,
+the optional debug series. It validates and compiles the resulting Python files,
 then copies the complete pinned `vllm/` tree over the SM80 image.
 
 To inspect only the source result:
