@@ -1,0 +1,260 @@
+diff --git a/lmcache/v1/distributed/api.py b/lmcache/v1/distributed/api.py
+index ab8876c..a53c906 100644
+--- a/lmcache/v1/distributed/api.py
++++ b/lmcache/v1/distributed/api.py
+@@ -421,9 +421,9 @@ class PrefetchRequestSpec:
+ 
+     Attributes:
+         keys: Object keys to prefetch; order defines the prefix.
+-        group_layout_descs: Maps object_group_id to that group's memory
+-            layout for L1 write-buffer allocation; entries beyond
+-            ``attn_desc``'s groups are harmless.
++        group_layout_descs: Maps ``(kv_rank, object_group_id)`` to the exact
++            rank layout for L1 allocation. Integer object-group keys are
++            retained as fallbacks for homogeneous/legacy registrations.
+         num_kv_readers: Total read locks to take per key -- one per
+             reader that will retrieve the object.
+         policy: Retained-subset policy (see :class:`TrimPolicy`).
+@@ -435,7 +435,7 @@ class PrefetchRequestSpec:
+     """
+ 
+     keys: list[ObjectKey]
+-    group_layout_descs: dict[int, MemoryLayoutDesc]
++    group_layout_descs: dict[int | tuple[int, int], MemoryLayoutDesc]
+     num_kv_readers: int = 1
+     policy: TrimPolicy = TrimPolicy.PREFIX
+     attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC
+diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index ef78cee..6eda918 100644
+--- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -49,7 +49,6 @@ serves.
+ from collections import Counter, defaultdict
+ from dataclasses import dataclass, field
+ from itertools import groupby
+-from operator import attrgetter
+ from typing import TYPE_CHECKING, Iterable
+ import enum
+ import select
+@@ -234,9 +233,11 @@ class InFlightPrefetchRequest:
+     # Key indices found (and read-locked) in L1 when the request starts.
+     l1_readlocks: Bitmap = field(default_factory=lambda: Bitmap(0))
+ 
+-    group_layout_descs: dict[int, MemoryLayoutDesc] = field(default_factory=dict)
+-    """Maps object_group_id to that group's layout (one ``MemoryLayoutDesc``
+-    describes a single group's MemoryObj). Covers every object group."""
++    group_layout_descs: dict[int | tuple[int, int], MemoryLayoutDesc] = field(
++        default_factory=dict
++    )
++    """Rank-specific ``(kv_rank, object_group_id)`` layouts plus legacy
++    integer-key fallbacks for homogeneous clients."""
+ 
+     def all_lookups_done(self) -> bool:
+         return len(self.pending_lookup_tasks) == 0
+@@ -1067,13 +1068,25 @@ class PrefetchController(StorageControllerInterface):
+             )
+         retention_map = dict(zip(keys_to_reserve, retentions, strict=True))
+ 
+-        # Batch reserve_write by object_group_id so each group uses its own
+-        # tensor shapes.
++        # PP ranks may own different layer counts. Batch by encoded rank and
++        # object group, selecting the exact registered layout for each object.
+         write_results: dict[ObjectKey, tuple[L1Error, MemoryObj | None]] = {}
+-        by_group = sorted(keys_to_reserve, key=attrgetter("object_group_id"))
+-        for gid, group_iter in groupby(by_group, key=attrgetter("object_group_id")):
++        rank_group = lambda k: (k.kv_rank, k.object_group_id)
++        by_group = sorted(keys_to_reserve, key=rank_group)
++        for (kv_rank, gid), group_iter in groupby(by_group, key=rank_group):
+             group_keys = list(group_iter)
+-            gld = request.group_layout_descs[gid]
++            gld = request.group_layout_descs.get((kv_rank, gid))
++            if gld is None:
++                has_rank_layouts = any(
++                    isinstance(layout_key, tuple)
++                    for layout_key in request.group_layout_descs
++                )
++                if has_rank_layouts:
++                    raise KeyError(
++                        "No registered layout for "
++                        f"kv_rank={kv_rank:#x}, object_group_id={gid}"
++                    )
++                gld = request.group_layout_descs[gid]
+             gr = self._l1_manager.reserve_write(
+                 keys=group_keys,
+                 is_temporary=[not retention_map[k] for k in group_keys],
+diff --git a/lmcache/v1/multiprocess/engine_context.py b/lmcache/v1/multiprocess/engine_context.py
+index de268ff..92b8c3e 100644
+--- a/lmcache/v1/multiprocess/engine_context.py
++++ b/lmcache/v1/multiprocess/engine_context.py
+@@ -2,7 +2,7 @@
+ """Shared context and layout descriptor registry for engine modules."""
+ 
+ # Standard
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass, field, replace
+ from typing import TypedDict
+ import threading
+ 
+@@ -46,7 +46,13 @@ class _LayoutDescEntry:
+     """Cross-chunk attention windows of all object groups, in object-group
+     order. Defaults to a single full-attention group."""
+     group_layout_descs: dict[int, MemoryLayoutDesc] | None = None
+-    """Per-group layout descriptors, or ``None`` if all share ``layout_desc``."""
++    """Fallback per-group layouts for homogeneous/legacy registrations."""
++    rank_group_layout_descs: dict[tuple[int, int], MemoryLayoutDesc] = field(
++        default_factory=dict
++    )
++    """Per-(kv_rank, object_group_id) layouts for heterogeneous PP ranks."""
++    rank_ref_counts: dict[int, int] = field(default_factory=dict)
++    """Active registration count per encoded KV rank."""
+ 
+ 
+ class LayoutDescRegistry:
+@@ -71,6 +77,7 @@ class LayoutDescRegistry:
+         layout_desc: MemoryLayoutDesc,
+         attn_desc: AttnWindowDesc = DEFAULT_ATTN_WINDOW_DESC,
+         group_layout_descs: dict[int, MemoryLayoutDesc] | None = None,
++        kv_rank: int | None = None,
+     ) -> None:
+         """Register a layout descriptor for a (model_name, world_size) pair.
+ 
+@@ -102,15 +109,36 @@ class LayoutDescRegistry:
+                     ref_count=1,
+                     attn_desc=attn_desc,
+                     group_layout_descs=group_layout_descs,
++                    rank_group_layout_descs=(
++                        {(kv_rank, gid): desc for gid, desc in group_layout_descs.items()}
++                        if kv_rank is not None
++                        else {}
++                    ),
++                    rank_ref_counts=({kv_rank: 1} if kv_rank is not None else {}),
+                 )
+                 return
+ 
++            if entry.attn_desc.num_chunks_in_sw != attn_desc.num_chunks_in_sw:
++                raise ValueError(
++                    "Attention-window descriptors differ across KV ranks for "
++                    f"model={model_name!r}, world_size={world_size}: "
++                    f"{entry.attn_desc.num_chunks_in_sw} != "
++                    f"{attn_desc.num_chunks_in_sw}"
++                )
+             entry.layout_desc = layout_desc
+-            entry.attn_desc = attn_desc
+             entry.group_layout_descs = group_layout_descs
++            if kv_rank is not None:
++                entry.rank_group_layout_descs.update(
++                    {(kv_rank, gid): desc for gid, desc in group_layout_descs.items()}
++                )
++                entry.rank_ref_counts[kv_rank] = (
++                    entry.rank_ref_counts.get(kv_rank, 0) + 1
++                )
+             entry.ref_count += 1
+ 
+-    def unregister(self, model_name: str, world_size: int) -> None:
++    def unregister(
++        self, model_name: str, world_size: int, kv_rank: int | None = None
++    ) -> None:
+         """Unregister one layout descriptor registration for a pair.
+ 
+         The descriptor is removed only when the last active registration for
+@@ -126,6 +154,17 @@ class LayoutDescRegistry:
+             if entry is None:
+                 return
+ 
++            if kv_rank is not None:
++                rank_refs = entry.rank_ref_counts.get(kv_rank, 0)
++                if rank_refs <= 1:
++                    entry.rank_ref_counts.pop(kv_rank, None)
++                    for rank_gid in [
++                        k for k in entry.rank_group_layout_descs if k[0] == kv_rank
++                    ]:
++                        entry.rank_group_layout_descs.pop(rank_gid, None)
++                else:
++                    entry.rank_ref_counts[kv_rank] = rank_refs - 1
++
+             if entry.ref_count <= 1:
+                 self._registry.pop(key)
+                 return
+@@ -150,13 +189,17 @@ class LayoutDescRegistry:
+ 
+     def find_group_layout_descs(
+         self, model_name: str, world_size: int
+-    ) -> dict[int, MemoryLayoutDesc] | None:
+-        """Look up per-object-group layout descriptors, or ``None``."""
++    ) -> dict[int | tuple[int, int], MemoryLayoutDesc] | None:
++        """Return fallback layouts plus rank-specific PP layouts."""
+         with self._lock:
+             entry = self._registry.get((model_name, world_size))
+             if entry is None:
+                 return None
+-            return entry.group_layout_descs
++            result: dict[int | tuple[int, int], MemoryLayoutDesc] = dict(
++                entry.group_layout_descs or {}
++            )
++            result.update(entry.rank_group_layout_descs)
++            return result
+ 
+     def find_attn_desc(self, model_name: str, world_size: int) -> AttnWindowDesc:
+         """Look up the attention-window descriptor for a pair.
+diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 90688f1..551aac3 100644
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -670,6 +670,8 @@ class ContextEntry:
+     cache_context: BaseCacheContext
+     model_name: str
+     world_size: int
++    kv_rank: int | None = None
++    """Encoded ObjectKey rank used for rank-specific layout registration."""
+     last_seen: float = 0.0
+     has_liveness_signal: bool = False
+     event_backend: EventIPCBackend | None = None
+@@ -875,7 +877,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+         for entry in entries:
+             entry.cache_context.close()
+             self._ctx.layout_desc_registry.unregister(
+-                entry.model_name, entry.world_size
++                entry.model_name, entry.world_size, entry.kv_rank
+             )
+         del entry
+         entries.clear()
+@@ -988,12 +990,31 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             for gid in range(num_object_groups)
+         }
+         attn_desc = kv_groups_manager.get_attn_desc()
++        # Prefer the logical rank supplied by the paired vLLM client. The
++        # device-index fallback only supports legacy single-node clients.
++        worker_rank = (layout_hints or {}).get(
++            "mp_worker_rank", cache_context.device.index
++        )
++        if worker_rank is None and world_size == 1:
++            worker_rank = 0
++        if worker_rank is None or not 0 <= worker_rank < world_size:
++            raise ValueError(
++                "Cannot derive MP worker rank from registered cache device "
++                f"{cache_context.device} for world_size={world_size}"
++            )
++        kv_rank = ObjectKey.ComputeKVRank(
++            world_size=world_size,
++            global_rank=worker_rank,
++            local_world_size=world_size,
++            local_rank=worker_rank,
++        )
+         self._ctx.layout_desc_registry.register(
+             model_name,
+             world_size,
+             layout_desc,
+             attn_desc,
+             group_layout_descs=group_layout_descs,
++            kv_rank=kv_rank,
+         )
+ 
+         with self._lock:
+@@ -1001,6 +1022,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 cache_context=cache_context,
+                 model_name=model_name,
+                 world_size=world_size,
++                kv_rank=kv_rank,
+                 last_seen=now,
+                 has_liveness_signal=False,
+                 event_backend=event_backend,

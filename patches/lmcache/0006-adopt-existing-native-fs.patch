@@ -1,0 +1,351 @@
+diff --git a/lmcache/v1/distributed/l2_adapters/base.py b/lmcache/v1/distributed/l2_adapters/base.py
+index 00ad729..1bd7249 100644
+--- a/lmcache/v1/distributed/l2_adapters/base.py
++++ b/lmcache/v1/distributed/l2_adapters/base.py
+@@ -360,6 +360,29 @@ class L2AdapterInterface(ABC):
+         """Register a listener to receive L2 adapter events."""
+         self._listeners.append(listener)
+ 
++    def adopt_existing_keys(self) -> int:
++        """Seed accounting and listeners from data persisted by a previous run.
++
++        Adapters whose backing store survives restarts (e.g. the filesystem
++        adapters) override this to scan the store, reconstruct the surviving
++        keys, and report them through ``_notify_keys_stored`` so byte
++        accounting and eviction policies (LRU order seeded oldest-first)
++        cover them. Without adoption, files from a previous server lifetime
++        are still served by lookups but are invisible to capacity tracking
++        and eviction — repeated restarts then accumulate unaccounted data
++        until the disk fills.
++
++        The storage manager calls this once per adapter, after the L2
++        eviction controller has registered its listeners (an adoption that
++        ran earlier would bypass eviction bookkeeping and recreate the leak).
++
++        Returns:
++            Number of keys adopted. The base implementation adopts nothing
++            and returns 0 (correct for adapters without persistent state or
++            whose backend keeps its own accounting).
++        """
++        return 0
++
+     def set_backend_identity(self, name: str, shared: bool = False) -> None:
+         """Set the identity used to tag this adapter's cache events.
+ 
+diff --git a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+index 2d70349..ece1235 100644
+--- a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ # Standard
+ from typing import TYPE_CHECKING, Optional
++import os
+ 
+ if TYPE_CHECKING:
+     from lmcache.v1.distributed.internal_api import (
+@@ -19,6 +20,7 @@ if TYPE_CHECKING:
+ 
+ # First Party
+ from lmcache.logging import init_logger
++from lmcache.v1.distributed.api import ObjectKey
+ from lmcache.v1.distributed.l2_adapters.base import (
+     L2AdapterInterface,
+ )
+@@ -29,6 +31,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
+ from lmcache.v1.distributed.l2_adapters.factory import (
+     register_l2_adapter_factory,
+ )
++from lmcache.v1.distributed.l2_adapters.fs_key_codec import (
++    filename_to_object_key,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -45,6 +50,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+     - use_odirect: bypass page cache via O_DIRECT.
+     - read_ahead_size: trigger filesystem readahead by
+       reading this many bytes first (optional).
++    - adopt_existing: on startup, scan ``base_path`` and seed byte
++      accounting / eviction with files persisted by a previous run
++      (default true).
+     """
+ 
+     def __init__(
+@@ -55,6 +63,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         use_odirect: bool = False,
+         read_ahead_size: Optional[int] = None,
+         max_capacity_gb: float = 0,
++        adopt_existing: bool = True,
+     ):
+         self.base_path = base_path
+         self.num_workers = num_workers
+@@ -62,6 +71,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         self.use_odirect = use_odirect
+         self.read_ahead_size = read_ahead_size
+         self.max_capacity_gb = max_capacity_gb
++        self.adopt_existing = adopt_existing
+ 
+     @classmethod
+     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
+@@ -90,6 +100,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
+             raise ValueError("max_capacity_gb must be a non-negative number")
+ 
++        adopt_existing = d.get("adopt_existing", True)
++        if not isinstance(adopt_existing, bool):
++            raise ValueError("adopt_existing must be a boolean")
++
+         return cls(
+             base_path=base_path,
+             num_workers=num_workers,
+@@ -97,6 +111,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+             use_odirect=use_odirect,
+             read_ahead_size=read_ahead_size,
+             max_capacity_gb=float(max_capacity_gb),
++            adopt_existing=adopt_existing,
+         )
+ 
+     @classmethod
+@@ -116,10 +131,98 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+             "first (optional)\n"
+             "- max_capacity_gb (float): max L2 capacity "
+             "in GB for usage tracking / eviction "
+-            "(default 0 = disabled)"
++            "(default 0 = disabled)\n"
++            "- adopt_existing (bool): on startup, seed "
++            "accounting/eviction from files persisted by "
++            "a previous run (default true)"
+         )
+ 
+ 
++def scan_adoptable_files(
++    base_path: str,
++    relative_tmp_dir: str,
++) -> list[tuple["ObjectKey", int, float]]:
++    """Scan ``base_path`` for adoptable object files from a previous run.
++
++    Only completed objects are considered: the FS connectors write through a
++    temp file and atomically rename to the final name, so any file that both
++    carries the ``.data`` extension and decodes back to an ``ObjectKey`` is a
++    fully written object. Temp files (under ``relative_tmp_dir`` or with a
++    non-``.data`` extension) and foreign files are skipped.
++
++    Args:
++        base_path: The adapter's object directory.
++        relative_tmp_dir: The adapter's temp sub-directory name (empty when
++            temp files live next to the objects under a different extension).
++
++    Returns:
++        One ``(key, size_bytes, mtime)`` tuple per adoptable file, sorted by
++        ``mtime`` ascending so callers can seed LRU order oldest-first.
++    """
++    found: list[tuple[ObjectKey, int, float]] = []
++    try:
++        entries = list(os.scandir(base_path))
++    except FileNotFoundError:
++        return []
++    for entry in entries:
++        if not entry.is_file(follow_symlinks=False):
++            continue
++        key = filename_to_object_key(entry.name)
++        if key is None:
++            continue
++        stat = entry.stat(follow_symlinks=False)
++        found.append((key, stat.st_size, stat.st_mtime))
++    found.sort(key=lambda item: item[2])
++    return found
++
++
++_ADOPT_NOTIFY_BATCH = 4096
++
++
++def _make_adapter_class(native_cls):
++    """Build the FS-native adapter class on top of the lazily imported
++    ``NativeConnectorL2Adapter`` (imported lazily to avoid the circular
++    dependency documented in ``_create_fs_native_l2_adapter``)."""
++
++    class _FSNativeConnectorL2Adapter(native_cls):
++        """``NativeConnectorL2Adapter`` plus filesystem startup adoption."""
++
++        def __init__(
++            self,
++            *args,
++            base_path="",
++            relative_tmp_dir="",
++            adopt_existing=True,
++            **kwargs,
++        ):
++            super().__init__(*args, **kwargs)
++            self._base_path = base_path
++            self._relative_tmp_dir = relative_tmp_dir
++            self._adopt_existing = adopt_existing
++
++        def adopt_existing_keys(self) -> int:
++            if not self._adopt_existing:
++                return 0
++            adoptable = scan_adoptable_files(self._base_path, self._relative_tmp_dir)
++            for start in range(0, len(adoptable), _ADOPT_NOTIFY_BATCH):
++                batch = adoptable[start : start + _ADOPT_NOTIFY_BATCH]
++                self._notify_keys_stored(
++                    [key for key, _size, _mtime in batch],
++                    [size for _key, size, _mtime in batch],
++                )
++            if adoptable:
++                total = sum(size for _key, size, _mtime in adoptable)
++                logger.info(
++                    "FS native adapter adopted %d existing objects (%.2f GiB) from %s",
++                    len(adoptable),
++                    total / (1 << 30),
++                    self._base_path,
++                )
++            return len(adoptable)
++
++    return _FSNativeConnectorL2Adapter
++
++
+ def _create_fs_native_l2_adapter(
+     config: L2AdapterConfigBase,
+     l1_memory_desc: "Optional[L1MemoryDesc]" = None,
+@@ -158,7 +261,8 @@ def _create_fs_native_l2_adapter(
+         config.use_odirect,
+         config.read_ahead_size,
+     )
+-    return NativeConnectorL2Adapter(
++    adapter_cls = _make_adapter_class(NativeConnectorL2Adapter)
++    return adapter_cls(
+         native_client,
+         max_capacity_gb=config.max_capacity_gb,
+         type_name="FSNativeL2Adapter",
+@@ -168,6 +272,9 @@ def _create_fs_native_l2_adapter(
+             "num_workers": config.num_workers,
+             "read_ahead_size": config.read_ahead_size,
+         },
++        base_path=config.base_path,
++        relative_tmp_dir=config.relative_tmp_dir,
++        adopt_existing=config.adopt_existing,
+     )
+ 
+ 
+diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
+index 1bd2602..f7ef849 100644
+--- a/lmcache/v1/distributed/storage_manager.py
++++ b/lmcache/v1/distributed/storage_manager.py
+@@ -144,6 +144,20 @@ class StorageManager:
+         )
+         self._l2_eviction_controller.start()
+ 
++        # Startup adoption AFTER the eviction controller has registered its
++        # listeners: objects persisted by a previous server lifetime are
++        # re-seeded into byte accounting and eviction (LRU oldest-first), so
++        # restarts reuse the on-disk cache instead of accumulating
++        # unaccounted data on top of it until the disk fills.
++        for adapter_id, adapter in self._l2_adapters.items():
++            adopted = adapter.adopt_existing_keys()
++            if adopted:
++                logger.info(
++                    "L2 adapter %d adopted %d objects from a previous run",
++                    adapter_id,
++                    adopted,
++                )
++
+         # Controllers receive the initial set as ordered lists; they key
+         # their own copies by ``descriptor.index`` (== adapter_id) and learn
+         # of later changes via add_adapter/request_remove_adapter.
+diff --git a/lmcache/v1/distributed/l2_adapters/fs_key_codec.py b/lmcache/v1/distributed/l2_adapters/fs_key_codec.py
+new file mode 100644
+index 0000000..b81cb28
+--- /dev/null
++++ b/lmcache/v1/distributed/l2_adapters/fs_key_codec.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Reversible ObjectKey <-> filename codec shared by filesystem L2 adapters.
++
++Both the pure-Python ``fs`` adapter and the C++-backed ``fs_native`` adapter
++(see ``csrc/storage_backends/fs/connector.cpp``) lay objects out as one file
++per key using this exact encoding, so a cache directory written by either is
++readable by both — and by the startup-adoption scan that re-seeds byte
++accounting from files left by a previous server lifetime.
++"""
++
++# Standard
++from typing import Optional
++
++# First Party
++from lmcache.v1.distributed.api import ObjectKey
++
++KEY_SEP = "@"
++# ``@`` in both ``model_name`` and ``cache_salt`` is rejected by
++# ObjectKey.__post_init__, so splitting on ``@`` is unambiguous.
++# Kept in sync with native_connector_l2_adapter.py and
++# csrc/storage_backends/fs/connector.cpp.
++PATH_SLASH_REPLACEMENT = "-SEP-"
++FILE_EXT = ".data"
++
++
++def object_key_to_filename(key: ObjectKey) -> str:
++    """Build a reversible, filesystem-safe filename.
++
++    Unsalted::
++
++        <safe_model>@0x<kv_rank_hex>@<object_group_id_hex>@<chunk_hash_hex>.data
++
++    Salted (trailing ``cache_salt``)::
++
++        <safe_model>@0x<kv_rank_hex>@<object_group_id_hex>@<chunk_hash_hex>@<cache_salt>.data
++
++    ``kv_rank`` is written in ``0x`` prefixed hex so each byte
++    of the bitmap ``(ws<<24)|(rank<<16)|(local_ws<<8)|local``
++    is directly readable. ``object_group_id`` is written in plain hex.
++    """
++    safe_model = key.model_name.replace("/", PATH_SLASH_REPLACEMENT)
++    base = (
++        f"{safe_model}{KEY_SEP}{key.kv_rank:#010x}"
++        f"{KEY_SEP}{key.object_group_id:x}{KEY_SEP}{key.chunk_hash.hex()}"
++    )
++    if key.cache_salt:
++        return f"{base}{KEY_SEP}{key.cache_salt}{FILE_EXT}"
++    return f"{base}{FILE_EXT}"
++
++
++def filename_to_object_key(
++    filename: str,
++) -> Optional[ObjectKey]:
++    """Reverse :func:`object_key_to_filename`.
++
++    Accepts both the 4-field unsalted shape and the 5-field salted
++    shape (trailing ``cache_salt``). Returns ``None`` for anything
++    else. Since ``model_name`` is guaranteed not to contain ``@``,
++    plain ``split`` suffices — no marker, no rsplit.
++    """
++    if not filename.endswith(FILE_EXT):
++        return None
++    stem = filename[: -len(FILE_EXT)]
++    parts = stem.split(KEY_SEP)
++    if len(parts) == 4:
++        safe_model, kv_rank_str, object_group_str, chunk_hash_hex = parts
++        cache_salt = ""
++    elif len(parts) == 5:
++        safe_model, kv_rank_str, object_group_str, chunk_hash_hex, cache_salt = parts
++    else:
++        return None
++
++    model_name = safe_model.replace(PATH_SLASH_REPLACEMENT, "/")
++    try:
++        chunk_hash = bytes.fromhex(chunk_hash_hex)
++        kv_rank = int(kv_rank_str, 16)
++        object_group_id = int(object_group_str, 16)
++        # ObjectKey.__post_init__ raises ValueError when the decoded
++        # model_name / cache_salt violate the forbidden-char or length
++        # invariants (e.g. a stray file from another tool on disk).
++        # The contract here is to return None for anything unparsable,
++        # so keep the constructor inside the try block.
++        return ObjectKey(
++            chunk_hash=chunk_hash,
++            model_name=model_name,
++            kv_rank=kv_rank,
++            object_group_id=object_group_id,
++            cache_salt=cache_salt,
++        )
++    except ValueError:
++        return None

@@ -1,0 +1,539 @@
+--- a/lmcache/integration/vllm/kv_cache_groups.py
++++ b/lmcache/integration/vllm/kv_cache_groups.py
+@@ -32,6 +32,24 @@
+     return any(cls.__name__ == "AttentionSpec" for cls in type(spec).__mro__)
+ 
+ 
++def is_prefix_cacheable_spec(spec: Any) -> bool:
++    """Whether a group spec holds positional prefix KV.
++
++    vLLM's per-request scratch rings (``CircularBufferSpec``, ``KpoolTailSpec``)
++    declare ``prefix_cacheable = False`` (renamed to
++    ``participates_in_prefix_caching`` on newer engines; probe both). Their
++    bytes must never be stored or served as prefix cache.
++    """
++    return (
++        getattr(
++            spec,
++            "participates_in_prefix_caching",
++            getattr(spec, "prefix_cacheable", True),
++        )
++        is not False
++    )
++
++
+ def get_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
+     """Global tokens covered by one block id of ``kv_cache_spec``.
+ 
+@@ -327,6 +345,14 @@
+             group_tokens_per_block[engine_group_id] = get_tokens_per_block(
+                 group.kv_cache_spec, dcp_size
+             )
++            if not is_prefix_cacheable_spec(group.kv_cache_spec):
++                logger.info(
++                    "Excluding non-prefix-cacheable engine group %d (%s, %d layers)",
++                    engine_group_id,
++                    type(group.kv_cache_spec).__name__,
++                    len(group.layer_names),
++                )
++                continue
+             for name in group.layer_names:
+                 per_layer_group_idx[layer_to_idx[name]] = engine_group_id
+         per_layer_sw_size = _resolve_per_layer_sw_sizes(
+--- a/lmcache/integration/vllm/kv_cache_group_edits.py
++++ b/lmcache/integration/vllm/kv_cache_group_edits.py
+@@ -4,11 +4,12 @@
+ This is needed to mask out attention-specific details while making sure that
+ LMCache can still store / load KV cache correctly.
+ 
+-Currently there are three edits, one per :class:`KVCacheGroupEdit` subclass
+-below. All are for Mamba-hybrid models; the registry is only consulted when
+-``kv_cache_config.has_mamba_layers``. :func:`validate_kv_cache_groups`
+-additionally rejects, at startup, group specs the transfer path cannot serve
+-correctly yet (see its docstring).
++There is one edit per :class:`KVCacheGroupEdit` subclass below. The registry
++is consulted for every model with a ``kv_cache_config``: the unified-layout
++edits (vLLM RFC #42082 ``[B, H, N, C]`` views) apply to attention groups too,
++not only to Mamba hybrids. :func:`validate_kv_cache_groups` additionally
++rejects, at startup, group specs the transfer path cannot serve correctly yet
++(see its docstring).
+ 
+ Reference design: vLLM PR #42828 ("[KVConnector][DSV4] HMA support for
+ Mooncake store connector") solves the same problem class for an external KV
+@@ -50,6 +51,7 @@
+ import torch
+ 
+ # First Party
++from lmcache.integration.vllm.kv_cache_groups import is_prefix_cacheable_spec
+ from lmcache.logging import init_logger
+ from lmcache.v1.gpu_connector.utils import LayoutHints
+ 
+@@ -83,7 +85,43 @@
+     groups belong to the compression path in ``lmcache.v1.kv_layer_groups``.
+     """
+     return (
+-        getattr(spec, "compress_ratio", 1) > 1 or getattr(spec, "tq_slot_size", 0) > 0
++        getattr(spec, "compress_ratio", 1) > 1
++        or _tokens_per_state(spec) > 1
++        or getattr(spec, "tq_slot_size", 0) > 0
++    )
++
++
++def _tokens_per_state(spec: KVCacheSpec) -> int:
++    """vLLM unified KV cache slot packing (``num_states = block_size //
++    tokens_per_state``); the base property raises for specs without it.
++
++    Values below 1 (``MambaSpec`` uses ``-1``; Whisper block pooling uses a
++    ``Fraction``) mean one state per token here.
++    """
++    try:
++        value = getattr(spec, "tokens_per_state", 1)
++    except NotImplementedError:
++        return 1
++    return int(value) if value >= 1 else 1
++
++
++def _is_heads_first_layout(kv_layout: str) -> bool:
++    """Whether the per-layer view is ``[B, H, N, C]`` (HND) in memory.
++
++    vLLM's blocks-first layouts (``BLHNC`` / ``BLNHC``) keep the same
++    within-block axis order as ``HND`` / ``NHD`` and only inflate the block
++    stride, which the transfer kernels honour through ``block_stride_elems``.
++
++    Raises:
++        ValueError: For hints outside the vocabulary LMCache can transfer.
++    """
++    if kv_layout in ("HND", "BLHNC"):
++        return True
++    if kv_layout in ("NHD", "BLNHC"):
++        return False
++    raise ValueError(
++        f"Unsupported kv_layout: {kv_layout}. Only NHD, HND, BLHNC and BLNHC "
++        "are supported."
+     )
+ 
+ 
+@@ -125,6 +163,11 @@
+             kind = get_kv_cache_spec_kind(spec)
+             if kind == KVCacheSpecKind.CROSS_ATTENTION:
+                 unsupported.append(f"group {group_idx}: CrossAttentionSpec")
++            elif kind == KVCacheSpecKind.UNKNOWN and is_prefix_cacheable_spec(spec):
++                unsupported.append(
++                    f"group {group_idx}: {type(spec).__name__} (unknown spec "
++                    "kind that declares prefix-cacheable KV)"
++                )
+             elif kind == KVCacheSpecKind.MAMBA and getattr(
+                 spec, "mamba_cache_mode", "none"
+             ) not in ("align", "all"):
+@@ -373,6 +416,41 @@
+ ######################
+ 
+ 
++class _UnifiedAttentionViewEdit(KVCacheGroupEdit):
++    """Permute a unified attention view into its physical axis order.
++
++    vLLM's unified KV cache (RFC #42082) hands every layer a *logical*
++    ``[B, H, N, C]`` view whose strides encode the physical layout. LMCache
++    infers the format from the stride-sorted shape, which is ambiguous when
++    ``H == 1`` or ``N == 1`` (equal strides): a ``[NB, 1, BS, CS]`` NHD
++    pool would be read as ``bs=1, nh=BS``, collapsing a block into one slot.
++    Re-viewing along the resolved layout makes the shape unambiguous:
++    NHD -> ``[B, N, H, C]``, HND -> ``[B, H, N, C]``.
++    """
++
++    name = "unified-attention-view"
++
++    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
++        return (
++            get_kv_cache_spec_kind(spec) != KVCacheSpecKind.MAMBA
++            and "AttentionSpec" in {cls.__name__ for cls in type(spec).__mro__}
++            and isinstance(kv_cache, torch.Tensor)
++            and kv_cache.ndim == 4
++            and getattr(spec, "num_heads", None) == kv_cache.shape[1]
++        )
++
++    def apply(
++        self,
++        spec: KVCacheSpec,
++        kv_cache: RegisteredKVCache,
++        layout_hints: LayoutHints,
++    ) -> torch.Tensor:
++        assert isinstance(kv_cache, torch.Tensor)
++        if _is_heads_first_layout(layout_hints.get("kv_layout", "none")):
++            return kv_cache
++        return kv_cache.permute(0, 2, 1, 3)
++
++
+ class _MambaUnifiedViewEdit(KVCacheGroupEdit):
+     """Re-view mamba's unified state as a per-token paged tensor.
+ 
+@@ -417,11 +495,7 @@
+         assert isinstance(kv_cache, torch.Tensor), (
+             "single-layer KV cache must be a torch.Tensor"
+         )
+-        kv_layout = layout_hints.get("kv_layout", "none")
+-        if kv_layout not in ("NHD", "HND"):
+-            raise ValueError(
+-                f"Unsupported kv_layout: {kv_layout}. Only NHD and HND are supported."
+-            )
++        heads_first = _is_heads_first_layout(layout_hints.get("kv_layout", "none"))
+         num_blocks = kv_cache.shape[0]
+         row = kv_cache[0].numel()
+         block_size = spec.block_size
+@@ -447,12 +521,12 @@
+                 f"cannot tile a {row}-element state row into {block_size} "
+                 f"aligned tokens within the {page_bytes}-byte page"
+             )
+-        if kv_layout == "NHD":
+-            inner = (block_size, 1, head_size)
+-            inner_strides = (head_size, head_size, 1)
+-        else:
++        if heads_first:
+             inner = (1, block_size, head_size)
+             inner_strides = (block_size * head_size, head_size, 1)
++        else:
++            inner = (block_size, 1, head_size)
++            inner_strides = (head_size, head_size, 1)
+         return kv_cache.as_strided(
+             (num_blocks, *inner), (kv_cache.stride(0), *inner_strides)
+         )
+@@ -529,8 +603,71 @@
+         return kv_cache.view(num_kernel_pages // ratio, logical_block_size, -1)
+ 
+ 
++class _SubpagedUnifiedMLAViewEdit(KVCacheGroupEdit):
++    """Re-view a kernel-paged 4-dim MLA/indexer pool at logical-block pages.
++
++    GLM-5.3-Flash registers its MLA latent pool as ``[NB*10, 1, 64, 512]``
++    (64-token kernel pages) and its kpool indexer as ``[NB*5, 1, 32, 132]``
++    (32-slot kernel pages), while the scheduler's block ids address 640-token
++    logical blocks. Without this edit ``_UnifiedAttentionViewEdit`` matches
++    first and keeps kernel-page granularity, so the transfer path indexes the
++    page array with logical-block ids -- reading and writing 10x (MLA) / 5x
++    (indexer) off, which corrupts every stored chunk of these groups
++    (recurrent-state groups were unaffected; that is why hits produced
++    garbage while KDA state round-tripped exactly).
++
++    Matches only when the slot count per logical block
++    (``block_size // tokens_per_state``) is a whole multiple of the kernel
++    page's slot dim and the pool is tight (page stride == page numel), so a
++    plain ``view`` regroups ``factor`` contiguous kernel pages into one
++    logical page. Layouts already at logical granularity (Qwen, DSV4) do not
++    match.
++    """
++
++    name = "subpaged-unified-mla-view"
++
++    def matches(self, spec: KVCacheSpec, kv_cache: RegisteredKVCache) -> bool:
++        if (
++            get_kv_cache_spec_kind(spec) == KVCacheSpecKind.MAMBA
++            or not isinstance(kv_cache, torch.Tensor)
++            or kv_cache.ndim != 4
++            or kv_cache.shape[1] != 1
++            or getattr(spec, "compress_ratio", 1) > 1
++            or getattr(spec, "tq_slot_size", 0) > 0
++        ):
++            return False
++        block_size = getattr(spec, "block_size", 0)
++        if not block_size:
++            return False
++        expected_slots = block_size // _tokens_per_state(spec)
++        page_slots = kv_cache.shape[2]
++        return (
++            expected_slots > page_slots
++            and page_slots > 0
++            and expected_slots % page_slots == 0
++            and kv_cache.shape[0] % (expected_slots // page_slots) == 0
++            and int(kv_cache.stride(0))
++            == kv_cache.shape[1] * kv_cache.shape[2] * kv_cache.shape[3]
++        )
++
++    def apply(
++        self,
++        spec: KVCacheSpec,
++        kv_cache: RegisteredKVCache,
++        _layout_hints: LayoutHints,
++    ) -> torch.Tensor:
++        assert isinstance(kv_cache, torch.Tensor)
++        expected_slots = spec.block_size // _tokens_per_state(spec)
++        factor = expected_slots // kv_cache.shape[2]
++        return kv_cache.view(
++            kv_cache.shape[0] // factor, 1, expected_slots, kv_cache.shape[3]
++        )
++
++
+ # Rule registry, in match priority order.
+ _EDITS: tuple[KVCacheGroupEdit, ...] = (
++    _SubpagedUnifiedMLAViewEdit(),
++    _UnifiedAttentionViewEdit(),
+     _MambaUnifiedViewEdit(),
+     _MambaPageViewEdit(),
+     _SubpagedMLAAttentionViewEdit(),
+@@ -547,8 +684,8 @@
+ 
+     Each layer is checked against the ``_EDITS`` rules (first match wins) and
+     re-viewed by the matching rule; layers matching no rule pass through
+-    unchanged. ``None`` configs and configs without Mamba groups are returned
+-    as-is (as a dict): all current rules only apply to Mamba-hybrid models.
++    unchanged. ``None`` configs are returned as-is (as a dict). Layers of a
++    ``UniformTypeKVCacheSpecs`` group are matched against their own leaf spec.
+ 
+     Args:
+         kv_cache_config: vLLM ``KVCacheConfig`` (read for per-group specs).
+@@ -566,14 +703,23 @@
+     """
+     # Backstop for connectors initialized without a kv_cache_config.
+     validate_kv_cache_groups(kv_cache_config)
+-    if kv_cache_config is None or not kv_cache_config.has_mamba_layers:
++    if kv_cache_config is None:
+         return dict(kv_caches)
+ 
+     edited = dict(kv_caches)
+     counts: Counter[str] = Counter()
+     for group in kv_cache_config.kv_cache_groups:
+-        spec = group.kv_cache_spec
++        group_spec = group.kv_cache_spec
++        # ``UniformTypeKVCacheSpecs`` wraps per-layer leaf specs (e.g. vLLM's
++        # unified attention groups mix full-attention and compressed MLA
++        # owners); edits reason about the leaf that owns the layer.
++        leaf_specs = getattr(group_spec, "kv_cache_specs", None)
+         for name in group.layer_names:
++            spec = (
++                leaf_specs.get(name, group_spec)
++                if isinstance(leaf_specs, dict)
++                else group_spec
++            )
+             for edit in _EDITS:
+                 if edit.matches(spec, kv_caches[name]):
+                     edited[name] = edit.apply(spec, kv_caches[name], layout_hints)
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -43,6 +43,7 @@
+ from lmcache.integration.vllm.kv_cache_groups import (
+     create_engine_group_infos_from_vllm,
+     get_tokens_per_block,
++    is_prefix_cacheable_spec,
+ )
+ from lmcache.integration.vllm.lazy_offload_pending_store import (
+     LazyOffloadPendingStore,
+@@ -168,8 +169,11 @@
+ 
+     Attention pages are local DCP shards and therefore cover
+     ``spec.block_size * dcp_size`` global tokens. Recurrent-state pages are
+-    replicated and retain their physical ``spec.block_size`` span. When vLLM
+-    does not provide group metadata, preserve the legacy single-group rule.
++    replicated and retain their physical ``spec.block_size`` span. Groups
++    whose spec is not prefix cacheable (vLLM's per-request
++    ``CircularBufferSpec`` / ``KpoolTailSpec`` scratch rings) hold no
++    positional KV and are reported as ``0``. When vLLM does not provide
++    group metadata, preserve the legacy single-group rule.
+ 
+     Args:
+         vllm_config: The active vLLM configuration.
+@@ -185,7 +189,10 @@
+         else ()
+     )
+     return [
+-        get_tokens_per_block(group.kv_cache_spec, dcp_size) for group in groups
++        get_tokens_per_block(group.kv_cache_spec, dcp_size)
++        if is_prefix_cacheable_spec(group.kv_cache_spec)
++        else 0
++        for group in groups
+     ] or [vllm_config.cache_config.block_size * dcp_size]
+ 
+ 
+@@ -205,7 +212,13 @@
+     Returns:
+         The scheduler block size in tokens.
+     """
+-    group_spans = get_group_tokens_per_block(vllm_config, kv_cache_config)
++    group_spans = [
++        span
++        for span in get_group_tokens_per_block(vllm_config, kv_cache_config)
++        if span > 0
++    ]
++    if not group_spans:
++        raise ValueError("no prefix-cacheable KV cache group to serve")
+     scheduler_block_size = math.lcm(*group_spans)
+     largest_group_span = max(group_spans)
+     if scheduler_block_size > largest_group_span * _MAX_LCM_EXPANSION_FACTOR:
+@@ -338,6 +351,26 @@
+             f"max_num_batched_tokens={max_batched}, block_size={block_size}. "
+             f"Set --max-num-batched-tokens to at least {block_size}."
+         )
++    # Speculative decoding (MTP) breaks the store path when a prefill step can
++    # advance more than one block: chunks stored from such steps deterministically
++    # corrupt later prefix hits (verified on Qwen3.8-Flash-Next FP8: with
++    # max_num_batched_tokens in (block_size, 2*block_size], hits of certain
++    # depths resume from a wrong recurrent state and generate garbage, while
++    # max_num_batched_tokens == block_size is correct for the same prompts).
++    # Fail closed until the snapshot/store interaction is fixed.
++    if (
++        getattr(vllm_config, "speculative_config", None) is not None
++        and max_batched > block_size
++    ):
++        raise ValueError(
++            f"Mamba-hybrid models with LMCache and speculative decoding "
++            f"require max_num_batched_tokens == block_size ({block_size}); "
++            f"got {max_batched}. Larger values let a prefill step advance "
++            f"more than one block, and the recurrent-state chunks stored "
++            f"from such steps corrupt later prefix-cache hits. "
++            f"Set --max-num-batched-tokens {block_size}, or disable "
++            f"speculative decoding to use a larger step."
++        )
+ 
+ 
+ def validate_dcp_support(
+@@ -645,18 +678,56 @@
+         # full-attention groups 16; DeepSeek V4: 256/64/8/4). Falls back to
+         # the engine's base block size when no group metadata is available
+         # (single non-hybrid group).
++        # A ``0`` marks a non-positional group (spec not prefix cacheable,
++        # e.g. vLLM's per-request ``CircularBufferSpec`` ring buffer): it is
++        # excluded from registration, block-id slicing and capacity math.
+         self._group_tokens_per_block = group_tokens_per_block
++        positional_tokens_per_block = [
++            t for t in self._group_tokens_per_block if t != 0
++        ]
+         for engine_group_idx, tokens_per_block in enumerate(
+             self._group_tokens_per_block
+         ):
+-            if tokens_per_block <= 0:
++            if tokens_per_block < 0:
+                 raise ValueError(
+                     f"group {engine_group_idx} tokens_per_block "
+                     f"{tokens_per_block} must be positive"
+                 )
++        if not positional_tokens_per_block:
++            raise ValueError("no prefix-cacheable KV cache group to serve")
++        # Engine group used for flat (single-group) telemetry.
++        self._primary_group_idx = self._group_tokens_per_block.index(
++            positional_tokens_per_block[0]
++        )
+         # Smallest token count aligned to every group's paged-chunk
+         # boundary; used to round down vLLM APC hit counts.
+-        self._hit_alignment_tokens = math.lcm(*self._group_tokens_per_block)
++        self._hit_alignment_tokens = math.lcm(*positional_tokens_per_block)
++        # Recurrent (Mamba/GDN) and sliding-window groups only keep reusable
++        # state snapshots at retained prefix-cache checkpoints. vLLM's sparse
++        # retention (prefix_cache_retention_interval=0) keeps only the latest
++        # replay boundary, so stored chunks would carry null state pages and
++        # a hit ending on one resumes from a wrong state. Require checkpoints
++        # on every LMCache chunk boundary.
++        needs_checkpoints = any(
++            is_prefix_cacheable_spec(spec)
++            and any(
++                c.__name__ == "MambaSpec" or "SlidingWindow" in c.__name__
++                for c in type(spec).__mro__
++            )
++            for spec in _iter_kv_cache_specs(kv_cache_config)
++        )
++        if needs_checkpoints and self.role == KVConnectorRole.SCHEDULER:
++            interval = getattr(
++                vllm_config.cache_config, "prefix_cache_retention_interval", None
++            )
++            chunk = self.scheduler_adapter.lmcache_tokens_per_chunk
++            if interval is not None and (interval == 0 or chunk % interval != 0):
++                raise ValueError(
++                    "This model has recurrent or sliding-window KV cache groups; "
++                    "LMCache needs a state checkpoint at every chunk boundary. "
++                    f"Set --prefix-cache-retention-interval to a divisor of the "
++                    f"LMCache chunk size ({chunk}, e.g. {chunk}), got {interval}."
++                )
+         if self.role == KVConnectorRole.SCHEDULER:
+             # Chunk boundaries must land on every group's paged-chunk
+             # boundary so per-group block-id slicing stays aligned.
+@@ -664,7 +735,7 @@
+             for engine_group_idx, tokens_per_block in enumerate(
+                 self._group_tokens_per_block
+             ):
+-                if lmcache_tokens_per_chunk % tokens_per_block != 0:
++                if tokens_per_block and lmcache_tokens_per_chunk % tokens_per_block:
+                     raise ValueError(
+                         f"LMCache chunk size {lmcache_tokens_per_chunk} must be "
+                         f"a multiple of group {engine_group_idx} "
+@@ -1535,9 +1606,13 @@
+             tracker = self.request_trackers.get(new_request.req_id)
+             if tracker is None:
+                 continue
+-            primary_block_ids = tracker.allocated_block_ids.get(0, [])
++            primary_block_ids = tracker.allocated_block_ids.get(
++                self._primary_group_idx, []
++            )
+             num_blocks = len(primary_block_ids)
+-            total_tokens = num_blocks * self._group_tokens_per_block[0]
++            total_tokens = (
++                num_blocks * self._group_tokens_per_block[self._primary_group_idx]
++            )
+             records.append(
+                 RequestAllocationRecord(
+                     req_id=new_request.req_id,
+@@ -1554,7 +1629,11 @@
+         for idx, request_id in enumerate(cached_reqs.req_ids):
+             # The L0 subscriber works on the primary (group 0) block-id list.
+             new_group_block_ids = cached_reqs.new_block_ids[idx]
+-            new_block_ids = new_group_block_ids[0] if new_group_block_ids else []
++            new_block_ids = (
++                new_group_block_ids[self._primary_group_idx]
++                if new_group_block_ids
++                else []
++            )
+             if not new_block_ids:
+                 continue
+             tracker = self.request_trackers.get(request_id)
+@@ -1562,9 +1641,11 @@
+                 continue
+             # The new blocks sit at the end of the request's block list.
+             # Compute the token range they cover.
+-            total_blocks = len(tracker.allocated_block_ids.get(0, []))
++            total_blocks = len(
++                tracker.allocated_block_ids.get(self._primary_group_idx, [])
++            )
+             num_new_blocks = len(new_block_ids)
+-            tokens_per_block = self._group_tokens_per_block[0]
++            tokens_per_block = self._group_tokens_per_block[self._primary_group_idx]
+             start_token = (total_blocks - num_new_blocks) * tokens_per_block
+             end_token = total_blocks * tokens_per_block
+             new_token_ids = tracker.get_token_ids()[start_token:end_token]
+--- a/lmcache/integration/vllm/lmcache_mp_metadata.py
++++ b/lmcache/integration/vllm/lmcache_mp_metadata.py
+@@ -231,13 +231,18 @@
+         # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
+         # 16-token full-attention ID).
+         allocated_lengths = tracker.num_allocated_blocks()
++        positional_groups = [
++            engine_group_idx
++            for engine_group_idx in range(num_engine_groups)
++            if group_tokens_per_block[engine_group_idx] > 0
++        ]
+         allocated_tokens = (
+             min(
+                 allocated_lengths.get(engine_group_idx, 0)
+                 * group_tokens_per_block[engine_group_idx]
+-                for engine_group_idx in range(num_engine_groups)
++                for engine_group_idx in positional_groups
+             )
+-            if num_engine_groups > 0
++            if positional_groups
+             else 0
+         )
+         min_available_tokens = min(
+--- a/lmcache/v1/gpu_connector/kv_format/contiguity.py
++++ b/lmcache/v1/gpu_connector/kv_format/contiguity.py
+@@ -147,11 +147,14 @@
+         _fail("ndim < 2")
+     if stride[-1] != 1:
+         _fail("stride[-1] != 1 (inner dim not contiguous)")
+-    if stride[-2] != shape[-1]:
++    # A size-1 dim carries no addressing information (PyTorch may report any
++    # stride for it, e.g. the singleton head axis of vLLM's unified
++    # [NB, 1, BS, CS] views), so it cannot introduce padding.
++    if shape[-2] != 1 and stride[-2] != shape[-1]:
+         _fail("stride[-2] != shape[-1] (last-two dims not tightly packed)")
+     inner_tight = 1
+     for i in range(ndim - 1, 0, -1):
+-        if i < ndim - 1 and stride[i] != inner_tight:
++        if i < ndim - 1 and shape[i] != 1 and stride[i] != inner_tight:
+             _fail(
+                 f"dim {i} stride {stride[i]} != tight {inner_tight} "
+                 "(interior-dim padding is not supported)"
