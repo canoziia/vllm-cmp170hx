@@ -23,6 +23,7 @@ from lmcache.v1.distributed.l2_adapters.fs_key_codec import object_key_to_filena
 from lmcache.v1.distributed.l2_adapters.fs_native_l2_adapter import _make_adapter_class
 from lmcache.v1.distributed.storage_controllers.store_controller import _group_keys_by_shape
 from lmcache.v1.multiprocess.engine_context import LayoutDescRegistry
+from lmcache.v1.multiprocess.group_view import slice_block_ids_per_group
 
 
 def key(n, rank=0, group=0, salt="fixture"):
@@ -48,6 +49,12 @@ class RegressionTests(unittest.TestCase):
                             _object_key_to_string(replace(a, cache_salt="other")))
         self.assertEqual(len(_group_keys_by_shape([
             a, key(2), key(3, group=1), key(4, rank=1)])), 3)
+
+    def test_zero_span_scratch_group_is_skipped(self):
+        self.assertEqual(
+            slice_block_ids_per_group({0: [10, 11], 1: [99]}, [1600, 0], 0, 3200),
+            [[10, 11], []],
+        )
 
     def test_six_rank_layout_lifecycle(self):
         registry = LayoutDescRegistry()
