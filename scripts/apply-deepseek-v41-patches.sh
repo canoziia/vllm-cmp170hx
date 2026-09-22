@@ -5,9 +5,10 @@ set -euo pipefail
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
-source "$REPO_ROOT/manifests/source.env"
+MODEL_DIR="$REPO_ROOT/models/deepseek-v41"
+source "$MODEL_DIR/manifests/source.env"
 
-(cd "$REPO_ROOT" && sha256sum -c manifests/patches.sha256)
+(cd "$REPO_ROOT" && sha256sum -c models/deepseek-v41/manifests/patches.sha256)
 
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {
   echo "SOURCE_TREE must be a git checkout containing vllm/" >&2
@@ -27,7 +28,7 @@ apply_series() {
   local series=$1 patch patch_path
   while read -r patch; do
     [[ -n "$patch" && $patch != \#* ]] || continue
-    patch_path="$REPO_ROOT/patches/$patch"
+    patch_path="$MODEL_DIR/patches/$patch"
     [[ -f "$patch_path" ]] || { echo "Missing series patch: $patch" >&2; exit 6; }
     echo "Applying $patch"
     git -C "$SOURCE_TREE" apply --check "$patch_path"
@@ -41,9 +42,9 @@ if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} != 0 ]]; then
   echo "Use ENABLE_PERF_DEBUG=1 for the combined debug package" >&2
   exit 2
 fi
-apply_series "$REPO_ROOT/patches/series"
+apply_series "$MODEL_DIR/patches/series"
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  apply_series "$REPO_ROOT/patches/optional/series.perf-debug"
+  apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
 fi
 
 # The pinned author revision provides native PP6+DSpark; the local patch adds

@@ -10,7 +10,7 @@ Pinned inputs are in `manifests/lmcache.env`:
 - official server image digest `sha256:59b350...`;
 - official payload image digest `sha256:0dd644...`.
 
-`build-lmcache-images.sh` extracts the complete official package (Python,
+`scripts/build-deepseek-v41-lmcache-images.sh` extracts the complete official package (Python,
 compiled extensions, and dist-info) from the official payload image, applies
 `series`, and injects that identical tree into both images:
 
@@ -83,7 +83,7 @@ First build the normal DeepSeek image on the same branch, then run:
 
 ```bash
 DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
-  scripts/build-lmcache-images.sh
+  scripts/build-deepseek-v41-lmcache-images.sh
 ```
 
 Outputs default to:

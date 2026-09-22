@@ -5,7 +5,7 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Default active series
 
-`patches/series` contains exactly one patch:
+`models/deepseek-v41/patches/series` contains exactly one patch:
 
 1. `0001-prime-pp-communicators-before-model-load.patch`
    - Initializes persistent PP communication resources immediately after
@@ -39,10 +39,10 @@ Default builds include no performance-debug runtime code.
    - Runtime sampling stays on the production Graph dispatch/padding path.
 
 The legacy debug image `73d0be8-debug-eventfix` used the **image-layer-only**
-`optional/0003-lmcache-event-capability-cache.patch` against the third-party
+`models/deepseek-v41/patches/optional/0003-lmcache-event-capability-cache.patch` against the third-party
 base image's bundled LMCache. Keep it only to reproduce that historical
 DeepSeek base. New LMCache deployments use the digest-pinned official package
-and the auditable series under `patches/lmcache/`; its canonical equivalent is
+and the auditable common series under `patches/lmcache/`; its canonical equivalent is
 `patches/lmcache/0003-event-capability-cache.patch`. Do not apply both to the
 same package.
 
