@@ -537,3 +537,29 @@
              _fail(
                  f"dim {i} stride {stride[i]} != tight {inner_tight} "
                  "(interior-dim padding is not supported)"
+--- a/lmcache/v1/multiprocess/group_view.py
++++ b/lmcache/v1/multiprocess/group_view.py
+@@ -196,8 +196,9 @@
+         allocated_block_ids: Block IDs keyed by engine group id; a missing group
+             yields an empty list.
+         group_tokens_per_block: Each group's tokens-per-paged-chunk, in
+-            engine-group order. Every value must be positive and divide both
+-            range endpoints.
++            engine-group order. Every positive value must divide both range
++            endpoints; ``0`` marks a non-positional group that yields an
++            empty list.
+         start_token_idx: Range start token index, inclusive.
+         end_token_idx: Range end token index, exclusive.
+ 
+@@ -209,6 +210,11 @@
+     """
+     sliced: list[list[int]] = []
+     for engine_group_idx, tokens_per_block in enumerate(group_tokens_per_block):
++        if tokens_per_block <= 0:
++            # Non-positional group (e.g. a per-request ring buffer that is not
++            # prefix cacheable): it holds no KV for a token range.
++            sliced.append([])
++            continue
+         if start_token_idx % tokens_per_block != 0 or (
+             end_token_idx % tokens_per_block != 0
+         ):

@@ -49,8 +49,9 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
 
 4. `0004-vllm-unified-kv-compatibility.patch`
    - carries the vLLM unified-layout compatibility required by the pinned
-     DeepSeek engine: excludes non-prefix-cacheable scratch rings, resolves
-     logical vs physical KV views, and enforces recurrent-state checkpoints;
+     engines: excludes non-prefix-cacheable scratch rings (including zero-span
+     block slicing), resolves logical vs physical KV views, and enforces
+     recurrent-state checkpoints;
    - this is an explicit compatibility patch, not an implicit dependency on
      the third-party LMCache wheel.
 
