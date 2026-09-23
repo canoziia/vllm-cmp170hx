@@ -1,0 +1,144 @@
+From 7f6a12b8882b505095bb67714da05945c0c5e899 Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 08:57:27 +0000
+Subject: [PATCH] deepseek: reuse fixed Triton prefill logits workspace
+
+Allocate the bounded sparse-indexer logits buffer through WorkspaceManager on CUDA devices without DeepGEMM. Reuse it across prefill chunks while retaining the existing metadata sub-chunk budget.
+---
+ .../layers/sparse_attn_indexer.py             | 37 ++++++++++++-------
+ vllm/v1/attention/ops/mqa_logits_triton.py    | 20 ++++++++--
+ 2 files changed, 40 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 3769c92..733c6b6 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -444,18 +444,21 @@ def sparse_attn_indexer(
+         values_spec, scales_spec = _gather_workspace_shapes(
+             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+         )
+-        current_workspace_manager().get_simultaneous(
+-            values_spec,
+-            scales_spec,
+-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++        max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++        fixed_logits = current_platform.is_cuda() and not is_deep_gemm_supported()
++        scratch_spec = (
++            ((max_logits_bytes // 4,), torch.float32)
++            if fixed_logits
++            else ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8)
+         )
+-
+-        # Dummy allocation to simulate for peak logits tensor memory during inference.
+-        # FP8 elements so elements == bytes
+-        max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+-        _ = torch.empty(
+-            max_logits_elems, dtype=torch.uint8, device=hidden_states.device
++        current_workspace_manager().get_simultaneous(
++            values_spec, scales_spec, scratch_spec
+         )
++        if not fixed_logits:
++            # Account for the separate logits allocation used by other backends.
++            _ = torch.empty(
++                max_logits_bytes, dtype=torch.uint8, device=hidden_states.device
++            )
+ 
+         return sparse_attn_indexer_fake(
+             hidden_states,
+@@ -566,10 +569,14 @@ def sparse_attn_indexer(
+         values_spec, scales_spec = _gather_workspace_shapes(
+             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+         )
+-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+-            values_spec,
+-            scales_spec,
+-        )
++        fixed_logits = current_platform.is_cuda() and not use_deep_gemm
++        workspace_specs = [values_spec, scales_spec]
++        if fixed_logits:
++            max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            workspace_specs.append(((max_logits_bytes // 4,), torch.float32))
++        workspace = workspace_manager.get_simultaneous(*workspace_specs)
++        k_quant_full, k_scale_full = workspace[:2]
++        logits_workspace = workspace[2] if fixed_logits else None
+         for chunk in prefill_metadata.chunks:
+             cu_seqlen_ks = chunk.cu_seqlen_ks
+             cu_seqlen_ke = chunk.cu_seqlen_ke
+@@ -649,6 +656,7 @@ def sparse_attn_indexer(
+                             cu_seqlen_ke[r0:r1],
+                             clean_logits=False,
+                             round_allocations=round_logits_allocations,
++                            out=logits_workspace,
+                         )
+                         _apply_prefill_candidates(
+                             logits,
+@@ -682,6 +690,7 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                         round_allocations=round_logits_allocations,
++                        out=logits_workspace,
+                     )
+                 if logits.shape[0] > 0:
+                     num_rows = logits.shape[0]
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 8fd5f23..7f13221 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -521,6 +521,7 @@ def fp8_mqa_logits_triton(
+     cu_seqlen_ke: torch.Tensor,
+     clean_logits: bool = True,
+     round_allocations: bool = False,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Triton implementation of DeepGEMM's fp8_mqa_logits.
+ 
+@@ -533,7 +534,8 @@ def fp8_mqa_logits_triton(
+         clean_logits: when False, skip the -inf pre-fill of the output
+             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
+         round_allocations: Use power-of-two storage capacities to let growing
+-            contexts reuse allocation sizes. The logical output shape is unchanged.
++            contexts reuse allocation sizes. Ignored when ``out`` is provided.
++        out: Optional flat or 2-D float32 workspace with room for ``M * N`` values.
+     Returns:
+         logits:       [M, N] float32
+     """
+@@ -545,6 +547,7 @@ def fp8_mqa_logits_triton(
+         cu_seqlen_ke,
+         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
+         round_allocations=round_allocations,
++        out=out,
+     )
+ 
+ 
+@@ -556,6 +559,7 @@ def _fp8_mqa_logits_triton_impl(
+     cu_seqlen_ke: torch.Tensor,
+     kv_group: int,
+     round_allocations: bool = False,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     k_fp8, k_scales = kv
+     k_scales = k_scales.reshape(-1)
+@@ -566,8 +570,18 @@ def _fp8_mqa_logits_triton_impl(
+     # The grid covers every (m, n_block) and each tile stores its full row
+     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
+     # is accepted for DeepGEMM signature parity only.
+-    capacity = triton.next_power_of_2(N) if round_allocations else N
+-    logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
++    if out is None:
++        capacity = triton.next_power_of_2(N) if round_allocations else N
++        logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
++    else:
++        if (
++            out.dtype != torch.float32
++            or out.device != q.device
++            or not out.is_contiguous()
++            or out.numel() < M * N
++        ):
++            raise ValueError("Invalid sparse-indexer logits workspace")
++        logits = out.view(-1)[: M * N].view(M, N)
+ 
+     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
+     BLOCK_D = triton.next_power_of_2(head_dim)
+-- 
+2.55.0
+
