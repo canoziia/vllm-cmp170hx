@@ -8,6 +8,7 @@ COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY ple_pread.c /tmp/ple_pread.c
 COPY lmcache-cli /usr/local/bin/lmcache
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
+COPY qwen-cache-tests/ /opt/qwen-cache-tests/
 COPY lmcache-payload/ /opt/lmcache-patched/
 
 ENV PYTHONPATH=/opt/lmcache-patched
@@ -21,12 +22,15 @@ RUN gcc -O3 -fopenmp -shared -fPIC \
       /opt/lmcache-patched/lmcache \
     && python3 -c 'import lmcache, torch; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert torch.version.cuda == "13.0"' \
     && python3 /tmp/test-lmcache-patches.py \
+    && python3 /opt/qwen-cache-tests/test_decode_checkpoint_scheduler.py /usr/local/lib/python3.12/dist-packages \
+    && python3 /opt/qwen-cache-tests/test_qwen_mtp_group_annotation.py /usr/local/lib/python3.12/dist-packages \
+    && python3 /opt/qwen-cache-tests/test_qsa_logits_workspace.py /usr/local/lib/python3.12/dist-packages \
     && rm /tmp/test-lmcache-patches.py
 
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       io.canoziia.integration.revision="${INTEGRATION_REVISION}" \
       io.canoziia.model="qwen3.8-flash-next-nvfp4" \
-      io.canoziia.patch-series="models/qwen3.8-flash-next/patches/series+patches/vllm/series" \
+      io.canoziia.patch-series="models/qwen3.8-flash-next/patches/series+patches/vllm/series+models/qwen3.8-flash-next/patches/series.post-common" \
       io.canoziia.lmcache.source="LMCache/LMCache@05a013b29da78cf2321b9b46ec5039dde2fb0bb0" \
       io.canoziia.lmcache.patch-series="patches/lmcache/series"

@@ -3,7 +3,7 @@ x-podman:
 
 services:
   lmcache:
-    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-cmp170hx-final}
+    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
     container_name: qwen38-lmcache
     restart: "no"
     entrypoint: ["lmcache"]
@@ -37,7 +37,7 @@ services:
       retries: 30
 
   qwen:
-    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-cmp170hx-final}
+    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
     container_name: qwen38-author-nvfp4
     depends_on:
       lmcache:
@@ -83,9 +83,9 @@ services:
       - --quantization=modelopt
       - --trust-remote-code
       - --max-model-len=1000000
-      - --max-num-seqs=64
+      - --max-num-seqs=32
       - --max-num-batched-tokens=4096
-      - --kv-cache-memory=17716740096
+      - --kv-cache-memory=17179869184
       - --kv-cache-dtype=bfloat16
       - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
@@ -93,6 +93,7 @@ services:
       - --disable-custom-all-reduce
       - --no-enable-flashinfer-autotune
       - --enable-prefix-caching
+      - --prefix-match-unit=32
       - --mamba-cache-mode=align
       - --prefix-cache-retention-interval=1600
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5557}}'
