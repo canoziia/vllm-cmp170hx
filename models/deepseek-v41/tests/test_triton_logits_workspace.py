@@ -59,9 +59,14 @@ if len(sys.argv) == 3 and sys.argv[2] == "--gpu":
         starts = torch.zeros(rows, dtype=torch.int32, device=device)
         ends = torch.full((rows,), width, dtype=torch.int32, device=device)
         args = (q, (k, scales), weights, starts, ends)
-        expected = op.fp8_mqa_logits_triton(*args, clean_logits=False)
+        expected = op.fp8_mqa_logits_triton(
+            *args, clean_logits=False, round_allocations=True
+        )
         actual = op.fp8_mqa_logits_triton(
-            *args, clean_logits=False, out=workspace
+            *args,
+            clean_logits=False,
+            round_allocations=True,
+            out=workspace,
         )
         torch.cuda.synchronize()
         assert torch.equal(actual, expected)

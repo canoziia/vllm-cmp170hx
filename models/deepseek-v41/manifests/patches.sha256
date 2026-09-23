@@ -1,5 +1,5 @@
 16d8b755470052a7e939a10c97e6877396b55d06b24b548c166c7e5974dd5af7  models/deepseek-v41/patches/0001-prime-pp-communicators-before-model-load.patch
-1b49bd07cf8193ab6c86c0c6ec19cfbb76904562da9beb1ed51a1420a51a616b  models/deepseek-v41/patches/0002-fixed-triton-logits-workspace.patch
+caf7852108c5f58fa988bf9d2cf1354694bf016c902bc3bcc0c1d8e8763e4ee6  models/deepseek-v41/patches/0002-fixed-triton-logits-workspace.patch
 d318e9fdc7d63b321300d32fa6f4ea85fe826054a44143ca424e6d9db15c4011  models/deepseek-v41/patches/optional/0002-hot-perf-debug.patch
 a2493e14607686e755b30d1eb29ec94256e3aaa69b9d70c60e86ed2e7a0264c8  models/deepseek-v41/patches/optional/0003-lmcache-event-capability-cache.patch
-18f299b5337acc33741cb7332b3a161aa419bc1fa87c798638a6a480b8aced4c  models/deepseek-v41/tests/test_triton_logits_workspace.py
+a3557779a6de63368e444a289529d285fe5d3ed687969a05f717d6b1b3526d9d  models/deepseek-v41/tests/test_triton_logits_workspace.py
