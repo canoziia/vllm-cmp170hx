@@ -110,7 +110,7 @@ The ten-minute grace period is also encoded in Compose.
 
 `compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6
 `7,7,7,7,7,5`, seq32, 6 GiB GPU KV per rank, and a separate LMCache MP server.
-It reserves a 16 GiB L1 CPU cache, uses 1024-token chunks, separate object
+It reserves a 64 GiB L1 CPU cache, uses 1024-token chunks, separate object
 groups, LRU, and a 500 GiB buffered native-FS L2. Set `LMCACHE_L2_PATH` to a
 dedicated host filesystem; the repository does not hard-code a block device.
 Both services use host IPC and the same six CDI GPUs. LMCache binds RPC/HTTP to

@@ -1,4 +1,4 @@
-From 7f6a12b8882b505095bb67714da05945c0c5e899 Mon Sep 17 00:00:00 2001
+From 41bc0c4bffe577aeec69bfc43fd680710a6f628c Mon Sep 17 00:00:00 2001
 From: canoziia <canoziia@users.noreply.github.com>
 Date: Wed, 23 Sep 2026 08:57:27 +0000
 Subject: [PATCH] deepseek: reuse fixed Triton prefill logits workspace
@@ -6,8 +6,8 @@ Subject: [PATCH] deepseek: reuse fixed Triton prefill logits workspace
 Allocate the bounded sparse-indexer logits buffer through WorkspaceManager on CUDA devices without DeepGEMM. Reuse it across prefill chunks while retaining the existing metadata sub-chunk budget.
 ---
  .../layers/sparse_attn_indexer.py             | 37 ++++++++++++-------
- vllm/v1/attention/ops/mqa_logits_triton.py    | 20 ++++++++--
- 2 files changed, 40 insertions(+), 17 deletions(-)
+ vllm/v1/attention/ops/mqa_logits_triton.py    | 18 ++++++++-
+ 2 files changed, 39 insertions(+), 16 deletions(-)
 
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
 index 3769c92..733c6b6 100644
@@ -81,7 +81,7 @@ index 3769c92..733c6b6 100644
                  if logits.shape[0] > 0:
                      num_rows = logits.shape[0]
 diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
-index 8fd5f23..7f13221 100644
+index 8fd5f23..094d4ee 100644
 --- a/vllm/v1/attention/ops/mqa_logits_triton.py
 +++ b/vllm/v1/attention/ops/mqa_logits_triton.py
 @@ -521,6 +521,7 @@ def fp8_mqa_logits_triton(
@@ -118,14 +118,12 @@ index 8fd5f23..7f13221 100644
  ) -> torch.Tensor:
      k_fp8, k_scales = kv
      k_scales = k_scales.reshape(-1)
-@@ -566,8 +570,18 @@ def _fp8_mqa_logits_triton_impl(
-     # The grid covers every (m, n_block) and each tile stores its full row
+@@ -567,7 +571,17 @@ def _fp8_mqa_logits_triton_impl(
      # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
      # is accepted for DeepGEMM signature parity only.
--    capacity = triton.next_power_of_2(N) if round_allocations else N
+     capacity = triton.next_power_of_2(N) if round_allocations else N
 -    logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
 +    if out is None:
-+        capacity = triton.next_power_of_2(N) if round_allocations else N
 +        logits = torch.empty((M, capacity), dtype=torch.float32, device=q.device)[:, :N]
 +    else:
 +        if (
