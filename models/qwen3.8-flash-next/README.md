@@ -99,7 +99,7 @@ chmod 600 .env
 
 podman compose --podman-run-args=--ipc=host \
   -f compose.yml up -d
-podman logs -f qwen38-author-nvfp4
+podman logs -f qwen3.8-flash-next
 ```
 
 The default Compose assigns only GPUs 6 and 7 and uses loopback ports:
