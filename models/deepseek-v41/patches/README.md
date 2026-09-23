@@ -5,9 +5,8 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Default active series
 
-The model-specific `models/deepseek-v41/patches/series` contains exactly one
-patch. The build then applies the shared runtime fixes in
-`patches/vllm/series`:
+The model-specific `models/deepseek-v41/patches/series` contains two patches.
+The build then applies the shared runtime fixes in `patches/vllm/series`:
 
 1. `0001-prime-pp-communicators-before-model-load.patch`
    - Initializes persistent PP communication resources immediately after
@@ -20,6 +19,11 @@ patch. The build then applies the shared runtime fixes in
      check becomes a no-op after successful early initialization.
    - Makes later memory accounting include communicator resources and avoids
      first-use NCCL allocation failures under tight HBM budgets.
+2. `0002-fixed-triton-logits-workspace.patch`
+   - Reuses the profiled sparse-indexer logits workspace on CUDA devices where
+     DeepGEMM is unavailable, including CMP 170HX.
+   - Keeps the existing 128 MiB budget and automatic prefill sub-chunking; it
+     changes allocation reuse, not request admission or indexer results.
 
 The shared series adds async-PP Mamba state reclamation and resolved-cache
 geometry restoration; both are also used by Qwen. The communicator primer

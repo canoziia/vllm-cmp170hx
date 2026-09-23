@@ -58,9 +58,12 @@ grep -q '_pp_communicators_primed' \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 grep -q 'handler.broadcast_group' \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+python3 "$MODEL_DIR/tests/test_triton_logits_workspace.py" "$SOURCE_TREE"
 
 compile_files=(
+  "$SOURCE_TREE/vllm/model_executor/layers/sparse_attn_indexer.py"
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
+  "$SOURCE_TREE/vllm/v1/attention/ops/mqa_logits_triton.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 )

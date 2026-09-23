@@ -13,11 +13,11 @@ Reproducible minimal patches and a Podman Compose deployment for
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
 Engram tables use the author's exact-size pinned CPU offload path. The pinned
-author revision includes native PP6+DSpark support. The DeepSeek-specific
-patch primes all persistent PP communicators before model and KV allocation;
-the shared vLLM series fixes asynchronous-PP Mamba reclamation and resumed
-state geometry. Performance-debug runtime code is optional and is not included
-in default images.
+author revision includes native PP6+DSpark support. DeepSeek-specific patches
+prime persistent PP communicators before model and KV allocation and reuse a
+fixed sparse-indexer logits workspace on SM80. The shared vLLM series fixes
+asynchronous-PP Mamba reclamation and resumed state geometry. Performance-debug
+runtime code is optional and is not included in default images.
 
 ## Runtime configuration
 
