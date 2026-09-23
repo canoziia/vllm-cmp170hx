@@ -2,9 +2,9 @@ x-podman:
   in_pod: false
 
 services:
-  lmcache:
+  qwen3.8-flash-next-lmcache:
     image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
-    container_name: qwen38-lmcache
+    container_name: qwen3.8-flash-next-lmcache
     restart: "no"
     entrypoint: ["lmcache"]
     command:
@@ -36,11 +36,11 @@ services:
       start_period: 2m
       retries: 30
 
-  qwen:
+  qwen3.8-flash-next:
     image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
-    container_name: qwen38-author-nvfp4
+    container_name: qwen3.8-flash-next
     depends_on:
-      lmcache:
+      qwen3.8-flash-next-lmcache:
         condition: service_healthy
     restart: "no"
     network_mode: host
