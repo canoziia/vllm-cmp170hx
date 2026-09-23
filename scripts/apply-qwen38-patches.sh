@@ -24,17 +24,30 @@ actual=$(git -C "$SOURCE_TREE" rev-parse HEAD)
   exit 5
 }
 
-while IFS= read -r patch_name; do
-  [[ -n "$patch_name" && ${patch_name:0:1} != "#" ]] || continue
-  patch_file="$MODEL_DIR/patches/$patch_name"
-  [[ -f "$patch_file" ]] || { echo "Missing Qwen patch: $patch_file" >&2; exit 6; }
-  echo "Applying Qwen patch: $patch_name"
-  git -C "$SOURCE_TREE" apply --check "$patch_file"
-  git -C "$SOURCE_TREE" apply "$patch_file"
-done < "$MODEL_DIR/patches/series"
+apply_model_series() {
+  local series=$1 patch_name patch_file
+  while IFS= read -r patch_name; do
+    [[ -n "$patch_name" && ${patch_name:0:1} != "#" ]] || continue
+    patch_file="$MODEL_DIR/patches/$patch_name"
+    [[ -f "$patch_file" ]] || {
+      echo "Missing Qwen patch: $patch_file" >&2
+      exit 6
+    }
+    echo "Applying Qwen patch: $patch_name"
+    git -C "$SOURCE_TREE" apply --check "$patch_file"
+    git -C "$SOURCE_TREE" apply "$patch_file"
+  done < "$series"
+}
 
+apply_model_series "$MODEL_DIR/patches/series"
 "$REPO_ROOT/scripts/apply-vllm-common-patches.sh" "$SOURCE_TREE"
+# Generated-history checkpointing builds on the shared PP/Mamba lifecycle
+# fixes, so it is intentionally applied after the shared series.
+apply_model_series "$MODEL_DIR/patches/series.post-common"
 
+python3 "$MODEL_DIR/tests/test_decode_checkpoint_scheduler.py" "$SOURCE_TREE"
+python3 "$MODEL_DIR/tests/test_qwen_mtp_group_annotation.py" "$SOURCE_TREE"
+python3 "$MODEL_DIR/tests/test_qsa_logits_workspace.py" "$SOURCE_TREE"
 git -C "$SOURCE_TREE" diff --check
 python3 -m compileall -q \
   "$SOURCE_TREE/vllm/config" \

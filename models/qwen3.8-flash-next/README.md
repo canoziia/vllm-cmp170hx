@@ -28,13 +28,25 @@ Applied in this order:
    - queues old Mamba source-state indices until safe reclamation.
 3. `patches/vllm/0002-mamba-resolved-cache-geometry.patch`
    - restores resumed Mamba state from the resolved per-group block geometry.
-4. The complete shared `patches/lmcache/series`, including MTP align-mode
+4. `models/qwen3.8-flash-next/patches/0002-generated-history-checkpoints-pp2.patch`
+   - stores finalized generated-history checkpoints every 128 tokens;
+   - preserves uniform MTP verification shapes and caps only accepted output;
+   - fences optimistic PP2 work at checkpoint boundaries;
+   - performs copy-on-write only in the owning KV cache group;
+   - identifies Qwen's dedicated `mtp.layers.*` full-attention group without
+     incorrectly applying the speculative trailing-block rule to Mamba groups.
+5. Upstream vLLM PR [#57105](https://github.com/vllm-project/vllm/pull/57105),
+   applied as `0003-qsa-fixed-logits-workspace.patch`, which reserves the
+   worst-case 512 MiB QSA prefill logits workspace once per call and reuses it
+   for every internal chunk instead of retaining every increasing allocation
+   size in the CUDA caching allocator.
+6. The complete shared `patches/lmcache/series`, including MTP align-mode
    speculative-block relocation tracking.
 
 The two vLLM Mamba fixes are shared with DeepSeek and therefore live in root
-`patches/vllm/`; Qwen's PLE implementation remains model-specific. Applying
-these series to the pinned clean source reproduces all 18 `vllm/` files changed
-by the authoritative `qwen38-cmp170hx-final` tree byte-for-byte.
+`patches/vllm/`; Qwen's PLE, generated-history, and QSA workspace changes remain
+model-specific. The complete runtime tree is reproducible from the pinned clean
+source and these ordered patch series.
 
 ## Build
 
@@ -42,14 +54,15 @@ From the repository root:
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-backport:qwen38-cmp170hx-final \
+OUTPUT_IMAGE=localhost/vllm-backport:qwen38-flash-next-nvfp4 \
 bash scripts/build-qwen38-image.sh
 ```
 
-The build performs a fresh checkout of the pinned source, applies the model and
-shared series, compiles Python files, extracts the official LMCache payload by
-immutable digest, applies the shared LMCache series, builds the native PLE
-`pread` helper, and runs LMCache regression gates.
+The build checks out the pinned source, applies the model and shared patch
+series, compiles Python files, extracts the official LMCache payload by digest,
+applies the shared LMCache series, builds the native PLE `pread` helper, and
+runs the LMCache, generated-history, MTP-group, and QSA-workspace regression
+gates. Run the GPU tests in `/opt/qwen-cache-tests/` before deployment.
 
 ## Runtime geometry
 
@@ -58,9 +71,10 @@ GPU devices: 6,7
 TP1 x PP2, partition 26,22
 max_model_len=1,000,000
 max_num_batched_tokens=4,096
-max_num_seqs=64
-KV=bfloat16, 16.5 GiB per GPU
+max_num_seqs=32
+KV=bfloat16, 16 GiB per GPU
 MTP=3
+prefix_match_unit=32
 mamba_cache_mode=align
 prefix_cache_retention_interval=1,600
 CUDA Graph=FULL_AND_PIECEWISE
@@ -70,6 +84,10 @@ LMCache chunk=1,600, L1=64 GiB by default, buffered native-FS L2
 
 A 1M configured maximum is not by itself proof that a 1M request is stable.
 Retain explicit long-context acceptance tests before advertising that limit.
+The QSA workspace fix keeps the prefill logits allocation at a fixed 512 MiB
+(`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`) instead of allowing the allocator's
+reserved high-water mark to grow with every new context width; it does not
+reduce that per-call cap or change indexer results.
 
 ## Deploy
 

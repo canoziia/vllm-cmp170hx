@@ -1,0 +1,633 @@
+From 24527b4245128dec355a4e59b645be2705fc4425 Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 04:48:06 +0000
+Subject: [PATCH] qwen: preserve generated history checkpoints over PP2
+
+---
+ vllm/v1/core/block_pool.py                    |  5 +
+ vllm/v1/core/kv_cache_coordinator.py          |  6 +-
+ vllm/v1/core/kv_cache_manager.py              | 21 +++--
+ vllm/v1/core/kv_cache_utils.py                | 52 ++++++++++
+ vllm/v1/core/sched/async_scheduler.py         | 18 +++-
+ vllm/v1/core/sched/scheduler.py               | 19 +++-
+ vllm/v1/core/single_type_kv_cache_manager.py  | 56 ++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            | 52 ++++++++++
+ .../worker/gpu/model_states/mamba_hybrid.py   |  9 ++
+ vllm/v1/worker/mamba_utils.py                 | 20 +++-
+ vllm/v1/worker/utils.py                       | 94 ++++++++++++-------
+ 11 files changed, 299 insertions(+), 53 deletions(-)
+
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 1efa0e0..59c2075 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -451,6 +451,7 @@ class BlockPool:
+         kv_cache_group_id: int,
+         block_size: int,
+         replace_existing_hashes: bool = False,
++        preserve_earlier: bool = False,
+     ) -> BlockHashWithGroupId | None:
+         """Register a partial prefix-cache entry for an existing block.
+ 
+@@ -481,6 +482,9 @@ class BlockPool:
+             replace_existing_hashes: Whether the block contents were replaced
+                 and all existing cache entries must be removed before the new
+                 entry is registered.
++            preserve_earlier: Keep earlier aliases for append-only contents.
++                Decode checkpoints inside an attention page use this because a
++                later boundary does not invalidate an earlier prefix.
+ 
+         Returns:
+             The hash key with group ID if a partial entry can be registered;
+@@ -509,6 +513,7 @@ class BlockPool:
+             already_cached = False
+         elif (
+             not already_cached
++            and not preserve_earlier
+             and block.block_hash is not None
+             and block.block_hash_num_tokens is not None
+             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index a495f99..de5a04b 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -882,8 +882,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
+                         and group_block_size > self.hash_block_size
+                         else group_block_size
+                     )
++                    # Probe one marker unit beyond the public cap. The finder
++                    # immediately drops that unit, so the exposed hit remains
++                    # at or below max_cache_hit_length.
+                     _max_length = min(
+-                        curr_hit_length + eagle_margin, max_cache_hit_length
++                        curr_hit_length + eagle_margin,
++                        max_cache_hit_length + eagle_margin,
+                     )
+                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
+                     block_hashes=block_hashes,
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 2842ad9..05cffc0 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -861,17 +861,18 @@ class KVCacheManager:
+         self,
+     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+         """Drain pending copies and return their retained endpoints."""
+-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
++        copies: list[KVCacheBlockCopy] = []
++        retained_blocks: list[KVCacheBlock] = []
+         for mgr in self.coordinator.single_type_managers:
+-            pending_copies.extend(mgr.take_pending_cow_copies())
+-        copies = [
+-            KVCacheBlockCopy(
+-                src_block_id=source_block.block_id,
+-                dst_block_id=cow_block.block_id,
+-            )
+-            for source_block, cow_block in pending_copies
+-        ]
+-        retained_blocks = [block for pair in pending_copies for block in pair]
++            for source_block, cow_block in mgr.take_pending_cow_copies():
++                copies.append(
++                    KVCacheBlockCopy(
++                        src_block_id=source_block.block_id,
++                        dst_block_id=cow_block.block_id,
++                        kv_cache_group_id=mgr.kv_cache_group_id,
++                    )
++                )
++                retained_blocks.extend((source_block, cow_block))
+         return copies, retained_blocks
+ 
+     def take_boundary_state_offloads(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 7ee001d..9d98087 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -226,6 +226,8 @@ class KVCacheBlock:
+ class KVCacheBlockCopy(NamedTuple):
+     src_block_id: int
+     dst_block_id: int
++    # Scheduler block IDs are group-scoped under heterogeneous geometries.
++    kv_cache_group_id: int = -1
+ 
+ 
+ class FreeKVCacheBlockQueue:
+@@ -2091,6 +2093,17 @@ def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
+     )
+ 
+ 
++def _is_qwen4_exp_mtp(vllm_config: VllmConfig) -> bool:
++    spec_config = vllm_config.speculative_config
++    if spec_config is None or spec_config.method != "mtp":
++        return False
++    draft_config = spec_config.draft_model_config
++    return (
++        draft_config is not None
++        and draft_config.hf_config.model_type == "qwen4_exp_mtp"
++    )
++
++
+ def _annotate_eagle_groups(
+     vllm_config: VllmConfig,
+     kv_cache_spec: dict[str, KVCacheSpec],
+@@ -2137,6 +2150,45 @@ def _annotate_eagle_groups(
+         ):
+             group.is_eagle_group = True
+ 
++    if _is_qwen4_exp_mtp(vllm_config):
++        # Qwen4Exp registers its native MTP full-attention layers under
++        # ``mtp.layers.<target_num_hidden_layers + idx>``. Their specs are
++        # otherwise indistinguishable from target full attention, so identify
++        # the owning merged group by this stable model path. Never flag the
++        # target's recurrent groups: widening their lookup window makes a
++        # Mamba checkpoint impossible to satisfy and disables all reuse.
++        qwen_mtp_groups = [
++            group
++            for group in kv_cache_groups
++            if any(
++                layer_name.startswith("mtp.layers.")
++                or ".mtp.layers." in layer_name
++                for layer_name in group.layer_names
++            )
++        ]
++        if not qwen_mtp_groups:
++            raise ValueError(
++                "Qwen4Exp MTP did not resolve to a draft attention KV cache group"
++            )
++        if any(
++            isinstance(spec, MambaSpec)
++            for group in qwen_mtp_groups
++            for spec in iter_layer_specs(group.kv_cache_spec)
++        ):
++            raise ValueError(
++                "Qwen4Exp MTP draft attention group unexpectedly contains Mamba state"
++            )
++        for group in qwen_mtp_groups:
++            group.is_eagle_group = True
++        logger.info(
++            "Identified %d Qwen4Exp MTP draft attention KV cache groups: %s",
++            len(qwen_mtp_groups),
++            [
++                [name for name in group.layer_names if "mtp.layers." in name]
++                for group in qwen_mtp_groups
++            ],
++        )
++
+     if not use_deepseek_v4_fallback:
+         return
+     last_layer = next(reversed(kv_cache_spec))
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 56a532b..31aa9db 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -62,9 +62,21 @@ class AsyncScheduler(Scheduler):
+             request.num_output_placeholders -= len(new_token_ids)
+             assert request.num_output_placeholders >= 0
+ 
+-        # Cache the new tokens. Preempted requests should be skipped.
++        # Cache the new tokens. Preempted requests should be skipped. Decode
++        # checkpoints are registered only after the async result confirms the
++        # accepted prefix; PP may still have newer optimistic work in flight.
+         if status_before_update == RequestStatus.RUNNING:
+-            self.kv_cache_manager.cache_blocks(
+-                request, request.num_computed_tokens - request.num_output_placeholders
++            request._cache_confirmed_decode = (
++                self.mamba_partial_cache_hit
++                and self.use_v2_model_runner
++                and not stopped  # EOS/length can trim after GPU state advanced.
++                and request.num_computed_tokens > request.num_prompt_tokens
+             )
++            try:
++                self.kv_cache_manager.cache_blocks(
++                    request,
++                    request.num_computed_tokens - request.num_output_placeholders,
++                )
++            finally:
++                request._cache_confirmed_decode = False
+         return new_token_ids, stopped
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bd4d809..4a96356 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -437,9 +437,26 @@ class Scheduler(SchedulerInterface):
+         # resumed requests replaying their output tokens.
+         prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+         if start >= prefill_end:
++            if (
++                self.mamba_partial_cache_hit
++                and self.use_v2_model_runner
++                and self.scheduler_config.async_scheduling
++            ):
++                # Decode checkpoints are materialized every 128 accepted tokens.
++                # Keep target/MTP verification shapes uniform; the worker caps
++                # the accepted prefix at the boundary. If an optimistic PP step
++                # is sitting on that boundary, wait for its accepted-token count
++                # before allowing a later step to overwrite the running state.
++                checkpoint_unit = 128
++                if request.num_in_flight_tokens and (
++                    start % checkpoint_unit <= self.num_spec_tokens
++                ):
++                    return 0
+             return num_new_tokens
+ 
+-        block_size = self.cache_config.block_size
++        # Use the scheduler's resolved geometry. cache_config.block_size is the
++        # user-facing attention value and can differ for hybrid Mamba groups.
++        block_size = self.block_size
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ac48420..d94f49c 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -845,9 +845,28 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+         block are intentionally skipped.
+         """
+         hash_block_size = self.block_pool.hash_block_size
+-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+-        if boundary_tokens == 0 or boundary_tokens > num_tokens:
++        decode_checkpoint = getattr(request, "_cache_confirmed_decode", False)
++        if decode_checkpoint:
++            # Attention KV is append-only, so publish every finalized fine hash
++            # boundary. MTP consumes the next 32-token alias as a marker and
++            # drops back onto the latest 128-token recurrent checkpoint.
++            boundary_tokens = num_tokens // hash_block_size * hash_block_size
++        else:
++            boundary_tokens = (
++                request.num_prompt_tokens // hash_block_size * hash_block_size
++            )
++        if boundary_tokens == 0:
+             return
++        if boundary_tokens > num_tokens:
++            # MTP/EAGLE lookup consumes one complete hash unit as a marker and
++            # drops it before exposing the reusable prefix. Permit that marker
++            # when only the unit itself extends beyond finalized tokens.
++            is_eagle_drop_marker = (
++                self.use_eagle
++                and boundary_tokens - hash_block_size <= num_tokens
++            )
++            if not is_eagle_drop_marker:
++                return
+         if boundary_tokens % self.block_size == 0:
+             return
+ 
+@@ -861,6 +880,9 @@ class FullAttentionManager(SingleTypeKVCacheManager):
+             num_tokens=boundary_tokens,
+             kv_cache_group_id=self.kv_cache_group_id,
+             block_size=self.block_size,
++            # A later generated-history alias does not invalidate an earlier
++            # prefix inside this append-only attention page.
++            preserve_earlier=decode_checkpoint,
+         )
+ 
+     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+@@ -1454,6 +1476,12 @@ class MambaManager(SingleTypeKVCacheManager):
+             # connector; a request that finishes first hands off this table
+             # source directly.
+             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
++            # Retain three recent generated-history snapshots. MTP lookup drops
++            # one hash unit, so retaining only the latest checkpoint is unsafe.
++            self._decode_tail_boundaries: dict[str, int] = {}
++            self._decode_tail_snapshots: dict[
++                str, list[tuple[KVCacheBlock, BlockHashWithGroupId]]
++            ] = {}
+ 
+     @classmethod
+     def find_longest_cache_hit(
+@@ -1856,6 +1884,7 @@ class MambaManager(SingleTypeKVCacheManager):
+                         producer_tail = self._producer_partial_tail_reqs.pop(
+                             request_id, None
+                         )
++                        boundary_tokens = None
+                         if producer_tail is not None:
+                             marker_block, boundary_tokens = producer_tail
+                             assert marker_block is source_block
+@@ -1870,6 +1899,20 @@ class MambaManager(SingleTypeKVCacheManager):
+                                     boundary_tokens,
+                                 )
+                             )
++                        decode_boundary = self._decode_tail_boundaries.pop(
++                            request_id, None
++                        )
++                        if decode_boundary is not None and decode_boundary == boundary_tokens:
++                            snapshots = self._decode_tail_snapshots.setdefault(
++                                request_id, []
++                            )
++                            assert cow_block.block_hash is not None
++                            snapshots.append((cow_block, cow_block.block_hash))
++                            while len(snapshots) > 3:
++                                retired, expected_hash = snapshots.pop(0)
++                                # A free-pool object may already have been reused.
++                                if retired.block_hash == expected_hash:
++                                    self.block_pool.evict_blocks({retired.block_id})
+                         if cow_block.block_hash is not None:
+                             # The moved entry is only filled by this step's
+                             # copy, so defer same-step hits on it.
+@@ -1916,6 +1959,8 @@ class MambaManager(SingleTypeKVCacheManager):
+             self.pending_state_block_indices.pop(request_id, None)
+             self._checkpoints.pop(request_id, None)
+             self._producer_partial_tail_reqs.pop(request_id, None)
++            self._decode_tail_boundaries.pop(request_id, None)
++            self._decode_tail_snapshots.pop(request_id, None)
+             # An offer is only guaranteed to hold committed bytes until the end
+             # of the pass that made it. This request's blocks are going back to
+             # the pool now, so drop its not-yet-offered hand-offs rather than
+@@ -2022,6 +2067,13 @@ class MambaManager(SingleTypeKVCacheManager):
+             latest_prompt_hash_boundary = max(
+                 latest_prompt_hash_boundary - hash_block_size, 0
+             )
++        if getattr(request, "_cache_confirmed_decode", False):
++            # PP can run ahead optimistically. Publish only a fully drained,
++            # finalized 128-token boundary, never an in-flight state.
++            if num_tokens % 128 != 0 or request.num_in_flight_tokens != 0:
++                return None
++            latest_prompt_hash_boundary = num_tokens
++            self._decode_tail_boundaries[request.request_id] = num_tokens
+         # The junction is the other position a sibling resumes at: where one was
+         # observed to stop, and where the scheduler already ends a chunk. Bounded
+         # to the prompt chunk being computed -- during decode the target is the
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 0fd9a58..62592fb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -63,6 +63,7 @@ from vllm.multimodal.encoder_budget import (
+ )
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import SupportedTask
++from vllm.triton_utils import tl, triton
+ from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+@@ -185,6 +186,31 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ logger = init_logger(__name__)
+ 
+ 
++@triton.jit
++def _cap_decode_checkpoint_acceptance(
++    idx_mapping_ptr,
++    computed_ptr,
++    prompt_len_ptr,
++    sampled_ptr,
++    rejected_ptr,
++    UNIT: tl.constexpr,
++):
++    """Keep MTP verification uniform but do not accept past a checkpoint."""
++    row = tl.program_id(0)
++    slot = tl.load(idx_mapping_ptr + row)
++    if slot < 0:
++        return
++    start = tl.load(computed_ptr + slot)
++    prompt = tl.load(prompt_len_ptr + slot)
++    if start < prompt:
++        return
++    count = tl.load(sampled_ptr + row)
++    cap = UNIT - start % UNIT
++    keep = tl.minimum(count, cap)
++    tl.store(sampled_ptr + row, keep)
++    tl.store(rejected_ptr + row, tl.load(rejected_ptr + row) + count - keep)
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -799,6 +825,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.vllm_config,
+                 kv_cache_allocation_context=kv_cache_allocation_context,
+             )
++        # Scheduler block IDs are scoped to a KV cache group. Keep the raw
++        # per-group allocations so partial-tail CoW copies never touch another
++        # group's page that happens to have the same numeric block ID.
++        self.kv_caches_by_group = [
++            [kv_caches_dict[name] for name in group.layer_names]
++            for group in self.kv_cache_config.kv_cache_groups
++        ]
+         if is_profiling:
+             self.kv_connector = NO_OP_KV_CONNECTOR
+         else:
+@@ -1248,6 +1281,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.kv_caches,
+                 self.kv_cache_config.num_blocks,
+                 scheduler_output.kv_cache_block_copies,
++                kv_caches_by_group=self.kv_caches_by_group,
+             )
+ 
+     def gather_batch_req_state(
+@@ -1609,6 +1643,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+ 
+         assert sampler_output is not None
++        if (
++            self.cache_config.enable_prefix_caching
++            and self.cache_config.mamba_cache_mode == "align"
++            and self.cache_config.prefix_match_unit
++            and self.scheduler_config.async_scheduling
++            and input_batch.num_draft_tokens > 0
++        ):
++            # The target still verifies its normal uniform MTP shape. Limit only
++            # the accepted prefix so every 128-token generated-history snapshot
++            # corresponds to an exact recurrent state on every PP rank.
++            _cap_decode_checkpoint_acceptance[(input_batch.num_reqs,)](
++                input_batch.idx_mapping,
++                self.req_states.num_computed_tokens.gpu,
++                self.req_states.prompt_len.gpu,
++                sampler_output.num_sampled,
++                sampler_output.num_rejected,
++                UNIT=128,
++            )
+         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+ 
+     def postprocess_sampled(
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 86ba9a5..b44b22a 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -393,6 +393,15 @@ class MambaHybridModelState(DefaultModelState):
+                 self._mamba_state_idx_gpu,
+                 num_computed_tokens,
+                 idx_mapping,
++                decode_checkpoint_unit=(
++                    128
++                    if (
++                        self.cache_config.enable_prefix_caching
++                        and self.cache_config.prefix_match_unit
++                        and self.vllm_config.scheduler_config.async_scheduling
++                    )
++                    else 0
++                ),
+             )
+ 
+ 
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index ca00894..9a6fa15 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -411,6 +411,9 @@ def postprocess_mamba_fused_kernel(
+     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
+     # the post-step new_num_computed value (V2 supplies the advanced count).
+     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
++    # Optional fine-grained generated-history checkpoint interval. Zero keeps
++    # the ordinary block-aligned path.
++    DECODE_CHECKPOINT_UNIT: tl.constexpr = 0,
+     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
+     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
+     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
+@@ -461,13 +464,24 @@ def postprocess_mamba_fused_kernel(
+     aligned_new_computed = (new_num_computed // block_size) * block_size
+ 
+     needs_copy = aligned_new_computed >= num_tokens_running_state
++    fine_checkpoint = False
++    if DECODE_CHECKPOINT_UNIT > 0:
++        fine_checkpoint = (
++            new_num_computed > 0
++            and new_num_computed % DECODE_CHECKPOINT_UNIT == 0
++            and new_num_computed % block_size != 0
++        )
+ 
+-    if not needs_copy:
++    if not needs_copy and not fine_checkpoint:
+         return
+ 
+-    # Compute copy parameters
++    # A fine checkpoint normalizes the accepted recurrent state into the
++    # running slot. The scheduler CoW preserves that slot before next forward.
+     accept_token_bias = aligned_new_computed - num_tokens_running_state
+     dest_block_idx = aligned_new_computed // block_size - 1
++    if fine_checkpoint:
++        accept_token_bias = num_accepted - 1
++        dest_block_idx = src_block_idx
+ 
+     # Update accepted-token count before early exits (per-request, so only
+     # state_idx == 0 writes). Also guard on tile_idx == 0 so tiles > 0
+@@ -1252,6 +1266,7 @@ class MambaSpecDecodeGPUContext:
+         state_idx_gpu: torch.Tensor,
+         new_num_computed_tokens_gpu: torch.Tensor,
+         idx_mapping: torch.Tensor,
++        decode_checkpoint_unit: int = 0,
+     ) -> None:
+         """V2 align postprocess: save the running state to the block-aligned
+         position after spec-decode acceptance leaves the sequence non-aligned.
+@@ -1297,6 +1312,7 @@ class MambaSpecDecodeGPUContext:
+             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+             HAS_IDX_MAPPING=True,
+             PRECOMPUTED_NEW_COMPUTED=True,
++            DECODE_CHECKPOINT_UNIT=decode_checkpoint_unit,
+             TEMPORAL_TILES=_TEMPORAL_TILES,
+         )
+ 
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9250498..0225457 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -695,52 +695,78 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+ 
+ 
+ def copy_kv_cache_blocks_inplace(
+-    kv_caches: Iterable[torch.Tensor],
++    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+     num_blocks: int,
+     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
++    kv_caches_by_group: list[
++        list[torch.Tensor | list[torch.Tensor]]
++    ] | None = None,
+ ) -> None:
+     if not kv_cache_block_copies:
+         return
+ 
+-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
++    if kv_caches_by_group is not None:
++        by_group: dict[int, list[KVCacheBlockCopy]] = defaultdict(list)
++        for copy in kv_cache_block_copies:
++            by_group[copy.kv_cache_group_id].append(copy)
++        for group_id, copies in by_group.items():
++            group_caches = (
++                kv_caches if group_id < 0 else kv_caches_by_group[group_id]
++            )
++            copy_kv_cache_blocks_inplace(
++                group_caches,
++                num_blocks,
++                [KVCacheBlockCopy(c.src_block_id, c.dst_block_id) for c in copies],
++            )
++        return
++
++    indices_np = np.array(
++        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
++        dtype=np.int64,
++    )
+     indices: torch.Tensor | None = None
+     seen: set[tuple[torch.device, int]] = set()
+     copied_storages: set[tuple[torch.device, int]] = set()
+-    for cache in kv_caches:
+-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
++    for cache_entry in kv_caches:
++        for cache in (
++            cache_entry
++            if isinstance(cache_entry, (list, tuple))
++            else (cache_entry,)
++        ):
++            # Layers sharing KV (cross-layer sharing) alias the same view; copy it
+         # once. data_ptr distinguishes per-layer views of a shared allocation.
+-        key = (cache.device, cache.data_ptr())
+-        if key in seen:
+-            continue
+-        seen.add(key)
++            key = (cache.device, cache.data_ptr())
++            if key in seen:
++                continue
++            seen.add(key)
+ 
+-        if indices is None:
+-            indices = async_tensor_h2d(indices_np, device=cache.device)
+-        assert cache.device == indices.device
+-        src, dst = indices.unbind(dim=1)
++            if indices is None:
++                indices = async_tensor_h2d(indices_np, device=cache.device)
++            assert cache.device == indices.device
++            src, dst = indices.unbind(dim=1)
+ 
+-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+-        assert remainder == 0, (
+-            f"{cache.shape[0]} kernel blocks not divisible by "
+-            f"{num_blocks} scheduler blocks"
+-        )
+-        storage = cache.untyped_storage()
+-        storage_key = (cache.device, storage.data_ptr())
+-        scheduler_block_stride = (
+-            cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+-        )
+-        if storage.nbytes() == num_blocks * scheduler_block_stride:
+-            if storage_key in copied_storages:
+-                continue
+-            copied_storages.add(storage_key)
+-            blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
+-            blocks.set_(storage)
+-            blocks = blocks.view(num_blocks, -1)
+-        else:
+-            # Fold virtual block splitting into the shape so that dim 0 counts
+-            # scheduler blocks; unflatten of dim 0 is always a view.
+-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+-        blocks[dst] = blocks[src]
++            kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
++            assert remainder == 0, (
++                f"{cache.shape[0]} kernel blocks not divisible by "
++                f"{num_blocks} scheduler blocks"
++            )
++            storage = cache.untyped_storage()
++            storage_key = (cache.device, storage.data_ptr())
++            scheduler_block_stride = (
++                cache.stride(0) * cache.element_size() * kernel_blocks_per_block
++            )
++            if storage.nbytes() == num_blocks * scheduler_block_stride:
++                if storage_key in copied_storages:
++                    continue
++                copied_storages.add(storage_key)
++                blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
++                blocks.set_(storage)
++                blocks = blocks.view(num_blocks, -1)
++            else:
++                # Fold virtual block splitting into the shape so that dim 0 counts
++                # scheduler blocks; unflatten of dim 0 is always a view.
++                blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
++            blocks[dst] = blocks[src]
+ 
+ 
+ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:

@@ -47,6 +47,7 @@ cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 cp "$MODEL_DIR/native/ple_pread.c" "$WORKDIR/context/ple_pread.c"
 cp "$MODEL_DIR/scripts/lmcache" "$WORKDIR/context/lmcache-cli"
 cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
+cp -a "$MODEL_DIR/tests" "$WORKDIR/context/qwen-cache-tests"
 cp "$MODEL_DIR/Containerfile" "$WORKDIR/context/Containerfile"
 
 args=(
