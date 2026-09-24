@@ -2,3 +2,4 @@
 0002-authoritative-budget-input.patch
 0003-pack-confidence-with-draft-feedback.patch
 0004-v2-budget-relay-integration.patch
+0005-pair-pp-confidence-relay-with-fixed-warmup.patch

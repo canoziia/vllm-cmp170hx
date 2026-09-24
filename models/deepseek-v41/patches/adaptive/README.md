@@ -49,6 +49,13 @@ roundtrip .7815 ms, inline budget .7800, inline budget+GPU lengths .8314, old JS
 tensor+lengths .9302. At 96 rows all are ~7.34–7.38 ms. This is not PP6/model
 throughput evidence and excludes confidence/allocator/model work.
 
+`0005` pairs the existing fixed-width JIT warmup's temporary adaptive-manager
+suspension with an equally temporary PP confidence-relay suspension. The
+previous candidate failed in warmup with `confidence=None` while PPHandler
+still demanded a `[32,5]` confidence payload. Actual warmup function control
+flow was exercised for success/exception, PP on/off and relay on/off (8 cases).
+PP6 model startup revalidation is pending; this is not yet a resolved E2E gate.
+
 This does NOT establish whole-model FULL capture, KV equivalence at model level,
 PP6 multi-step adaptive protocol, mixed prefill support under adaptive FULL,
 feature-OFF performance, or end-to-end speedup. These remain enablement gates.
