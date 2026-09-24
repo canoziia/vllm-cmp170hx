@@ -24,6 +24,7 @@ RUN gcc -O3 -fopenmp -shared -fPIC \
     && python3 /tmp/test-lmcache-patches.py \
     && python3 /opt/qwen-cache-tests/test_decode_checkpoint_scheduler.py /usr/local/lib/python3.12/dist-packages \
     && python3 /opt/qwen-cache-tests/test_mtp_snapshot_retention.py /usr/local/lib/python3.12/dist-packages \
+    && python3 /opt/qwen-cache-tests/test_qsa_mtp_block_alignment.py /usr/local/lib/python3.12/dist-packages \
     && python3 /opt/qwen-cache-tests/test_qwen_mtp_group_annotation.py /usr/local/lib/python3.12/dist-packages \
     && python3 /opt/qwen-cache-tests/test_qsa_logits_workspace.py /usr/local/lib/python3.12/dist-packages \
     && rm /tmp/test-lmcache-patches.py
