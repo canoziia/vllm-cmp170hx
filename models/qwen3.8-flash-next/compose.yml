@@ -13,12 +13,12 @@ services:
       - --port=5557
       - --http-host=127.0.0.1
       - --http-port=18557
-      - --chunk-size=1600
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
       - --separate-object-groups
       - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
       - --eviction-policy=LRU
       - --max-workers=8
-      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":500,"adopt_existing":true}'
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true}'
     network_mode: host
     ipc: host
     devices: ["nvidia.com/gpu=6", "nvidia.com/gpu=7"]
@@ -95,7 +95,7 @@ services:
       - --enable-prefix-caching
       - --prefix-match-unit=32
       - --mamba-cache-mode=align
-      - --prefix-cache-retention-interval=1600
+      - --prefix-cache-retention-interval=${QWEN_PREFIX_RETENTION_INTERVAL:-1600}
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5557}}'
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_xml

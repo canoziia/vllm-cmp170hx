@@ -102,12 +102,16 @@ podman compose --podman-run-args=--ipc=host \
 podman logs -f qwen3.8-flash-next
 ```
 
-The `QWEN_MTP_TOKENS` Compose variable changes the model command, not the
-LMCache server. The PP2 generated-history snapshot retention and scheduler
-lookahead follow the configured window; verify both GPU decode state and
-multi-turn cache hits when raising it. Before switching an existing service,
-keep the original image and Compose/.env for rollback. Do not reuse historical
-MTP3 performance or correctness measurements as evidence for MTP5.
+`QWEN_MTP_TOKENS` changes the model command and may change the resolved KV
+block size: QSA's ring is rounded from `indexer_compress_ratio + MTP depth`.
+Set `LMCACHE_CHUNK_SIZE` to a multiple of the **resolved** block size for that
+depth, and choose a distinct `LMCACHE_L2_PATH` for incompatible cache geometry.
+`QWEN_PREFIX_RETENTION_INTERVAL` can track that chunk size. An optional
+`LMCACHE_L2_CAPACITY_GB` bounds a new test cache. Defaults preserve the
+MTP3/1600-token production configuration. The PP2 generated-history snapshot
+retention and scheduler lookahead follow the configured window; verify both
+GPU decode state and multi-turn cache hits when raising it. Before switching
+an existing service, keep the original image and Compose/.env for rollback.
 
 The default Compose assigns only GPUs 6 and 7 and uses loopback ports:
 
