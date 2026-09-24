@@ -55,27 +55,69 @@ Same exact C1 prompts, adaptive hot three-repeat decode tok/s:
 - coding 112.30 / 116.59 / 115.29, original ~115.63;
 - prose 45.84 / 47.91 / 47.44, original ~53.13 (**regression**).
 
-C2/C4 pooled eight-category output over wall time: original 115.21/177.79,
-adaptive 99.59/161.96 tok/s. C6 original 225.99, adaptive 226.36 tok/s;
-no credible net gain. C8/C12/C16/C32 candidate-only tests completed; no
-matched original high-concurrency run yet. Do not compare nonidentical prompts,
-seeds or phase windows as strict A/B.
+Earlier v1 C2/C4 pooled eight-category output over wall time: original
+115.21/177.79, adaptive 99.59/161.96 tok/s. C6 original 225.99,
+adaptive 226.36 tok/s. These were not sufficient to show net benefit.
+
+Two fresh-prefix, full-corpus A/B pairs (`v2-clean-ab-20260925` and
+`v3-clean-ab-20260925`) used the same script, deterministic tag and output
+budgets on the same host, with reverse startup ordering for the second pair.
+Pooled tok/s is sum of each category's completed tokens divided by sum of
+its wall times; count ceiling excluded. No prefix-cache hit was allowed.
+
+| C | v2 original | v2 adaptive | v3 original | v3 adaptive |
+|---|---:|---:|---:|---:|
+| 1 | 69.21 | 67.55 | 68.30 | 65.84 |
+| 2 | 112.63 | 100.97 | 108.04 | 105.18 |
+| 4 | 168.26 | 169.04 | 164.86 | 164.81 |
+| 6 | 222.87 | 218.06 | 229.68 | 213.76 |
+| 16 | 356.26 | 380.09 | 344.69 | 384.69 |
+| 32 | 364.48 | 434.24 | 370.39 | 435.95 |
+
+C16/C32 improve in both pairs; C1/C2/C6 regress or are noisy. This is
+**not an across-load speedup**. Independent max-stage cost experiment did
+not remove low-concurrency regression and had a large C16 outlier; it is
+excluded from final patch series. Earlier source-line diagnostic probes and
+startup profiling logs are not part of the shipped path.
 
 Server `draft` counter counts *proposed* tokens, not admitted target rows;
 acceptance counters alone cannot establish that verification physically shrank.
-Budget trace was added to a separate diagnostic image only to count scalar
-budget decisions without printing private tensors. It has not been read yet.
+A separate diagnostic image `e59ffe823a39ed1de4fa691a532d06b198020d008a27f0bcd7be47fdd070db6a`
+counts scalar budget decisions without printing private tensors or changing
+normal candidate hot path. On the first 400 exact-benchmark steps, 130 were
+trimmed; 1,731 of 2,000 scheduled drafts were admitted (269 rows removed).
+After a mixed C4 corpus and subsequent exact run, 1,600 accumulated steps
+showed 664 trimmed and 9,431 of 12,540 scheduled drafts admitted (3,109
+removed). These counters are first-rank budget decisions; the V2 runner
+constructs an actual `num_tokens` and compacted input from those decisions,
+but a stage-by-stage physical-row trace is still pending. No win follows
+from trimming alone.
 
 ## Pending performance and correctness gates
 
 - Confirm actual budget/admitted distribution and graph descriptor buckets
   through non-perturbing counters, without treating acceptance as admission.
-- Verify PP cost model under concurrency; startup sum-of-six-stage latency may
-  misprice pipeline steady-state throughput. No arbitrary threshold tuning.
+- Verify PP cost model under concurrency; startup sum-of-six-stage GPU event
+  timings (C1 ~20–27 ms) do not represent pipeline cycle occupancy (per-stage
+  ~3–6 ms for 1–6 graph rows). Test a separate max-stage-cost candidate
+  against unchanged original and sum-cost candidate; do not equate a better
+  scalar proxy with a proven speedup. No arbitrary threshold tuning.
 - Matched fixed/adaptive full benchmark across C1, C2, C4, C6 and C8–C32,
   with step/s, accepted/step, physical rows, output tok/s and no errors.
 - Heterogeneous partial budgets on model, rejection KV rollback, logprobs,
-  prefill/mixed batches, cancellation/slot reuse, cache cold/hit, forced graph
-  bucket changes. Component tests alone are insufficient.
+  prefill/mixed batches, forced graph bucket changes. Component tests alone
+  are insufficient. The candidate did pass 9 cancellations + 9 slot-reused
+  replacement requests, 1024-token output + two LMCache hits (3072/3712
+  tokens), C12/C16/C32 runs and logprob API smoke, but no strict model-wide
+  KV/logprob equivalence claim follows.
+- Six temperature-0, seed-0, fresh-prefix original/adaptive token-ID pairs:
+  count, math and table matched; code diverged at token 23, prose at 5,
+  JSON at 9. Repeating the adaptive arm yielded identical IDs. A
+  teacher-forced one-token oracle at the first divergent prefix was itself
+  unstable for code (7/8 chose original, 1/8 adaptive), and prose picked a
+  third token on all 8 trials; candidate logprobs ranked its selected tokens
+  highest but by small margins. This does **not** establish that candidate
+  outputs are incorrect, nor prove strict greedy equivalence. Investigate
+  numeric/context sensitivity before production acceptance.
 - If no measured improvement above original without quality regression, leave
   adaptive disabled. Do not call a no-regression fast path a performance win.
