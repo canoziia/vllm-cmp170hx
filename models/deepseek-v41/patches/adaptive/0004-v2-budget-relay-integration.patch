@@ -169,7 +169,7 @@
              )
              block_tables, slot_mappings = self.prepare_attn(input_batch)
              # Mamba "align" pre-copy: migrate recurrent state across block
-@@ -1924,9 +1991,17 @@
+@@ -1924,9 +1991,21 @@
              # Non-last PP rank: return IntermediateTensors for sending.
              assert output_intermediate_tensors is not None
              assert self.pp_handler is not None
@@ -178,17 +178,21 @@
                  model_inputs["intermediate_tensors"], output_intermediate_tensors
              )
 +            if needs_pp_budget:
-+                output.tensors["__verification_budget"] = pp_verification_budget
++                # FULL-graph output can be the manager's persistent
++                # IntermediateTensors. Never insert wire fields into that
++                # reusable dict: the next step may have no drafts at all.
++                fields = {"__verification_budget": pp_verification_budget}
 +                lengths = self.adaptive_verification.partial_capacities(
 +                    input_batch.num_reqs, scheduled_drafts, pp_verification_budget
 +                )
 +                if lengths is not None:
-+                    output.tensors["__verification_lengths"] = lengths
++                    fields["__verification_lengths"] = lengths
++                return IntermediateTensors(output.tensors | fields)
 +            return output
          return None
  
      @torch.inference_mode()
-@@ -2077,7 +2152,7 @@
+@@ -2077,7 +2156,7 @@
                      mm_inputs=mm_inputs,
                  )
              self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -197,7 +201,7 @@
                  self.adaptive_verification.record_confidences(
                      self.speculator.draft_token_confidence_probs, input_batch
                  )
-@@ -2091,7 +2166,9 @@
+@@ -2091,7 +2170,9 @@
              )
              if self.pp_handler is not None:
                  self.pp_handler.broadcast_drafts(

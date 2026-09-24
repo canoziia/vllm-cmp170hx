@@ -36,6 +36,10 @@ callback directly feeds manager state. Twelve real 2-GPU FIFO cycles PASS.
 
 `0004` threads budget/lengths through GPUWorker/V2 gather/prepare. CPU integer
 budget rides existing object metadata; partial budgets carry a device vector.
+The send-side FULL graph output is persistent: wrap it in a fresh send-only
+`IntermediateTensors` instead of mutating its reused `.tensors` dict. The
+first candidate failed under C12 with stale budget presence; this fix passed
+budget/no-budget/reuse runner-block test and subsequent C12/C16/C32 model runs.
 Original adaptive config/sampler semantics stay enabled. Startup local stage
 profiles are gathered into sum-of-stages cost, with last-rank drafter cost;
 this is a low-concurrency estimate, not a validated concurrency cost model.
