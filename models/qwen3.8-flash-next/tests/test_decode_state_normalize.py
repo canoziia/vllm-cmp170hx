@@ -8,18 +8,18 @@ from vllm.v1.worker.mamba_utils import postprocess_mamba_fused_kernel
 cases = 0
 for dtype in (torch.bfloat16, torch.float32):
     for dim_first in (False, True):
-        for accepted in (1, 2, 3, 4):
-            width, dim = 7, 128
-            shape = (8, dim, width) if dim_first else (8, width, dim)
+        for accepted in range(1, 9):
+            width, dim, rows = 16, 128, 16
+            shape = (rows, dim, width) if dim_first else (rows, width, dim)
             conv = torch.arange(
-                8 * width * dim, device="cuda", dtype=torch.float32
+                rows * width * dim, device="cuda", dtype=torch.float32
             ).reshape(shape).to(dtype)
             temporal = torch.arange(
-                8 * 128 * 128, device="cuda", dtype=torch.float32
-            ).reshape(8, 128, 128).to(dtype)
+                rows * 128 * 128, device="cuda", dtype=torch.float32
+            ).reshape(rows, 128, 128).to(dtype)
             original_conv = conv.clone()
             original_temporal = temporal.clone()
-            block_table = torch.arange(8, device="cuda", dtype=torch.int32).reshape(1, 8)
+            block_table = torch.arange(rows, device="cuda", dtype=torch.int32).reshape(1, rows)
             i64 = lambda values: torch.tensor(values, device="cuda", dtype=torch.int64)
             i32 = lambda values: torch.tensor(values, device="cuda", dtype=torch.int32)
             accepted_gpu = i32([accepted])
@@ -34,7 +34,7 @@ for dtype in (torch.bfloat16, torch.float32):
                 computed,
                 None,
                 i64([block_table.data_ptr()]),
-                8,
+                rows,
                 i64([conv.data_ptr(), temporal.data_ptr()]),
                 i64([
                     conv.stride(0) * conv.element_size(),
