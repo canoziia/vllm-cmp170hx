@@ -1,0 +1,27 @@
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -925,8 +925,22 @@
+                 kernel_block_alignment_size * attn_page_size_1_token,
+             )
+             indexer_align = cls._get_indexer_block_alignment(vllm_config)
+-            if indexer_align:
+-                attn_block_size = indexer_align * cdiv(attn_block_size, indexer_align)
++            # Qwen's raw QSA key ring holds the open compression group plus
++            # every speculative row. Its capacity must also divide the final
++            # attention block size; MTP depth can change this divisor.
++            compress_ratio = getattr(
++                model_config.hf_text_config, "indexer_compress_ratio", None
++            )
++            qsa_ring = 1
++            if compress_ratio and vllm_config.num_speculative_tokens:
++                span = compress_ratio + vllm_config.num_speculative_tokens
++                qsa_ring = compress_ratio * cdiv(span, compress_ratio)
++            block_alignment = lcm(
++                kernel_block_alignment_size, indexer_align or 1, qsa_ring
++            )
++            attn_block_size = block_alignment * cdiv(
++                max(attn_block_size, cache_config.block_size), block_alignment
++            )
+ 
+         if cache_config.block_size < attn_block_size:
+             cache_config.block_size = attn_block_size
