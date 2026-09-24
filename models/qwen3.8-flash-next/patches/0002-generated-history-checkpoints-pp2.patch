@@ -285,8 +285,8 @@ index ac48420..d94f49c 100644
              # connector; a request that finishes first hands off this table
              # source directly.
              self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
-+            # Retain three recent generated-history snapshots. MTP lookup drops
-+            # one hash unit, so retaining only the latest checkpoint is unsafe.
++            # Keep at least three historical boundaries for MTP's dropped
++            # hash marker, and never retain fewer than the speculative window.
 +            self._decode_tail_boundaries: dict[str, int] = {}
 +            self._decode_tail_snapshots: dict[
 +                str, list[tuple[KVCacheBlock, BlockHashWithGroupId]]
@@ -315,7 +315,7 @@ index ac48420..d94f49c 100644
 +                            )
 +                            assert cow_block.block_hash is not None
 +                            snapshots.append((cow_block, cow_block.block_hash))
-+                            while len(snapshots) > 3:
++                            while len(snapshots) > max(3, self.num_speculative_blocks):
 +                                retired, expected_hash = snapshots.pop(0)
 +                                # A free-pool object may already have been reused.
 +                                if retired.block_hash == expected_hash:

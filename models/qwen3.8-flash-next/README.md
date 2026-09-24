@@ -73,7 +73,7 @@ max_model_len=1,000,000
 max_num_batched_tokens=4,096
 max_num_seqs=32
 KV=bfloat16, 16 GiB per GPU
-MTP=3
+MTP=3 by default; set QWEN_MTP_TOKENS=5 to test a longer draft window
 prefix_match_unit=32
 mamba_cache_mode=align
 prefix_cache_retention_interval=1,600
@@ -101,6 +101,13 @@ podman compose --podman-run-args=--ipc=host \
   -f compose.yml up -d
 podman logs -f qwen3.8-flash-next
 ```
+
+The `QWEN_MTP_TOKENS` Compose variable changes the model command, not the
+LMCache server. The PP2 generated-history snapshot retention and scheduler
+lookahead follow the configured window; verify both GPU decode state and
+multi-turn cache hits when raising it. Before switching an existing service,
+keep the original image and Compose/.env for rollback. Do not reuse historical
+MTP3 performance or correctness measurements as evidence for MTP5.
 
 The default Compose assigns only GPUs 6 and 7 and uses loopback ports:
 
