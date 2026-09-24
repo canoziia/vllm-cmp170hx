@@ -9,6 +9,8 @@ check hidden/length tensors. This does NOT establish PP6 lifecycle or latency.
 from datetime import timedelta
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace as NS
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -24,13 +26,28 @@ def worker(rank, rendezvous):
         rank=rank,world_size=2,timeout=timedelta(seconds=45))
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import AdaptiveVerificationManager
     group=GroupCoordinator([[0,1]],rank,'nccl',use_device_communicator=False,
                            group_name='inline-budget-audit')
+    slots=[3,1] if rank==0 else [2,7]
+    request_state=NS(device=device,num_speculative_steps=5,max_num_reqs=8,
+        req_id_to_index=dict(zip(('a','b'),slots)),max_num_batched_tokens=32)
+    manager=AdaptiveVerificationManager(request_state,
+        torch.zeros(9,device=device,dtype=torch.int32),1,32)
+    scheduled={'a':6,'b':6};drafts={'a':[0]*5,'b':[0]*5}
+    mapping=torch.tensor(slots,device=device)
+    observed=torch.empty(3,device=device,dtype=torch.int32)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):observed.copy_(manager.query_start_loc[:3])
     for step,lengths in enumerate(([5,2],[2,5],[0,0],[5,5])):
         # Metadata integers are host-known before allocation: not read from GPU.
         metadata=(1,step,len(lengths),sum(lengths))
         expected=torch.tensor(lengths,dtype=torch.int32,device=device)
         if rank==0:
+            manager.get_num_tokens(scheduled,drafts,authoritative_budget=sum(lengths))
+            manager.reallocate_drafts(['a','b'],mapping,authoritative_capacities=expected)
+            graph.replay()
+            torch.testing.assert_close(observed,torch.tensor([0,1+lengths[0],2+sum(lengths)],device=device,dtype=torch.int32))
             source=expected.clone()
             payload={KEY:metadata,'lengths':source.clone(),
                      'hidden_states':torch.full((16,8),step+.5,device=device)}
@@ -56,13 +73,20 @@ def worker(rank, rendezvous):
             assert real_rows==sum(lengths)+len(lengths)
             assert not intermediate._comm_waited
             # Later model input staging establishes CUDA receive dependency.
+            # CPU budget known before touching any received GPU tensor.
+            manager.get_num_tokens(scheduled,drafts,authoritative_budget=budget)
+            compact,_=manager.compact_batch(np.array([5,5]),np.array([6,6]),np.array([0,6,12]))
+            assert compact.sum()==real_rows
             completed=intermediate.tensors
             assert intermediate._comm_waited
+            manager.reallocate_drafts(['a','b'],mapping,authoritative_capacities=completed['lengths'])
+            graph.replay()
+            torch.testing.assert_close(observed,torch.tensor([0,1+lengths[0],2+sum(lengths)],device=device,dtype=torch.int32))
             torch.testing.assert_close(completed['lengths'],expected)
             completed['hidden_states'].add_(1)
             for h in group.isend_tensor_dict(completed | {KEY:metadata},dst=0):h.wait()
         torch.cuda.synchronize();dist.barrier(device_ids=[rank])
-    if rank==0:print('INLINE_PP_METADATA four roundtrips PASS; no additional CPU tensor/handle',flush=True)
+    if rank==0:print('INLINE_PP_METADATA four roundtrips + actual manager + graph offsets PASS; no additional CPU tensor/handle',flush=True)
     group.destroy();dist.destroy_process_group()
 
 
