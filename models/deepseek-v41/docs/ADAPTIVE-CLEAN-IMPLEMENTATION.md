@@ -84,10 +84,41 @@ indexer-flatten kernel forward just because they exist. The tested contracts
 already work through current builders and kernels. Any later replacement must
 prove a missing capability or measurable bottleneck.
 
-No runtime modifications or capability enables in this checkpoint. Existing
-UNIFORM_BATCH guards remain untouched. A captured component working is NOT
-proof that the runner dispatch/capture path can use a variable-length FULL
-model graph safely.
+Initial checkpoint had no runtime modifications. Following additional coverage,
+`patches/adaptive/0001-sm80-device-ragged-backends.patch` introduces scoped
+backend opt-in declarations, reusing all existing kernels; it is NOT in the
+default patch/build chain and was tested only as an isolated source overlay.
+A captured component working is NOT proof that runner dispatch/capture can use
+a variable-length FULL model graph safely.
+
+## Additional evidence
+
+- MLA/SWA suite now covers three additional padded request slots: 40 total
+  eager/replay cases, also rerun on the adaptive-only backend subclasses.
+- Indexer suite now constructs the real builder and calls its complete
+  `build_for_cudagraph_capture`, rather than only the preparation method;
+  compression ratios 1/2 yield ten layout cases with real MQA output checks.
+  Isolated adaptive backend tests also cover depth1 and depth5 (20 cases).
+- MLA/SWA metadata now goes through actual `DefaultModelState.prepare_attn`
+  and `build_attn_metadata` with FULL padded sizes. Capture-time construction
+  uses `for_capture=True`, subsequent construction False; 40 numerical replay
+  cases pass on the scoped adaptive backend. ModelState is manually initialized
+  with minimal config, not a loaded model. First fixture stacked fresh slot
+  tensors each step and correctly failed pointer checks; changed to persistent
+  group slot buffers matching the real runner's ownership contract.
+- `test_sm80_compressor_rejection.py`: 96 multi-step cycles using actual
+  compression/cache-insert kernels. Full proposed prefixes can write rejected
+  suffixes; subsequent accepted-prefix progress overwrites those values.
+  Committed cache bytes and required predecessor ring state exactly match a
+  separate accepted-prefix-only stream, eager and graph. Synthetic raw states;
+  not an end-to-end proof for the model/scheduler.
+- `test_pp_inline_metadata.py`: four real two-GPU tensor-dict roundtrips with
+  a small non-tensor budget tuple. Received tuple is available before waiting
+  on CUDA payloads; send has metadata + two CUDA handles, no CPU tensor payload.
+  This validates an existing transport feature, not PP6 lifecycle or speed.
+
+The minimal PP design under review is in `ADAPTIVE-PP-CONTRACT.md`; alternatives
+must be resolved before runner implementation. No claim of speedup yet.
 
 ## Next gates
 

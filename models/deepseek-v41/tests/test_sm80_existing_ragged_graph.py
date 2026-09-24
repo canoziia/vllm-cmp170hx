@@ -9,6 +9,7 @@ Run in the pinned DeepSeek image on one SM80 GPU.
 """
 from types import SimpleNamespace as NS
 import math
+import os
 import torch
 
 from vllm.models.deepseek_v4_1.ampere.ampere_sparse import DeepseekV41AmpereMLASparseBackend
@@ -16,7 +17,9 @@ from vllm.models.deepseek_v4_1.amd.rocm import (
     DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
     compute_global_topk_ragged_indices_and_indptr,
 )
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.config import CUDAGraphMode
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.utils import AttentionGroup
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_decode
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
@@ -35,29 +38,35 @@ def pack(keys, block):
 
 
 @torch.inference_mode()
-def main():
+def main(padded_requests):
     assert torch.cuda.get_device_capability() == (8, 0)
     device = torch.device('cuda', 0)
-    n, rows, block, window, heads = 3, 18, 128, 32, 16
+    n, rows, block, window, heads = 3+padded_requests, 18, 128, 32, 16
+    adaptive = os.environ.get('TEST_SM80_ADAPTIVE_BACKENDS', '0') == '1'
+    swa_builder_cls = DeepseekV4ROCMAiterSparseSWAMetadataBuilder
+    if adaptive:
+        from vllm.models.deepseek_v4_1.ampere.ampere_sparse import DeepseekV41AmpereSWAMetadataBuilder
+        swa_builder_cls = DeepseekV41AmpereSWAMetadataBuilder
     config = NS(
         model_config=NS(max_model_len=512, hf_config=NS(
             compress_ratios=[0,1,2], index_topk=8, sliding_window=window)),
         scheduler_config=NS(max_num_batched_tokens=rows, max_num_seqs=n),
         parallel_config=NS(decode_context_parallel_size=1),
         speculative_config=NS(num_speculative_tokens=5, parallel_drafting=False,
-                              enable_adaptive_verification=False, use_dspark=lambda:True),
+                              enable_adaptive_verification=adaptive, use_dspark=lambda:True),
     )
     swa_spec = SlidingWindowMLASpec(block_size=block,num_kv_heads=1,head_size=512,
         dtype=torch.uint8,sliding_window=window,cache_dtype_str='fp8_ds_mla',model_version='deepseek_v4')
     torch.manual_seed(37)
-    table = torch.tensor([[4,1,8],[7,3,0],[2,6,5]],dtype=torch.int32,device=device)
+    table = torch.tensor([[4,1,8],[7,3,0],[2,6,5]]+[[0,0,0]]*padded_requests,dtype=torch.int32,device=device)
     q = torch.randn(rows,heads,512,dtype=torch.bfloat16,device=device)*.125
     sink = torch.randn(heads,device=device)*.2
     swa_cache, swa_keys = pack(torch.randn(9*block,512,dtype=torch.bfloat16,device=device)*.125,block)
     starts = torch.zeros(n+1,dtype=torch.int32,device=device)
     seq = torch.zeros(n,dtype=torch.int32,device=device)
-    slots = torch.full((rows,),-1,dtype=torch.int64,device=device)
-    cpu_starts = torch.arange(0,rows+1,6,dtype=torch.int32)
+    slot_groups = torch.full((2,rows),-1,dtype=torch.int64,device=device)
+    slots = slot_groups[0]
+    cpu_starts = torch.zeros(n+1,dtype=torch.int32)
     cpu_seq = torch.tensor([384]*n,dtype=torch.int32)
     topk = torch.arange(8,dtype=torch.int32,device=device).expand(rows,-1).contiguous()
     output = torch.empty_like(q)
@@ -66,10 +75,21 @@ def main():
         mla_spec = MLAAttentionSpec(block_size=block,num_kv_heads=1,head_size=512,
             dtype=torch.bfloat16,tokens_per_state=ratio,cache_dtype_str='fp8_ds_mla',model_version='deepseek_v4')
         mla_builder = DeepseekV41AmpereMLASparseBackend.get_builder_cls()(mla_spec,['c'],config,device)
-        swa_builder = DeepseekV4ROCMAiterSparseSWAMetadataBuilder(swa_spec,['c'],config,device)
+        swa_builder = swa_builder_cls(swa_spec,['c'],config,device)
+        # Run the actual V2 metadata orchestration, not direct builder calls.
+        model_state=DefaultModelState.__new__(DefaultModelState)
+        model_state.max_model_len=384
+        model_state.supports_mm_inputs=False
+        groups=[
+            [AttentionGroup(DeepseekV41AmpereMLASparseBackend,['mla'],mla_spec,0,[mla_builder])],
+            [AttentionGroup(DeepseekV41AmpereMLASparseBackend,['swa'],swa_spec,1,[swa_builder])],
+        ]
+        kv_config=NS(kv_cache_groups=[NS(layer_names=['mla']),NS(layer_names=['swa'])])
         compressed_block = int(mla_spec.num_states)
         compressed, comp_keys = pack(torch.randn(9*compressed_block,512,dtype=torch.bfloat16,device=device)*.125,compressed_block)
-        def install(lengths,contexts):
+        def install(lengths,contexts,for_capture=False):
+            lengths=list(lengths)+[0]*padded_requests
+            contexts=list(contexts)+[0]*padded_requests
             off=[0]
             for count in lengths:off.append(off[-1]+count)
             starts.copy_(torch.tensor(off,dtype=torch.int32,device=device))
@@ -77,7 +97,7 @@ def main():
             # equal the device total. Graph padding is num_actual_tokens,
             # NOT an extra nonempty request in query_start_loc.
             total=sum(lengths)
-            balanced=[total//n+(i<total%n) for i in range(n)]
+            balanced=[total//3+(i<total%3) for i in range(3)]+[0]*padded_requests
             cpu_starts[0]=0
             torch.cumsum(torch.tensor(balanced,dtype=torch.int32),0,out=cpu_starts[1:])
             seq.copy_(torch.tensor([c+k for c,k in zip(contexts,lengths)],dtype=torch.int32,device=device))
@@ -87,10 +107,16 @@ def main():
                 slot_values.extend(table_cpu[i][p//block]*block+p%block for p in range(c,c+k))
             slots.fill_(-1)
             slots[:len(slot_values)].copy_(torch.tensor(slot_values,dtype=torch.int64,device=device))
-            cm=CommonAttentionMetadata(query_start_loc=starts,query_start_loc_cpu=cpu_starts,
-                seq_lens=seq,seq_lens_cpu_upper_bound=cpu_seq,num_reqs=n,num_actual_tokens=rows,
-                max_query_len=6,max_seq_len=384,block_table_tensor=table,slot_mapping=slots,causal=True)
-            return mla_builder.build_for_cudagraph_capture(cm),swa_builder.build_for_cudagraph_capture(cm)
+            slot_groups[1].copy_(slots)
+            import numpy as np
+            batch=NS(num_reqs=3,num_reqs_after_padding=n,num_tokens=sum(lengths),
+                num_tokens_after_padding=rows,query_start_loc_np=cpu_starts.numpy(),
+                query_start_loc=starts,max_query_len=6,seq_lens_cpu_upper_bound=cpu_seq,
+                seq_lens=seq,dcp_local_seq_lens=None,positions=torch.zeros(rows,device=device,dtype=torch.int64),
+                is_prefilling_np=np.zeros(n,dtype=bool),prompt_lens=None)
+            metadata=model_state.prepare_attn(batch,CUDAGraphMode.FULL,(table,table),
+                slot_groups,groups,kv_config,for_capture=for_capture)
+            return metadata['mla'],metadata['swa']
         def pointers(m,s):
             return tuple(x.data_ptr() for x in (m.req_id_per_token,m.slot_mapping,
                 s.token_to_req_indices,s.decode_swa_ragged_indices,s.decode_swa_ragged_indptr))
@@ -127,7 +153,7 @@ def main():
             assert m.slot_mapping[:active].tolist()==expected_slots
             assert (m.slot_mapping[active:]==-1).all()
             torch.testing.assert_close(output[active:],torch.zeros_like(output[active:]),rtol=0,atol=0)
-        m,s=install([6,6,6],[125,255,129]);stable=pointers(m,s)
+        m,s=install([6,6,6],[125,255,129],for_capture=True);stable=pointers(m,s)
         for _ in range(3):invoke(m,s)
         torch.cuda.synchronize()
         graph=torch.cuda.CUDAGraph()
@@ -139,7 +165,8 @@ def main():
                 output.fill_(float('nan'));invoke(m,s);check(m,s,lengths,contexts)
                 output.fill_(float('nan'));graph.replay();check(m,s,lengths,contexts)
                 cases+=1
-    print(f'EXISTING_SM80_BUILDERS {cases} eager+graph oracle cases PASS; no capability flags changed')
+    print(f'EXISTING_SM80_BUILDERS padded_requests={padded_requests} {cases} eager+graph oracle cases PASS; adaptive_backend_opt_in={adaptive}')
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    for padding in (0,3):main(padding)
