@@ -80,6 +80,20 @@ not remove low-concurrency regression and had a large C16 outlier; it is
 excluded from final patch series. Earlier source-line diagnostic probes and
 startup profiling logs are not part of the shipped path.
 
+A separate diagnosis forced full draft budget for batches with <=4 requests.
+Exact C1 prose recovered from ~47.85 to 52.6 tok/s (original ~53.13),
+and all six deterministic 160-token/stop test outputs matched original.
+But fresh-prefix C6 eight-category throughput was 186.74 (v3) and 214.55
+(v4), so this is **not a safe final policy**. A further <=8 test-only gate
+showed volatile C16 results: pooled 219.12 in v5 versus 356.30 on the v6
+repeat, with no PP error; this is not an acceptable speed claim or a
+production policy. Neither heuristic is in the formal patches. Exact C1
+forced-full outputs matched the original on all six sampled deterministic
+prompts, whereas the adaptive-trimmed arm differed on code/prose/JSON;
+the latter was repeatable but the teacher-forced oracle near those choices
+was sensitive to numerical/context differences. Strict greedy equivalence
+is still unverified.
+
 Server `draft` counter counts *proposed* tokens, not admitted target rows;
 acceptance counters alone cannot establish that verification physically shrank.
 A separate diagnostic image `e59ffe823a39ed1de4fa691a532d06b198020d008a27f0bcd7be47fdd070db6a`
