@@ -1,6 +1,6 @@
 --- a/vllm/platforms/interface.py
 +++ b/vllm/platforms/interface.py
-@@ -925,8 +925,22 @@
+@@ -925,8 +925,25 @@
                  kernel_block_alignment_size * attn_page_size_1_token,
              )
              indexer_align = cls._get_indexer_block_alignment(vllm_config)
@@ -17,7 +17,10 @@
 +                span = compress_ratio + vllm_config.num_speculative_tokens
 +                qsa_ring = compress_ratio * cdiv(span, compress_ratio)
 +            block_alignment = lcm(
-+                kernel_block_alignment_size, indexer_align or 1, qsa_ring
++                kernel_block_alignment_size,
++                indexer_align or 1,
++                qsa_ring,
++                cache_config.prefix_match_unit or 1,
 +            )
 +            attn_block_size = block_alignment * cdiv(
 +                max(attn_block_size, cache_config.block_size), block_alignment

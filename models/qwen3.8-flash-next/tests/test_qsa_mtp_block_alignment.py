@@ -18,7 +18,7 @@ code = compile(ast.fix_missing_locations(ast.Module(body=branch, type_ignores=[]
 for depth in range(1, 17):
     for indexer_align in (None, 128):
         ratio = 4
-        cache = SimpleNamespace(block_size=64)
+        cache = SimpleNamespace(block_size=64, prefix_match_unit=32)
         cfg = SimpleNamespace(num_speculative_tokens=depth)
         model = SimpleNamespace(hf_text_config=SimpleNamespace(indexer_compress_ratio=ratio))
         cls = SimpleNamespace(_get_indexer_block_alignment=lambda _: indexer_align)
@@ -31,7 +31,9 @@ for depth in range(1, 17):
         size = scope['attn_block_size']
         ring = ratio * math.ceil((ratio + depth) / ratio)
         assert size >= 1616
-        assert size % ring == size % (indexer_align or 1) == size % 16 == 0
+        assert size % ring == size % (indexer_align or 1) == size % 16 == size % 32 == 0
+        if depth == 4 and indexer_align is None:
+            assert ring == 8 and size == 1632, (ring, size)
         if depth == 5 and indexer_align is None:
             assert ring == 12 and size == 1632, (ring, size)
 print('QSA_MTP_BLOCK_ALIGNMENT depths=1..16 PASS')

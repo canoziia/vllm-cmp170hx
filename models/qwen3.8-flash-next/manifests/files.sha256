@@ -3,7 +3,7 @@ eaf6d68541595e7aef66eefb2cf21fbb6622e0afcbc27d48270cf217f7789a92  models/qwen3.8
 eef8dcb2356037d8c9cfc1535e663eeb1120d3e287b293d07b06c550acfd282a  models/qwen3.8-flash-next/patches/0001-process-isolated-nvme-ple.patch
 a899d26a460d558ba3ce5901a45bf7767e6e7f2d3feadda36b181fde80da8826  models/qwen3.8-flash-next/patches/0002-generated-history-checkpoints-pp2.patch
 6a2c559b2ebba41d7c1f3aa2ef7dcc059de7234ac8ab8982c40b297b3fdbb20c  models/qwen3.8-flash-next/patches/0003-qsa-fixed-logits-workspace.patch
-e93f68c29f2f4851979feda3a1c5b7a03096e96417de378bd6b89b92631b1586  models/qwen3.8-flash-next/patches/0004-qsa-dynamic-mtp-block-alignment.patch
+d59010dbf094733b8783d795a6279d28b03aa61bbc390522f2bd172fddacd53a  models/qwen3.8-flash-next/patches/0004-qsa-dynamic-mtp-block-alignment.patch
 b18c0834c5379b5df5a982cf94ecc0a3ea0beba62000cdbb739ce298802056d3  models/qwen3.8-flash-next/patches/series
 2f480458808fab9da8746f24738fd70d01e57d325ff11c9e06b5625a8471905f  models/qwen3.8-flash-next/patches/series.post-common
 4aa036ee93aa62013fc543cc578f10b1d93d62426e211e7a22b827dbd2e4f708  models/qwen3.8-flash-next/scripts/lmcache
@@ -14,5 +14,5 @@ fcefdc86c6d017c4c8bad34f87209a9eb427e03e9f4bc281920e1d828ee31ea4  models/qwen3.8
 bd3173da2afa03fcbdd417d5d5d215156b373a39084428ea82883b28db568dba  models/qwen3.8-flash-next/tests/test_mtp_snapshot_retention.py
 f84370ab9d98ffe5f4a646acdb5f70e54e3008556b76aef0186af0946c9899f5  models/qwen3.8-flash-next/tests/test_multiturn_cache.mjs
 5a2a2008d003e824f5d816a484c749d6e0a6bc1e15c37bd5d821e264a3a677ce  models/qwen3.8-flash-next/tests/test_qsa_logits_workspace.py
-10c719c02eb8f7203b45bc6ea7a76e0b0eaf5de4e365d9fd296e66c19089205b  models/qwen3.8-flash-next/tests/test_qsa_mtp_block_alignment.py
+fc0ee112766a260e8b19392acd41980104df17a55c6e0d3cf330e2abdcfaa748  models/qwen3.8-flash-next/tests/test_qsa_mtp_block_alignment.py
 1a2b1eabce0782d73f735e37d6e9e6217899c3e96f010c52d806d8c78c178479  models/qwen3.8-flash-next/tests/test_qwen_mtp_group_annotation.py
