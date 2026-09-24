@@ -32,21 +32,22 @@ scheduler = types.SimpleNamespace(
     mamba_partial_cache_hit=True,
     use_v2_model_runner=True,
     scheduler_config=types.SimpleNamespace(async_scheduling=True),
-    num_spec_tokens=3,
 )
 cases = 0
-for start in range(128, 224):
-    for count in range(1, 5):
-        request = types.SimpleNamespace(
-            num_computed_tokens=start,
-            num_prompt_tokens=100,
-            num_tokens=start + 1,
-            num_in_flight_tokens=0,
-        )
-        assert split(scheduler, request, count) == count
-        request.num_in_flight_tokens = 4
-        assert split(scheduler, request, count) == (
-            0 if start % 128 <= scheduler.num_spec_tokens else count
-        )
-        cases += 2
+for depth in (1, 3, 5, 6):
+    scheduler.num_spec_tokens = depth
+    for start in range(128, 224):
+        for count in range(1, depth + 2):
+            request = types.SimpleNamespace(
+                num_computed_tokens=start,
+                num_prompt_tokens=100,
+                num_tokens=start + 1,
+                num_in_flight_tokens=0,
+            )
+            assert split(scheduler, request, count) == count
+            request.num_in_flight_tokens = depth + 1
+            assert split(scheduler, request, count) == (
+                0 if start % 128 <= depth else count
+            )
+            cases += 2
 print(f"PP2_DECODE_CHECKPOINT_SCHEDULER cases={cases} PASS")

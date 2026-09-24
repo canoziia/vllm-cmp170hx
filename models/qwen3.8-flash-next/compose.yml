@@ -87,7 +87,7 @@ services:
       - --max-num-batched-tokens=4096
       - --kv-cache-memory=17179869184
       - --kv-cache-dtype=bfloat16
-      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":${QWEN_MTP_TOKENS:-3}}'
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - '--hf-overrides={"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
       - --disable-custom-all-reduce
