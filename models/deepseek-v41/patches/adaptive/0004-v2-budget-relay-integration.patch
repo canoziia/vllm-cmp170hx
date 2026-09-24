@@ -1,0 +1,314 @@
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -628,8 +628,9 @@
+         # The speculator clears the flag at load time when the checkpoint has
+         # no confidence head, so it holds the effective value.
+         self.adaptive_verification = maybe_create_adaptive_verification_manager(
+-            enable_adaptive_verification=getattr(
+-                self.speculator, "enable_adaptive_verification", False
++            enable_adaptive_verification=(
++                bool(self.speculative_config and self.speculative_config.enable_adaptive_verification)
++                if self.use_pp else getattr(self.speculator, "enable_adaptive_verification", False)
+             ),
+             attn_groups=self.attn_groups,
+             attn_cg_support=attn_cg_support,
+@@ -642,6 +643,14 @@
+             additional_attn_cg_support=additional_attn_cg_support,
+         )
+ 
++        if self.use_pp and self.adaptive_verification is not None:
++            if self.speculative_config.method != "dspark" or self.parallel_config.tensor_parallel_size != 1:
++                raise NotImplementedError("Adaptive PP integration currently requires DSpark/TP1")
++            if self.is_last_pp_rank and not getattr(self.speculator, "enable_adaptive_verification", False):
++                raise ValueError("Adaptive PP requires a checkpoint confidence head")
++            assert self.pp_handler is not None
++            self.pp_handler.relay_draft_confidences = True
++
+         self.block_tables = BlockTables(
+             block_sizes=block_sizes,
+             max_num_reqs=self.max_num_reqs,
+@@ -812,6 +821,12 @@
+ 
+         # Non-last PP ranks don't produce output for sampling.
+         if not self.is_last_pp_rank:
++            if self.use_pp and self.adaptive_verification is not None:
++                # Record local target cost with zero drafter work; only used
++                # inside the existing startup timing collector.
++                self.step_timing.forward_end()
++                self.step_timing.drafter_start()
++                self.step_timing.drafter_end()
+             return None, None
+ 
+         assert self.execute_model_state is not None
+@@ -1001,6 +1016,30 @@
+                                 self.cudagraph_manager.captured_token_counts()
+                             ):
+                                 self._dummy_run(**batch)
++                        if self.use_pp:
++                            # Startup-only CPU collective: all ranks profile the
++                            # same shapes, then price a low-concurrency pipeline
++                            # cycle as sum of target stages + last-stage draft.
++                            # Online concurrency/communication cost calibration
++                            # is a separate performance validation gate.
++                            rank_timings = [None] * self.parallel_config.pipeline_parallel_size
++                            torch.distributed.all_gather_object(
++                                rank_timings, timings, group=get_pp_group().cpu_group
++                            )
++                            from vllm.v1.worker.gpu.async_utils import StepTimingSample
++                            combined = []
++                            for samples in zip(*rank_timings, strict=True):
++                                first = samples[0]
++                                if any((s.num_reqs, s.num_target_tokens, s.full_cudagraph) !=
++                                       (first.num_reqs, first.num_target_tokens, first.full_cudagraph)
++                                       for s in samples):
++                                    raise RuntimeError("PP profiling shape disagreement")
++                                combined.append(StepTimingSample(
++                                    sum(s.forward_ms for s in samples),
++                                    samples[-1].drafter_ms, first.num_target_tokens,
++                                    first.num_reqs, first.full_cudagraph,
++                                ))
++                            timings = combined
+                         self.adaptive_verification.set_initial_cost_curves(timings)
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+@@ -1063,7 +1102,12 @@
+         # the prior step in which they were scheduled (pp_size steps ago).
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs(
+-                self.req_states.draft_tokens
++                self.req_states.draft_tokens,
++                confidence_consumer=(
++                    self.adaptive_verification.record_confidence_rows
++                    if self.is_first_pp_rank and self.adaptive_verification is not None
++                    else None
++                ),
+             )
+             if outputs is not None:
+                 self.postprocess_sampled(**outputs)
+@@ -1163,7 +1207,8 @@
+             )
+ 
+     def gather_batch_req_state(
+-        self, scheduler_output: SchedulerOutput, dummy_run: bool
++        self, scheduler_output: SchedulerOutput, dummy_run: bool,
++        authoritative_budget: int | None = None,
+     ) -> tuple["BatchReqState | None", int | None]:
+         """Gather CPU request state for the scheduled batch, in batch order.
+         Returns (batch_state, uniform_decode_token_count)
+@@ -1198,7 +1243,8 @@
+ 
+         if self.adaptive_verification is not None and draft_tokens:
+             num_toks = self.adaptive_verification.get_num_tokens(
+-                num_tokens_per_req, draft_tokens
++                num_tokens_per_req, draft_tokens,
++                authoritative_budget=authoritative_budget,
+             )
+ 
+         batch_state = BatchReqState(
+@@ -1220,6 +1266,7 @@
+         scheduler_output: SchedulerOutput,
+         batch_req_state: "BatchReqState",
+         batch_desc: BatchExecutionDescriptor,
++        authoritative_capacities: torch.Tensor | None = None,
+     ) -> InputBatch:
+         num_tokens = batch_req_state.num_tokens
+         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+@@ -1300,7 +1347,10 @@
+         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+         if adaptive_verification is not None:
+             cu_num_logits, query_start_loc, total_num_draft_tokens = (
+-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
++                adaptive_verification.reallocate_drafts(
++                    req_ids, idx_mapping,
++                    authoritative_capacities=authoritative_capacities,
++                )
+             )
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+         if draft_tokens:
+@@ -1573,6 +1623,8 @@
+         is_profile: bool = False,
+         context_len: int = 0,
+         valid_dummy_state_slots: bool = False,
++        pp_verification_budget: int | None = None,
++        pp_verification_lengths: torch.Tensor | None = None,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
+             # Update the request states.
+@@ -1593,9 +1645,23 @@
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
++        needs_pp_budget = (
++            self.use_pp and self.adaptive_verification is not None
++            and not dummy_run and bool(scheduler_output.scheduled_spec_decode_tokens)
++        )
++        if needs_pp_budget and not self.is_first_pp_rank and pp_verification_budget is None:
++            raise RuntimeError("Missing authoritative PP verification budget")
++        if not needs_pp_budget and (pp_verification_budget is not None or pp_verification_lengths is not None):
++            raise RuntimeError("Unexpected PP verification payload")
+         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+-            scheduler_output, dummy_run
++            scheduler_output, dummy_run, pp_verification_budget
+         )
++        if needs_pp_budget:
++            pp_verification_budget = self.adaptive_verification.batch_draft_budget
++            scheduled_drafts = sum(map(len, scheduler_output.scheduled_spec_decode_tokens.values()))
++            partial = pp_verification_budget not in (0, scheduled_drafts)
++            if not self.is_first_pp_rank and partial != (pp_verification_lengths is not None):
++                raise RuntimeError("PP verification lengths/schema mismatch")
+         if batch_req_state is not None:
+             num_toks = batch_req_state.num_tokens
+             if self.pcp_manager is not None:
+@@ -1648,7 +1714,8 @@
+                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
+             assert batch_req_state is not None
+             input_batch = self.prepare_inputs(
+-                scheduler_output, batch_req_state, batch_desc
++                scheduler_output, batch_req_state, batch_desc,
++                authoritative_capacities=pp_verification_lengths,
+             )
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
+             # Mamba "align" pre-copy: migrate recurrent state across block
+@@ -1924,9 +1991,17 @@
+             # Non-last PP rank: return IntermediateTensors for sending.
+             assert output_intermediate_tensors is not None
+             assert self.pp_handler is not None
+-            return self.pp_handler.relay_aux_hidden_states(
++            output = self.pp_handler.relay_aux_hidden_states(
+                 model_inputs["intermediate_tensors"], output_intermediate_tensors
+             )
++            if needs_pp_budget:
++                output.tensors["__verification_budget"] = pp_verification_budget
++                lengths = self.adaptive_verification.partial_capacities(
++                    input_batch.num_reqs, scheduled_drafts, pp_verification_budget
++                )
++                if lengths is not None:
++                    output.tensors["__verification_lengths"] = lengths
++            return output
+         return None
+ 
+     @torch.inference_mode()
+@@ -2077,7 +2152,7 @@
+                     mm_inputs=mm_inputs,
+                 )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+-            if self.adaptive_verification is not None:
++            if self.adaptive_verification is not None and not self.use_pp:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+                 )
+@@ -2091,7 +2166,9 @@
+             )
+             if self.pp_handler is not None:
+                 self.pp_handler.broadcast_drafts(
+-                    self.req_states.draft_tokens, input_batch
++                    self.req_states.draft_tokens, input_batch,
++                    self.speculator.draft_token_confidence_probs[:input_batch.num_reqs]
++                    if self.adaptive_verification is not None else None,
+                 )
+ 
+         # Post-step KV connector related operations.
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1206,6 +1206,7 @@
+             self._pp_send_work = []
+ 
+         intermediate_tensors = None
++        verification_kwargs = {}
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         all_gather_tensors = {}
+@@ -1249,6 +1250,23 @@
+                 )
+             )
+             assert tensor_dict is not None
++            budget = tensor_dict.pop("__verification_budget", None)
++            lengths = tensor_dict.pop("__verification_lengths", None)
++            if budget is not None or lengths is not None:
++                if (not self.use_v2_model_runner
++                        or self.model_runner.adaptive_verification is None
++                        or type(budget) is not int):
++                    raise RuntimeError("Unexpected PP adaptive metadata")
++                # Budget is available in the existing object metadata. Only
++                # partial allocation has a GPU payload. Establish CUDA stream
++                # ordering before installing it; never read its values on CPU.
++                if lengths is not None:
++                    for handle in comm_handles:
++                        handle.wait()
++                verification_kwargs = dict(
++                    pp_verification_budget=budget,
++                    pp_verification_lengths=lengths,
++                )
+             intermediate_tensors = AsyncIntermediateTensors(
+                 tensor_dict,
+                 comm_handles=comm_handles,
+@@ -1257,7 +1275,7 @@
+ 
+         with self.annotate_profile(scheduler_output):
+             output = self.model_runner.execute_model(
+-                scheduler_output, intermediate_tensors
++                scheduler_output, intermediate_tensors, **verification_kwargs
+             )
+             if (
+                 self.use_v2_model_runner
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -237,6 +237,22 @@
+             # three [num_reqs, shard_width] round trips collapsed into one
+             # pass over markov_w2. Writes draft_tokens directly.
+             self._fused_markov.sample(num_reqs, base_logits, prev, self.draft_tokens)
++            if self.enable_adaptive_verification:
++                # The fused chain writes target-vocabulary IDs but does not
++                # expose the preceding-token embeddings needed by the head.
++                # Reconstruct them in request-major order without rerunning
++                # either the draft backbone or the vocabulary projection.
++                previous_ids = torch.cat(
++                    (prev[:, None], self.draft_tokens[:num_reqs, : n_spec - 1]),
++                    dim=1,
++                )
++                markov_embeds = self.model.markov_embed(previous_ids.flatten())
++                confidence = self.model.compute_confidence(
++                    sample_hidden, markov_embeds
++                )
++                self.draft_token_confidence_probs[:num_reqs] = confidence.view(
++                    num_reqs, n_spec
++                )
+             return
+ 
+         for i in range(n_spec):
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2739,14 +2739,26 @@
+             )
+ 
+         if self.parallel_config.pipeline_parallel_size > 1:
+-            # Cost curves and confidences currently only exist on the last PP rank;
+-            # earlier ranks would diverge on the trimmed batch shape.
+-            # TODO: we should be able to support adaptive verification with PP by
+-            # broadcasting the cost curves and confidences to all ranks.
+-            raise ValueError(
+-                "Adaptive verification is not currently compatible "
+-                "with pipeline parallelism"
++            from vllm.platforms import current_platform
++
++            parallel = self.parallel_config
++            supported = (
++                spec_config.method == "dspark"
++                and spec_config.draft_sample_method == "greedy"
++                and current_platform.is_device_capability_family(80)
++                and self.model_config is not None
++                and "DeepseekV41ForCausalLM" in self.model_config.architectures
++                and parallel.tensor_parallel_size == 1
++                and parallel.data_parallel_size == 1
++                and parallel.prefill_context_parallel_size == 1
++                and parallel.decode_context_parallel_size == 1
++                and not parallel.use_ubatching
+             )
++            if not supported:
++                raise ValueError(
++                    "Adaptive PP currently requires SM80 DeepSeek V4.1 DSpark "
++                    "greedy drafting, TP1/DP1/PCP1/DCP1 and no DBO"
++                )
+ 
+     def _validate_batch_sharded_sampling(self) -> None:
+         """Validate `enable_batch_sharded_sampling` against the rest of the config."""

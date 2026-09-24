@@ -1,0 +1,127 @@
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -57,7 +57,9 @@
+     out_of_range = steps[None, :] >= capacities[:, None]
+     survival = survival.masked_fill(out_of_range, -float("inf"))
+     flat = survival.flatten()
+-    winners = flat.topk(draft_budget).indices
++    # Equal survival values must admit earlier positions first (including
++    # zero-probability tails); otherwise counted slots need not form prefixes.
++    winners = torch.argsort(flat, descending=True, stable=True)[:draft_budget]
+     admitted = torch.zeros_like(flat, dtype=torch.bool).index_fill_(0, winners, True)
+     torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
+ 
+@@ -245,7 +247,14 @@
+     ) -> None:
+         """Publish this step's raw confidences for the ranking kernel and start
+         copying them to the CPU, where a later step's budget reads them."""
+-        num_reqs = input_batch.num_reqs
++        self.record_confidence_rows(
++            confidence_probs[:input_batch.num_reqs], input_batch.idx_mapping
++        )
++
++    def record_confidence_rows(
++        self, confidence_probs: torch.Tensor, idx_mapping: torch.Tensor
++    ) -> None:
++        """Publish live rows, also usable after PP FIFO liveness filtering."""
+         ready_idx = self._stale_idx ^ 1
+         with gpu_sync_allowed():
+             self._copy_events[ready_idx].synchronize()
+@@ -256,7 +265,7 @@
+         # slot they were reading before.
+         self._stale_idx, write_idx = ready_idx, self._stale_idx
+ 
+-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
++        self._confidence_probs[idx_mapping] = confidence_probs
+         write_slot = self._stale_confidences[write_idx]
+         write_slot.gpu.copy_(self._confidence_probs)
+ 
+@@ -270,13 +279,14 @@
+         self,
+         num_tokens_per_req: dict[str, int],
+         draft_tokens: dict[str, list[int]],
++        *,
++        authoritative_budget: int | None = None,
+     ) -> int:
+         """Token count once the draft budget is trimmed to fit.
+ 
+         Stashes the chosen budget in ``_batch_budget`` for the compaction and
+         reallocation that follow in the same step.
+         """
+-        assert self.cost_tables is not None
+         req_ids = list(num_tokens_per_req)
+         num_reqs = len(req_ids)
+         scheduled_tokens = np.fromiter(
+@@ -293,6 +303,21 @@
+             dtype=np.int32,
+             count=len(req_ids),
+         )
++        if authoritative_budget is not None:
++            limit = min(
++                int(scheduled_drafts.sum()),
++                max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
++            )
++            if type(authoritative_budget) is not int or not 0 <= authoritative_budget <= limit:
++                raise ValueError("Authoritative draft budget exceeds batch/logits capacity")
++            self._batch_budget = (
++                dict(zip(req_ids, map(int, scheduled_drafts), strict=True)),
++                dict(zip(req_ids, map(int, num_non_draft_tokens), strict=True)),
++                authoritative_budget,
++            )
++            return int(num_non_draft_tokens.sum()) + authoritative_budget
++
++        assert self.cost_tables is not None
+         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(self.num_speculative_steps)
+@@ -336,6 +361,22 @@
+         )
+         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+ 
++    @property
++    def batch_draft_budget(self) -> int:
++        if self._batch_budget is None:
++            raise RuntimeError("No adaptive verification batch is prepared")
++        return self._batch_budget[2]
++
++    def partial_capacities(self, num_reqs: int, scheduled_drafts: int, budget: int):
++        """Only partial budgets need an authority vector on the PP wire.
++
++        Zero/full budgets are determined entirely by CPU scheduler metadata.
++        The snapshot survives subsequent use of the persistent allocator buffer.
++        """
++        if budget in (0, scheduled_drafts):
++            return None
++        return self._batch_draft_capacity[:num_reqs].clone()
++
+     def compact_batch(
+         self,
+         num_draft_tokens_per_req: np.ndarray,
+@@ -377,7 +418,8 @@
+         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
+ 
+     def reallocate_drafts(
+-        self, req_ids: list[str], idx_mapping: torch.Tensor
++        self, req_ids: list[str], idx_mapping: torch.Tensor,
++        *, authoritative_capacities: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, int]:
+         batch_budget, self._batch_budget = self._batch_budget, None
+         assert batch_budget is not None
+@@ -399,7 +441,16 @@
+         # capacities enters holding each request's valid draft count (the kernel
+         # uses it to bound eligible slots) and leaves holding the admitted count.
+         capacities = self._batch_draft_capacity[:num_reqs]
+-        if draft_budget == 0:
++        if authoritative_capacities is not None:
++            # Internal PP payload from the authority's allocator, not a public
++            # untrusted API. CPU schema checks do not read device values or
++            # synchronize the stream; the transport orders the copy below.
++            if (authoritative_capacities.shape != capacities.shape
++                    or authoritative_capacities.dtype != capacities.dtype
++                    or authoritative_capacities.device != capacities.device):
++                raise ValueError("Invalid authoritative draft-capacity tensor")
++            capacities.copy_(authoritative_capacities)
++        elif draft_budget == 0:
+             capacities.zero_()
+         else:
+             async_copy_to_gpu(scheduled_drafts, out=capacities)

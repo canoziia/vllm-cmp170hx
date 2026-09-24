@@ -1,0 +1,151 @@
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -3,6 +3,7 @@
+ """Pipeline Parallelism utils for V2 Model Runner."""
+ 
+ from collections import deque
++from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+ import numpy as np
+@@ -32,6 +33,7 @@
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
+     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
++    draft_confidences: torch.Tensor | None = None  # same rows/generation as drafts
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -58,13 +60,15 @@
+     """
+ 
+     def __init__(
+-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
++        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device,
++        *, relay_draft_confidences: bool = False,
+     ):
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+         self.max_sample_len = num_speculative_steps + 1
+         self.num_speculative_steps = num_speculative_steps
+         self.device = device
++        self.relay_draft_confidences = relay_draft_confidences
+         self.main_stream = torch.cuda.current_stream(device)
+         self.broadcast_stream = torch.cuda.Stream(device)
+ 
+@@ -114,7 +118,8 @@
+         )
+ 
+     def get_prev_sampled_outputs(
+-        self, draft_tokens_to_update: torch.Tensor | None = None
++        self, draft_tokens_to_update: torch.Tensor | None = None,
++        confidence_consumer: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+     ) -> dict[str, torch.Tensor] | None:
+         """Consume the entry from pp_size steps ago and wait for its recv event,
+         then filter out entries whose request was freed since `receive`.
+@@ -144,14 +149,21 @@
+         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+             draft_tokens = slot.draft_tokens
+             draft_idx_mapping = slot.idx_mapping
++            confidence = slot.draft_confidences
+             if exclude_mask.any():
+                 keep = ~exclude_mask
+-                keep_t = torch.as_tensor(keep, device=self.device)
+-                draft_tokens = draft_tokens[keep_t]
++                keep_indices = async_copy_to_gpu(np.flatnonzero(keep), device=self.device)
++                draft_tokens = draft_tokens[keep_indices]
++                if confidence is not None:
++                    confidence = confidence[keep_indices]
+                 draft_idx_mapping = async_copy_to_gpu(
+                     slot.idx_mapping_np[keep], device=self.device
+                 )
+             draft_tokens_to_update[draft_idx_mapping] = draft_tokens
++            if confidence is not None and confidence_consumer is not None:
++                # Reuse the adaptive manager's GPU state and stale CPU copy;
++                # no parallel confidence table or request-generation owner.
++                confidence_consumer(confidence, draft_idx_mapping)
+ 
+         return dict(
+             sampled_tokens=slot.sampled_tokens,
+@@ -161,21 +173,34 @@
+         )
+ 
+     def broadcast_drafts(
+-        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch,
++        draft_confidences: torch.Tensor | None = None,
+     ) -> None:
+         """Broadcast draft proposals so non-last ranks can embed real token ids."""
+         assert self.is_last_rank
+         if compute_need_sampled_mask(input_batch) is None:
+             return
++        if self.relay_draft_confidences:
++            if (draft_confidences is None or draft_confidences.dtype != torch.float32
++                    or draft_confidences.shape != (input_batch.num_reqs, self.num_speculative_steps)
++                    or draft_confidences.device != draft_tokens.device):
++                raise ValueError("Invalid PP draft confidence payload")
++            # FP32 bits carried in spare int64 columns, not a lossy float-to-ID
++            # conversion. Pack on producer stream before a graph can overwrite
++            # scores; one existing draft collective, no new communicator/call.
++            send = torch.cat((draft_tokens[input_batch.idx_mapping],
++                draft_confidences.contiguous().view(torch.int32).to(torch.int64)), dim=1)
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+-            send = draft_tokens[input_batch.idx_mapping].contiguous()
++            if not self.relay_draft_confidences:
++                send = draft_tokens[input_batch.idx_mapping].contiguous()
+             # Must record the idx_mapping tensor since it was allocated
+             # on the main stream.
+             input_batch.idx_mapping.record_stream(self.broadcast_stream)
+             torch.distributed.broadcast(
+                 send, src=self.last_rank, group=self.broadcast_group
+             )
++            send.record_stream(self.broadcast_stream)
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+@@ -204,24 +229,31 @@
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
+             draft_tokens = None
++            draft_confidences = None
++            draft_payload = None
+             if self.num_speculative_steps > 0:
+-                draft_tokens = torch.empty(
++                draft_payload = torch.empty(
+                     num_reqs,
+-                    self.num_speculative_steps,
++                    self.num_speculative_steps * (2 if self.relay_draft_confidences else 1),
+                     dtype=torch.int64,
+                     device=self.device,
+                 )
+                 torch.distributed.broadcast(
+-                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                    draft_payload, src=self.last_rank, group=self.broadcast_group
+                 )
++                draft_tokens = draft_payload[:, :self.num_speculative_steps]
++                if self.relay_draft_confidences:
++                    draft_confidences = draft_payload[:, self.num_speculative_steps:].to(torch.int32).view(torch.float32)
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
+-            if draft_tokens is not None:
+-                draft_tokens.record_stream(self.main_stream)
++            if draft_payload is not None:
++                draft_payload.record_stream(self.main_stream)
++            if draft_confidences is not None:
++                draft_confidences.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -232,6 +264,7 @@
+             need_sampled_mask,
+             gen_at_receive_np,
+             draft_tokens,
++            draft_confidences,
+         )
+         return bool(need_sampled_mask.all())
+ 
