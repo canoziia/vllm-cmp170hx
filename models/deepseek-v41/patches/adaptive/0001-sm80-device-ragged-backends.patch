@@ -1,0 +1,105 @@
+--- a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+@@ -14,12 +14,48 @@
+ 
+ from vllm.models.deepseek_v4_1.amd.rocm import (
+     DeepseekV4ROCMAiterMLASparseBackend,
++    DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
++    DeepseekV41ROCMAiterSparseSWABackend,
+     DeepseekV41ROCMAiterMLAAttention,
+ )
+ from vllm.models.deepseek_v4_1.ampere.prefill_metadata import (
+     combine_topk_swa_indices,
+ )
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4SparseMLAMetadataBuilder
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backend import AttentionCGSupport
++
++
++class _AmpereAdaptiveMetadata:
++    @classmethod
++    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
++        spec = vllm_config.speculative_config
++        if (current_platform.is_device_capability_family(80)
++                and spec is not None and spec.enable_adaptive_verification):
++            # Existing builders stage device-driven request owners, compressed
++            # slots and ragged SWA indices into persistent buffers. Restrict
++            # this opt-in to the physical SM80 path covered by replay tests.
++            return AttentionCGSupport.ALWAYS
++        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
++
++
++class DeepseekV41AmpereMLAMetadataBuilder(
++    _AmpereAdaptiveMetadata, DeepseekV4SparseMLAMetadataBuilder
++):
++    pass
++
++
++class DeepseekV41AmpereSWAMetadataBuilder(
++    _AmpereAdaptiveMetadata, DeepseekV4ROCMAiterSparseSWAMetadataBuilder
++):
++    pass
++
++
++class DeepseekV41AmpereSWABackend(DeepseekV41ROCMAiterSparseSWABackend):
++    @staticmethod
++    def get_builder_cls():
++        return DeepseekV41AmpereSWAMetadataBuilder
+ 
+ 
+ class DeepseekV41AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
+@@ -27,6 +63,10 @@
+     def get_name() -> str:
+         return "TRITON_MLA_SPARSE_DSV41"
+ 
++    @staticmethod
++    def get_builder_cls():
++        return DeepseekV41AmpereMLAMetadataBuilder
++
+     @classmethod
+     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+         return capability.major == 8
+@@ -36,6 +76,7 @@
+     """SM8x DeepSeek V4.1 attention: ROCm Triton path on CUDA Ampere."""
+ 
+     backend_cls = DeepseekV41AmpereMLASparseBackend
++    swa_backend_cls = DeepseekV41AmpereSWABackend
+ 
+     @staticmethod
+     def _combine_prefill_indices(*args, **kwargs):
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -437,6 +437,11 @@
+ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+     """DeepSeek-V4.1 indexer pages: 64 tokens on SM90 (FlashMLA), else 128."""
+ 
++    @classmethod
++    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
++        return (current_platform.is_device_capability_family(80)
++                or super().supports_device_cpu_query_lens_mismatch())
++
+     @staticmethod
+     def get_name() -> str:
+         return "DEEPSEEK_V41_INDEXER"
+@@ -870,10 +875,19 @@
+     return next_n in (1, 2)
+ 
+ 
++def _sm80_v41_adaptive(vllm_config: VllmConfig) -> bool:
++    spec = vllm_config.speculative_config
++    return (
++        current_platform.is_device_capability_family(80)
++        and spec is not None and spec.enable_adaptive_verification
++        and "DeepseekV41ForCausalLM" in vllm_config.model_config.architectures
++    )
++
++
+ def _use_flattening(vllm_config: VllmConfig) -> bool:
+     speculative_config = vllm_config.speculative_config
+     next_n = 1 + vllm_config.num_speculative_tokens
+-    return not _supports_native_decode(next_n) or (
++    return _sm80_v41_adaptive(vllm_config) or not _supports_native_decode(next_n) or (
+         speculative_config is not None
+         and speculative_config.enable_adaptive_verification
+         and _supports_flattened_device_query_lens()
