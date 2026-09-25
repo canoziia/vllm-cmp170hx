@@ -4,6 +4,8 @@
 Uses real official native FS extensions and a temporary directory. This is not
 an end-to-end DeepSeek GPU/L1/L2 acceptance test.
 """
+import inspect
+import sys
 import tempfile
 import time
 import unittest
@@ -43,6 +45,30 @@ def wait_for(fn):
 
 
 class RegressionTests(unittest.TestCase):
+    def test_patch_series_landed_in_the_connector(self):
+        """Guard against `patch --forward` silently skipping a whole file.
+
+        apply-lmcache-patches.sh uses `patch --batch --forward`, which reports
+        success even when it decides a file's patch is "previously applied" and
+        skips every hunk in it. The MTP/Mamba relocation patch is order
+        dependent, so a skipped connector file would ship a tracker that takes
+        a relocation window while the connector never passes one. Assert the
+        connector side of that patch directly from the shipped source.
+        """
+        connector = sys.modules[LMCacheMPConnector.__module__]
+        src = inspect.getsource(connector)
+        self.assertGreaterEqual(
+            src.count("_mamba_relocation_window"),
+            4,
+            "expected the relocation window field, its assignment and two "
+            "append_block_ids call sites in the shipped connector",
+        )
+        self.assertNotIn(
+            "require max_num_batched_tokens == block_size",
+            src,
+            "the superseded fail-closed guard is back in the shipped connector",
+        )
+
     def test_mtp_mamba_relocation(self):
         tracker = object.__new__(LMCacheMPRequestTracker)
         tracker.allocated_block_ids = {}
