@@ -49,13 +49,17 @@ Default builds include no performance-debug runtime code.
      CMP 170HX does not expose CUPTI CUDA kernel activities.
    - Runtime sampling stays on the production Graph dispatch/padding path.
 
-The legacy debug image `73d0be8-debug-eventfix` used the **image-layer-only**
-`models/deepseek-v41/patches/optional/0003-lmcache-event-capability-cache.patch` against the third-party
-base image's bundled LMCache. Keep it only to reproduce that historical
-DeepSeek base. New LMCache deployments use the digest-pinned official package
-and the auditable common series under `patches/lmcache/`; its canonical equivalent is
-`patches/lmcache/0003-event-capability-cache.patch`. Do not apply both to the
-same package.
+LMCache is **never patched at stage 1**. The layer-only patch that used to do this
+(`optional/0003-lmcache-event-capability-cache.patch`, applied only under
+`ENABLE_PERF_DEBUG=1` and SHA-256-pinned to the third-party base image's
+`event_ipc.py`) has been removed: stage 1 is an intermediate image, not a
+deployable artifact, so patching its bundled LMCache matched no configuration we
+run, while the SHA pin made every debug build abort whenever the base image
+moved. The single source of truth for that fix is
+`patches/lmcache/0003-event-capability-cache.patch`, applied to the digest-pinned
+official payload and exported to both client and server images through
+`PYTHONPATH=/opt/lmcache-patched`. To reproduce the historical
+`73d0be8-debug-eventfix` image, check out the commit that built it.
 
 The pinned author revision already contains native PP6+DSpark support, including
 auxiliary hidden-state relay capability and last-rank target-embedding sharing.

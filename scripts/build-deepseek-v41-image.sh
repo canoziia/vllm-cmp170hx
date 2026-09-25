@@ -43,25 +43,13 @@ ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG \
   "$REPO_ROOT/scripts/apply-deepseek-v41-patches.sh" "$WORKDIR/source"
 
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
-if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  mkdir -p "$WORKDIR/context/lmcache/v1/platform/base"
-  "$ENGINE" run --rm --entrypoint cat "$BASE_IMAGE" \
-    /usr/local/lib/python3.12/dist-packages/lmcache/v1/platform/base/event_ipc.py \
-    > "$WORKDIR/context/lmcache/v1/platform/base/event_ipc.py"
-  expected_lmcache_sha=7635c30a5be4534bc592554514787906b0d819ee3112458e3dd1ce1ed6e0c0a0
-  actual_lmcache_sha=$(sha256sum "$WORKDIR/context/lmcache/v1/platform/base/event_ipc.py" | cut -d' ' -f1)
-  [[ $actual_lmcache_sha == "$expected_lmcache_sha" ]] || {
-    echo "Base LMCache event_ipc.py hash mismatch: $actual_lmcache_sha" >&2
-    exit 7
-  }
-  (cd "$WORKDIR/context" && patch -p1 < "$MODEL_DIR/patches/optional/0003-lmcache-event-capability-cache.patch")
-  python3 -m py_compile "$WORKDIR/context/lmcache/v1/platform/base/event_ipc.py"
-fi
+# Stage 1 never patches LMCache: it is an intermediate image, and the
+# deployable client gets the patched payload in stage 2
+# (patches/lmcache/series, exported through PYTHONPATH).
 cat >"$WORKDIR/context/Containerfile" <<CONTAINERFILE
 FROM $BASE_IMAGE
 USER root
 COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
-$(if [[ $ENABLE_PERF_DEBUG == 1 ]]; then echo 'COPY lmcache/ /usr/local/lib/python3.12/dist-packages/lmcache/'; fi)
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \\
       org.opencontainers.image.revision="$SOURCE_COMMIT" \\
       io.canoziia.upstream="$SOURCE_REPO@$SOURCE_COMMIT" \\
