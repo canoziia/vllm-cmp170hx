@@ -2,3 +2,9 @@
 caf7852108c5f58fa988bf9d2cf1354694bf016c902bc3bcc0c1d8e8763e4ee6  models/deepseek-v41/patches/0002-fixed-triton-logits-workspace.patch
 d318e9fdc7d63b321300d32fa6f4ea85fe826054a44143ca424e6d9db15c4011  models/deepseek-v41/patches/optional/0002-hot-perf-debug.patch
 a3557779a6de63368e444a289529d285fe5d3ed687969a05f717d6b1b3526d9d  models/deepseek-v41/tests/test_triton_logits_workspace.py
+d7017f71af237a77e19678b8a49cfe37c6413dbf22d6cff563172fe88514ca4c  models/deepseek-v41/patches/adaptive/0001-sm80-device-ragged-backends.patch
+d4bf27af0f982594c1108ecff09c9ab4916d1a9c25b10b23f672dbcaa019ccd7  models/deepseek-v41/patches/adaptive/0002-authoritative-budget-input.patch
+b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepseek-v41/patches/adaptive/0003-pack-confidence-with-draft-feedback.patch
+0fe44111c6a723311c0597c6514b135c884e5961901aa53a3014dc439e7f99e7  models/deepseek-v41/patches/adaptive/0004-v2-budget-relay-integration.patch
+6e10c44cf3fd73ed5e8951993c281830523351bbab6fa2c7585e1d726872d6e2  models/deepseek-v41/patches/adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
+d446edb6b05ee31f212ff2284cd68c45c752d9173eef8ebb4f2cd9b3baf31ddb  models/deepseek-v41/patches/adaptive/series
