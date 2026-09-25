@@ -4,6 +4,19 @@ This directory is a replacement design, not an extension of the previous
 experimental stack. Current checkpoint includes candidate V2 PP integration, not validated adaptive
 serving or a throughput result. It is not in the default build chain.
 
+Build it explicitly (it is never applied by default):
+
+    ENABLE_ADAPTIVE_VERIFICATION=1 scripts/build-deepseek-v41-image.sh
+
+and enable it at runtime in the engine spec config, e.g.
+`--speculative-config={"method":"dspark","num_speculative_tokens":5,
+"use_local_argmax_reduction":true,"enable_adaptive_verification":true}`.
+
+`ENABLE_ADAPTIVE_VERIFICATION=1` cannot be combined with `ENABLE_PERF_DEBUG=1`:
+the hot DSpark control file rejects adaptive verification in its own guard, so
+that combination is refused before anything is patched. Get the AR reference for
+this branch from a separate no-speculative-config boot instead.
+
 `0001-sm80-device-ragged-backends.patch`:
 - Scoped V4.1 exact-SM80 adaptive metadata builders reuse existing MLA/SWA code.
 - Advertise the tested persistent device-ragged FULL capability only under

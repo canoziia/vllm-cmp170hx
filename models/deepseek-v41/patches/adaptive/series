@@ -1,5 +1,5 @@
-0001-sm80-device-ragged-backends.patch
-0002-authoritative-budget-input.patch
-0003-pack-confidence-with-draft-feedback.patch
-0004-v2-budget-relay-integration.patch
-0005-pair-pp-confidence-relay-with-fixed-warmup.patch
+adaptive/0001-sm80-device-ragged-backends.patch
+adaptive/0002-authoritative-budget-input.patch
+adaptive/0003-pack-confidence-with-draft-feedback.patch
+adaptive/0004-v2-budget-relay-integration.patch
+adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch

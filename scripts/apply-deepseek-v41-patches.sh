@@ -38,6 +38,12 @@ apply_series() {
 
 ENABLE_PERF_DEBUG=${ENABLE_PERF_DEBUG:-0}
 [[ $ENABLE_PERF_DEBUG == 0 || $ENABLE_PERF_DEBUG == 1 ]] || exit 2
+ENABLE_ADAPTIVE_VERIFICATION=${ENABLE_ADAPTIVE_VERIFICATION:-0}
+[[ $ENABLE_ADAPTIVE_VERIFICATION == 0 || $ENABLE_ADAPTIVE_VERIFICATION == 1 ]] || exit 2
+if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 && $ENABLE_PERF_DEBUG == 1 ]]; then
+  echo "ENABLE_ADAPTIVE_VERIFICATION cannot be combined with ENABLE_PERF_DEBUG: the hot DSpark control rejects adaptive verification in its guard, so the debug package would abort startup." >&2
+  exit 2
+fi
 if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} != 0 ]]; then
   echo "Use ENABLE_PERF_DEBUG=1 for the combined debug package" >&2
   exit 2
@@ -46,6 +52,12 @@ apply_series "$MODEL_DIR/patches/series"
 "$REPO_ROOT/scripts/apply-vllm-common-patches.sh" "$SOURCE_TREE"
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
   apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
+fi
+
+# Adaptive verification is a research candidate, never a default: it stays out of
+# the production chain unless it is asked for explicitly.
+if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
+  apply_series "$MODEL_DIR/patches/adaptive/series"
 fi
 
 # The pinned author revision provides native PP6+DSpark; the local patch adds
@@ -67,6 +79,19 @@ compile_files=(
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 )
+if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-0} == 1 ]]; then
+  grep -q 'def record_confidence_rows' \
+    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  grep -q 'enable_adaptive_verification: bool = False' \
+    "$SOURCE_TREE/vllm/config/speculative.py"
+  grep -q 'supports_aux_hidden_states_over_pp' \
+    "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
+  compile_files+=(
+    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+  )
+fi
+
 if [[ ${ENABLE_PERF_DEBUG:-0} == 1 ]]; then
   grep -q 'signal.SIGUSR2' \
     "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
