@@ -59,11 +59,61 @@ Histogram of requests per step:
   source (`d63af5a`) through `apply-vllm-common-patches.sh`. The cost is
   proportional to `pp_size`, so Qwen at PP=2 is expected to be marginal; it has
   not been A/B'd here.
-* Correctness is argued structurally (the cap reuses the existing
-  `continue`-style deferral and mutates nothing but a per-step set). A strict
-  per-request token-ID oracle across the two arms has **not** been run yet: the
-  bench harness only records token counts, so it needs a dedicated probe.
-* Upstream: the gap is listed in vllm#50853; vllm#50410 caps *all* scheduled
-  requests, which its own thread measured as −8.21% throughput and +11.31% mean
-  TTFT versus doing nothing. This patch implements the decode-only form
-  (+22.95% in that thread's measurement, on a different model/topology).
+## Correctness
+
+Structurally the cap only defers: it is the same `continue` the existing cadence
+gate already uses, it mutates nothing but a per-step set of request ids, the
+count is returned when a selected request is preempted, and prefill/admission
+paths are untouched. Cadence, ring and collective order are unchanged.
+
+An exact per-request token-ID oracle turned out to be **undecidable on this
+deployment**, and that is worth recording on its own. `tests/token-id-probe.mjs`
+captures full streamed `token_ids` (`temperature=0`, `top_p=1`, `ignore_eos`,
+random `cache_salt`) and repeats runs:
+
+| Comparison | identical outputs |
+|---|---|
+| c1 run vs c1 run (batch shape fixed) | **4/4 byte-identical** |
+| c4 run vs c4 run (same arm, same concurrency) | 1/4 |
+| c32 run vs c32 run (same arm, same concurrency) | **3/32**, divergence from token ~27 |
+| c1 vs c4 (different batch shape) | 3/4, 1/4 |
+
+So greedy output here is already non-reproducible between two runs of the *same*
+configuration once more than one request is in flight; batch shape changes
+logistics enough to flip argmax early in the sequence. Any OFF/ON token-equality
+test would be dominated by that noise and could neither clear nor condemn the
+patch. (This also means the "token IDs diverged" observations from the earlier
+adaptive-verification work were not by themselves evidence about trimming.)
+
+What is decidable is content correctness under a binding cap.
+`tests/semantic-check.mjs` runs six prompts with objectively checkable answers
+(count to 60, 17x23, alphabet backwards, planet order, 2048 B to KiB, geometric
+continuation), 400 tokens each, answered inside the reasoning block:
+
+| Configuration | result |
+|---|---|
+| concurrency 1 (cap provably inert: 1 < target 6) | 12/12 |
+| concurrency 30, **cap binding**, pass 1 | **30/30** |
+| concurrency 30, **cap binding**, pass 2 | **30/30** |
+
+with the composition trace confirming the cap was in force (median requests per
+step exactly `ceil(32/6) = 6`). Accepted tokens per request-step are unchanged
+between arms (2.32 to 2.35), so verification semantics are intact.
+
+Still open: this is a correctness *proxy*, not a proof of equivalence with the
+unpatched scheduler for the same request stream. A strict differential test
+needs a batch-invariant baseline, which this stack does not currently provide.
+
+## Upstream references
+
+* vllm-project/vllm#42187 introduced the `pp_size`-step decode cadence
+  ("Avoid pipeline parallel bubbles").
+* vllm-project/vllm#50853 lists the resulting cohort imbalance as an open gap.
+* vllm-project/vllm#50410 attempts the same rebalancing but caps *all* scheduled
+  requests; per that thread the global cap measured -8.21% throughput and
+  +11.31% mean TTFT versus doing nothing, while the decode-only form used here
+  measured +22.95% on Kimi-K3 + DSpark, TP8xPP4, max_num_seqs=32.
+* vllm-project/vllm#53810 / #53948 are adjacent work on the same broadcast ring
+  (deferring receiver-side NCCL kernels), worth watching when the pin moves.
+* vllm-project/vllm#55145 added `VLLM_XPU_PP_MICROBATCH`, letting XPU set the
+  stagger to 1. There is no CUDA equivalent, which is why this is a local patch.
