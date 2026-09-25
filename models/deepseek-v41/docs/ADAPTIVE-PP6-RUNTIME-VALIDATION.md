@@ -80,6 +80,66 @@ not remove low-concurrency regression and had a large C16 outlier; it is
 excluded from final patch series. Earlier source-line diagnostic probes and
 startup profiling logs are not part of the shipped path.
 
+### Historical same-prompt C1 step decomposition
+
+No new model boot is needed to localize the C1 regression. From three warmed
+repeats of the same `v1` exact prompt and metrics deltas, `request steps =
+drafted/5`, `decode time = total - TTFT`, and `step/s = request steps / decode
+time`. These are **request-step estimates**, not measured GPU engine cycles; C1
+has one request and fixed five-token proposals, so the count is meaningful.
+
+| C1 prompt/arm | Steps | Accepted/step | Step/s (mean) | Decode tok/s (mean) |
+|---|---:|---:|---:|---:|
+| count original | 41 | 4.829 | 24.02 | 139.41 |
+| count adaptive final hot | 41 | 4.829 | 24.18 | 140.36 |
+| code original | 41 | 3.878 | 23.82 | 115.63 |
+| code adaptive final hot | 41 | 3.878 | 23.70 | 115.05 |
+| prose original | 55 | 1.200 | 24.35 | 53.13 |
+| prose adaptive final hot | 59 | 1.051 | 23.53 | 47.85 |
+| prose adaptive forced-full diagnostic | 55 | 1.200 | 24.10 | 52.59 |
+
+Prose's ~9.9% tok/s loss is chiefly an accepted-output-per-step loss:
+59 instead of 55 steps for the same 121 output tokens (~6.8% fewer output
+tokens/step), plus ~3.4% fewer request steps/s. This is direct evidence that
+saving target rows alone did not compensate for shortened speculative chains
+and control/dispatch overhead. The public `draft` counter is proposals, not
+admitted target rows. For concurrent batches `draft/5` counts summed
+request-steps, **not** global engine steps; do not report it as an engine
+step/s without batch-level instrumentation.
+
+### Historical concurrent request-step decomposition
+
+The same v2/v3 eight-category A/B results also contain server draft and
+accepted deltas. The ratios below are **summed request-steps**, not engine
+batch-step/s: `sum(draft)/5 / sum(batch wall seconds)`. Parallel requests
+make request-step/s potentially much larger than a single engine cycle rate.
+`accepted/step` is accepted drafts per request-step; `output/step` includes
+approximately one target bonus token. Output totals/usage can differ slightly
+across arms and prompts near ties. Thus this table isolates the acceptance
+versus throughput trade-off but does not measure actual pipeline step/s.
+
+| Pair/C | Original accepted/step | Adaptive accepted/step | Original request-steps/s | Adaptive request-steps/s | Original tok/s | Adaptive tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| v2/C1 | 2.214 | 2.236 | 21.53 | 20.84 | 69.21 | 67.55 |
+| v2/C2 | 2.218 | 2.118 | 35.00 | 32.37 | 112.63 | 100.97 |
+| v2/C4 | 2.259 | 2.075 | 51.58 | 55.10 | 168.26 | 169.04 |
+| v2/C6 | 2.244 | 2.077 | 68.66 | 70.85 | 222.87 | 218.06 |
+| v2/C16 | 2.245 | 1.968 | 109.66 | 128.09 | 356.26 | 380.09 |
+| v2/C32 | 2.235 | 1.769 | 112.70 | 156.94 | 364.48 | 434.24 |
+| v3/C1 | 2.152 | 2.138 | 21.63 | 20.98 | 68.30 | 65.84 |
+| v3/C2 | 2.223 | 2.150 | 33.49 | 33.42 | 108.04 | 105.18 |
+| v3/C4 | 2.186 | 2.017 | 51.69 | 54.63 | 164.86 | 164.81 |
+| v3/C6 | 2.242 | 1.960 | 70.77 | 72.24 | 229.68 | 213.76 |
+| v3/C16 | 2.228 | 1.959 | 106.81 | 130.30 | 344.69 | 384.69 |
+| v3/C32 | 2.226 | 1.750 | 114.91 | 158.77 | 370.39 | 435.95 |
+
+At C32 the lower acceptance is offset by ~39% more *request-steps per
+second*; at C6 only ~2–3% more request-steps/s cannot offset the reduced
+output/step. This explains why the same implementation helps C32 yet hurts
+C6 without blaming graph dispatch alone. An actual engine batch-step count
+needs batch-level instrumentation; cannot be reconstructed from these
+aggregate Prometheus counters.
+
 A separate diagnosis forced full draft budget for batches with <=4 requests.
 Exact C1 prose recovered from ~47.85 to 52.6 tok/s (original ~53.13),
 and all six deterministic 160-token/stop test outputs matched original.
