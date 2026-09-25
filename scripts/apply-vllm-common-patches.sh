@@ -21,3 +21,6 @@ while IFS= read -r patch_name; do
   git -C "$SOURCE_TREE" apply --check "$patch_file"
   git -C "$SOURCE_TREE" apply "$patch_file"
 done < "$SERIES"
+
+# Verify every shared fix survived, against the now-patched tree.
+python3 "$REPO_ROOT/scripts/test-vllm-common-patches.py" "$SOURCE_TREE"

@@ -1,0 +1,159 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] scheduler: balance established decodes across PP batches
+
+Model Runner V2 + pipeline parallelism + async scheduling lets a decode request
+advance only once every `pp_size` scheduler steps, because the worker-side
+sampled-token broadcast ring consumes a step-T result at T+pp_size (#42187).
+The scheduler has no corresponding fairness term, so one step can take most of
+the established decodes while the other in-flight batches stay short.
+vllm#50853 lists this as an open gap ("a burst can fill the global request
+slots in one batch and leave later PP batches empty").
+
+Measured on our six-GPU SM80 DeepSeek-V4.1-Flash box (PP=6, DSpark K=5,
+max_num_seqs=32) with the worker step tracer at sample_every=1, concurrency 32,
+feature off: 79% of steps carried <=2 requests while 203 steps carried 26
+(median 2, max 26). Requests admitted together lock into one cohort and then
+advance and stall together.
+
+Add an opt-in share limit: a step takes at most
+ceil(max_num_seqs / pp_size) established decode requests, where "established"
+is evaluated before the request is scheduled
+(`num_computed_tokens >= num_prompt_tokens`). Prefill requests, prefill chunks
+and the chunk that completes a prompt are never capped, so the token budget
+stays free to absorb new work. A deferred request simply remains eligible, so
+no state changes and no starvation is introduced; the count is restored if a
+selected request is preempted later in the same step. The cadence, the ring and
+the collective order are untouched.
+
+Off by default; set VLLM_PP_DECODE_COHORT_BALANCE=1 to enable. One image
+therefore serves both sides of an A/B.
+
+A/B on that box, same image, only the env var differing, 3 runs each, tracer
+off, same prompts and output budget:
+
+  conc  tokens/s off   tokens/s on    delta
+  16         356          347        -2.3%  (spread 270-361 -> 340-351)
+  32         255          614      +141.1%  (spread 254-288 -> 603-615)
+
+and with the tracer on at concurrency 32 the composition becomes what the cap
+intends: median requests/step 2 -> 6 (== ceil(32/6)), max 26 -> 20, steps with
+<=2 requests 79% -> 21%.
+
+This follows the decode-only form discussed on vllm#50410, not that PR's global
+request cap: per that thread the global cap measured -8.21% throughput and
++11.31% mean TTFT against doing nothing, while the decode-only form measured
++22.95%.
+
+Signed-off-by: canoziia <canoziia@users.noreply.github.com>
+---
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -48,6 +48,7 @@
+     VLLM_TRACE_FUNCTION: int = 0
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
++    VLLM_PP_DECODE_COHORT_BALANCE: bool = False
+     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_ENGRAM_EXACT_PIN: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+@@ -905,6 +906,12 @@
+     ),
+     # Pipeline stage partition strategy
+     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
++    # Cap established decode requests per scheduler step so MRV2 + PP + async
++    # spreads them across the `pp_size` in-flight pipeline batches. Does not
++    # change the PP decode cadence itself.
++    "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
++        int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "0"))
++    ),
+     # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+     # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+     # loaded pipeline stages can offload more than lighter ones.
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -7,6 +7,7 @@
+ from dataclasses import replace
+ from typing import Any
+ 
++from vllm import envs
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import KVEventsConfig, VllmConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+@@ -323,6 +324,32 @@
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        # MRV2 + PP + async lets a decode request advance only once every
++        # `pp_size` steps: the sampled-token broadcast ring consumes a step-T
++        # result at T+pp_size. Nothing spreads the requests over those
++        # in-flight batches, so one step can take most of the established
++        # decodes and leave the other steps short. Cap each step with a share
++        # of them; prefill work is never capped.
++        self.pp_decode_cohort_target = 0
++        self._pp_scheduled_decode_ids: set[str] = set()
++        if (
++            envs.VLLM_PP_DECODE_COHORT_BALANCE
++            and self.use_v2_model_runner
++            and self.use_pp
++            and vllm_config.scheduler_config.async_scheduling
++        ):
++            pp_size = self.parallel_config.pipeline_parallel_size
++            # ceil(max_num_seqs / pp_size)
++            self.pp_decode_cohort_target = max(
++                1, -(-self.max_num_running_reqs // pp_size)
++            )
++            logger.info(
++                "PP decode-cohort balancing: <=%d established decodes per "
++                "step (max_num_seqs=%d, pp_size=%d)",
++                self.pp_decode_cohort_target,
++                self.max_num_running_reqs,
++                pp_size,
++            )
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
+@@ -563,6 +590,7 @@
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._pp_scheduled_decode_ids.clear()
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -639,6 +667,19 @@
+                 req_index += 1
+                 continue
+ 
++            is_established_decode = (
++                self.pp_decode_cohort_target > 0
++                and request.num_computed_tokens >= request.num_prompt_tokens
++            )
++            if (
++                is_established_decode
++                and len(self._pp_scheduled_decode_ids)
++                >= self.pp_decode_cohort_target
++            ):
++                # Defer it to a step that has room; it stays eligible meanwhile.
++                req_index += 1
++                continue
++
+             if defer_prefills and request.is_prefill_chunk:
+                 # DP prefill balancing: defer this in-progress prefill chunk to a
+                 # cadence-aligned step; decodes still run to fill this step.
+@@ -770,6 +811,7 @@
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id
+                             scheduled_running_reqs.remove(preempted_req)
++                            self._pp_scheduled_decode_ids.discard(preempted_req_id)
+                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                             token_budget += restored
+                             input_budget += restored + draft_slots
+@@ -807,6 +849,8 @@
+             scheduled_running_reqs.append(request)
+             prefill_scheduled |= request.is_prefill_chunk
+             request_id = request.request_id
++            if is_established_decode:
++                self._pp_scheduled_decode_ids.add(request_id)
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
