@@ -65,7 +65,7 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_xml
       - --reasoning-parser=qwen3
-      - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true,"enable_in_reasoning":true}'
+      - '--structured-outputs-config={"backend":"xgrammar","disable_any_whitespace":true}'
       - --enable-prompt-tokens-details
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:
