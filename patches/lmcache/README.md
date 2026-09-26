@@ -10,12 +10,20 @@ Pinned inputs are in `manifests/lmcache.env`:
 - official server image digest `sha256:59b350...`;
 - official payload image digest `sha256:0dd644...`.
 
-`scripts/build-deepseek-v41-lmcache-images.sh` extracts the complete official package (Python,
-compiled extensions, and dist-info) from the official payload image, applies
-`series`, and injects that identical tree into both images:
+Two scripts carry this package, so every role runs the same tree:
 
-1. the standalone LMCache server image;
-2. the DeepSeek/vLLM client image.
+- `scripts/build-lmcache-server-image.sh` builds the shared server image from the
+  official server image plus the patched payload. The server is model-agnostic,
+  so one image serves every deployment in this repository;
+- `scripts/ensure-lmcache-server-image.sh` builds it only when the current
+  revision's image is absent (`REBUILD_LMCACHE_IMAGE=1` forces a rebuild) and
+  prints the reference, so every model build can take the payload from it.
+
+Client images get the tree from that server image rather than extracting and
+patching the official payload again: `scripts/build-deepseek-v41-lmcache-client.sh`
+copies `/opt/lmcache-patched` out of it, and the Qwen build does the same. One
+build, one tree - client and server provably run the same code. Only the server
+build touches the official payload image and applies `series`.
 
 The payload is selected with `PYTHONPATH=/opt/lmcache-patched`, so it replaces
 rather than mixes with the base image's bundled LMCache package. Verify at
@@ -85,21 +93,24 @@ here.
 
 ## Build
 
-First build the normal DeepSeek image on the same branch, then run:
+Build the shared server image once, then the client payload layer per model
+(the DeepSeek image has to exist first):
 
 ```bash
+scripts/build-lmcache-server-image.sh
+
 DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
-  scripts/build-deepseek-v41-lmcache-images.sh
+  scripts/build-deepseek-v41-lmcache-client.sh
 ```
 
 Outputs default to:
 
 ```text
-localhost/deepseek-v41-lmcache:official-v0.5.5-patched
+localhost/lmcache-server:latest
 localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched
 ```
 
-Override `SERVER_OUTPUT_IMAGE` and `CLIENT_OUTPUT_IMAGE` when publishing.
+Override `OUTPUT_IMAGE` (server) and `CLIENT_OUTPUT_IMAGE` (client) when publishing.
 Never replace a running deployment solely because the images build: first run
 the registration, complete-store, eviction, restore, restart-adoption, and
 corrupt-file fallback acceptance tests.
