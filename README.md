@@ -75,7 +75,7 @@ chmod 600 .env
 # Set a private VLLM_API_KEY and host paths in .env.
 
 podman compose --podman-run-args=--ipc=host \
-  -f compose.lmcache.yml up -d
+  -f compose.yml up -d
 ```
 
 Never commit `.env`, API keys, model weights, benchmark results, or host disk
