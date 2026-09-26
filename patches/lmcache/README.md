@@ -15,9 +15,12 @@ Two scripts carry this package, so every role runs the same tree:
 - `scripts/build-lmcache-server-image.sh` builds the shared server image from the
   official server image plus the patched payload. The server is model-agnostic,
   so one image serves every deployment in this repository;
-- `scripts/ensure-lmcache-server-image.sh` builds it only when the current
-  revision's image is absent (`REBUILD_LMCACHE_IMAGE=1` forces a rebuild) and
-  prints the reference, so every model build can take the payload from it.
+- `scripts/ensure-lmcache-server-image.sh` prints `localhost/lmcache-server:latest`,
+  building it only when that tag is absent; `REBUILD_LMCACHE_IMAGE=1` forces a
+  rebuild. Reuse is keyed on the tag rather than the repository revision because
+  most commits do not touch LMCache. The build also tags `:<short-rev>` to record
+  which revision produced the image, and notes (without rebuilding) when `:latest`
+  came from a different revision.
 
 Client images get the tree from that server image rather than extracting and
 patching the official payload again: `scripts/build-deepseek-v41-lmcache-client.sh`

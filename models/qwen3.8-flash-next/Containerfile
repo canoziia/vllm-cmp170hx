@@ -3,6 +3,7 @@ FROM ${QWEN_BASE_IMAGE}
 
 ARG INTEGRATION_REVISION=unknown
 ARG SOURCE_REVISION=unknown
+ARG LMCACHE_SERVER_IMAGE=unknown
 USER root
 COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY ple_pread.c /tmp/ple_pread.c
@@ -35,4 +36,5 @@ LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx
       io.canoziia.model="qwen3.8-flash-next-nvfp4" \
       io.canoziia.patch-series="models/qwen3.8-flash-next/patches/series+patches/vllm/series+models/qwen3.8-flash-next/patches/series.post-common" \
       io.canoziia.lmcache.source="LMCache/LMCache@05a013b29da78cf2321b9b46ec5039dde2fb0bb0" \
-      io.canoziia.lmcache.patch-series="patches/lmcache/series"
+      io.canoziia.lmcache.patch-series="patches/lmcache/series" \
+      io.canoziia.lmcache.payload-from="${LMCACHE_SERVER_IMAGE}"
