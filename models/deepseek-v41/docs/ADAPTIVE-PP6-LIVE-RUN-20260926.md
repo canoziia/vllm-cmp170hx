@@ -63,6 +63,32 @@ was never measured (the batteries only covered c16/c32), so 55.9 tok/s can only 
 compared against the older non-debug main figure of ~57 - within noise, but not a
 controlled comparison.
 
+## Full prose sweep with the feature on (c1..c32)
+
+Warmed, 3 repeats per concurrency, same instance as above:
+
+| conc | aggregate tok/s (median) | runs | per-request tok/s | step/s | ms/step | accepted/step |
+|---|---|---|---|---|---|---|
+| 1 | 52.3 | 56/52/52 | 52.30 | 23.48 | 42.6 | 2.222 |
+| 2 | 94.5 | 95/94/94 | 47.17 | 21.17 | 47.2 | 2.222 |
+| 4 | 156.6 | 155/157/160 | 38.83 | 17.61 | 56.8 | 2.202 |
+| 8 | 259.7 | 225/264/260 | 32.47 | 14.80 | 67.6 | 2.171 |
+| 16 | 416.3 | 433/416/412 | 25.56 | 11.92 | 83.9 | 2.153 |
+| 32 | 712.1 | 708/712/717 | 21.94 | 10.55 | 94.8 | 2.074 |
+
+Against the adaptive-off arm on this image (measured only at c16/c32): **+18.4%**
+and **+16.9%**, matching the +19.6%/+16.5% of the earlier warmed run, so the prose
+gain is reproducible. Against the older non-debug, unpatched-main curve
+(1:57, 2:96, 4:150, 8:188, 16:257, 32:260) the shape is what matters: the curve is
+now monotonic to c32 (+174% at c32) where it used to flatten at c16.
+
+Open question, deliberately unresolved: prose at c1 measured 55.9 and then 52.3 on
+two independent warmed triples, i.e. 3-8% under the historical 57, while counting
+at c1 was neutral (150.3 vs 149). There is no adaptive-off prose c1 cell on this
+image, so this cannot be attributed between the debug image, manager overhead on a
+single stream, or noise. Resolving it needs one boot with the feature off to fill
+c1/c2/c4/c8 for prose.
+
 ## Correctness with the feature on
 
 `tests/semantic-check.mjs` (objectively checkable answers, 400 tokens each,
