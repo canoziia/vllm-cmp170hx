@@ -89,27 +89,55 @@ image, so this cannot be attributed between the debug image, manager overhead on
 single stream, or noise. Resolving it needs one boot with the feature off to fill
 c1/c2/c4/c8 for prose.
 
-## Category attribution - what the 09-24 data can and cannot say
+## Recovered 09-24 raw data (cohort balancing did not exist yet)
 
-The 2026-09-24 A/B (`ADAPTIVE-PP6-RUNTIME-VALIDATION.md`) is often quoted next to
-this document, and the two are easy to mis-attribute:
+Raw per-category results are on the server under
+`/root/app/dspark-adaptive-dev/results/bench-{original,adaptive}-v{2,3}-c12461632.{json,md}`
+(concurrencies 1/2/4/6/16/32, nine categories, `temperature=0`, thinking off,
+identical prompt set across boots, `cached_tokens=0`). The pooled `C1..C32` table
+quoted in `ADAPTIVE-PP6-RUNTIME-VALIDATION.md` averages eight of them and excludes
+`ceiling_count`, which is why per-category reading matters here.
 
-* its `C1..C32` table is a **pooled eight-category corpus**, dominated in token
-  volume by prose. Its `+6.7% / +19.1%` at C16/C32 are therefore not counting
-  results;
-* per-category numbers in that data exist **only at C1**: count 137.30/140.12/141.64
-  vs ~139.41 original (neutral), coding 112.30/116.59/115.29 vs ~115.63 (neutral),
-  prose 45.84/47.91/47.44 vs ~53.13 (**-10%**);
-* so there is **no cohort-off counting measurement above C1 at all**. The
-  "-12 to -15% on counting" in this document is a cohort-**on** comparison, and its
-  off-arm reference (788 / 1093 / 1724 at c8/c16/c32) was itself recorded as
-  `mode=counting`, 1000 tokens per request, so that comparison is like-for-like.
+Aggregate tok/s for `ceiling_count` (1..80, 239 completion tokens per request):
 
-Read together, the two sessions agree once categories are attributed correctly:
-adaptive verification helps prose at higher concurrency (pooled +6.7~19.1% then,
-prose-only +16.9~18.4% now) and is neutral for counting at c1 in both. What remains
-unmeasured is counting at c8+ with the cohort balancing off, and the -10% prose
-regression at c1 against a cohort-on off-arm reference.
+| arm | C1 | C2 | C4 | C6 | C16 | C32 |
+|---|---|---|---|---|---|---|
+| original v2 | 131.0 | 226.5 | 361.5 | 404.6 | 827.3 | 697.1 |
+| adaptive v2 | 130.2 | 225.8 | 288.2 | 412.8 | 695.2 | 856.6 |
+| original v3 | 131.7 | 225.9 | 342.1 | 525.4 | 872.5 | 691.0 |
+| adaptive v3 | 129.9 | 223.9 | 341.8 | 418.6 | 710.1 | 628.0 |
+
+Round-to-round deltas: v2 `-0.6 / -0.3 / -20.3 / +2.0 / -16.0 / +22.9 %`,
+v3 `-1.4 / -0.9 / -0.1 / -20.3 / -18.6 / -9.1 %`. But the two **original** arms
+disagree with each other by up to 30% at C6 (404.6 vs 525.4) and 5.5% at C16, so
+most of those deltas sit inside the same-arm cross-run spread. Honest reading for
+counting with the balancing off: **unresolved - the instrument is too noisy at
+these cell lengths**, and the sign flips between rounds. This is a short
+completion (239 tokens) dominated by queueing and TTFT, unlike this session's
+`counting` cell (1000 tokens per request, three warmed repeats, clean -12 to -15%).
+
+Aggregate tok/s for `prose`:
+
+| arm | C1 | C2 | C4 | C6 | C16 | C32 |
+|---|---|---|---|---|---|---|
+| original v2 | 49.9 | 79.6 | 114.8 | 162.3 | 292.7 | 285.9 |
+| adaptive v2 | 50.0 | 74.7 | 128.8 | 156.3 | 287.3 | 391.7 |
+| original v3 | 48.4 | 73.1 | 121.6 | 173.0 | 268.8 | 243.5 |
+| adaptive v3 | 48.3 | 74.6 | 134.5 | 171.7 | 368.0 | 356.8 |
+
+Deltas: v2 `+0.2 / -6.2 / +12.2 / -3.7 / -1.8 / +37.0 %`, v3 `-0.2 / +2.1 / +10.6 /
+-0.8 / +36.9 / +46.5 %`. Here the two independent rounds **agree** at C4 (+10.6 to
++12.2%) and C32 (+37 to +46.5%), and those exceed the original-vs-original spread
+at the same cells. So adaptive helping prose at higher concurrency is corroborated
+across two separate weeks and two different builds, and it does not depend on the
+cohort balancing.
+
+Correction to what this document said before: it claimed the 09-24 data had no
+counting measurement above C1. That was wrong - I had only looked at the pooled
+table and the C1 step-decomposition in the markdown, not at the raw JSON, which
+carries all nine categories at all six concurrencies. An earlier in-chat claim
+that the old `+19% at C32` was counting-driven was also wrong: the pooled headline
+excludes counting entirely.
 
 ## Correctness with the feature on
 
