@@ -1,0 +1,42 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] adaptive: clamp the published PP verification budget to drafts
+
+The last PP rank publishes `batch_draft_budget` as the authoritative
+verification budget for the step, then decides whether the batch is partially
+allocated with
+
+    partial = pp_verification_budget not in (0, scheduled_drafts)
+
+but it never reconciled that budget against `scheduled_drafts`, the number of
+drafts the scheduler actually scheduled this step. Any step where the two differ
+- a hot K=0 toggle, or a step whose drafts were dropped - has the manager
+reporting a positive budget with `scheduled_drafts == 0`, so `partial` becomes
+True and the step demands device-side `verification_lengths` for drafts that do
+not exist, on every rank, with the schema check below it then failing or
+verifying rows that were never proposed.
+
+Clamp the published value to the drafts that exist. The scheduler is the single
+source of truth for K; the adaptive manager sizes within it rather than
+overriding it.
+
+Found while integrating the tracing package, whose hot-K0 path needs this to be
+correct on the last rank; the fix belongs to the adaptive series so the default
+production build carries it too.
+
+Signed-off-by: canoziia <canoziia@users.noreply.github.com>
+---
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1659,6 +1659,12 @@
+         if needs_pp_budget:
+             pp_verification_budget = self.adaptive_verification.batch_draft_budget
+             scheduled_drafts = sum(map(len, scheduler_output.scheduled_spec_decode_tokens.values()))
++            # The scheduler owns how many drafts exist this step: a hot K toggle or
++            # a step whose drafts were dropped can drive scheduled_drafts to zero
++            # while the manager still believes its budget is positive, which would
++            # read as a partial allocation with device lengths for drafts that do
++            # not exist. Clamp so a zero-draft step verifies zero rows.
++            pp_verification_budget = min(pp_verification_budget, scheduled_drafts)
+             partial = pp_verification_budget not in (0, scheduled_drafts)
+             if not self.is_first_pp_rank and partial != (pp_verification_lengths is not None):
+                 raise RuntimeError("PP verification lengths/schema mismatch")

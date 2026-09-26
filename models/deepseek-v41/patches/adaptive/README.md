@@ -38,9 +38,13 @@ mid-patch.
 Merged semantics worth knowing when reading either layer: a hot K=0 step skips the
 draft tokens *and* the confidence columns of the same broadcast, publishes no
 drafts, records no confidence, and the verification budget is clamped to the
-drafts the scheduler actually scheduled (`min(batch_draft_budget,
-scheduled_drafts)`), so the scheduler toggle - not the manager - is the single
-source of truth for K.
+drafts the scheduler actually scheduled - so the scheduler, not the manager, is
+the single source of truth for K. That clamp is `0006` in this series, not part
+of the tracing layer: it is a bug in the adaptive integration itself (the last
+rank published `batch_draft_budget` without reconciling it against
+`scheduled_drafts`, so a zero-draft step was read as a partial allocation
+demanding device lengths for drafts that do not exist) and the production build
+must carry it. The build now greps for it.
 
 ### Measured cost of shipping it (runtime flag off)
 

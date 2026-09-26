@@ -644,19 +644,7 @@ new file mode 100644
          # Get batch descriptor and sync across DP ranks.
          num_reqs = len(scheduler_output.num_scheduled_tokens)
          num_toks = scheduler_output.total_num_scheduled_tokens
-@@ -1659,6 +1730,11 @@
-         if needs_pp_budget:
-             pp_verification_budget = self.adaptive_verification.batch_draft_budget
-             scheduled_drafts = sum(map(len, scheduler_output.scheduled_spec_decode_tokens.values()))
-+            # The scheduler owns how many drafts exist this step: the hot DSpark
-+            # control file can drive it to zero while the manager still believes
-+            # its budget is positive. Clamping keeps K=0 a true zero-row verify
-+            # and stops a nonexistent budget from being read as partial.
-+            pp_verification_budget = min(pp_verification_budget, scheduled_drafts)
-             partial = pp_verification_budget not in (0, scheduled_drafts)
-             if not self.is_first_pp_rank and partial != (pp_verification_lengths is not None):
-                 raise RuntimeError("PP verification lengths/schema mismatch")
-@@ -1678,6 +1754,7 @@
+@@ -1684,6 +1755,7 @@
              )
  
          skip_compiled = False
@@ -664,7 +652,7 @@ new file mode 100644
          if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
              # Encoder-decoder models such as Whisper should run eager/non-compiled
              # when encoder inputs are scheduled, because this step updates
-@@ -1692,7 +1769,7 @@
+@@ -1698,7 +1770,7 @@
              self.dp_size,
              self.dp_rank,
              max_query_len=max_query_len,
@@ -673,7 +661,7 @@ new file mode 100644
              num_active_loras=num_active_loras,
              parallel_config=self.parallel_config,
              allow_ubatching=(
-@@ -1706,6 +1783,10 @@
+@@ -1712,6 +1784,10 @@
              empty_output = self.kv_connector.no_forward(scheduler_output)
              return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
  
@@ -684,7 +672,7 @@ new file mode 100644
          cudagraph_stats = None
          if not dummy_run:
              # Common case.
-@@ -1717,7 +1798,13 @@
+@@ -1723,7 +1799,13 @@
                  scheduler_output, batch_req_state, batch_desc,
                  authoritative_capacities=pp_verification_lengths,
              )
@@ -698,7 +686,7 @@ new file mode 100644
              # Mamba "align" pre-copy: migrate recurrent state across block
              # boundaries before the forward. Runs only on real batches, and
              # before model_state.prepare_attn gathers num_accepted_tokens so the
-@@ -1799,9 +1886,12 @@
+@@ -1805,9 +1887,12 @@
              )
          elif not (dummy_run and skip_attn_for_dummy_run):
              assert slot_mappings is not None
@@ -711,7 +699,7 @@ new file mode 100644
              assert block_tables is not None
              attn_groups = self.attn_groups
              if dummy_run and is_profile:
-@@ -1811,6 +1901,7 @@
+@@ -1817,6 +1902,7 @@
                      [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                      for groups in attn_groups
                  ]
@@ -719,7 +707,7 @@ new file mode 100644
              attn_metadata = self.model_state.prepare_attn(
                  input_batch,
                  batch_desc.cg_mode,
-@@ -1823,6 +1914,8 @@
+@@ -1829,6 +1915,8 @@
                  # indices from the previous real batch.
                  for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
              )
@@ -728,7 +716,7 @@ new file mode 100644
  
          input_ids = input_batch.input_ids
          inputs_embeds = None
-@@ -1855,6 +1948,10 @@
+@@ -1861,6 +1949,10 @@
              if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                  input_ids = None
  
@@ -739,7 +727,7 @@ new file mode 100644
          model_inputs = {
              "input_ids": input_ids,
              "positions": input_batch.positions,
-@@ -1862,7 +1959,7 @@
+@@ -1868,7 +1960,7 @@
              "intermediate_tensors": None,
              # NOTE: Values returned by `prepare_inputs` will override the default
              # values above.
@@ -748,7 +736,7 @@ new file mode 100644
          }
          if not self.is_first_pp_rank:
              # Update for non-first PP ranks.
-@@ -1879,6 +1976,7 @@
+@@ -1885,6 +1977,7 @@
              assert intermediate_tensors is not None
              assert self.intermediate_tensors is not None
              n = input_batch.num_tokens_after_padding
@@ -756,7 +744,7 @@ new file mode 100644
              new_tensors = {}
              for k, v in self.intermediate_tensors.tensors.items():
                  recv = intermediate_tensors.tensors[k]
-@@ -1893,6 +1991,8 @@
+@@ -1899,6 +1992,8 @@
                  new_tensors[k] = v[:n] if dummy_run else v[:n].copy_(recv[:n])
              model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
              del intermediate_tensors
@@ -765,7 +753,7 @@ new file mode 100644
  
          # Update the EPLB meta.
          ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
-@@ -1904,7 +2004,23 @@
+@@ -1910,7 +2005,23 @@
              input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
          )
          self.step_timing.forward_start()
@@ -789,7 +777,7 @@ new file mode 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1912,7 +2028,14 @@
+@@ -1918,7 +2029,14 @@
              # because they are already copied to the CUDA graph input buffers.
              assert self.cudagraph_manager is not None
              self.kv_connector.pre_forward(scheduler_output)
@@ -805,7 +793,7 @@ new file mode 100644
          else:
              # For piecewise and eager mode, just call model().
              batch_descriptor = BatchDescriptor(
-@@ -1946,12 +2069,27 @@
+@@ -1952,12 +2070,27 @@
                      # cudagraph, chosen inside run_pw_graph). cg_mode is only
                      # PIECEWISE after the cudagraph manager exists.
                      assert self.cudagraph_manager is not None
@@ -837,7 +825,7 @@ new file mode 100644
  
          if self.is_last_pp_rank:
              if self.use_aux_hidden_state_outputs:
-@@ -1985,6 +2123,8 @@
+@@ -1991,6 +2124,8 @@
              ec_connector_output=ec_connector_output,
              routed_experts=routed_experts,
              cudagraph_stats=cudagraph_stats,
@@ -846,7 +834,7 @@ new file mode 100644
          )
  
          if not self.is_last_pp_rank:
-@@ -2027,6 +2167,7 @@
+@@ -2033,6 +2168,7 @@
          ec_connector_output = self.execute_model_state.ec_connector_output
          routed_experts = self.execute_model_state.routed_experts
          cudagraph_stats = self.execute_model_state.cudagraph_stats
@@ -854,7 +842,7 @@ new file mode 100644
          self.execute_model_state = None
  
          if not self.is_last_pp_rank:
-@@ -2034,7 +2175,13 @@
+@@ -2040,7 +2176,13 @@
              # IntermediateTensors instead of final hidden states. Receive the
              # sampled tokens broadcast from the last rank and update local state.
              assert self.pp_handler is not None
@@ -869,7 +857,7 @@ new file mode 100644
              # Optimistically update num_computed_tokens for entire batch here.
              # Will be adjusted for rejections if necessary in update_requests.
              self.postprocess_num_computed_tokens(input_batch)
-@@ -2054,9 +2201,20 @@
+@@ -2060,9 +2202,20 @@
              self.pcp_manager, hidden_states, input_batch
          )
  
@@ -893,7 +881,7 @@ new file mode 100644
  
          if self.pp_handler is not None:
              # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2121,6 +2279,9 @@
+@@ -2127,6 +2280,9 @@
          # ensuring that `copy_event` is recorded before calling postprocess.
          # This sequencing may slightly reduce latency as async D2H copy does not
          # need to wait for the postprocess to finish.
@@ -903,7 +891,7 @@ new file mode 100644
          self.postprocess_sampled(
              input_batch.idx_mapping,
              sampler_output.sampled_token_ids,
-@@ -2128,6 +2289,8 @@
+@@ -2134,6 +2290,8 @@
              num_rejected,
              input_batch.query_start_loc,
          )
@@ -912,7 +900,7 @@ new file mode 100644
  
          if self.speculator is not None:
              assert self.sampler is not None
-@@ -2139,24 +2302,43 @@
+@@ -2145,24 +2303,43 @@
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                  spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
@@ -972,7 +960,7 @@ new file mode 100644
                  self.adaptive_verification.record_confidences(
                      self.speculator.draft_token_confidence_probs, input_batch
                  )
-@@ -2166,9 +2348,9 @@
+@@ -2172,9 +2349,9 @@
              # not have a speculator (i.e. self.speculator is None)
              self.draft_tokens_handler.set_draft_tokens(
                  input_batch,
@@ -984,7 +972,7 @@ new file mode 100644
                  self.pp_handler.broadcast_drafts(
                      self.req_states.draft_tokens, input_batch,
                      self.speculator.draft_token_confidence_probs[:input_batch.num_reqs]
-@@ -2314,6 +2496,7 @@
+@@ -2320,6 +2497,7 @@
      ec_connector_output: ECConnectorOutput | None
      routed_experts: RoutedExpertsTensors | None
      cudagraph_stats: CUDAGraphStat | None

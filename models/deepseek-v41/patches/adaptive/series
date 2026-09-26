@@ -3,3 +3,4 @@ adaptive/0002-authoritative-budget-input.patch
 adaptive/0003-pack-confidence-with-draft-feedback.patch
 adaptive/0004-v2-budget-relay-integration.patch
 adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
+adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
