@@ -1,30 +1,39 @@
 From: canoziia <canoziia@users.noreply.github.com>
 Subject: [PATCH] adaptive: keep uniform decode graphs alongside varlen decode
 
-Measured on PP6 (DeepSeek-V4.1-Flash, DSpark K=5, max_num_seqs=32, SM80):
-with adaptive verification enabled but nothing actually trimmed, a step of
-6 requests x 6 verification rows ran the 40-row graph, i.e. it did 11% more
-verification work than the step asked for. Counting throughput dropped 12-15%
-against the same build with the feature off, at unchanged acceptance (5.952 of 6)
-and unchanged real row count (36).
+Measured on PP6 (DeepSeek-V4.1-Flash, DSpark K=5, max_num_seqs=32, SM80): with
+adaptive verification enabled but nothing actually trimmed, a step of 6 requests
+x 6 verification rows ran the 40-row graph, i.e. it did 11% more verification
+work than the step asked for. Counting throughput was 12-15% below the same
+build with the feature off, at unchanged acceptance (5.952 of 6) and unchanged
+real row count (36).
 
 Cause: CudaGraphManager._init_candidates treats the two decode capture strategies
-as mutually exclusive. Under varlen_decode (set whenever the adaptive manager
-exists) the uniform-decode branch is skipped entirely, so the only decode graphs
-available are the varlen buckets, which are [1,2,4] + multiples of 8 - and 6x6=36
-is not among them. Uniform steps whose row count is not also a multiple of 8 are
-therefore padded up to the next bucket. Enabling the feature thus costs work even
-on the steps it decides not to trim.
+as alternatives. varlen_decode is set whenever the adaptive manager exists, and
+the uniform-decode branch hung off that test as `elif ... and not
+self.varlen_decode`, so with the feature on the only decode graphs available were
+the varlen buckets - [1,2,4] plus multiples of 8 - which do not contain 6x6=36.
+Any uniform step whose row count is not also a multiple of 8 is padded up to the
+next bucket. Enabling the feature therefore costs work even on steps it decides
+not to trim.
 
-Fix: capture uniform decode graphs alongside the varlen set, skipping any row
-count a varlen bucket already covers exactly (17 new graphs for this
-configuration, 36 rows included). They are deliberately kept out of the
-priority-ordered range partitioning: inserting them there would let a uniform
-graph claim the row counts below its bucket and starve ragged steps of their
-varlen graph, dropping those steps to eager. Instead each uniform descriptor is
-prepended to the exact row counts it can serve, and _is_compatible() already
-refuses a uniform graph unless the step really is uniform at that width, so a
-ragged step still falls through to its varlen graph unchanged.
+Fix: capture uniform decode graphs alongside the varlen set, for the row counts
+no varlen bucket covers exactly (17 new graphs in this configuration, 36 among
+them). Two guards keep this from hurting anything:
+
+  * they are prepended to the candidate lists instead of joining the range
+    partitioning, because a uniform graph inserted into the partitioning would
+    claim every row count below its bucket and starve ragged steps of their
+    varlen graph; and
+  * a uniform graph is prepended to a row count only when it is strictly smaller
+    than the smallest FULL graph already covering it, so exact buckets (24, 48,
+    96) and near-exact ones (30 -> 32 rows, 2 rows of padding) keep their
+    existing graphs rather than being bumped to a larger uniform fit.
+
+Dispatch is otherwise unchanged: _is_compatible() still refuses a uniform graph
+unless the step is uniform at exactly that width, so ragged and mixed steps
+resolve exactly as before. Simulated over all 192 reachable decode row counts
+for both uniform and ragged steps: 17 counts improve to zero padding, 0 regress.
 
 Signed-off-by: canoziia <canoziia@users.noreply.github.com>
 ---
@@ -35,35 +44,39 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
              separate_decode_routine and bool(decode_mode) and self.varlen_decode
          )
 +        # Uniform decode graphs are captured ALONGSIDE the varlen set rather than
-+        # replaced by it. Varlen buckets are multiples of 8 above 8, so a
-+        # full-budget step of 6 reqs x 6 rows = 36 has no 36-row graph and pads
-+        # up to 40, verifying 11% more rows than the step asked for - on a step
-+        # where adaptive verification trimmed nothing at all.
++        # replacing it. Varlen buckets are multiples of 8 above 8, so a full-budget
++        # step of 6 reqs x 6 rows = 36 has no 36-row graph and pads up to 40,
++        # verifying 11% more rows than it asked for - on a step where adaptive
++        # verification trimmed nothing at all.
 +        uniform_decode_descs: list[BatchExecutionDescriptor] = []
          for num_tokens, num_active_loras in product(
              capture_sizes, self.lora_capture_cases
          ):
-@@ -275,9 +281,9 @@
+@@ -275,9 +281,12 @@
                      num_active_loras=num_active_loras,
                  )
                  descs_by_mode[decode_mode].append(desc)
 -            # Capture uniform decode specfifc graphs if required
-+            # Capture uniform decode specific graphs if required
-             #  (i.e. separate decode routine)
+-            #  (i.e. separate decode routine)
 -            elif separate_decode_routine and decode_mode and not self.varlen_decode:
-+            elif separate_decode_routine and decode_mode:
++            # Capture uniform decode specific graphs if required
++            #  (i.e. separate decode routine). Deliberately an independent `if`,
++            # never an `elif` on the varlen branch: under varlen every bucket at
++            # or below max_decode_tokens takes the varlen path first, so an `elif`
++            # here would not run for exactly the sizes that need it.
++            if separate_decode_routine and decode_mode:
                  for decode_query_len in decode_query_lens:
                      rounded_num_tokens = round_up(num_tokens, decode_query_len)
                      rounded_num_reqs = rounded_num_tokens // decode_query_len
-@@ -298,7 +304,17 @@
+@@ -298,7 +307,17 @@
                      )
  
                      # avoid duplicate graphs
 -                    if desc not in descs_by_mode[decode_mode]:
 +                    if capture_varlen_decode:
 +                        # A varlen graph of the same row count already serves a
-+                        # uniform step with zero padding, so only the row counts
-+                        # that would otherwise be rounded up need a uniform graph.
++                        # uniform step with zero padding, so only row counts that
++                        # would otherwise be rounded up need a uniform graph.
 +                        if (
 +                            rounded_num_tokens
 +                            not in {d.num_tokens for d in descs_by_mode[decode_mode]}
@@ -74,29 +87,47 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
                          descs_by_mode[decode_mode].append(desc)
  
              # recoverSSM cannot capture a dummy query wider than its workspace.
-@@ -326,6 +342,26 @@
+@@ -326,6 +345,44 @@
              descs.sort(key=lambda d: d.num_tokens, reverse=True)
              self._capture_descs[mode] = descs
  
 +        if uniform_decode_descs:
-+            # Capture them, but deliberately keep them out of the range
-+            # partitioning below-built list: inserting them there would let a
-+            # uniform graph claim the row counts under its bucket and starve
-+            # ragged steps of their varlen graph (falling back to eager). They
-+            # are instead prepended to the exact row counts they can serve, and
-+            # _is_compatible() only matches a uniform graph when the step really
-+            # is uniform at that width.
++            # Capture them, but keep them out of the range partitioning that
++            # follows: a uniform graph inserted there would claim the row counts
++            # under its bucket and starve ragged steps of their varlen graph,
++            # dropping those steps to eager. Each one is instead prepended only to
++            # the row counts it can serve, and _is_compatible() already refuses a
++            # uniform graph unless the step is uniform at exactly that width.
 +            captured = self._capture_descs[decode_mode]
 +            captured.extend(uniform_decode_descs)
 +            captured.sort(key=lambda d: d.num_tokens, reverse=True)
-+            for desc in uniform_decode_descs:
-+                width = desc.uniform_token_count
++            # Descending size, inserting at the head, so the TIGHTEST fitting
++            # uniform graph ends up first: dispatch returns the first compatible
++            # candidate, and a uniform graph is compatible with any uniform step
++            # whose row count is one of its multiples.
++            for uniform_desc in sorted(
++                uniform_decode_descs, key=lambda d: -d.num_tokens
++            ):
++                width = uniform_desc.uniform_token_count
 +                assert width is not None
-+                for rows in range(width, desc.num_tokens + 1, width):
-+                    key = (rows, desc.num_active_loras)
++                for rows in range(width, uniform_desc.num_tokens + 1, width):
++                    key = (rows, uniform_desc.num_active_loras)
 +                    candidates = self._candidates.setdefault(key, [])
-+                    if desc not in candidates:
-+                        candidates.insert(0, desc)
++                    # Only outrank an existing FULL graph when this one is
++                    # strictly smaller, i.e. pads less. Varlen buckets are
++                    # multiples of 8, so 24/48/96 are already exact and 30 is
++                    # covered by the 32-row graph with 2 rows of padding - a
++                    # uniform-36 graph would pad that to 6, so it must not
++                    # displace them.
++                    covered_by = [
++                        desc.num_tokens
++                        for desc in candidates
++                        if desc.cg_mode == decode_mode
++                    ]
++                    if covered_by and uniform_desc.num_tokens >= min(covered_by):
++                        continue
++                    if uniform_desc not in candidates:
++                        candidates.insert(0, uniform_desc)
 +
          for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
              mode_descs = tuple(reversed(descs_by_mode.get(mode, [])))
