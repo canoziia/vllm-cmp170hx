@@ -1,0 +1,272 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] scheduler: balance async PP decode batches (aligns upstream #57433)
+
+Model Runner V2 + pipeline parallelism + async scheduling lets a decode request
+advance only once every `pp_size` scheduler steps, because the worker-side
+sampled-token broadcast ring consumes a step-T result at T+pp_size (#42187).
+Nothing spreads the running set over those in-flight batches, so requests whose
+prefills complete in the same step lock into one cadence group and then advance
+and starve together. #50853 lists this as an open gap; #57433 fixes it upstream
+with a decode-only per-step share of `ceil(max_num_seqs / pp_size)`.
+
+This patch is that upstream implementation, ported to our pinned source, with
+one deliberate deviation: upstream applies it unconditionally for MRV2 +
+AsyncScheduler + PP>1, while here it is gated behind VLLM_PP_DECODE_COHORT_BALANCE
+(default off). Reason: one image then serves both sides of an A/B, rollback is a
+single env var plus a restart, and the shared series is also consumed by the
+Qwen build, whose PP2 configuration has not been measured against it yet. Set
+the variable to 1 to get upstream behaviour.
+
+Everything else matches #57433 structurally rather than only semantically, so a
+future pin bump can drop this patch without a rewrite:
+
+  * the policy lives in `_get_max_num_scheduled_decodes()`, defined on Scheduler
+    (returns max_num_running_reqs, so PP1 / sync / MRV1 keep the old effective
+    limit) and overridden on AsyncScheduler;
+  * the cohort set is a local of schedule(), not scheduler state, so a step can
+    never inherit a stale count;
+  * the cap sits immediately before KV block allocation in the RUNNING loop, and
+    established decodes resumed from WAITING are capped too (skipped via
+    step_skipped_waiting, like the other cannot-schedule-now cases);
+  * preemption discards the cohort slot it had taken;
+  * `assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes` guards
+    the invariant at the end of the step.
+
+Prefill, chunked prefill and the chunk that completes a prompt in this step stay
+uncapped, which is the whole reason this form was chosen over the global request
+cap in #50410: per that thread the global cap measured -8.21% throughput and
++11.31% mean TTFT against doing nothing, while the decode-only form measured
++22.95%.
+
+Signed-off-by: canoziia <canoziia@users.noreply.github.com>
+---
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -48,6 +48,7 @@
+     VLLM_TRACE_FUNCTION: int = 0
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
++    VLLM_PP_DECODE_COHORT_BALANCE: bool = False
+     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_ENGRAM_EXACT_PIN: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+@@ -905,6 +906,14 @@
+     ),
+     # Pipeline stage partition strategy
+     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
++    # Balance established decode requests across the `pp_size` in-flight
++    # pipeline batches of Model Runner V2 + PP + async scheduling
++    # (vllm-project/vllm#57433). Upstream applies it unconditionally; we keep an
++    # opt-in so a single image can serve an A/B and so the default of every
++    # existing deployment is unchanged until it is measured per model.
++    "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
++        int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "0"))
++    ),
+     # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+     # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+     # loaded pipeline stages can offload more than lighter ones.
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from vllm import envs
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.core.sched.scheduler import Scheduler
+@@ -16,6 +17,16 @@
+         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
+         self.pp_size = self.parallel_config.pipeline_parallel_size
+ 
++    def _get_max_num_scheduled_decodes(self) -> int:
++        if (
++            not envs.VLLM_PP_DECODE_COHORT_BALANCE
++            or not self.use_v2_model_runner
++            or not self.use_pp
++        ):
++            return self.max_num_running_reqs
++        # ceil(max_num_seqs / pp_size)
++        return (self.max_num_running_reqs + self.pp_size - 1) // self.pp_size
++
+     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+         super()._update_after_schedule(scheduler_output)
+         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -577,8 +577,15 @@
+         scheduled_new_reqs: list[Request] = []
+         scheduled_resumed_reqs: list[Request] = []
+         scheduled_running_reqs: list[Request] = []
++        scheduled_decode_req_ids: set[str] = set()
+         preempted_reqs: list[Request] = []
+ 
++        # Async PP assigns each request to a decode cadence group based on the
++        # step where its prefill completes. Limiting each step to an equal share
++        # of the runner capacity keeps those groups balanced. Prefills remain
++        # uncapped because mixed batches need token-aware balancing instead.
++        max_num_scheduled_decodes = self._get_max_num_scheduled_decodes()
++
+         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+         num_scheduled_tokens: dict[str, int] = {}
+         token_budget = self.max_num_scheduled_tokens
+@@ -726,6 +733,11 @@
+                 req_index += 1
+                 continue
+ 
++            is_decode = request.num_computed_tokens >= request.num_prompt_tokens
++            if is_decode and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes:
++                req_index += 1
++                continue
++
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
+@@ -770,6 +782,7 @@
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id
+                             scheduled_running_reqs.remove(preempted_req)
++                            scheduled_decode_req_ids.discard(preempted_req_id)
+                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                             token_budget += restored
+                             input_budget += restored + draft_slots
+@@ -809,6 +822,8 @@
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
++            if is_decode:
++                scheduled_decode_req_ids.add(request_id)
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
+             req_index += 1
+@@ -1133,6 +1148,18 @@
+                         # The request cannot be scheduled.
+                         break
+ 
++                is_decode = (
++                    not load_kv_async
++                    and num_computed_tokens >= request.num_prompt_tokens
++                )
++                if (
++                    is_decode
++                    and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes
++                ):
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
++
+                 # During async KV load, no forward pass is run yet.
+                 # Allocate speculative lookahead slots later to avoid
+                 # mismatching local and remote block counts.
+@@ -1268,6 +1295,8 @@
+                     request_id
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
++                if is_decode:
++                    scheduled_decode_req_ids.add(request_id)
+                 token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+@@ -1311,6 +1340,7 @@
+ 
+         assert token_budget >= 0
+         assert input_budget >= 0
++        assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes
+         assert len(self.running) <= self.max_num_running_reqs
+         # Since some requests in the RUNNING queue may not be scheduled in
+         # this step, the total number of scheduled requests can be smaller than
+@@ -1464,6 +1494,9 @@
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+ 
++    def _get_max_num_scheduled_decodes(self) -> int:
++        return self.max_num_running_reqs
++
+     def _build_kv_connector_meta(
+         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
+--- a/tests/v1/core/test_async_scheduler.py
++++ b/tests/v1/core/test_async_scheduler.py
+@@ -109,6 +109,82 @@
+     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+ 
+ 
++def test_async_pp_balances_decode_batches_without_throttling_prefills(monkeypatch):
++    # Upstream #57433 applies this policy unconditionally for MRV2 + async PP;
++    # our port keeps it behind VLLM_PP_DECODE_COHORT_BALANCE, so enable it here.
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", True)
++    scheduler = create_scheduler(
++        async_scheduling=True,
++        max_num_seqs=32,
++        max_num_batched_tokens=8192,
++        num_speculative_tokens=7,
++        speculative_method="ngram_gpu",
++        use_v2_model_runner=True,
++    )
++    # Emulate PP at the scheduler level. Constructing with PP=2 requires two
++    # visible GPUs, but this policy only depends on the pipeline size.
++    scheduler.pp_size = 2
++    scheduler.use_pp = True
++
++    requests = create_requests(
++        num_requests=32,
++        num_tokens=1,
++        max_tokens=10,
++        ignore_eos=True,
++    )
++    for request in requests:
++        scheduler.add_request(request)
++
++    prefill = scheduler.schedule()
++    bubble = scheduler.schedule()
++    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
++    first_decode = scheduler.schedule()
++    scheduler.update_from_output(bubble, _make_model_runner_output(bubble))
++    second_decode = scheduler.schedule()
++    scheduler.update_from_output(first_decode, _make_model_runner_output(first_decode))
++    third_decode = scheduler.schedule()
++
++    # every prompt completes in the first step: prefill is never throttled
++    assert len(prefill.num_scheduled_tokens) == 32
++    assert not bubble.num_scheduled_tokens
++    first_ids = set(first_decode.num_scheduled_tokens)
++    second_ids = set(second_decode.num_scheduled_tokens)
++    third_ids = set(third_decode.num_scheduled_tokens)
++    # 32 seqs over a 2-step cadence -> two disjoint cohorts of 16, alternating
++    assert len(first_ids) == len(second_ids) == 16
++    assert first_ids.isdisjoint(second_ids)
++    assert third_ids == first_ids
++
++
++def test_async_pp_balance_is_off_by_default(monkeypatch):
++    # The deviation from upstream is opt-in only: with the flag unset the step
++    # keeps taking the whole running set, so no existing deployment changes.
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", False)
++    scheduler = create_scheduler(
++        async_scheduling=True,
++        max_num_seqs=32,
++        max_num_batched_tokens=8192,
++        num_speculative_tokens=7,
++        speculative_method="ngram_gpu",
++        use_v2_model_runner=True,
++    )
++    scheduler.pp_size = 2
++    scheduler.use_pp = True
++    assert scheduler._get_max_num_scheduled_decodes() == 32
++
++    requests = create_requests(num_requests=32, num_tokens=1, max_tokens=10, ignore_eos=True)
++    for request in requests:
++        scheduler.add_request(request)
++    prefill = scheduler.schedule()
++    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
++    first_decode = scheduler.schedule()
++    assert len(first_decode.num_scheduled_tokens) == 32
++
++
+ def test_abort():
+     scheduler = create_scheduler(async_scheduling=True)
+     requests = create_requests(num_requests=10, max_tokens=20)

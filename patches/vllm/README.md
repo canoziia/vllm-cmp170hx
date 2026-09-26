@@ -15,15 +15,23 @@ build that uses that runtime.
    - derives align-mode resumed-state columns from `MambaSpec.block_size`
      instead of the smallest global cache group.
 
-3. `0003-balance-pp-decode-cohorts.patch`
-   - optionally caps how many established decode requests one scheduler step
-     may take, so MRV2 + PP + async spreads them over the `pp_size` in-flight
-     pipeline batches instead of bursting them into one step;
-   - disabled by default, enabled with `VLLM_PP_DECODE_COHORT_BALANCE=1`;
-     prefill work is never capped and the PP decode cadence is unchanged.
-   - measured on the six-GPU SM80 PP6 deployment: concurrency 32 output rate
-     +141% (255 -> 614 tokens/s), requests/step median 2 -> 6; concurrency 16
-     unchanged within run spread. See `models/deepseek-v41/docs/` for the data.
+3. `0003-balance-async-pp-decode-batches.patch`
+   - port of vllm-project/vllm#57433: one scheduler step takes at most
+     `ceil(max_num_seqs / pp_size)` established decode requests, so MRV2 + PP +
+     async spreads the running set over the `pp_size` in-flight pipeline batches
+     instead of letting one cadence group burst and the rest starve;
+   - applied to the RUNNING loop, to established decodes resumed from WAITING,
+     and the cohort slot is returned on preemption; prefill is never capped and
+     PP1 / synchronous scheduling / MRV1 keep `max_num_seqs`;
+   - one deviation: upstream enables it unconditionally, here it is gated behind
+     `VLLM_PP_DECODE_COHORT_BALANCE` (default `0`) so one image serves an A/B,
+     rollback is an env var, and the Qwen build of this shared series is not
+     changed before it has been measured there;
+   - concurrency 32 output rate +89% on prose and +184% on counting on the
+     six-GPU SM80 PP6 deployment; see
+     `models/deepseek-v41/docs/PP-DECODE-COHORT-BALANCE.md`.
+   - upstream behavioural test ported into `tests/v1/core/test_async_scheduler.py`
+     (CPU only), plus one test for the opt-in deviation.
 
 Both patches were validated in the DeepSeek default/debug series and in the
 Qwen PP2/MTP3 series. Model-specific code such as Qwen's process-isolated PLE
