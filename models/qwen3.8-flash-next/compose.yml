@@ -18,7 +18,7 @@ services:
       - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
       - --eviction-policy=LRU
       - --max-workers=8
-      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true}'
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
     network_mode: host
     ipc: host
     devices: ["nvidia.com/gpu=6", "nvidia.com/gpu=7"]

@@ -144,7 +144,7 @@ services:
       - --l1-size-gb=64
       - --eviction-policy=LRU
       - --max-workers=8
-      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":500,"adopt_existing":true}'
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":500,"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',5556),3).close(); socket.create_connection(('127.0.0.1',18556),3).close()\""]
       interval: 10s
