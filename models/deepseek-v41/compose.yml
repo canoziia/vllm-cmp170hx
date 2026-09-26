@@ -21,7 +21,6 @@ services:
     # and expose only 64 MiB /dev/shm, so start with --podman-run-args=--ipc=host
     # as well (see README).
     ipc: host
-    stop_grace_period: 10m
 
     devices:
       - nvidia.com/gpu=0
@@ -115,7 +114,6 @@ services:
     restart: "no"
     network_mode: host
     ipc: host
-    stop_grace_period: 1m
     devices:
       - nvidia.com/gpu=0
       - nvidia.com/gpu=1
