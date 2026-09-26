@@ -22,9 +22,14 @@ The cadence, the ring and the collective order are untouched.
 
 One deviation from upstream, recorded in the patch header: #57433 applies this
 unconditionally for MRV2 + AsyncScheduler + PP>1, while here it is gated behind
-`VLLM_PP_DECODE_COHORT_BALANCE` (default `0`), so one image serves both sides of
-an A/B, rollback is one env var plus a restart, and the Qwen build of this shared
-series is not changed before it is measured there.
+`VLLM_PP_DECODE_COHORT_BALANCE`. The switch now defaults to `1`, on the strength
+of the A/B below, and `=0` restores upstream behaviour, so rollback is one env var
+plus a restart.
+
+Recorded honestly: the Qwen PP2 deployment runs with the switch enabled and has not
+been measured against it switched off, so its numbers are not evidence about this
+patch - on PP2 the cap is about running/2 rather than running/6, and the effect
+there is unquantified. The default rests entirely on the PP6 measurement.
 
 ## A/B result on the port — same image, only the flag differing
 

@@ -24,9 +24,12 @@ build that uses that runtime.
      and the cohort slot is returned on preemption; prefill is never capped and
      PP1 / synchronous scheduling / MRV1 keep `max_num_seqs`;
    - one deviation: upstream enables it unconditionally, here it is gated behind
-     `VLLM_PP_DECODE_COHORT_BALANCE` (default `0`) so one image serves an A/B,
-     rollback is an env var, and the Qwen build of this shared series is not
-     changed before it has been measured there;
+     `VLLM_PP_DECODE_COHORT_BALANCE`, which **defaults to `1`** because the PP6
+     A/B measured it as a large, repeatable win. Setting it to `0` restores
+     upstream behaviour, so a rollback is one env var plus a restart. Note that
+     the Qwen PP2 deployment runs with it enabled without having been A/B'd
+     (its battery was measured in the on state only), so the default rests on
+     the DeepSeek evidence, not on a Qwen measurement;
    - concurrency 32 output rate +89% on prose and +184% on counting on the
      six-GPU SM80 PP6 deployment; see
      `models/deepseek-v41/docs/PP-DECODE-COHORT-BALANCE.md`.

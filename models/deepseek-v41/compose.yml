@@ -54,7 +54,7 @@ services:
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
       # Ported from vllm-project/vllm#57433: spread established decodes over the
       # pp_size in-flight pipeline batches. 1 = upstream behaviour.
-      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-1}"
       # Measured on this box (PP6, c32): prose +17-19%, counting -12-15%. Default
       # off; enable deliberately per deployment.
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
