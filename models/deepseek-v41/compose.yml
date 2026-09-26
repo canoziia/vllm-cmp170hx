@@ -55,6 +55,10 @@ services:
       # Ported from vllm-project/vllm#57433: spread established decodes over the
       # pp_size in-flight pipeline batches. 1 = upstream behaviour.
       VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+      # Opt-in cost-model correction for adaptive verification. Default off: the
+      # measurement it was written for turned out not to be the cause of the
+      # single-stream loss it targeted (docs/ADAPTIVE-PP6-LIVE-RUN-20260926.md).
+      VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST: "${VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST:-0}"
       # Measured on this box (PP6, c32): prose +17-19%, counting -12-15%. Default
       # off; enable deliberately per deployment.
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"

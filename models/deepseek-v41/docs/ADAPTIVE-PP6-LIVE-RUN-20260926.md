@@ -353,3 +353,64 @@ previous image (0007 was dead in it, but those steps are trimmed, so 0007 should
 have touched them) and each OFF point is a single repeat; the c16/c32 rows are 3
 repeats with spreads under 2.5% and are the ones worth quoting. Deployment is left at
 the intended state: `.env` and the live engine both `false`, same image, health 200.
+
+## 0008 tested and it did not work: the c1 loss is not over-trimming
+
+I predicted that pricing the unpriced part of a step would remove the single-stream
+prose deficit while keeping the high-concurrency gains. Image `8b2828a-debug`
+(`7eba2f6c3d2b`), adaptive on, cold cell discarded, 3 warm repeats, and the same
+build measured again with the tracer to check what the estimator actually did.
+
+| cell | adaptive OFF | ON + 0007 | ON + 0008 | 0008 vs OFF | 0008 vs 0007 |
+|---|---:|---:|---:|---:|---:|
+| prose c1 | 56.3 | 52.3 | 52.5 | **-6.7%** | +0.5% |
+| prose c2 | 102.1 | 94.5 | 93.3 | -8.6% | -1.3% |
+| prose c4 | 163.3 | 156.6 | 153.6 | -5.9% | -1.9% |
+| prose c8 | 213.7 | 259.7 | 242.9 | +13.6% | **-6.5%** |
+| prose c16 | 349.4 | 411.7 | 401.5 | +14.9% | -2.5% |
+| prose c32 | 609.0 | 690.6 | 638.4 | +4.8% | **-7.6%** |
+| counting c16 | 1064.2 | 979.9 | 821.5 | -22.8% | -16.2% |
+| counting c32 | 1722.1 | 1639.7 | 1597.4 | -7.2% | -2.6% |
+
+The estimator was not broken, which is what makes this a clean negative result.
+Traced prose c1 before and after:
+
+| | full-width (6 rows) steps | trimmed to 4 rows | step period | throughput |
+|---|---:|---:|---:|---:|
+| ON + 0007 | 30.7% | 69% | 43.4 ms | 52.3 |
+| ON + 0008 | **48.3%** | ~50% | 42.2 ms | 52.5 |
+
+So it moved the decision in the predicted direction and the throughput did not
+move. **The hypothesis is falsified: over-trimming is not what costs single-stream
+prose.** Decomposing the c1 gap with the tracer explains why the prediction could
+not work: OFF is 41.1 ms/step at 2.315 accepted, ON+0008 is 42.2 ms/step at 2.273 -
+about +1.1 ms/step of machinery and -1.8% acceptance, roughly -4.5%, and no amount
+of choosing-more-rows recovers either term, because at one request the row count
+barely affects the step at all (4 rows and 6 rows both sit in the same ~42 ms
+pipeline period). The saving 0008 was chasing did not exist.
+
+Worse, adding a constant to the denominator degrades the cases where trimming is
+genuinely profitable: prose c32 fell from +13.4% to +4.8% and counting c16 from
+-7.9% to -22.8%, because the constant is largest exactly where cohort ramp and
+drain dominate the sample set. Reported per-bucket estimates at first trigger:
+1 req 107.3 ms, 2 req 7.3, 3 req 36.1, 4 req 11.1, 5 req 40.7, 6 req 10.1 - against
+a tracer-measured 38.4 ms at 1 request and 6.8 ms at 6. Non-monotonic across
+buckets, i.e. the estimator is measuring step *composition* (prefill mixed into
+small-cohort steps), not a per-request-count constant, which is a second reason its
+corrections land in the wrong places.
+
+Disposition: 0008 stays in the series as code but **defaults to off**
+(`VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST=0`, also exposed in `compose.yml` so
+a future experiment can enable it without a rebuild). 0007 is kept and stays on: it
+was a measured +8.1% on counting c32 with an independently confirmed mechanism
+(padded-but-unneeded verification rows 2712 -> 0). The deployment goes back to
+adaptive off, which is the state that should be shipped.
+
+What the corrected picture of the c1 deficit looks like, and what would be worth
+trying next: the objective prices a row by the *standalone* forward delta at the
+last rank, while what matters is a row's *marginal effect on the pipeline period* -
+flat at one request, real at six. That is a different correction (reprice the verify
+curve from observed step periods rather than add a constant), and it is the part of
+#52057's "online profiling" that would actually apply here. I am not shipping a guess
+at it: after 0008 the bar is a prediction that survives measurement, not a plausible
+model.
