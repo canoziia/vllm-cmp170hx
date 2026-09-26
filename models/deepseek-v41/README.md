@@ -140,13 +140,15 @@ LMCache no longer comes from the third-party DeepSeek image. Build both images
 from the digest-pinned official LMCache v0.5.5 CUDA 13.0 payload:
 
 ```bash
-# First build the normal/debug DeepSeek image on this branch, then inject the
-# same patched official LMCache package into both client and server images.
+# Build the client image first, then layer the patched official LMCache payload
+# onto it. The server image is shared by all deployments and built once.
 DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
-  scripts/build-deepseek-v41-lmcache-images.sh
+  scripts/build-deepseek-v41-lmcache-client.sh
+
+scripts/build-lmcache-server-image.sh
 
 export VLLM_IMAGE=localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched
-export LMCACHE_IMAGE=localhost/deepseek-v41-lmcache:official-v0.5.5-patched
+export LMCACHE_IMAGE=localhost/lmcache-server:latest
 export LMCACHE_L2_PATH=/mnt/lmcache-sda/deepseek-v41
 podman compose --podman-run-args=--ipc=host \
   -f models/deepseek-v41/compose.yml \
