@@ -1,5 +1,10 @@
 # Clean adaptive implementation (not in default patch series)
 
+These patches now live on `main`, applied only when
+`ENABLE_ADAPTIVE_VERIFICATION=1`; re-validated against the upstream #57433 port
+(all five apply and the tree compiles). They are not enabled by any build or
+runtime default.
+
 This directory is a replacement design, not an extension of the previous
 experimental stack. Current checkpoint includes candidate V2 PP integration, not validated adaptive
 serving or a throughput result. It is not in the default build chain.

@@ -184,6 +184,13 @@ from trimming alone.
   replacement requests, 1024-token output + two LMCache hits (3072/3712
   tokens), C12/C16/C32 runs and logprob API smoke, but no strict model-wide
   KV/logprob equivalence claim follows.
+> **Superseded 2026-09-26.** Greedy token-ID equality is not a decidable gate on this
+> deployment: two runs of the *same* configuration disagree at concurrency > 1, and
+> plain decode without any speculative decoding shows the same per-position
+> below-argmax rate as DSpark (1.56% both). See
+> `docs/GREEDY-OUTPUT-ARGMAX-AUDIT.md`; the live gate is `tests/argmax-audit.py`.
+> The bullet below is kept as written for the record.
+
 - Six temperature-0, seed-0, fresh-prefix original/adaptive token-ID pairs:
   count, math and table matched; code diverged at token 23, prose at 5,
   JSON at 9. Repeating the adaptive arm yielded identical IDs. A
