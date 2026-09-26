@@ -36,6 +36,37 @@ build that uses that runtime.
    - upstream behavioural test ported into `tests/v1/core/test_async_scheduler.py`
      (CPU only), plus one test for the opt-in deviation.
 
-Both patches were validated in the DeepSeek default/debug series and in the
+4. `0004-grammar-fail-closed-draft-rows.patch`
+   - port of vllm-project/vllm#54442, the fail-closed half of #54437: a
+     structured-output request could accept drafts that were verified against an
+     all-permissive bitmask row. `grammar_bitmask` reads a `-1` placeholder in
+     the scheduled draft window as "the grammar rejected this draft" and fills
+     every later row with `_full_mask`, which only holds when that `-1` came from
+     `validate_tokens`. With async scheduling + PP the drafts are filled in by
+     the worker, so a request whose drafts never arrive keeps its placeholders
+     while the worker verifies the real drafts from its own device copy;
+     acceptance then walks into the permissive rows and the step emits up to
+     `num_speculative_tokens` tokens with no grammar constraint — silently
+     poisoning the request, or killing it with `Failed to advance FSM` /
+     `grammar rejected tokens` when those tokens are not grammar-legal;
+   - the scheduler now reports how many leading drafts the bitmask actually
+     constrained (`GrammarOutput.num_acceptable_drafts`, derived from the
+     upstream `strip_speculative_padding` helper), the model runner turns that
+     into a mask over logit rows, and the rejection sampler verifies against
+     drafts with those rows pinned invalid (`draft_sampled >= 0`), so acceptance
+     cannot reach them;
+   - one deviation: upstream keys the row limit by absolute flattened positions,
+     which is wrong under adaptive verification because `cu_num_logits_np` keeps
+     the pre-compaction layout; here local positions come from the device
+     `cu_num_logits`, as in the rebased upstream revision;
+   - upstream's unit test ported into
+     `tests/v1/worker/test_grammar_invalid_drafts.py` (CPU only, a
+     `SimpleNamespace` batch), including the adaptive-verification layout case;
+   - the root cause is still open upstream (the draft hand-off carries no request
+     identity), so this patch does not restore lost drafts; it only stops the
+     request from sampling without the grammar. Warmup and the legacy
+     `gpu_model_runner` path pass no row limit and keep their behaviour.
+
+The four patches were validated in the DeepSeek default/debug series and in the
 Qwen PP2/MTP3 series. Model-specific code such as Qwen's process-isolated PLE
 NVMe backend remains under `models/qwen3.8-flash-next/patches/`.
