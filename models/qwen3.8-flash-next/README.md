@@ -59,10 +59,11 @@ bash scripts/build-qwen38-image.sh
 ```
 
 The build checks out the pinned source, applies the model and shared patch
-series, compiles Python files, extracts the official LMCache payload by digest,
-applies the shared LMCache series, builds the native PLE `pread` helper, and
-runs the LMCache, generated-history, MTP-group, and QSA-workspace regression
-gates. Run the GPU tests in `/opt/qwen-cache-tests/` before deployment.
+series, takes the patched LMCache payload from the shared server image (building
+that image first if this revision's is not present - see
+`patches/lmcache/README.md`), builds the native PLE `pread` helper, and runs the
+LMCache, generated-history, MTP-group, and QSA-workspace regression gates. Run the
+GPU tests in `/opt/qwen-cache-tests/` before deployment.
 
 ## Runtime geometry
 

@@ -36,12 +36,15 @@ git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
 
 # Extract the complete ABI-matched official package, then apply the shared
 # LMCache series used by every model image in this repository.
-"$ENGINE" pull "$LMCACHE_PAYLOAD_IMAGE"
-PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_PAYLOAD_IMAGE")
-"$ENGINE" cp "$PAYLOAD_CID:/payload/." "$WORKDIR/context/lmcache-payload/"
+# The patched LMCache payload has a single source: the shared server image.
+# It is built on demand here (REBUILD_LMCACHE_IMAGE=1 forces a rebuild), and the
+# tree is taken from it rather than extracted and patched a second time, so the
+# client runs exactly what the server runs.
+LMCACHE_SERVER_IMAGE=$("$REPO_ROOT/scripts/ensure-lmcache-server-image.sh")
+PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_SERVER_IMAGE")
+"$ENGINE" cp "$PAYLOAD_CID:/opt/lmcache-patched/." "$WORKDIR/context/lmcache-payload/"
 "$ENGINE" rm "$PAYLOAD_CID" >/dev/null
 PAYLOAD_CID=
-"$REPO_ROOT/scripts/apply-lmcache-patches.sh" "$WORKDIR/context/lmcache-payload"
 
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 cp "$MODEL_DIR/native/ple_pread.c" "$WORKDIR/context/ple_pread.c"

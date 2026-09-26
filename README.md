@@ -13,7 +13,8 @@ This `main` branch separates shared infrastructure from model-specific files:
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
-│   ├── build-deepseek-v41-lmcache-images.sh
+│   ├── build-deepseek-v41-lmcache-client.sh  # client payload layer
+│   ├── build-lmcache-server-image.sh         # shared LMCache server image
 │   ├── build-qwen38-image.sh
 │   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
 │   └── test-lmcache-patches.py
@@ -58,12 +59,14 @@ OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
-Build the official patched LMCache server and inject the identical LMCache
-payload into the DeepSeek client image:
+Build the shared LMCache server image once - it serves every deployment - then
+inject the identical payload into the DeepSeek client image:
 
 ```bash
+bash scripts/build-lmcache-server-image.sh
+
 DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
-bash scripts/build-deepseek-v41-lmcache-images.sh
+bash scripts/build-deepseek-v41-lmcache-client.sh
 ```
 
 Create a private deployment environment and start it:

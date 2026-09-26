@@ -2,40 +2,6 @@ x-podman:
   in_pod: false
 
 services:
-  qwen3.8-flash-next-lmcache:
-    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
-    container_name: qwen3.8-flash-next-lmcache
-    restart: "no"
-    entrypoint: ["lmcache"]
-    command:
-      - server
-      - --host=127.0.0.1
-      - --port=5557
-      - --http-host=127.0.0.1
-      - --http-port=18557
-      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
-      - --separate-object-groups
-      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
-      - --eviction-policy=LRU
-      - --max-workers=8
-      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
-    network_mode: host
-    ipc: host
-    devices: ["nvidia.com/gpu=6", "nvidia.com/gpu=7"]
-    security_opt: ["label=disable", "apparmor=unconfined"]
-    environment:
-      CUDA_DEVICE_ORDER: PCI_BUS_ID
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-      PYTHONUNBUFFERED: "1"
-    volumes:
-      - ${LMCACHE_L2_PATH:-/mnt/lmcache-sdb/nvidia/Qwen3.8-Flash-Next-NVFP4}:/lmcache-l2
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18557/status"]
-      interval: 10s
-      timeout: 5s
-      start_period: 2m
-      retries: 30
-
   qwen3.8-flash-next:
     image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
     container_name: qwen3.8-flash-next
@@ -43,7 +9,9 @@ services:
     network_mode: host
     ipc: host
     stop_grace_period: 10m
-    devices: ["nvidia.com/gpu=6", "nvidia.com/gpu=7"]
+    devices:
+      - nvidia.com/gpu=6
+      - nvidia.com/gpu=7
     security_opt: ["label=disable", "apparmor=unconfined"]
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
@@ -105,5 +73,47 @@ services:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
       interval: 30s
       timeout: 10s
-      start_period: 30m
+      start_period: 15m
       retries: 3
+  qwen3.8-flash-next-lmcache:
+    # Shared server image, the same one the DeepSeek deployment runs; the client
+    # image above carries the identical patched payload.
+    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    container_name: qwen3.8-flash-next-lmcache
+    restart: "no"
+    # Matches the lmcache service on the DeepSeek deployment. Without it the
+    # container gets podman's 10s default, which is not enough for the L2 writer
+    # to shut down cleanly - the lmcache server has been observed exiting 137.
+    stop_grace_period: 1m
+    entrypoint: ["lmcache"]
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=5557
+      - --http-host=127.0.0.1
+      - --http-port=18557
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
+      - --separate-object-groups
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      - --eviction-policy=LRU
+      - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
+    network_mode: host
+    ipc: host
+    devices:
+      - nvidia.com/gpu=6
+      - nvidia.com/gpu=7
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:-/mnt/lmcache-sdb/nvidia/Qwen3.8-Flash-Next-NVFP4}:/lmcache-l2
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18557/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+
