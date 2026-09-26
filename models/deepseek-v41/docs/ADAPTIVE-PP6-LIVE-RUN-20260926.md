@@ -21,14 +21,13 @@ comparing `enable_adaptive_verification` false (recorded in
 
 | workload | conc | adaptive off | adaptive on | delta |
 |---|---|---|---|---|
-| counting (near-full acceptance) | 1 | 149 | 124.5 | **-16.4%** |
-| counting | 2 | 256 | 256.5 | +0.2% |
-| counting | 4 | 412 | 475.8 | +15.5% |
-| counting | 8 | 788 | 511.9 | **-35.0%** |
-| counting | 16 | 1093 | 947.3 | -13.3% |
-| counting | 32 | 1724 (repeats 1706) | **1513** (1513/1453/1517) | **-12.2%** |
 | prose (low acceptance) | 16 | 351.6 | **420.4** (392/426/420) | **+19.6%** |
 | prose | 32 | 609.4 | **710.0** (710/710/707) | **+16.5%** |
+| counting (near-full acceptance) | 1 | 149 | 150.3 (150.6/149.7/150.3) | +0.9% |
+| counting | 8 | 788 | 672 (672/697/666) | **-14.7%** |
+| counting | 16 | 1093 | 941 (1046/909/941) | -13.9% |
+| counting | 32 | 1724 (repeats 1706) | 1517 (1464/1519/1517) | -12.0% |
+| prose | 1 | not measured in the off arm on this image | 55.9 (52.3/56.1/55.9) | see note |
 
 Two readings, and the sign is not a coincidence:
 
@@ -39,16 +38,30 @@ Two readings, and the sign is not a coincidence:
   verification-row count is irrelevant on this box - it is irrelevant when the
   rows would have been cut short anyway, and it is not irrelevant when a step
   carries six requests times six rows.
-* **counting gets slower** because there is nothing to trim (acceptance stays
-  5.952 of 6) while the manager still costs work per step. Two cells reached
-  `acceptance 5.708 < 5.952`, i.e. the trimming cut rows that would actually
-  have been accepted - a real loss, not just overhead.
+* **counting gets slower by a flat ~12-15%** at every concurrency from c8 to c32,
+  with acceptance pinned at 5.952 of 6 in all of them. So the loss is manager
+  overhead on a workload that has nothing to trim, not trimmed acceptances.
 
-The counting curve is also non-monotonic (`+15.5%` at c4, `-35%` at c8), which is
-the cost-estimate instability upstream describes in #52057 ("profiling at startup
-by replaying recorded CUDA graphs is known to have some drift, especially at
-higher batch sizes"). Our numbers are one sweep each at those points, so treat the
-c4/c8 spread as "unstable", not as a measured effect.
+### Correction: the first sweep's low-concurrency numbers were cold-start artifacts
+
+My first adaptive-on pass was an inline ascending sweep (`c1,2,4,8,16,32`) with no
+discarded warm-up cell, and it gave counting c1 = 124.5 (-16.4%), c8 = 511.9
+(-35%) and acceptance 5.708 at c8. Re-measured with an explicit warm-up cell and
+three repeats per concurrency, those became 150.3, 672 and 5.952. The first cell
+after a boot is still paying cold costs, and in an ascending sweep that penalty
+lands on the smallest - and therefore most per-step-sensitive - cell, which is
+where it looks worst. The A/B batteries in this repo always ran a discarded
+warm-up first for exactly this reason; skipping it here was my error, and it
+produced three numbers that were wrong enough to change the story (it looked like
+adaptive was cutting accepted rows, and like the curve was badly non-monotonic).
+
+Rule recorded: **never report the first cell after a boot.** Every adaptive-on
+number in the table above comes from a warmed run with 3 repeats.
+
+Still open on the c1 prose row: the off-arm reference for `prose c1` on this image
+was never measured (the batteries only covered c16/c32), so 55.9 tok/s can only be
+compared against the older non-debug main figure of ~57 - within noise, but not a
+controlled comparison.
 
 ## Correctness with the feature on
 
