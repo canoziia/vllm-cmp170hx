@@ -46,6 +46,26 @@ rank published `batch_draft_budget` without reconciling it against
 demanding device lengths for drafts that do not exist) and the production build
 must carry it. The build now greps for it.
 
+### 0007: uniform decode graphs alongside varlen (why "on but trimmed nothing" was slow)
+
+`CudaGraphManager._init_candidates` treated uniform-decode and varlen-decode
+capture as mutually exclusive. Because the manager sets `varlen_decode=True`
+whenever adaptive verification is enabled, the uniform branch was skipped and the
+only decode graphs left were the varlen buckets (`[1,2,4]` + multiples of 8) -
+which do not contain 6x6=36. So a step that the manager decided not to trim at all
+still ran the 40-row graph: 11% extra verification work, purely from enabling the
+feature. That is the mechanism behind the -12..-15% counting regression measured
+below, not manager CPU cost and not the V1 cudagraph downgrade (#49986/#49548),
+which cannot fire here because we run the V2 model runner.
+
+0007 captures the uniform decode graphs alongside the varlen set for the row
+counts no varlen bucket covers exactly (17 new graphs here, 36 among them). They
+are prepended only to the row counts they can serve and kept out of the
+range-partitioning, because inserting them there would let a uniform graph claim
+the counts under its bucket and starve ragged steps of their varlen graph,
+dropping those steps to eager. `_is_compatible()` still refuses a uniform graph
+unless the step is uniform at that width, so ragged steps are unchanged.
+
 ### Measured cost of shipping it (runtime flag off)
 
 Combined tracing image `comb-debug-ce386ad` (adaptive + tracer + cohort
