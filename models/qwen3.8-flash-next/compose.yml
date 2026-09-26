@@ -39,9 +39,6 @@ services:
   qwen3.8-flash-next:
     image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
     container_name: qwen3.8-flash-next
-    depends_on:
-      qwen3.8-flash-next-lmcache:
-        condition: service_healthy
     restart: "no"
     network_mode: host
     ipc: host
