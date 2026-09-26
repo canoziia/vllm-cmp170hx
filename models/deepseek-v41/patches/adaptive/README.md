@@ -1,26 +1,75 @@
-# Clean adaptive implementation (not in default patch series)
+# Adaptive verification series (compiled into the default build, off at runtime)
 
-These patches now live on `main`, applied only when
-`ENABLE_ADAPTIVE_VERIFICATION=1`; re-validated against the upstream #57433 port
-(all five apply and the tree compiles). They are not enabled by any build or
-runtime default.
+`patches/adaptive/series` is applied by `scripts/build-deepseek-v41-image.sh` by
+default. It stays inert because `enable_adaptive_verification` defaults to `false`
+in the speculative config and every hook the series installs is behind an adaptive
+check, which the build now asserts. Opt out with `ENABLE_ADAPTIVE_VERIFICATION=0`.
+
+Enable per deployment:
+
+    --speculative-config={"method":"dspark","num_speculative_tokens":5,\
+      "use_local_argmax_reduction":true,"enable_adaptive_verification":true}
+
+### Why shipping it by default is inert (asserted at build time)
+
+* `AttentionBackend.supports_device_cpu_query_lens_mismatch()` answers `True` on
+  the SM80 family, but is only consulted under `use_adaptive_verification` in
+  `vllm/v1/attention/backend.py` and from the single caller in
+  `adaptive_verification.maybe_create_...`;
+* `PPHandler.relay_draft_confidences` is set only under
+  `if self.use_pp and self.adaptive_verification is not None:`;
+* the PP receive path unwraps `__verification_budget`/`__verification_lengths`
+  only when they were published, which only the adaptive branch does;
+* `enable_adaptive_verification: bool = False` in `vllm/config/speculative.py`.
+
+`scripts/apply-deepseek-v41-patches.sh` greps for each of these and fails the
+build if one disappears, so the inertness cannot rot silently.
+
+### Ordering and the tracing image
+
+The adaptive series is applied before `optional/series.perf-debug`, and the
+tracing package is maintained against the adaptive-modified `PPHandler.receive()`
+and draft-propose code (they previously collided in either order at
+`pp_utils.py:58-67` and `model_runner.py:1573`). Consequence: the tracing image
+carries adaptive too, and `ENABLE_PERF_DEBUG=1` with
+`ENABLE_ADAPTIVE_VERIFICATION=0` is refused up front instead of failing
+mid-patch.
+
+Merged semantics worth knowing when reading either layer: a hot K=0 step skips the
+draft tokens *and* the confidence columns of the same broadcast, publishes no
+drafts, records no confidence, and the verification budget is clamped to the
+drafts the scheduler actually scheduled (`min(batch_draft_budget,
+scheduled_drafts)`), so the scheduler toggle - not the manager - is the single
+source of truth for K.
+
+### Measured cost of shipping it (runtime flag off)
+
+Combined tracing image `comb-debug-ce386ad` (adaptive + tracer + cohort
+balancing) versus the port-only image `upp-debug-b6b6ea2`, same protocol
+(`balance=1`, DSpark on, 3 runs per cell, medians):
+
+| cell | port only | combined | delta |
+|---|---|---|---|
+| prose c16 | 351.2 | 351.6 | +0.1% |
+| prose c32 | 578.3 | 609.4 | +5.4% |
+| counting c16 | 1073.9 | 1093.4 | +1.8% |
+| counting c32 | 1700.2 | 1695.0 | -0.3% |
+| counting sweep c1..c32 | 150/255/363/603/1074/1733 | 149/256/412/788/1093/1724 | mid-range better |
+
+Acceptance is unchanged (prose 2.31-2.35, counting 5.952) and the composition
+cell keeps the policy shape (avg 5.11 requests/step, median 6, 21.6 vs 21.7 ms),
+with residual starved steps down from 19.3% to 4.4%. The mid-concurrency counting
+increase here, versus our own variant's numbers earlier, confirms those single-run
+sweep points were noise rather than a build property.
+
+The rebased hot-K path was re-checked end to end on the combined image: 500
+tokens at concurrency 1 gives 62.0 (K=5) / 41.3 (K=0) / 61.7 (K=5) tok/s,
+matching the pre-rebase 62.2 / 41.9 / 62.4.
+
 
 This directory is a replacement design, not an extension of the previous
-experimental stack. Current checkpoint includes candidate V2 PP integration, not validated adaptive
-serving or a throughput result. It is not in the default build chain.
-
-Build it explicitly (it is never applied by default):
-
-    ENABLE_ADAPTIVE_VERIFICATION=1 scripts/build-deepseek-v41-image.sh
-
-and enable it at runtime in the engine spec config, e.g.
-`--speculative-config={"method":"dspark","num_speculative_tokens":5,
-"use_local_argmax_reduction":true,"enable_adaptive_verification":true}`.
-
-`ENABLE_ADAPTIVE_VERIFICATION=1` cannot be combined with `ENABLE_PERF_DEBUG=1`:
-the hot DSpark control file rejects adaptive verification in its own guard, so
-that combination is refused before anything is patched. Get the AR reference for
-this branch from a separate no-speculative-config boot instead.
+experimental stack. The checkpoint below is candidate V2 PP integration; it is
+compiled in but not yet a validated serving feature (see the gates at the end).
 
 `0001-sm80-device-ragged-backends.patch`:
 - Scoped V4.1 exact-SM80 adaptive metadata builders reuse existing MLA/SWA code.
@@ -79,6 +128,9 @@ flow was exercised for success/exception, PP on/off and relay on/off (8 cases).
 PP6 model startup revalidation is pending; this is not yet a resolved E2E gate.
 
 This does NOT establish whole-model FULL capture, KV equivalence at model level,
-PP6 multi-step adaptive protocol, mixed prefill support under adaptive FULL,
-feature-OFF performance, or end-to-end speedup. These remain enablement gates.
-No default build/configuration was changed. Apply only in an isolated test tree.
+PP6 multi-step adaptive protocol, or mixed prefill support under adaptive FULL;
+those remain enablement gates before the feature is turned on for a deployment.
+Feature-off performance is now measured (table above): shipping the code costs
+nothing measurable. What has NOT been done in this session is running a serving
+test with `enable_adaptive_verification: true`, so the series is compiled in but
+still unvalidated in production traffic.
