@@ -212,8 +212,34 @@ Decision recorded: `enable_adaptive_verification` stays **false by default** in
 deliberately per deployment, only where the content is acceptance-poor, because on
 this box the measured trade is prose +16-19% against counting -12-15%.
 
-Open diagnostic for the next boot (cheap, log-only): capture the CUDA-graph capture
-mode line with the feature off and on for the same image. Our adaptive-on boot logs
-`Capturing CUDA graphs (PIECEWISE)`, and #49986/#49548 both name a graph-mode
-downgrade as the mechanism, but the corresponding adaptive-off log was destroyed
-with its container, so we have not established that the mode differs.
+## Resolved: the graph-mode downgrade does not apply to this deployment
+
+Upstream's mechanism is a deliberate rule, `VllmConfig._maybe_override_dynamic_sd_cudagraph_mode`
+(`vllm/config/vllm.py`): if the config uses dynamic speculative decoding, the
+cudagraph mode has full graphs, and **the V1 model runner is in use**, force
+PIECEWISE, logging "Dynamic speculative decoding changes the target verification
+length at runtime. Overriding cudagraph_mode ... for reliability. Use
+VLLM_USE_V2_MODEL_RUNNER=1 if you want to use full CUDA graphs." The reason is
+that a FULL replay bakes per-shape metadata, so a verification length that
+changes at runtime would be checked against the wrong widths - upstream picks
+reliability over graph coverage there, and names the V2 runner as the way out.
+
+That rule cannot fire on this box, and three independent checks agree:
+
+* we already run the V2 model runner, which is the early-out in the rule itself
+  (the whole `v1/worker/gpu/` stack, and the step tracer, are V2-only);
+* the resolved config keeps `cudagraph_mode=FULL_AND_PIECEWISE` with
+  `mode=CompilationMode.NONE` (breakable CUDA graphs force NONE, so Inductor is
+  not in play at all here);
+* the boot log contains **zero** "Overriding cudagraph_mode" lines, and
+  `LMCacheMPConnector` does not declare `requires_piecewise_for_cudagraph`, so the
+  other PIECEWISE rule (KV-connector layerwise async ops) did not fire either;
+* capture actually ran both phases: `Capturing CUDA graphs (FULL)` x17 and
+  `(PIECEWISE)` x32.
+
+So the -12..-15% on counting is **not** lost graph coverage. Remaining candidates,
+in the order I would test them: per-step manager work on the critical path
+(budget publication, `partial_capacities`, the compact/lengths handling), the
+doubled draft-broadcast payload when confidence relaying is on, and cost-profile
+drift from startup replay (#51303, #52057). Distinguishing them needs the tracer
+across an adaptive-off boot, which is the natural next measurement.
