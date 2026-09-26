@@ -243,3 +243,47 @@ in the order I would test them: per-step manager work on the critical path
 doubled draft-broadcast payload when confidence relaying is on, and cost-profile
 drift from startup replay (#51303, #52057). Distinguishing them needs the tracer
 across an adaptive-off boot, which is the natural next measurement.
+
+## 0007 measured on PP6 (adaptive ON, image `cbf8c4e-debug`, 3 warm repeats)
+
+Dispatch confirmation from the step tracer, before any throughput claim:
+
+| step kind | descriptor (before fix) | descriptor (after fix) | wasted rows |
+|---|---|---|---|
+| full-budget counting step, 6 reqs x 6 rows | `num_tokens=40, uniform=None`, real 36 / padded 40 | `num_tokens=36, uniform=6`, real 36 / padded 36 | 4/step -> **0** |
+| trimmed prose step | `num_tokens=16`, real 16 / padded 16 | unchanged | 0 |
+
+Across 1619 traced steps the total padded-but-unneeded verification rows went from
+~2712 to **0**, with no step falling back to eager and no ragged step changing
+graph (as the offline dispatch simulation over all 192 reachable row counts
+predicted: 17 counts improved, 0 regressed).
+
+Throughput, `full_batch_tok_s` medians of 3 warm repeats, same image and same
+deployment, compared against the adaptive-on run before 0007 and against the
+session's adaptive-off baseline:
+
+| cell | after 0007 | vs adaptive ON before 0007 | vs adaptive OFF | acceptance |
+|---|---:|---:|---:|---:|
+| counting c32 | **1639.7** | **+8.1%** | -4.9% (was -12.0%) | 5.930 of 6 |
+| counting c16 | 979.9 | +4.1% | -10.4% (was -13.9%) | 5.939 |
+| counting c8 | 452.2 | see note | see note | 5.952 |
+| prose c32 | 690.6 | -2.3% | +14.2% | 2.065 |
+| prose c16 | 411.7 | -1.1% | +17.0% | 2.118 |
+
+So the padding was a real component of the counting regression: at c32 it accounts
+for roughly half of it, and the residual -4.9% is where the remaining candidates
+live (2x wide draft broadcast while confidence relaying is on, the per-step varlen
+index build, and cost-profile drift).
+
+Honest limits on this table:
+
+* **counting c8 is not usable as evidence.** Within this single boot the three
+  repeats were 447/452/552 (23% spread), and c4/c8 counting has been unstable in
+  every previous boot too (the 09-24 raw data swings -20%..+23% at those cells).
+  I am not claiming the fix helped or hurt c8.
+* The adaptive-off column comes from a different boot of a different image, so its
+  uncertainty is not zero. A same-image off baseline (the deployment flag is now
+  back to false, so the next start provides it) is the clean comparison.
+* prose is within noise of the pre-fix value (repeats were tight, +-0.7%): the fix
+  removes padding on steps that were not trimmed, and prose mostly trims, so there
+  was nothing for it to recover - which is the expected result, not a coincidence.
