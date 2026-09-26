@@ -5,3 +5,4 @@ adaptive/0004-v2-budget-relay-integration.patch
 adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
 adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
 adaptive/0007-uniform-decode-alongside-varlen.patch
+adaptive/0008-price-unpriced-step-cost.patch
