@@ -168,3 +168,52 @@ deployment; `compose.yml` was a different, LMCache-less definition and editing i
 did nothing). That overlay has since been merged into `compose.yml` and
 `enable_adaptive_verification` is now interpolated from
 `${VLLM_ADAPTIVE_VERIFICATION:-false}`, so switching it is a `.env` edit.
+
+## Other people hit exactly this (upstream corroboration)
+
+The workload-split result is not specific to our box; it is the reported behaviour
+of dynamic/adaptive speculation in vLLM generally:
+
+* **#49986 - "DSD arms pay a large baseline tax vs no-spec under production
+  defaults"** (H100 NVL, gemma-4-31B FP8): every configuration carrying a
+  `speculative_config` is slower than no-spec at short context, `-21%` for static
+  K=3 and `-27..-31%` for dynamic schedules at ctx 400, crossing over to `+9..+10%`
+  only by ctx 4000. They attribute part of the tax to a
+  `FULL_AND_PIECEWISE -> PIECEWISE` CUDA-graph downgrade.
+* **#49548 - "Dynamic speculative decoding causes catastrophic aggregate-throughput
+  collapse under concurrency at the batch-size threshold"** - on a **DGX Spark
+  (GB10)**: an expected ~14% single-stream cost from the graph downgrade, plus an
+  8-concurrent workload going from 232 tok/s (static K=2) to 24-157 tok/s with a
+  schedule that disables speculation above batch 4. Their point matches ours: the
+  intuitive assumption "a zero-K step just falls back to non-spec speed" is wrong.
+* **#49369 - "DSpark much slower than no-spec on single B300 (DeepSeek-V4-Flash)"**:
+  DSpark on roughly **halves** aggregate throughput versus no speculation **with
+  healthy acceptance** - the same signature as our counting arm (acceptance 5.952
+  unchanged, throughput -12..-15%). That issue also notes prefix caching had to be
+  disabled there because acceptance collapsed with it on (#47930); our deployment
+  runs prefix caching + LMCache and did not see that collapse.
+* **#51303 - "Adaptive DSpark Bring-Up Tracker"** (open): the official tracker
+  states adaptive verification needs backends that treat GPU tensors, not CPU
+  query lengths, as the source of truth, and only lists FLASH_ATTN and DSV4
+  attention as supporting per-request variable decode lengths. It also documents
+  the startup cost profiling as "known to have some drift" and calls out the
+  dead-spot / exploration-vs-exploitation failure mode - which is the most likely
+  explanation for our non-monotonic counting curve (+15.5% at c4, -35% cold at c8,
+  settling at -12..-15% warm).
+* Related prior art in the same direction: #44336 (Adaptive K* from per-position
+  acceptance rates, closed), #35301 (dynamic speculation length with
+  confidence-threshold early exit), #53987 (entropy-gated deferred verification),
+  and on the SGLang side #28045 (throughput-aware policy for cost-guided adaptive
+  steps) and #39231 (stabilising the adaptive tier vote with a shared EMA and a
+  minimum dwell) - the latter two exist precisely because tier selection is noisy.
+
+Decision recorded: `enable_adaptive_verification` stays **false by default** in
+`compose.yml` (and the deployment `.env` now states it explicitly). It is enabled
+deliberately per deployment, only where the content is acceptance-poor, because on
+this box the measured trade is prose +16-19% against counting -12-15%.
+
+Open diagnostic for the next boot (cheap, log-only): capture the CUDA-graph capture
+mode line with the feature off and on for the same image. Our adaptive-on boot logs
+`Capturing CUDA graphs (PIECEWISE)`, and #49986/#49548 both name a graph-mode
+downgrade as the mechanism, but the corresponding adaptive-off log was destroyed
+with its container, so we have not established that the mode differs.
