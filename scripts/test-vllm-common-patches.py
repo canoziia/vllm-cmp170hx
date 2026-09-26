@@ -115,5 +115,50 @@ check(
     "set_kv_cache_config" in mr,
 )
 
+# ---- 0004 stop structured output from accepting drafts on permissive rows ----
+print("0004-grammar-fail-closed-draft-rows:")
+o4_out = (root / "vllm/v1/core/sched/output.py").read_text()
+o4_mr = (root / "vllm/v1/worker/gpu/model_runner.py").read_text()
+o4_rs = (root / "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py").read_text()
+o4_shard = (root / "vllm/v1/worker/gpu/sample/batch_shard.py").read_text()
+o4_test = (root / "tests/v1/worker/test_grammar_invalid_drafts.py").read_text()
+check(
+    "GrammarOutput carries the constrained draft prefix",
+    "num_acceptable_drafts: list[int] | None = None" in o4_out,
+)
+check(
+    "scheduler derives it from the scheduled draft window",
+    "len(strip_speculative_padding(spec_tokens.get(req_id, [])))" in sched_src,
+)
+check(
+    "row limit is keyed on device local positions",
+    "input_batch.expanded_local_pos" in o4_mr
+    and "cu_num_logits[1:] - cu_num_logits[:-1]" in o4_mr
+    and "local_pos > row_limit" in o4_mr,
+)
+check(
+    "absent prefix invalidates the whole draft window",
+    "num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0" in o4_mr,
+)
+check(
+    "row limit reaches the rejection sampler",
+    "invalid_drafts = grammar_invalid_drafts(" in o4_mr
+    and "self.speculator.draft_logits,\n                invalid_drafts,\n" in o4_mr,
+)
+check(
+    "sampler pins those drafts invalid before verification",
+    "verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)" in o4_rs
+    and "rejection_sample(\n            processed_logits,\n            draft_logits,\n            verify_draft_sampled,"
+    in o4_rs,
+)
+check(
+    "sharded TP batches keep the prefix aligned",
+    "num_acceptable_drafts=num_acceptable," in o4_shard,
+)
+check(
+    "upstream unit test ported",
+    "def test_follow_the_device_layout_under_adaptive_verification" in o4_test,
+)
+
 print("VLLM_COMMON_PATCHES", "FAIL: " + ", ".join(failures) if failures else "PASS")
 sys.exit(1 if failures else 0)

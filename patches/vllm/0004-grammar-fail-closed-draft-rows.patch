@@ -1,0 +1,289 @@
+diff --git a/tests/v1/worker/test_grammar_invalid_drafts.py b/tests/v1/worker/test_grammar_invalid_drafts.py
+new file mode 100644
+index 000000000..6c85b88e0
+--- /dev/null
++++ b/tests/v1/worker/test_grammar_invalid_drafts.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which speculative drafts a structured-output request may accept.
++
++`StructuredOutputManager.grammar_bitmask` fills row i before it inspects
++`req_tokens[i]`, so with the first -1 placeholder at index j rows 0..j carry a
++real mask and rows j+1.. carry the all-permissive `_full_mask`. Drafts j..K-1
++must therefore be rejected, or the request samples with no grammar constraint
++at a position the model really does sample.
++"""
++
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++from vllm.v1.worker.gpu.model_runner import grammar_invalid_drafts
++
++
++def _input_batch(req_ids, num_drafts, num_admitted=None):
++    """`num_admitted` is what adaptive verification kept on device."""
++    num_admitted = num_drafts if num_admitted is None else num_admitted
++    rows = [n + 1 for n in num_admitted]
++    return SimpleNamespace(
++        req_ids=list(req_ids),
++        num_reqs=len(req_ids),
++        num_draft_tokens=sum(num_drafts),
++        num_draft_tokens_per_req=np.array(num_drafts, dtype=np.int32),
++        cu_num_logits=torch.tensor([0, *np.cumsum(rows)], dtype=torch.int32),
++        expanded_local_pos=torch.cat(
++            [torch.arange(n, dtype=torch.int32) for n in rows]
++        ),
++    )
++
++
++def _invalid_rows(batch, grammar_req_ids, num_acceptable):
++    mask = grammar_invalid_drafts(batch, grammar_req_ids, num_acceptable)
++    return None if mask is None else mask.nonzero().flatten().tolist()
++
++
++def test_reject_whole_window_when_nothing_was_backfilled():
++    # Request "g" is at rows 0..3 (1 + 3 drafts), so its drafts are rows 1..3.
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [0]) == [1, 2, 3]
++
++
++def test_keep_the_drafts_the_bitmask_could_see():
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [2]) == [3]
++
++
++def test_reject_nothing_when_fully_backfilled():
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [3]) is None
++
++
++def test_rows_are_offset_per_request():
++    batch = _input_batch(["p", "g"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [0]) == [5, 6, 7]
++
++
++def test_follow_the_device_layout_under_adaptive_verification():
++    # Scheduled 3 drafts each, but adaptive verification admitted 2 for "a" and
++    # 3 for "b": the real rows are a=0..2, b=3..6, not the scheduled 0..3, 4..7.
++    batch = _input_batch(["a", "b"], [3, 3], num_admitted=[2, 3])
++    assert _invalid_rows(batch, ["a", "b"], [1, 0]) == [2, 4, 5, 6]
++
++
++def test_fall_back_to_the_whole_window_without_the_field():
++    # An older scheduler, or warmup, supplies no num_acceptable_drafts; be
++    # conservative rather than accepting drafts whose mask is unknown.
++    batch = _input_batch(["g"], [3])
++    assert _invalid_rows(batch, ["g"], None) == [1, 2, 3]
++
++
++def test_nothing_without_drafts_or_grammar_requests():
++    batch = _input_batch(["g"], [3])
++    batch.num_draft_tokens = 0
++    assert _invalid_rows(batch, ["g"], [0]) is None
++    assert _invalid_rows(_input_batch(["g"], [3]), [], []) is None
++
++
++def test_unknown_request_is_skipped():
++    batch = _input_batch(["p"], [3])
++    assert _invalid_rows(batch, ["g"], [0]) is None
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 0fb15bce8..b299167da 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -324,3 +324,8 @@ class GrammarOutput:
+     structured_output_request_ids: list[str]
+     # Bitmask ordered as structured_output_request_ids.
+     grammar_bitmask: "npt.NDArray[np.int32]"
++    # Per request, ordered as structured_output_request_ids: how many leading
++    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
++    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
++    # from this index on must not be accepted. None invalidates every draft.
++    num_acceptable_drafts: list[int] | None = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c16e5e599..2880a1b2d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1916,7 +1916,14 @@ class Scheduler(SchedulerInterface):
+             structured_output_request_ids,
+             scheduler_output.scheduled_spec_decode_tokens,
+         )
+-        return GrammarOutput(structured_output_request_ids, bitmask)
++        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
++        num_acceptable_drafts = [
++            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
++            for req_id in structured_output_request_ids
++        ]
++        return GrammarOutput(
++            structured_output_request_ids, bitmask, num_acceptable_drafts
++        )
+ 
+     def update_from_output(
+         self,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index eb3ea1ee9..72280bf8d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1470,6 +1470,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sample_hidden_states = hidden_states[input_batch.logits_indices]
+             logits = self.model.compute_logits(sample_hidden_states)
+ 
++        invalid_drafts = None
+         if grammar_output is not None:
+             # Apply grammar bitmask to the logits in-place.
+             assert self.structured_outputs_worker is not None
+@@ -1479,6 +1480,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.structured_output_request_ids,
+                 grammar_output.grammar_bitmask,
+             )
++            invalid_drafts = grammar_invalid_drafts(
++                input_batch,
++                grammar_output.structured_output_request_ids,
++                grammar_output.num_acceptable_drafts,
++            )
+ 
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+@@ -1497,6 +1503,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                invalid_drafts,
+             )
+ 
+         if shard_metadata is not None:
+@@ -2263,3 +2270,40 @@ def sort_batch_req_ids(
+         num,
+     )
+     return sorted(num_tokens_per_req, key=key)
++
++
++def grammar_invalid_drafts(
++    input_batch: InputBatch,
++    grammar_req_ids: list[str],
++    num_acceptable_drafts: list[int] | None,
++) -> torch.Tensor | None:
++    """Mask over logit rows whose draft was verified against a permissive row.
++
++    Draft i sits at local position i + 1, and drafts from `num_acceptable_drafts`
++    on met `_full_mask`. Local positions come from the device `cu_num_logits`, so
++    this stays right when adaptive verification trims drafts on device.
++    Returns None when there is nothing to invalidate.
++    """
++    if not grammar_req_ids or input_batch.num_draft_tokens == 0:
++        return None
++    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++    limit = np.full(input_batch.num_reqs, np.iinfo(np.int32).max, dtype=np.int32)
++    for i, req_id in enumerate(grammar_req_ids):
++        req_idx = req_id_to_idx.get(req_id)
++        if req_idx is not None:
++            # None (an older scheduler, or warmup): invalidate the whole window.
++            limit[req_idx] = (
++                num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0
++            )
++    # Adaptive verification only trims drafts, so this bound holds either way.
++    num_drafts = input_batch.num_draft_tokens_per_req
++    if num_drafts is not None and (limit >= num_drafts).all():
++        return None
++    local_pos = input_batch.expanded_local_pos
++    cu_num_logits = input_batch.cu_num_logits
++    row_limit = torch.repeat_interleave(
++        async_copy_to_gpu(limit, device=local_pos.device),
++        cu_num_logits[1:] - cu_num_logits[:-1],
++        output_size=local_pos.shape[0],
++    )
++    return local_pos > row_limit
+diff --git a/vllm/v1/worker/gpu/sample/batch_shard.py b/vllm/v1/worker/gpu/sample/batch_shard.py
+index 0f484f1a1..07f798728 100644
+--- a/vllm/v1/worker/gpu/sample/batch_shard.py
++++ b/vllm/v1/worker/gpu/sample/batch_shard.py
+@@ -335,9 +335,16 @@ def _shard_grammar_output(
+         cursor += num_req_logits
+     if not local_ids:
+         return None
++    # num_acceptable_drafts is ordered with structured_output_request_ids.
++    num_acceptable = grammar_output.num_acceptable_drafts
++    if num_acceptable is not None:
++        owned = set(local_ids)
++        ids = grammar_output.structured_output_request_ids
++        num_acceptable = [n for i, n in zip(ids, num_acceptable) if i in owned]
+     return GrammarOutput(
+         structured_output_request_ids=local_ids,
+         grammar_bitmask=grammar_output.grammar_bitmask[keep_indices],
++        num_acceptable_drafts=num_acceptable,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index a9027e055..5d2ab995f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -152,6 +152,7 @@ class RejectionSampler:
+         idx_mapping_np: np.ndarray,
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -165,7 +166,7 @@ class RejectionSampler:
+         sampled, num_sampled = rejection_sample(
+             processed_logits,
+             draft_logits,
+-            draft_sampled,
++            verify_draft_sampled,
+             cu_num_logits,
+             pos,
+             idx_mapping,
+@@ -189,7 +190,10 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         max_num_logprobs: int,
++        verify_draft_sampled: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
++        if verify_draft_sampled is None:
++            verify_draft_sampled = draft_sampled
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
+@@ -224,6 +228,7 @@ class RejectionSampler:
+                 input_batch.idx_mapping_np[start:end],
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
++                verify_draft_sampled[lo:hi],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -262,6 +267,7 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
++        invalid_drafts: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+@@ -270,6 +276,14 @@ class RejectionSampler:
+         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+         pos = input_batch.positions[input_batch.logits_indices]
+ 
++        # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
++        # accepted length before it reaches a permissive bitmask row. Only
++        # verification sees the copy: `apply_sampling_params` and watermarking
++        # keep the real draft ids.
++        verify_draft_sampled = draft_sampled
++        if invalid_drafts is not None:
++            verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
++
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+             input_batch.idx_mapping_np
+         )
+@@ -282,6 +296,7 @@ class RejectionSampler:
+             pos,
+             chunk_logit_limit,
+             max_num_logprobs,
++            verify_draft_sampled,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
