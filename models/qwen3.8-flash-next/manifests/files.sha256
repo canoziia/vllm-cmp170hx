@@ -1,4 +1,4 @@
-5d6b645c96f5f7fbfd7bbc7626eb987245b9cf3b0a3f0f96855b5bc0cd49a118  models/qwen3.8-flash-next/Containerfile
+e15058a6345dd94bb456bf6d74f13d74cf142b5a276f6a12ed239a2c85eb6f11  models/qwen3.8-flash-next/Containerfile
 eaf6d68541595e7aef66eefb2cf21fbb6622e0afcbc27d48270cf217f7789a92  models/qwen3.8-flash-next/native/ple_pread.c
 eef8dcb2356037d8c9cfc1535e663eeb1120d3e287b293d07b06c550acfd282a  models/qwen3.8-flash-next/patches/0001-process-isolated-nvme-ple.patch
 a899d26a460d558ba3ce5901a45bf7767e6e7f2d3feadda36b181fde80da8826  models/qwen3.8-flash-next/patches/0002-generated-history-checkpoints-pp2.patch
