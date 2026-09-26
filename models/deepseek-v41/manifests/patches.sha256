@@ -7,5 +7,6 @@ d4bf27af0f982594c1108ecff09c9ab4916d1a9c25b10b23f672dbcaa019ccd7  models/deepsee
 b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepseek-v41/patches/adaptive/0003-pack-confidence-with-draft-feedback.patch
 0fe44111c6a723311c0597c6514b135c884e5961901aa53a3014dc439e7f99e7  models/deepseek-v41/patches/adaptive/0004-v2-budget-relay-integration.patch
 6e10c44cf3fd73ed5e8951993c281830523351bbab6fa2c7585e1d726872d6e2  models/deepseek-v41/patches/adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
-8352f3ba1260d927f906b2f5f0779c80691582c60f0e128ed6ef2b82c34ced6a  models/deepseek-v41/patches/adaptive/series
+12e2f9d942f039f72abec4f882ccf876497d9b1b16d56a4c7e9ad4f8570da8ac  models/deepseek-v41/patches/adaptive/series
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v41/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
+41841c743734ce9414dc8222e1c8acf90385dd429013e7959194b41b14257c16  models/deepseek-v41/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
