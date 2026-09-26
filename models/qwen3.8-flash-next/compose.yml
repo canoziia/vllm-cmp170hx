@@ -72,7 +72,7 @@ services:
       NCCL_IB_DISABLE: "1"
       NCCL_CUMEM_HOST_ENABLE: "0"
       PYTHONUNBUFFERED: "1"
-      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-1}"
     command:
       - nvidia/Qwen3.8-Flash-Next-NVFP4
       - --host=0.0.0.0

@@ -27,8 +27,14 @@ test_src = (root / "tests/v1/core/test_async_scheduler.py").read_text()
 sched = ast.parse(sched_src)
 
 print("0003-balance-async-pp-decode-batches:")
-check("env var declared", "VLLM_PP_DECODE_COHORT_BALANCE: bool = False" in envs_src)
-check("env var defaults to off", 'os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "0")' in envs_src)
+check("env var declared", "VLLM_PP_DECODE_COHORT_BALANCE: bool = True" in envs_src)
+# The default is ON on purpose: the PP6 same-image A/B measured it as a large
+# win (prose +19.3%/+77.8%, counting +48.9%/+78.7%, acceptance unchanged). The
+# switch still exists so a deployment can restore upstream behaviour with
+# VLLM_PP_DECODE_COHORT_BALANCE=0, and that path stays asserted below.
+check("env var defaults to on", 'os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1")' in envs_src)
+check("the off path is still wired (not a removed gate)",
+      "envs.VLLM_PP_DECODE_COHORT_BALANCE" in async_src)
 check(
     "policy hook defined on the base Scheduler (PP1/sync/MRV1 unchanged)",
     "def _get_max_num_scheduled_decodes(self) -> int:\n        return self.max_num_running_reqs"
