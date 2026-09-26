@@ -287,3 +287,69 @@ Honest limits on this table:
 * prose is within noise of the pre-fix value (repeats were tight, +-0.7%): the fix
   removes padding on steps that were not trimmed, and prose mostly trims, so there
   was nothing for it to recover - which is the expected result, not a coincidence.
+
+## Same-image A/B against the 0007 build, and three questions closed at once
+
+Restarted the identical image (`cbf8c4e-debug`, `b4f5839d6445`) with
+`VLLM_ADAPTIVE_VERIFICATION=false` to get the baseline that previous tables had to
+borrow from other boots. Cold cell discarded, tracer disabled for all throughput
+cells, 3 warm repeats per cell (1 for the extra prose points), `full_batch_tok_s`.
+
+| cell | adaptive OFF | adaptive ON + 0007 | ON vs OFF | OFF acceptance |
+|---|---:|---:|---:|---:|
+| counting c32 | 1722.1 (spread 2.4%) | 1639.7 | **-4.8%** | 5.952 |
+| counting c16 | 1064.2 (5.0%) | 979.9 | -7.9% | 5.952 |
+| counting c8 | 667.2 (**25.9%**, reps 595/667/768) | 452.2 (447/452/552) | -32.2%, see note | 5.952 |
+| prose c32 | 609.0 (2.2%) | 712.1 | **+16.9%** | 2.347 |
+| prose c16 | 349.4 (0.7%) | 416.3 | **+19.1%** | 2.327 |
+| prose c8 | 213.7 | 259.7 | +21.5% | 2.300 |
+| prose c4 | 163.3 | 156.6 | -4.1% | 2.341 |
+| prose c2 | 102.1 | 94.5 | -7.5% | 2.283 |
+| prose c1 | 56.3 | 52.3 | -7.0% | 2.315 |
+
+**Closed: the counting c4/c8 instability is not caused by adaptive verification.**
+The OFF arm - no adaptive manager constructed at all - swings 595/667/768 (26%) on
+counting c8 while reporting exactly 5.952 accepted tokens per step every time. A
+pure acceptance-stable, throughput-unstable cell in the base deployment, at a
+cohort size of ceil(8/6)=2 requests per step. It had been on the open list as
+"suspect startup cost profiling drift (#52057)"; that hypothesis is wrong for this
+cell, since the profiler does not exist in this arm. What is still true: at c8 every
+adaptive repeat sits below every OFF repeat, so low concurrency pays the manager's
+per-step fixed cost against a very small GPU payload.
+
+**Closed: the ~12 ms in `state_updates` is relocated waiting, not work.** Comparing
+counting@32 traces at matched content, matched request count and matched real rows
+(36 both sides), OFF vs ON:
+
+| span, median ms | OFF | ON | delta |
+|---|---:|---:|---:|
+| `state_updates` | 0.37 | 12.22 | **+11.85** |
+| `execute_model` | 5.64 | 18.83 | +13.20 (contains the above) |
+| `sample_tokens` | 6.91 | 1.79 | **-5.13** |
+| GPU `feedback_receive` | 21.58 | 24.26 | +2.67 |
+| GPU `target_forward` | 16.63 | 14.39 | -2.25 |
+| **step period** | **21.55** | **21.86** | **+0.31 ms (+1.4%)** |
+
+A span can grow by 11.85 ms while the step it lives in takes 1.4% longer, because
+the span is where the CPU parks while waiting for the pipeline. In the OFF arm the
+parking happens in `sample_tokens` instead, which is 5.13 ms cheaper in the ON arm.
+So the number I first reported was measured correctly and interpreted wrongly both
+times I discussed it: first as manager bookkeeping cost, then as a prose-vs-counting
+artifact. The same trace also confirms 0007's premise from the other side: the OFF
+arm dispatches every counting step as `num_tokens=36, uniform_token_count=6`,
+padded 36 - the uniform graph was always there without the feature, which is
+exactly what the varlen branch had been suppressing.
+
+**Closed: the adaptive trade has a concurrency threshold near c8 on prose, and the
+residual counting loss is small at high concurrency.** Prose goes -7.0/-7.5/-4.1%
+at c1/c2/c4 and +21.5/+19.1/+16.9% at c8/c16/c32; counting is -4.8% at c32 versus
+-12.0% before 0007, so the padding was about six tenths of the original regression
+and the rest is small fixed cost. This is the same shape upstream argues for
+scheduling by (batch x ctx) rather than batch alone (#48627, PR #48944), with our
+coefficients.
+
+Caveats kept on purpose: the prose c1-c8 ON numbers come from an earlier boot of the
+previous image (0007 was dead in it, but those steps are trimmed, so 0007 should not
+have touched them) and each OFF point is a single repeat; the c16/c32 rows are 3
+repeats with spreads under 2.5% and are the ones worth quoting. Deployment is left at
+the intended state: `.env` and the live engine both `false`, same image, health 200.
