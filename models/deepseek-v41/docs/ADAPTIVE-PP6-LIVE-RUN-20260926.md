@@ -89,6 +89,28 @@ image, so this cannot be attributed between the debug image, manager overhead on
 single stream, or noise. Resolving it needs one boot with the feature off to fill
 c1/c2/c4/c8 for prose.
 
+## Category attribution - what the 09-24 data can and cannot say
+
+The 2026-09-24 A/B (`ADAPTIVE-PP6-RUNTIME-VALIDATION.md`) is often quoted next to
+this document, and the two are easy to mis-attribute:
+
+* its `C1..C32` table is a **pooled eight-category corpus**, dominated in token
+  volume by prose. Its `+6.7% / +19.1%` at C16/C32 are therefore not counting
+  results;
+* per-category numbers in that data exist **only at C1**: count 137.30/140.12/141.64
+  vs ~139.41 original (neutral), coding 112.30/116.59/115.29 vs ~115.63 (neutral),
+  prose 45.84/47.91/47.44 vs ~53.13 (**-10%**);
+* so there is **no cohort-off counting measurement above C1 at all**. The
+  "-12 to -15% on counting" in this document is a cohort-**on** comparison, and its
+  off-arm reference (788 / 1093 / 1724 at c8/c16/c32) was itself recorded as
+  `mode=counting`, 1000 tokens per request, so that comparison is like-for-like.
+
+Read together, the two sessions agree once categories are attributed correctly:
+adaptive verification helps prose at higher concurrency (pooled +6.7~19.1% then,
+prose-only +16.9~18.4% now) and is neutral for counting at c1 in both. What remains
+unmeasured is counting at c8+ with the cohort balancing off, and the -10% prose
+regression at c1 against a cohort-on off-arm reference.
+
 ## Correctness with the feature on
 
 `tests/semantic-check.mjs` (objectively checkable answers, 400 tokens each,
