@@ -8,7 +8,6 @@ services:
     restart: "no"
     network_mode: host
     ipc: host
-    stop_grace_period: 10m
     devices:
       - nvidia.com/gpu=6
       - nvidia.com/gpu=7
@@ -81,10 +80,6 @@ services:
     image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
     container_name: qwen3.8-flash-next-lmcache
     restart: "no"
-    # Matches the lmcache service on the DeepSeek deployment. Without it the
-    # container gets podman's 10s default, which is not enough for the L2 writer
-    # to shut down cleanly - the lmcache server has been observed exiting 137.
-    stop_grace_period: 1m
     entrypoint: ["lmcache"]
     command:
       - server

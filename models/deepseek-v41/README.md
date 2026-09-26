@@ -115,22 +115,22 @@ Do not reset the VM or kill the container. A hard stop can leave CMP GSP/ACR
 state set and make the next guest driver probe fail.
 
 ```bash
-podman stop -t 600 deepseek-v41
+podman stop deepseek-v41
 podman rm deepseek-v41
 ```
 
-The ten-minute grace period is also encoded in Compose.
+Nothing in this repository grants a stop timeout any more; Compose carries no
+`stop_grace_period`, so an unattended stop uses the engine default. The stack
+needs longer than that to unwind CUDA IPC and pinned Engram tables across the API
+server, the engine core and six PP workers, so give the stop an explicit timeout
+rather than letting it end in a kill.
 
-The graceful stop of this stack is slow: the API server, the engine core and six
-PP workers have to unwind CUDA IPC and pinned Engram tables, and in practice that
-does not finish inside 60 s, which is why the documented command waits ten
-minutes. During the 2026-09-26 scheduler experiments the container was SIGKILLed
-several times to skip that wait; the machine came out clean (no Xid in dmesg, all
-eight CMP cards enumerable, `RestartCount=0` on both deployments), but that is not
-a licence - the rule against hard-stopping exists because a hard stop can leave
-CMP GSP/ACR state set and break the next driver probe. Use `-t 600`, and if a
-restart cycle is too slow, batch the measurements per boot instead of shortening
-the grace.
+The reason is driver state, not tidiness: a hard stop can leave CMP GSP/ACR state
+set and make the next guest driver probe fail. During the 2026-09-26 scheduler
+experiments the container was SIGKILLed several times to skip the wait; the machine
+came out clean (no Xid in dmesg, all eight CMP cards enumerable, `RestartCount=0`
+on both deployments), but that is not a licence. If restart cycles are too slow,
+batch the measurements per boot instead of stopping harder.
 
 ## Optional LMCache deployment
 
