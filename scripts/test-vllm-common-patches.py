@@ -18,70 +18,81 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-# ---- 0003 balance established decodes across PP batches ----
+# ---- 0003 balance async PP decode batches (port of upstream #57433) ----
 envs_src = (root / "vllm/envs.py").read_text()
 sched_path = root / "vllm/v1/core/sched/scheduler.py"
 sched_src = sched_path.read_text()
+async_src = (root / "vllm/v1/core/sched/async_scheduler.py").read_text()
+test_src = (root / "tests/v1/core/test_async_scheduler.py").read_text()
 sched = ast.parse(sched_src)
 
-print("0003-balance-pp-decode-cohorts:")
+print("0003-balance-async-pp-decode-batches:")
 check("env var declared", "VLLM_PP_DECODE_COHORT_BALANCE: bool = False" in envs_src)
+check("env var defaults to off", 'os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "0")' in envs_src)
 check(
-    "env var defaults to off",
-    'os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "0")' in envs_src,
+    "policy hook defined on the base Scheduler (PP1/sync/MRV1 unchanged)",
+    "def _get_max_num_scheduled_decodes(self) -> int:\n        return self.max_num_running_reqs"
+    in sched_src,
 )
-check("gated on the env var", "envs.VLLM_PP_DECODE_COHORT_BALANCE" in sched_src)
 check(
-    "only when MRV2 + PP + async scheduling",
-    all(
-        s in sched_src
-        for s in ("self.use_v2_model_runner", "self.use_pp", "scheduler_config.async_scheduling")
+    "AsyncScheduler overrides it behind the env var",
+    "envs.VLLM_PP_DECODE_COHORT_BALANCE" in async_src
+    and "def _get_max_num_scheduled_decodes" in async_src,
+)
+check(
+    "async override keeps MRV2 + PP gating from upstream",
+    "not self.use_v2_model_runner" in async_src and "not self.use_pp" in async_src,
+)
+check(
+    "share is ceil(max_num_seqs / pp_size)",
+    "(self.max_num_running_reqs + self.pp_size - 1) // self.pp_size" in async_src,
+)
+check(
+    "cohort set is local to schedule(), not scheduler state",
+    "scheduled_decode_req_ids: set[str] = set()" in sched_src
+    and "_pp_scheduled_decode_ids" not in sched_src,
+)
+check(
+    "established decode defined as upstream",
+    sched_src.count("request.num_computed_tokens >= request.num_prompt_tokens") >= 1,
+)
+check(
+    "cap sits before KV block allocation in the RUNNING loop",
+    sched_src.find("len(scheduled_decode_req_ids) >= max_num_scheduled_decodes")
+    < sched_src.find("# Schedule newly needed KV blocks for the request."),
+)
+check(
+    "established decodes resumed from WAITING are capped too",
+    "step_skipped_waiting.prepend_request(request)" in sched_src
+    and sched_src.count("scheduled_decode_req_ids.add(request_id)") == 2,
+)
+check(
+    "preemption returns the cohort slot",
+    "scheduled_decode_req_ids.discard(preempted_req_id)" in sched_src,
+)
+check(
+    "per-step invariant asserted at the end of schedule()",
+    "assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes" in sched_src,
+)
+check(
+    "prefill/admission uncapped: WAITING gate requires not load_kv_async",
+    "not load_kv_async\n                    and num_computed_tokens >= request.num_prompt_tokens"
+    in sched_src,
+)
+check(
+    "upstream behavioural test ported",
+    "def test_async_pp_balances_decode_batches_without_throttling_prefills" in test_src,
+)
+check(
+    "opt-in deviation also covered",
+    "def test_async_pp_balance_is_off_by_default" in test_src,
+)
+check(
+    "no stale identifiers from the pre-port variant",
+    not any(
+        t in sched_src + async_src
+        for t in ("pp_decode_cohort_target", "is_established_decode", "_pp_scheduled_decode")
     ),
-)
-check(
-    "target is ceil(max_num_seqs / pp_size)",
-    "-(-self.max_num_running_reqs // pp_size)" in sched_src,
-)
-check(
-    "limits established decodes only",
-    "request.num_computed_tokens >= request.num_prompt_tokens" in sched_src,
-)
-check(
-    "cap is evaluated after the existing cadence gate",
-    sched_src.find("next_decode_eligible_step")
-    < sched_src.find("is_established_decode"),
-)
-check(
-    "counted at the schedule-accept point",
-    "self._pp_scheduled_decode_ids.add(request_id)" in sched_src,
-)
-check(
-    "count restored when a selected request is preempted",
-    "self._pp_scheduled_decode_ids.discard(" in sched_src,
-)
-check(
-    "per-step set cleared at the start of schedule()",
-    "self._pp_scheduled_decode_ids.clear()" in sched_src,
-)
-# The cap must live in the RUNNING loop only: prefill/admission paths stay free.
-schedule_fn = next(
-    n for n in ast.walk(sched)
-    if isinstance(n, ast.FunctionDef) and n.name == "schedule"
-)
-uses = sum(
-    1
-    for n in ast.walk(schedule_fn)
-    if isinstance(n, ast.Name) and n.id == "is_established_decode"
-)
-# 3 = the assignment itself + the cap test + the accept-point increment.
-check(
-    "established-decode flag used exactly 3x (bind + cap + accept)",
-    uses == 3,
-    f"found {uses}",
-)
-check(
-    "no new cap in the waiting/admission path",
-    sched_src.count("pp_decode_cohort_target > 0") == 1,
 )
 
 # ---- 0001 / 0002 stay present (they are load-bearing for async PP) ----
