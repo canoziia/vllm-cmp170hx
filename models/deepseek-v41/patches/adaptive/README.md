@@ -46,6 +46,52 @@ rank published `batch_draft_budget` without reconciling it against
 demanding device lengths for drafts that do not exist) and the production build
 must carry it. The build now greps for it.
 
+### What is upstream's and what is ours (attribution, since PP+adaptive is not an upstream feature)
+
+`vllm/v1/worker/gpu/spec_decode/adaptive_verification.py` is upstream code (Apache-2.0,
+"contributors to the vLLM project") and is already present in the pinned source. The
+scoring and allocation policy - rank every (request, step) slot by survival
+probability and admit the global top-k - and the cost curves built from replaying
+captured CUDA graphs at startup are theirs, and so is the budget objective:
+
+    draft_budget = argmax estimated_accepted_tokens / (draft_cost_ms + verify_cost_ms)
+
+Upstream, however, refuses to run any of it under pipeline parallelism. The pinned
+source says so directly:
+
+    if self.parallel_config.pipeline_parallel_size > 1:
+        # Cost curves and confidences currently only exist on the last PP rank;
+        # earlier ranks would diverge on the trimmed batch shape.
+        # TODO: we should be able to support adaptive verification with PP by
+        # broadcasting the cost curves and confidences to all ranks.
+        raise ValueError("Adaptive verification is not currently compatible with
+            pipeline parallelism")
+
+Everything that makes it run here is ours: 0001 (SM80 device-ragged backends), 0002
+(authoritative per-step budget input), 0003 (confidence relay packed into the existing
+draft feedback collective), 0004 (budget relay integration on the V2 runner), 0005
+(relay/warmup pairing), and the replacement of that raise with a narrow allowlist
+(SM80 + DeepSeek-V4.1 + DSpark greedy drafting + TP1/DP1/PCP1/DCP1 + no ubatching).
+In other words, this branch implements the TODO in that comment, so every adaptive
+performance number measured on PP6 - both the prose wins and the counting loss -
+characterises our port, not an upstream deployment.
+
+That distinction also assigns the two defects found so far:
+
+* **0007 (graph padding) is entirely ours.** `varlen_decode` is set by our PP path,
+  and its interaction with the upstream bucket list is what suppressed the uniform
+  decode graphs. Upstream never reaches this combination because it never runs
+  adaptive with PP.
+* **The missing fixed-cost term is ours to fix, not an upstream bug.** The objective
+  prices only drafting and target verification, which is a good approximation of a
+  step on the single-stage configuration upstream targets: there the step is
+  essentially draft plus verify. Under PP6 the unpriced part - inter-stage transfer
+  and pipeline wait - is about 70% of a c1 step (42.6 ms period against 12-15 ms of
+  priced work) and still about a third at c32. Moving the algorithm outside the
+  regime its cost model assumed, without extending that model, is what produces the
+  systematic under-verification at low concurrency. 0008 (price the fixed per-step
+  cost) is the completion of our port.
+
 ### 0007: uniform decode graphs alongside varlen (why "on but trimmed nothing" was slow)
 
 `CudaGraphManager._init_candidates` treated uniform-decode and varlen-decode
