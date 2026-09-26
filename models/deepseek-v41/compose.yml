@@ -21,9 +21,6 @@ services:
     # and expose only 64 MiB /dev/shm, so start with --podman-run-args=--ipc=host
     # as well (see README).
     ipc: host
-    depends_on:
-      lmcache:
-        condition: service_healthy
     stop_grace_period: 10m
 
     devices:
