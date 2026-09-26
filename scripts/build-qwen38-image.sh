@@ -41,6 +41,7 @@ git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
 # tree is taken from it rather than extracted and patched a second time, so the
 # client runs exactly what the server runs.
 LMCACHE_SERVER_IMAGE=$("$REPO_ROOT/scripts/ensure-lmcache-server-image.sh")
+LMCACHE_SERVER_ID=$("$ENGINE" image inspect --format "{{.Id}}" "$LMCACHE_SERVER_IMAGE" | cut -c1-12)
 PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_SERVER_IMAGE")
 "$ENGINE" cp "$PAYLOAD_CID:/opt/lmcache-patched/." "$WORKDIR/context/lmcache-payload/"
 "$ENGINE" rm "$PAYLOAD_CID" >/dev/null
@@ -57,6 +58,7 @@ args=(
   --build-arg "QWEN_BASE_IMAGE=$BASE_IMAGE"
   --build-arg "SOURCE_REVISION=$SOURCE_COMMIT"
   --build-arg "INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  --build-arg "LMCACHE_SERVER_IMAGE=$LMCACHE_SERVER_IMAGE ($LMCACHE_SERVER_ID)"
   -f "$WORKDIR/context/Containerfile"
   -t "$OUTPUT_IMAGE"
 )

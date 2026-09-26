@@ -32,6 +32,8 @@ cleanup() {
 trap cleanup EXIT
 
 LMCACHE_SERVER_IMAGE=$("$REPO_ROOT/scripts/ensure-lmcache-server-image.sh")
+# Resolve the moving tag once, so the label records an immutable id.
+LMCACHE_SERVER_ID=$("$ENGINE" image inspect --format "{{.Id}}" "$LMCACHE_SERVER_IMAGE" | cut -c1-12)
 
 mkdir -p "$WORKDIR/context/lmcache-payload"
 payload_cid=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_SERVER_IMAGE")
@@ -49,7 +51,7 @@ ENV PYTHONPATH=/opt/lmcache-patched
 RUN python3 -m compileall -q /opt/lmcache-patched/lmcache && python3 -c 'import lmcache,sys,torch,lmcache.cuda_ops,lmcache.lmcache_native,lmcache.lmcache_fs; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert sys.version_info[:2] == (3,12); assert torch.version.cuda == "13.0"; print(lmcache.__version__, lmcache.__file__, torch.__version__, torch.version.cuda)'
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \
       io.canoziia.lmcache.role="client" \
-      io.canoziia.lmcache.payload-from="$LMCACHE_SERVER_IMAGE"
+      io.canoziia.lmcache.payload-from="$LMCACHE_SERVER_IMAGE ($LMCACHE_SERVER_ID)"
 CONTAINERFILE
 
 if [[ $ENGINE == podman ]]; then

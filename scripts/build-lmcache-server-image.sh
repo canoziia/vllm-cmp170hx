@@ -10,10 +10,11 @@ set -euo pipefail
 # and patching the official payload themselves, so client and server provably
 # run the same tree.
 #
-# Identity: the repository revision. The image is tagged both :latest and
-# :<short-rev>, and ensure-lmcache-server-image.sh reuses :<short-rev> when it is
-# already present. Any commit therefore produces a new image, which is coarse but
-# cannot go stale.
+# Tags: :latest and :<short-rev>. The revision tag records where the image was
+# built; :latest is what deployments run and what client builds reuse, so the
+# server is not rebuilt for commits that do not touch LMCache. Pass
+# REBUILD_LMCACHE_IMAGE=1 (or just remove :latest) when the pinned payload digest
+# or the patch series does change.
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
@@ -79,7 +80,7 @@ else
   "$ENGINE" build -f "$WORKDIR/context/Containerfile" -t "$OUTPUT_IMAGE" "$WORKDIR/context"
 fi
 
-# Keep :latest pointing at the most recently built revision. The :<revision> tag
-# is what reuse and pinning key on.
+# Keep :latest pointing at the most recently built revision. Deployments and
+# client builds use :latest; :<revision> records which revision produced it.
 "$ENGINE" tag "$OUTPUT_IMAGE" "$IMAGE_BASE:latest" >/dev/null
 echo "Built LMCache server image: $OUTPUT_IMAGE (also tagged $IMAGE_BASE:latest)"
