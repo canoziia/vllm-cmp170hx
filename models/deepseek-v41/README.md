@@ -11,6 +11,21 @@ Reproducible minimal patches and a Podman Compose deployment for
   `docker.io/lazymio/vllm-backport@sha256:8094fcbab905a04a480b327f2761255e3d17cd8d39470cac9d76450bbb567f7e`
 - Default output image: `localhost/deepseek-v41-cmp170hx:latest`
 
+### Image naming (fixed convention - do not invent tags)
+
+| tag | meaning |
+|---|---|
+| `localhost/deepseek-v41-cmp170hx:latest` | production image, **no** tracing package |
+| `localhost/deepseek-v41-cmp170hx:latest-debug` | same, **with** the tracing package |
+| `localhost/deepseek-v41-cmp170hx:<shortsha>` | the commit build of `latest` |
+| `localhost/deepseek-v41-cmp170hx:<shortsha>-debug` | the commit build of `latest-debug` |
+| `localhost/deepseek-v41-lmcache:latest` | LMCache server (and the payload both clients use) |
+| `localhost/deepseek-v41-cmp170hx:<shortsha>-stage1`, `<shortsha>-debug-stage1` | intermediates from step 1; never deployed directly |
+
+`latest` and `latest-debug` are the only two moving tags. Experimental variants
+get their tag only for the lifetime of the experiment and are deleted afterwards;
+a result worth keeping is described by a commit sha, not by an adjective.
+
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
 Engram tables use the author's exact-size pinned CPU offload path. The pinned
 author revision includes native PP6+DSpark support. DeepSeek-specific patches
@@ -56,7 +71,7 @@ runtime. Build a separate diagnostic image explicitly:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:debug \
+OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug-stage1 \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -106,6 +121,17 @@ podman rm deepseek-v41
 
 The ten-minute grace period is also encoded in Compose.
 
+The graceful stop of this stack is slow: the API server, the engine core and six
+PP workers have to unwind CUDA IPC and pinned Engram tables, and in practice that
+does not finish inside 60 s, which is why the documented command waits ten
+minutes. During the 2026-09-26 scheduler experiments the container was SIGKILLed
+several times to skip that wait; the machine came out clean (no Xid in dmesg, all
+eight CMP cards enumerable, `RestartCount=0` on both deployments), but that is not
+a licence - the rule against hard-stopping exists because a hard stop can leave
+CMP GSP/ACR state set and break the next driver probe. Use `-t 600`, and if a
+restart cycle is too slow, batch the measurements per boot instead of shortening
+the grace.
+
 ## Optional LMCache deployment
 
 `compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6
@@ -142,7 +168,7 @@ DeepSeek base. Do not promote a build without real store/evict/L2-restore tests.
 ## Combined optional debug package: DSpark compute toggle
 
 ```bash
-ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:debug \
+ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug-stage1 \
   bash scripts/build-deepseek-v41-image.sh
 ```
 
