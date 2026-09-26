@@ -1,6 +1,6 @@
 16d8b755470052a7e939a10c97e6877396b55d06b24b548c166c7e5974dd5af7  models/deepseek-v41/patches/0001-prime-pp-communicators-before-model-load.patch
 caf7852108c5f58fa988bf9d2cf1354694bf016c902bc3bcc0c1d8e8763e4ee6  models/deepseek-v41/patches/0002-fixed-triton-logits-workspace.patch
-d318e9fdc7d63b321300d32fa6f4ea85fe826054a44143ca424e6d9db15c4011  models/deepseek-v41/patches/optional/0002-hot-perf-debug.patch
+90d387122823be2670fe5624a22ddd9627df9d5681b02905a8dccea2210e19dc  models/deepseek-v41/patches/optional/0002-hot-perf-debug.patch
 a3557779a6de63368e444a289529d285fe5d3ed687969a05f717d6b1b3526d9d  models/deepseek-v41/tests/test_triton_logits_workspace.py
 d7017f71af237a77e19678b8a49cfe37c6413dbf22d6cff563172fe88514ca4c  models/deepseek-v41/patches/adaptive/0001-sm80-device-ragged-backends.patch
 d4bf27af0f982594c1108ecff09c9ab4916d1a9c25b10b23f672dbcaa019ccd7  models/deepseek-v41/patches/adaptive/0002-authoritative-budget-input.patch

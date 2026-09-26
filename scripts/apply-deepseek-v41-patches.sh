@@ -38,26 +38,32 @@ apply_series() {
 
 ENABLE_PERF_DEBUG=${ENABLE_PERF_DEBUG:-0}
 [[ $ENABLE_PERF_DEBUG == 0 || $ENABLE_PERF_DEBUG == 1 ]] || exit 2
-ENABLE_ADAPTIVE_VERIFICATION=${ENABLE_ADAPTIVE_VERIFICATION:-0}
+# Adaptive verification is compiled in by default. It stays inert unless the
+# runtime spec config sets enable_adaptive_verification, so a production image
+# carries the code without changing behaviour. Set
+# ENABLE_ADAPTIVE_VERIFICATION=0 to reproduce an image built without it.
+ENABLE_ADAPTIVE_VERIFICATION=${ENABLE_ADAPTIVE_VERIFICATION:-1}
 [[ $ENABLE_ADAPTIVE_VERIFICATION == 0 || $ENABLE_ADAPTIVE_VERIFICATION == 1 ]] || exit 2
-if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 && $ENABLE_PERF_DEBUG == 1 ]]; then
-  echo "ENABLE_ADAPTIVE_VERIFICATION cannot be combined with ENABLE_PERF_DEBUG: the hot DSpark control rejects adaptive verification in its guard, so the debug package would abort startup." >&2
-  exit 2
-fi
 if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} != 0 ]]; then
   echo "Use ENABLE_PERF_DEBUG=1 for the combined debug package" >&2
   exit 2
 fi
 apply_series "$MODEL_DIR/patches/series"
 "$REPO_ROOT/scripts/apply-vllm-common-patches.sh" "$SOURCE_TREE"
-if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
+# Order matters: the tracing package is maintained against the adaptive-modified
+# PPHandler and draft-propose code, so the adaptive series has to go first.
+if [[ $ENABLE_ADAPTIVE_VERIFICATION == 0 && $ENABLE_PERF_DEBUG == 1 ]]; then
+  echo "ENABLE_PERF_DEBUG requires the adaptive series: optional/0002-hot-perf-debug.patch is" >&2
+  echo "maintained against the adaptive-modified PPHandler/draft-propose code. Use" >&2
+  echo "ENABLE_ADAPTIVE_VERIFICATION=1 (the default), or build the tracing image from the" >&2
+  echo "commit that predates this rebase to reproduce the older combination." >&2
+  exit 2
 fi
-
-# Adaptive verification is a research candidate, never a default: it stays out of
-# the production chain unless it is asked for explicitly.
 if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
   apply_series "$MODEL_DIR/patches/adaptive/series"
+fi
+if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
+  apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
 fi
 
 # The pinned author revision provides native PP6+DSpark; the local patch adds
@@ -79,11 +85,22 @@ compile_files=(
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 )
-if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-0} == 1 ]]; then
+if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
   grep -q 'def record_confidence_rows' \
     "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  # Inert unless enabled: the runtime default must stay false, and every PP hook
+  # the series adds must sit behind an adaptive check, otherwise shipping it by
+  # default would silently change ordinary production runs.
   grep -q 'enable_adaptive_verification: bool = False' \
     "$SOURCE_TREE/vllm/config/speculative.py"
+  grep -q 'if self.use_pp and self.adaptive_verification is not None:' \
+    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
+  grep -q 'if budget is not None or lengths is not None:' \
+    "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+  grep -q 'and not cls.supports_device_cpu_query_lens_mismatch()' \
+    "$SOURCE_TREE/vllm/v1/attention/backend.py"
+  grep -q 'use_adaptive_verification' \
+    "$SOURCE_TREE/vllm/v1/attention/backend.py"
   grep -q 'supports_aux_hidden_states_over_pp' \
     "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
   compile_files+=(
