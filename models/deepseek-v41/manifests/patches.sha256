@@ -9,4 +9,4 @@ b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepsee
 6e10c44cf3fd73ed5e8951993c281830523351bbab6fa2c7585e1d726872d6e2  models/deepseek-v41/patches/adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
 12e2f9d942f039f72abec4f882ccf876497d9b1b16d56a4c7e9ad4f8570da8ac  models/deepseek-v41/patches/adaptive/series
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v41/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
-41841c743734ce9414dc8222e1c8acf90385dd429013e7959194b41b14257c16  models/deepseek-v41/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
+3f7f6cfbecfa7aeb79e61f78bf85c1e43d0cf006a3bc863a57e8d248d6bbb01b  models/deepseek-v41/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
