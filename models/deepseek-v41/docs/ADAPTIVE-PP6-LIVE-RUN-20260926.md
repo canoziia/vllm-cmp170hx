@@ -162,9 +162,9 @@ has), and it needs the argmax audit plus the c4/c8 instability resolved first.
 
 ## How this run was made reproducible
 
-The switch lives in the engine command, which for the LMCache deployment comes
-from `compose.lmcache.yml` (NOT `compose.yml`, which the LMCache overlay
-replaces). The working tree of `/root/app/src/vllm-cmp170hx-main` carries that
-one-line edit for the duration of the test; revert with
-`git checkout -- models/deepseek-v41/compose.lmcache.yml` to go back to
-adaptive-off.
+The switch lives in the engine command. At the time of the run it was set by a
+one-line edit to `compose.lmcache.yml` (then the file defining the LMCache
+deployment; `compose.yml` was a different, LMCache-less definition and editing it
+did nothing). That overlay has since been merged into `compose.yml` and
+`enable_adaptive_verification` is now interpolated from
+`${VLLM_ADAPTIVE_VERIFICATION:-false}`, so switching it is a `.env` edit.

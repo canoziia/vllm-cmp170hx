@@ -134,13 +134,7 @@ the grace.
 
 ## Optional LMCache deployment
 
-`compose.lmcache.yml` is a standalone alternative to `compose.yml`: PP6
-`7,7,7,7,7,5`, seq32, 6 GiB GPU KV per rank, and a separate LMCache MP server.
-It reserves a 64 GiB L1 CPU cache, uses 1024-token chunks, separate object
-groups, LRU, and a 500 GiB buffered native-FS L2. Set `LMCACHE_L2_PATH` to a
-dedicated host filesystem; the repository does not hard-code a block device.
-Both services use host IPC and the same six CDI GPUs. LMCache binds RPC/HTTP to
-loopback ports 5556/18556. Socket health is not a cache-correctness test.
+`compose.yml` is the deployment: PP6 on six CMP 170HX with the LMCache KV tier (engine + `lmcache` server in one file, connector wired by default). LMCache is not an optional overlay any more; there is no `compose.lmcache.yml`. Add `compose.debug.yml` only on top of a `latest-debug` image.
 
 LMCache no longer comes from the third-party DeepSeek image. Build both images
 from the digest-pinned official LMCache v0.5.5 CUDA 13.0 payload:
@@ -155,7 +149,7 @@ export VLLM_IMAGE=localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patche
 export LMCACHE_IMAGE=localhost/deepseek-v41-lmcache:official-v0.5.5-patched
 export LMCACHE_L2_PATH=/mnt/lmcache-sda/deepseek-v41
 podman compose --podman-run-args=--ipc=host \
-  -f models/deepseek-v41/compose.lmcache.yml \
+  -f models/deepseek-v41/compose.yml \
   -f models/deepseek-v41/compose.debug.yml up -d
 ```
 
