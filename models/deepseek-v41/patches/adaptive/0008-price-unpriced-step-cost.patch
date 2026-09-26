@@ -52,7 +52,7 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
      VLLM_XLA_CHECK_RECOMPILATION: bool = False
      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
      VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
-+    VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST: bool = True
++    VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST: bool = False
      VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
      VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
      VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -64,9 +64,9 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
 +    # curves do not price (pipeline wait, sampling, state updates) in the budget
 +    # objective, estimated online per request count. Set to 0 to restore the
 +    # original objective, which prices only drafting and target verification.
-+    # Default: True
++    # Default: False - see the measured result below the commit message:
 +    "VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST": lambda: bool(
-+        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST", "1"))
++        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST", "0"))
 +    ),
      # If set, the OpenAI API server will stay alive even after the underlying
      # AsyncLLMEngine errors and stops serving requests

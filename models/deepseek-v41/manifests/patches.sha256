@@ -10,4 +10,4 @@ b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepsee
 9fba3c2d1012aeadd02c8f3242b8794c70d2d8ddcac4919112a15430540e3a53  models/deepseek-v41/patches/adaptive/series
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v41/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
 3f7f6cfbecfa7aeb79e61f78bf85c1e43d0cf006a3bc863a57e8d248d6bbb01b  models/deepseek-v41/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
-2ee51486a115415b117fe49a6eebb1e424e5ec8e432ce63d47d7292da07d2320  models/deepseek-v41/patches/adaptive/0008-price-unpriced-step-cost.patch
+5e454ebb8396209cc3485294f01cef74a54ead41117ee72c4264899e4318de09  models/deepseek-v41/patches/adaptive/0008-price-unpriced-step-cost.patch
