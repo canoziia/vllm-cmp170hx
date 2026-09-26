@@ -1,554 +1,39 @@
-diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 77f7d291a..3b8d8cb29 100644
---- a/vllm/v1/core/sched/scheduler.py
-+++ b/vllm/v1/core/sched/scheduler.py
-@@ -1,6 +1,7 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- import itertools
-+import os
- import time
- from collections import defaultdict, deque
- from collections.abc import Iterable
-@@ -270,6 +271,15 @@ class Scheduler(SchedulerInterface):
-         # manager's re-prefillable window (this minus 1), and how many tokens to
-         # reserve between a chunk boundary and the prefill end.
-         self.num_prefill_lookahead = 0
-+        self._dspark_control = os.environ.get("VLLM_DSPARK_CONTROL_FILE", "")
-+        self._dspark_poll_at = 0.0
-+        self._dspark_enabled = True
-+        if self._dspark_control:
-+            if not (speculative_config and speculative_config.use_dspark()
-+                    and vllm_config.use_v2_model_runner
-+                    and self.parallel_config.data_parallel_size == 1
-+                    and not speculative_config.enable_adaptive_verification):
-+                raise ValueError("Hot DSpark requires MRV2 DSpark, DP=1, no adaptive verification")
-         self.dynamic_sd_lookup: list[int] | None = None
-         if speculative_config is not None:
-             if speculative_config.num_speculative_tokens_per_batch_size:
-@@ -1037,7 +1047,8 @@ class Scheduler(SchedulerInterface):
-                     # preserve full cudagraph for this step.
-                     # Not for diffusion where draft tokens can't be padded.
-                     if (
--                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
-+                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
-+                         and not self._dspark_control)
-                         and self.num_sampled_tokens_per_step > 0
-                         and num_new_tokens == 1
-                         and not prefill_scheduled
-@@ -1393,6 +1404,25 @@ class Scheduler(SchedulerInterface):
-                 len(num_scheduled_tokens)
-             ]
- 
-+        if self._dspark_control:
-+            now = time.monotonic()
-+            if now >= self._dspark_poll_at:
-+                self._dspark_poll_at = now + 1.0
-+                try:
-+                    with open(self._dspark_control) as f:
-+                        value = f.read(16).strip()
-+                    if value in ("0", "1"):
-+                        enabled = value == "1"
-+                        if enabled != self._dspark_enabled:
-+                            logger.info("Hot DSpark: requested K=%d",
-+                                        self.num_spec_tokens if enabled else 0)
-+                        self._dspark_enabled = enabled
-+                except OSError:
-+                    pass
-+            num_spec_tokens_to_schedule = (
-+                self.num_spec_tokens if self._dspark_enabled else 0
-+            )
-+
-         scheduled_encoder_input_stats = None
-         if (
-             self.log_stats
-diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index 274cf1f54..2c0f99f5e 100644
---- a/vllm/v1/worker/gpu/cudagraph_utils.py
-+++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -2,6 +2,7 @@
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- import gc
- import itertools
-+import os
- from collections import defaultdict
- from collections.abc import Callable, Iterable
- from dataclasses import dataclass
-@@ -258,6 +259,11 @@ class CudaGraphManager:
-         else:
-             decode_query_lens = [self.decode_query_len]
- 
-+        if (isinstance(self, ModelCudaGraphManager)
-+                and os.environ.get("VLLM_DSPARK_CONTROL_FILE")
-+                and speculative_config and speculative_config.use_dspark()):
-+            decode_query_lens = sorted(set(decode_query_lens) | {1, self.decode_query_len})
-+
-         capture_varlen_decode = (
-             separate_decode_routine and bool(decode_mode) and self.varlen_decode
-         )
-diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 05bc6b8f5..bf44be30c 100644
---- a/vllm/v1/worker/gpu/model_runner.py
-+++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -19,8 +19,10 @@ instead of embedding feature-specific logic directly.
- 
- import functools
- import gc
-+import os
- import time
--from contextlib import AbstractContextManager
-+from collections import defaultdict
-+from contextlib import AbstractContextManager, nullcontext
- from copy import deepcopy
- from typing import Any, NamedTuple
- 
-@@ -137,6 +139,7 @@ from vllm.v1.worker.gpu.lora_utils import (
- from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
- from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
- from vllm.v1.worker.gpu.model_states import init_model_state
-+from vllm.v1.worker.gpu.perf_debug import get_perf_debug
- from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
- from vllm.v1.worker.gpu.pp_utils import PPHandler
- from vllm.v1.worker.gpu.sample.batch_shard import (
-@@ -272,6 +275,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         self.speculator = None
-         self.use_aux_hidden_state_outputs = False
-         self.num_speculative_steps = vllm_config.num_speculative_tokens
-+        self._hot_dspark = bool(os.environ.get("VLLM_DSPARK_CONTROL_FILE"))
-         if self.speculative_config is not None:
-             if self.is_last_pp_rank:
-                 self.speculator = init_speculator(self.vllm_config, self.device)
-@@ -305,6 +309,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         )
- 
-         self.step_timing = StepTimingCollector()
-+        self.perf_debug = get_perf_debug()
-+        self._perf_debug_hook_handles: list[Any] = []
- 
-         # General request states.
-         self.req_states = RequestState(
-@@ -516,6 +522,61 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             )
- 
-         get_offloader().post_init()
-+        if self.perf_debug is not None:
-+            self.perf_debug.set_module_hook_manager(self._set_perf_debug_module_hooks)
-+
-+    def _set_perf_debug_module_hooks(self, enabled: bool) -> None:
-+        for handle in self._perf_debug_hook_handles:
-+            handle.remove()
-+        self._perf_debug_hook_handles.clear()
-+        if not enabled or self.perf_debug is None:
-+            return
-+
-+        active: dict[int, list[Any]] = defaultdict(list)
-+
-+        def attach(root_name: str, root: nn.Module) -> None:
-+            for module_name, module in root.named_modules():
-+                cls = type(module).__name__
-+                selected = (
-+                    cls == "DeepseekV4DecoderLayer"
-+                    or cls == "Engram"
-+                    or cls == "ShadowSource"
-+                    or module_name.endswith(".attn")
-+                    or module_name.endswith(".ffn")
-+                    or (root_name == "draft" and module_name == "model")
-+                )
-+                if not selected:
-+                    continue
-+                label = f"module.{root_name}.{module_name or cls}"
-+                key = id(module)
-+
-+                def before(_module, _args, *, _key=key, _label=label):
-+                    tracer = self.perf_debug
-+                    if tracer is not None and tracer.step_active:
-+                        active[_key].append(tracer.cuda_begin(_label))
-+
-+                def after(_module, _args, _output, *, _key=key):
-+                    tracer = self.perf_debug
-+                    stack = active.get(_key)
-+                    if tracer is not None and tracer.step_active and stack:
-+                        tracer.cuda_end(stack.pop())
-+
-+                self._perf_debug_hook_handles.append(
-+                    module.register_forward_pre_hook(before)
-+                )
-+                self._perf_debug_hook_handles.append(
-+                    module.register_forward_hook(after)
-+                )
-+
-+        attach("target", self.model)
-+        draft = self.get_draft_model()
-+        if draft is not None:
-+            attach("draft", draft)
-+        logger.info(
-+            "Perf debug installed %d module hooks on rank %d",
-+            len(self._perf_debug_hook_handles),
-+            get_pp_group().rank_in_group,
-+        )
- 
-     def get_model(self) -> nn.Module:
-         return self.model
-@@ -1573,6 +1634,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         context_len: int = 0,
-         valid_dummy_state_slots: bool = False,
-     ) -> ModelRunnerOutput | IntermediateTensors | None:
-+        tracer = self.perf_debug
-+        timing = tracer is not None and tracer.step_active
-+        stamp = tracer.cpu_start() if timing else 0
-+        if timing:
-+            tracer.set_meta(request_ids=list(scheduler_output.num_scheduled_tokens),
-+                            scheduled_by_request=scheduler_output.num_scheduled_tokens,
-+                            next_k=scheduler_output.num_spec_tokens_to_schedule)
-         if not dummy_run:
-             # Update the request states.
-             self.update_pp_decode_requests()
-@@ -1588,6 +1656,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-                     scheduler_output, empty_output
-                 )
- 
-+        if timing:
-+            tracer.cpu_end("state_updates", stamp)
-+            stamp = tracer.cpu_start()
-         # Get batch descriptor and sync across DP ranks.
-         num_reqs = len(scheduler_output.num_scheduled_tokens)
-         num_toks = scheduler_output.total_num_scheduled_tokens
-@@ -1611,6 +1682,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             )
- 
-         skip_compiled = False
-+        debug_force_eager = False
-         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
-             # Encoder-decoder models such as Whisper should run eager/non-compiled
-             # when encoder inputs are scheduled, because this step updates
-@@ -1625,7 +1697,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             self.dp_size,
-             self.dp_rank,
-             max_query_len=max_query_len,
--            need_eager=is_profile or skip_compiled,
-+            need_eager=is_profile or skip_compiled or debug_force_eager,
-             num_active_loras=num_active_loras,
-             parallel_config=self.parallel_config,
-             allow_ubatching=(
-@@ -1639,6 +1711,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             empty_output = self.kv_connector.no_forward(scheduler_output)
-             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
- 
-+        if timing:
-+            tracer.cpu_end("gather_and_dispatch", stamp)
-+            tracer.set_meta(batch_descriptor=str(batch_desc))
-+            stamp = tracer.cpu_start()
-         cudagraph_stats = None
-         if not dummy_run:
-             # Common case.
-@@ -1649,7 +1725,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             input_batch = self.prepare_inputs(
-                 scheduler_output, batch_req_state, batch_desc
-             )
-+            if timing:
-+                tracer.cpu_end("prepare_inputs", stamp)
-+                stamp = tracer.cpu_start()
-             block_tables, slot_mappings = self.prepare_attn(input_batch)
-+            if timing:
-+                tracer.cpu_end("prepare_attn", stamp)
-+                stamp = tracer.cpu_start()
-             # Mamba "align" pre-copy: migrate recurrent state across block
-             # boundaries before the forward. Runs only on real batches, and
-             # before model_state.prepare_attn gathers num_accepted_tokens so the
-@@ -1731,9 +1813,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             )
-         elif not (dummy_run and skip_attn_for_dummy_run):
-             assert slot_mappings is not None
-+            fine_stamp = tracer.cpu_start() if timing else 0
-             slot_mappings_by_layer = build_slot_mappings_by_layer(
-                 slot_mappings, self.kv_cache_config
-             )
-+            if timing:
-+                tracer.cpu_end("build_slot_mappings_by_layer", fine_stamp)
-             assert block_tables is not None
-             attn_groups = self.attn_groups
-             if dummy_run and is_profile:
-@@ -1743,6 +1828,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
-                     for groups in attn_groups
-                 ]
-+            fine_stamp = tracer.cpu_start() if timing else 0
-             attn_metadata = self.model_state.prepare_attn(
-                 input_batch,
-                 batch_desc.cg_mode,
-@@ -1755,6 +1841,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-                 # indices from the previous real batch.
-                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
-             )
-+            if timing:
-+                tracer.cpu_end("model_state_prepare_attn", fine_stamp)
- 
-         input_ids = input_batch.input_ids
-         inputs_embeds = None
-@@ -1787,6 +1875,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
-                 input_ids = None
- 
-+        fine_stamp = tracer.cpu_start() if timing else 0
-+        model_state_inputs = self.model_state.prepare_inputs(input_batch, self.req_states)
-+        if timing:
-+            tracer.cpu_end("model_state_prepare_inputs", fine_stamp)
-         model_inputs = {
-             "input_ids": input_ids,
-             "positions": input_batch.positions,
-@@ -1794,7 +1886,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             "intermediate_tensors": None,
-             # NOTE: Values returned by `prepare_inputs` will override the default
-             # values above.
--            **self.model_state.prepare_inputs(input_batch, self.req_states),
-+            **model_state_inputs,
-         }
-         if not self.is_first_pp_rank:
-             # Update for non-first PP ranks.
-@@ -1811,6 +1903,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             assert intermediate_tensors is not None
-             assert self.intermediate_tensors is not None
-             n = input_batch.num_tokens_after_padding
-+            fine_stamp = tracer.cpu_start() if timing else 0
-             new_tensors = {}
-             for k, v in self.intermediate_tensors.tensors.items():
-                 recv = intermediate_tensors.tensors[k]
-@@ -1825,6 +1918,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-                 new_tensors[k] = v[:n] if dummy_run else v[:n].copy_(recv[:n])
-             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
-             del intermediate_tensors
-+            if timing:
-+                tracer.cpu_end("pp_intermediate_copy_enqueue", fine_stamp)
- 
-         # Update the EPLB meta.
-         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
-@@ -1836,7 +1931,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
-         )
-         self.step_timing.forward_start()
-+        debug_step = self.perf_debug is not None and self.perf_debug.step_active
-+        if debug_step:
-+            self.perf_debug.set_meta(
-+                graph_mode=batch_desc.cg_mode.name,
-+                real_tokens=input_batch.num_tokens,
-+                padded_tokens=input_batch.num_tokens_after_padding,
-+                model_reqs=input_batch.num_reqs,
-+                uniform_tokens=uniform_tok_count,
-+                debug_force_eager=debug_force_eager,
-+            )
-+            target_gpu = self.perf_debug.cuda_begin("target_forward")
-+        else:
-+            target_gpu = None
- 
-+        if timing:
-+            tracer.cpu_end("metadata_and_model_inputs", stamp)
-+            stamp = tracer.cpu_start()
-         # Run model.
-         if batch_desc.cg_mode == CUDAGraphMode.FULL:
-             # Use explicit cudagraph replay for FULL mode.
-@@ -1844,7 +1955,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             # because they are already copied to the CUDA graph input buffers.
-             assert self.cudagraph_manager is not None
-             self.kv_connector.pre_forward(scheduler_output)
--            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-+            if timing:
-+                tracer.cpu_end("connector_pre_forward", stamp)
-+                stamp = tracer.cpu_start()
-+            if debug_step:
-+                with self.perf_debug.scope("perf::target_forward"):
-+                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-+            else:
-+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-         else:
-             # For piecewise and eager mode, just call model().
-             batch_descriptor = BatchDescriptor(
-@@ -1878,12 +1996,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                     # PIECEWISE after the cudagraph manager exists.
-                     assert self.cudagraph_manager is not None
--                    model_output = self.cudagraph_manager.run_pw_graph(
--                        self.model, model_inputs
--                    )
-+                    if debug_step:
-+                        with self.perf_debug.scope("perf::target_forward"):
-+                            model_output = self.cudagraph_manager.run_pw_graph(
-+                                self.model, model_inputs
-+                            )
-+                    else:
-+                        model_output = self.cudagraph_manager.run_pw_graph(
-+                            self.model, model_inputs
-+                        )
-                 else:
-                     # Eager (NONE): call the raw model directly.
--                    model_output = self.model(**model_inputs)
-+                    if debug_step:
-+                        with self.perf_debug.scope("perf::target_forward"):
-+                            model_output = self.model(**model_inputs)
-+                    else:
-+                        model_output = self.model(**model_inputs)
-+
-+        if timing:
-+            tracer.cpu_end("forward_dispatch", stamp)
-+        if debug_step:
-+            self.perf_debug.cuda_end(target_gpu)
- 
-         if self.is_last_pp_rank:
-             if self.use_aux_hidden_state_outputs:
-@@ -1917,6 +2050,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             ec_connector_output=ec_connector_output,
-             routed_experts=routed_experts,
-             cudagraph_stats=cudagraph_stats,
-+            next_draft_k=(scheduler_output.num_spec_tokens_to_schedule
-+                          if self._hot_dspark else self.num_speculative_steps),
-         )
- 
-         if not self.is_last_pp_rank:
-@@ -1947,6 +2082,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         ec_connector_output = self.execute_model_state.ec_connector_output
-         routed_experts = self.execute_model_state.routed_experts
-         cudagraph_stats = self.execute_model_state.cudagraph_stats
-+        next_draft_k = self.execute_model_state.next_draft_k
-         self.execute_model_state = None
- 
-         if not self.is_last_pp_rank:
-@@ -1954,7 +2090,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             # IntermediateTensors instead of final hidden states. Receive the
-             # sampled tokens broadcast from the last rank and update local state.
-             assert self.pp_handler is not None
--            all_decode_next = self.pp_handler.receive(input_batch)
-+            debug_step = self.perf_debug is not None and self.perf_debug.step_active
-+            pp_recv_start = self.perf_debug.cpu_start() if debug_step else 0
-+            all_decode_next = self.pp_handler.receive(
-+                input_batch, receive_drafts=next_draft_k > 0
-+            )
-+            if debug_step:
-+                self.perf_debug.cpu_end("feedback_receive_enqueue", pp_recv_start)
-             # Optimistically update num_computed_tokens for entire batch here.
-             # Will be adjusted for rejections if necessary in update_requests.
-             self.postprocess_num_computed_tokens(input_batch)
-@@ -1974,9 +2116,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             self.pcp_manager, hidden_states, input_batch
-         )
- 
--        sampler_output, num_sampled, num_rejected = self.sample(
--            hidden_states, input_batch, grammar_output
--        )
-+        debug_step = self.perf_debug is not None and self.perf_debug.step_active
-+        sample_gpu = self.perf_debug.cuda_begin("target_sampling") if debug_step else None
-+        if debug_step:
-+            with self.perf_debug.scope("perf::target_sampling"):
-+                sampler_output, num_sampled, num_rejected = self.sample(
-+                    hidden_states, input_batch, grammar_output
-+                )
-+        else:
-+            sampler_output, num_sampled, num_rejected = self.sample(
-+                hidden_states, input_batch, grammar_output
-+            )
-+        if debug_step:
-+            self.perf_debug.cuda_end(sample_gpu)
-+            self.perf_debug.capture_acceptance(num_sampled, num_rejected)
- 
-         if self.pp_handler is not None:
-             # Broadcast to non-last PP ranks (handles spec decode multi-token).
-@@ -2041,6 +2194,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         # ensuring that `copy_event` is recorded before calling postprocess.
-         # This sequencing may slightly reduce latency as async D2H copy does not
-         # need to wait for the postprocess to finish.
-+        post_gpu = (
-+            self.perf_debug.cuda_begin("target_postprocess") if debug_step else None
-+        )
-         self.postprocess_sampled(
-             input_batch.idx_mapping,
-             sampler_output.sampled_token_ids,
-@@ -2048,6 +2204,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             num_rejected,
-             input_batch.query_start_loc,
-         )
-+        if debug_step:
-+            self.perf_debug.cuda_end(post_gpu)
- 
-         if self.speculator is not None:
-             assert self.sampler is not None
-@@ -2059,24 +2217,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             if hasattr(self.model, "get_mtp_target_hidden_states"):
-                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-+            draft_gpu = (
-+                self.perf_debug.cuda_begin("draft_propose") if debug_step else None
-+            )
-             with use_workspace_lane(self._draft_workspace_lane):
--                draft_tokens = self.speculator.propose(
--                    input_batch,
--                    attn_metadata,
--                    slot_mappings_by_layer,
--                    spec_hidden_states,
--                    aux_hidden_states,
--                    num_sampled,
--                    num_rejected,
--                    self.req_states.last_sampled_tokens,
--                    self.req_states.next_prefill_tokens,
--                    self.sampler.sampling_states.temperature.gpu,
--                    self.sampler.sampling_states.seeds.gpu,
--                    dp_sync=dp_sync,
--                    mm_inputs=mm_inputs,
-+                draft_scope = (
-+                    self.perf_debug.scope("perf::draft_propose")
-+                    if debug_step
-+                    else nullcontext()
-                 )
--            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
--            if self.adaptive_verification is not None:
-+                with draft_scope:
-+                    draft_tokens = self.speculator.propose(
-+                        input_batch,
-+                        attn_metadata,
-+                        slot_mappings_by_layer,
-+                        spec_hidden_states,
-+                        aux_hidden_states,
-+                        num_sampled,
-+                        num_rejected,
-+                        self.req_states.last_sampled_tokens,
-+                        self.req_states.next_prefill_tokens,
-+                        self.sampler.sampling_states.temperature.gpu,
-+                        self.sampler.sampling_states.seeds.gpu,
-+                        dp_sync=dp_sync,
-+                        mm_inputs=mm_inputs,
-+                        **({"context_only": next_draft_k == 0}
-+                           if self._hot_dspark else {}),
-+                        is_profile=False,
-+                    )
-+            if debug_step:
-+                self.perf_debug.cuda_end(draft_gpu)
-+                self.perf_debug.set_meta(next_draft_k=next_draft_k)
-+            if next_draft_k:
-+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-+            if self.adaptive_verification is not None and next_draft_k:
-                 self.adaptive_verification.record_confidences(
-                     self.speculator.draft_token_confidence_probs, input_batch
-                 )
-@@ -2086,9 +2260,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-             # not have a speculator (i.e. self.speculator is None)
-             self.draft_tokens_handler.set_draft_tokens(
-                 input_batch,
--                self.req_states.draft_tokens[input_batch.idx_mapping],
-+                self.req_states.draft_tokens[input_batch.idx_mapping, :next_draft_k],
-             )
--            if self.pp_handler is not None:
-+            if self.pp_handler is not None and next_draft_k:
-                 self.pp_handler.broadcast_drafts(
-                     self.req_states.draft_tokens, input_batch
-                 )
-@@ -2232,6 +2406,7 @@ class ExecuteModelState(NamedTuple):
-     ec_connector_output: ECConnectorOutput | None
-     routed_experts: RoutedExpertsTensors | None
-     cudagraph_stats: CUDAGraphStat | None
-+    next_draft_k: int
- 
- 
- class BatchReqState(NamedTuple):
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v41: hot perf tracing package, rebased onto adaptive PP
+
+Adds the optional diagnostic layer: a disabled-by-default step tracer
+(VLLM_PERF_DEBUG_CONTROL / SIGUSR2 reload), CUDA-event spans for the PP send,
+irecv enqueue, previous-send wait, draft broadcast/receive and drafter, plus the
+hot DSpark K toggle over VLLM_DSPARK_CONTROL_FILE.
+
+Rebased onto the adaptive series (patches/adaptive/0001-0005) because
+adaptive verification is now compiled into the default build, so the tracing
+image has to carry both. Before this rebase the two collided in either order at
+vllm/v1/worker/gpu/pp_utils.py:58-67, vllm/v1/worker/gpu/model_runner.py:1573 and
+two gpu_worker.py regions - both layers rewrite PPHandler.receive() and the
+draft-propose block. The merged form keeps each layer's intent:
+
+  * broadcast_drafts(): the tracer times the collective around whichever payload
+    the adaptive branch produced (relay columns or draft-only), it does not
+    re-derive `send`;
+  * receive(..., *, receive_drafts): the hot-K0 flag now gates the adaptive
+    payload as well, so a zero-K step skips both the draft tokens and the
+    confidence columns of the same broadcast;
+  * the draft-propose block publishes nothing, records no confidence, and reports
+    a zero verification budget when the toggle is off - the scheduler owns K,
+    the adaptive manager cannot override it;
+  * the startup guard no longer rejects adaptive verification next to the hot
+    toggle, since that interaction is now defined and clamped.
+
+Consequence: the tracing image and the production image carry the same scheduler
+and PP code paths, so traces describe the configuration that ships. Building the
+debug package without the adaptive series is no longer supported (the historical
+combination is reproducible from the commit that built it).
+
+Signed-off-by: canoziia <canoziia@users.noreply.github.com>
+---
 diff --git a/vllm/v1/worker/gpu/perf_debug.py b/vllm/v1/worker/gpu/perf_debug.py
 new file mode 100644
-index 000000000..e0b83a680
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/perf_debug.py
 @@ -0,0 +1,393 @@
@@ -945,11 +430,571 @@ index 000000000..e0b83a680
 +
 +def get_perf_debug() -> PerfDebugTracer | None:
 +    return _TRACER
-diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
-index 8c65a23ef..8ac0625d2 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -270,6 +271,20 @@
+         # manager's re-prefillable window (this minus 1), and how many tokens to
+         # reserve between a chunk boundary and the prefill end.
+         self.num_prefill_lookahead = 0
++        self._dspark_control = os.environ.get("VLLM_DSPARK_CONTROL_FILE", "")
++        self._dspark_poll_at = 0.0
++        self._dspark_enabled = True
++        if self._dspark_control:
++            # Adaptive verification is allowed alongside the hot toggle: a K=0
++            # step clamps the PP verification budget to the drafts the scheduler
++            # actually scheduled, so the toggle stays the single source of truth.
++            if not (
++                speculative_config
++                and speculative_config.use_dspark()
++                and vllm_config.use_v2_model_runner
++                and self.parallel_config.data_parallel_size == 1
++            ):
++                raise ValueError("Hot DSpark requires MRV2 DSpark with DP=1")
+         self.dynamic_sd_lookup: list[int] | None = None
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+@@ -1063,7 +1078,8 @@
+                     # preserve full cudagraph for this step.
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
++                         and not self._dspark_control)
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -1434,6 +1450,25 @@
+                 len(num_scheduled_tokens)
+             ]
+ 
++        if self._dspark_control:
++            now = time.monotonic()
++            if now >= self._dspark_poll_at:
++                self._dspark_poll_at = now + 1.0
++                try:
++                    with open(self._dspark_control) as f:
++                        value = f.read(16).strip()
++                    if value in ("0", "1"):
++                        enabled = value == "1"
++                        if enabled != self._dspark_enabled:
++                            logger.info("Hot DSpark: requested K=%d",
++                                        self.num_spec_tokens if enabled else 0)
++                        self._dspark_enabled = enabled
++                except OSError:
++                    pass
++            num_spec_tokens_to_schedule = (
++                self.num_spec_tokens if self._dspark_enabled else 0
++            )
++
+         scheduled_encoder_input_stats = None
+         if (
+             self.log_stats
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
+ import itertools
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+@@ -258,6 +259,11 @@
+         else:
+             decode_query_lens = [self.decode_query_len]
+ 
++        if (isinstance(self, ModelCudaGraphManager)
++                and os.environ.get("VLLM_DSPARK_CONTROL_FILE")
++                and speculative_config and speculative_config.use_dspark()):
++            decode_query_lens = sorted(set(decode_query_lens) | {1, self.decode_query_len})
++
+         capture_varlen_decode = (
+             separate_decode_routine and bool(decode_mode) and self.varlen_decode
+         )
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -19,8 +19,10 @@
+ 
+ import functools
+ import gc
++import os
+ import time
+-from contextlib import AbstractContextManager
++from collections import defaultdict
++from contextlib import AbstractContextManager, nullcontext
+ from copy import deepcopy
+ from typing import Any, NamedTuple
+ 
+@@ -137,6 +139,7 @@
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+ from vllm.v1.worker.gpu.model_states import init_model_state
++from vllm.v1.worker.gpu.perf_debug import get_perf_debug
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+ from vllm.v1.worker.gpu.pp_utils import PPHandler
+ from vllm.v1.worker.gpu.sample.batch_shard import (
+@@ -272,6 +275,7 @@
+         self.speculator = None
+         self.use_aux_hidden_state_outputs = False
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
++        self._hot_dspark = bool(os.environ.get("VLLM_DSPARK_CONTROL_FILE"))
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
+@@ -305,6 +309,8 @@
+         )
+ 
+         self.step_timing = StepTimingCollector()
++        self.perf_debug = get_perf_debug()
++        self._perf_debug_hook_handles: list[Any] = []
+ 
+         # General request states.
+         self.req_states = RequestState(
+@@ -516,6 +522,61 @@
+             )
+ 
+         get_offloader().post_init()
++        if self.perf_debug is not None:
++            self.perf_debug.set_module_hook_manager(self._set_perf_debug_module_hooks)
++
++    def _set_perf_debug_module_hooks(self, enabled: bool) -> None:
++        for handle in self._perf_debug_hook_handles:
++            handle.remove()
++        self._perf_debug_hook_handles.clear()
++        if not enabled or self.perf_debug is None:
++            return
++
++        active: dict[int, list[Any]] = defaultdict(list)
++
++        def attach(root_name: str, root: nn.Module) -> None:
++            for module_name, module in root.named_modules():
++                cls = type(module).__name__
++                selected = (
++                    cls == "DeepseekV4DecoderLayer"
++                    or cls == "Engram"
++                    or cls == "ShadowSource"
++                    or module_name.endswith(".attn")
++                    or module_name.endswith(".ffn")
++                    or (root_name == "draft" and module_name == "model")
++                )
++                if not selected:
++                    continue
++                label = f"module.{root_name}.{module_name or cls}"
++                key = id(module)
++
++                def before(_module, _args, *, _key=key, _label=label):
++                    tracer = self.perf_debug
++                    if tracer is not None and tracer.step_active:
++                        active[_key].append(tracer.cuda_begin(_label))
++
++                def after(_module, _args, _output, *, _key=key):
++                    tracer = self.perf_debug
++                    stack = active.get(_key)
++                    if tracer is not None and tracer.step_active and stack:
++                        tracer.cuda_end(stack.pop())
++
++                self._perf_debug_hook_handles.append(
++                    module.register_forward_pre_hook(before)
++                )
++                self._perf_debug_hook_handles.append(
++                    module.register_forward_hook(after)
++                )
++
++        attach("target", self.model)
++        draft = self.get_draft_model()
++        if draft is not None:
++            attach("draft", draft)
++        logger.info(
++            "Perf debug installed %d module hooks on rank %d",
++            len(self._perf_debug_hook_handles),
++            get_pp_group().rank_in_group,
++        )
+ 
+     def get_model(self) -> nn.Module:
+         return self.model
+@@ -1626,6 +1687,13 @@
+         pp_verification_budget: int | None = None,
+         pp_verification_lengths: torch.Tensor | None = None,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
++        tracer = self.perf_debug
++        timing = tracer is not None and tracer.step_active
++        stamp = tracer.cpu_start() if timing else 0
++        if timing:
++            tracer.set_meta(request_ids=list(scheduler_output.num_scheduled_tokens),
++                            scheduled_by_request=scheduler_output.num_scheduled_tokens,
++                            next_k=scheduler_output.num_spec_tokens_to_schedule)
+         if not dummy_run:
+             # Update the request states.
+             self.update_pp_decode_requests()
+@@ -1641,6 +1709,9 @@
+                     scheduler_output, empty_output
+                 )
+ 
++        if timing:
++            tracer.cpu_end("state_updates", stamp)
++            stamp = tracer.cpu_start()
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+@@ -1659,6 +1730,11 @@
+         if needs_pp_budget:
+             pp_verification_budget = self.adaptive_verification.batch_draft_budget
+             scheduled_drafts = sum(map(len, scheduler_output.scheduled_spec_decode_tokens.values()))
++            # The scheduler owns how many drafts exist this step: the hot DSpark
++            # control file can drive it to zero while the manager still believes
++            # its budget is positive. Clamping keeps K=0 a true zero-row verify
++            # and stops a nonexistent budget from being read as partial.
++            pp_verification_budget = min(pp_verification_budget, scheduled_drafts)
+             partial = pp_verification_budget not in (0, scheduled_drafts)
+             if not self.is_first_pp_rank and partial != (pp_verification_lengths is not None):
+                 raise RuntimeError("PP verification lengths/schema mismatch")
+@@ -1678,6 +1754,7 @@
+             )
+ 
+         skip_compiled = False
++        debug_force_eager = False
+         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
+             # Encoder-decoder models such as Whisper should run eager/non-compiled
+             # when encoder inputs are scheduled, because this step updates
+@@ -1692,7 +1769,7 @@
+             self.dp_size,
+             self.dp_rank,
+             max_query_len=max_query_len,
+-            need_eager=is_profile or skip_compiled,
++            need_eager=is_profile or skip_compiled or debug_force_eager,
+             num_active_loras=num_active_loras,
+             parallel_config=self.parallel_config,
+             allow_ubatching=(
+@@ -1706,6 +1783,10 @@
+             empty_output = self.kv_connector.no_forward(scheduler_output)
+             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+ 
++        if timing:
++            tracer.cpu_end("gather_and_dispatch", stamp)
++            tracer.set_meta(batch_descriptor=str(batch_desc))
++            stamp = tracer.cpu_start()
+         cudagraph_stats = None
+         if not dummy_run:
+             # Common case.
+@@ -1717,7 +1798,13 @@
+                 scheduler_output, batch_req_state, batch_desc,
+                 authoritative_capacities=pp_verification_lengths,
+             )
++            if timing:
++                tracer.cpu_end("prepare_inputs", stamp)
++                stamp = tracer.cpu_start()
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
++            if timing:
++                tracer.cpu_end("prepare_attn", stamp)
++                stamp = tracer.cpu_start()
+             # Mamba "align" pre-copy: migrate recurrent state across block
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+@@ -1799,9 +1886,12 @@
+             )
+         elif not (dummy_run and skip_attn_for_dummy_run):
+             assert slot_mappings is not None
++            fine_stamp = tracer.cpu_start() if timing else 0
+             slot_mappings_by_layer = build_slot_mappings_by_layer(
+                 slot_mappings, self.kv_cache_config
+             )
++            if timing:
++                tracer.cpu_end("build_slot_mappings_by_layer", fine_stamp)
+             assert block_tables is not None
+             attn_groups = self.attn_groups
+             if dummy_run and is_profile:
+@@ -1811,6 +1901,7 @@
+                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+                     for groups in attn_groups
+                 ]
++            fine_stamp = tracer.cpu_start() if timing else 0
+             attn_metadata = self.model_state.prepare_attn(
+                 input_batch,
+                 batch_desc.cg_mode,
+@@ -1823,6 +1914,8 @@
+                 # indices from the previous real batch.
+                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             )
++            if timing:
++                tracer.cpu_end("model_state_prepare_attn", fine_stamp)
+ 
+         input_ids = input_batch.input_ids
+         inputs_embeds = None
+@@ -1855,6 +1948,10 @@
+             if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
+                 input_ids = None
+ 
++        fine_stamp = tracer.cpu_start() if timing else 0
++        model_state_inputs = self.model_state.prepare_inputs(input_batch, self.req_states)
++        if timing:
++            tracer.cpu_end("model_state_prepare_inputs", fine_stamp)
+         model_inputs = {
+             "input_ids": input_ids,
+             "positions": input_batch.positions,
+@@ -1862,7 +1959,7 @@
+             "intermediate_tensors": None,
+             # NOTE: Values returned by `prepare_inputs` will override the default
+             # values above.
+-            **self.model_state.prepare_inputs(input_batch, self.req_states),
++            **model_state_inputs,
+         }
+         if not self.is_first_pp_rank:
+             # Update for non-first PP ranks.
+@@ -1879,6 +1976,7 @@
+             assert intermediate_tensors is not None
+             assert self.intermediate_tensors is not None
+             n = input_batch.num_tokens_after_padding
++            fine_stamp = tracer.cpu_start() if timing else 0
+             new_tensors = {}
+             for k, v in self.intermediate_tensors.tensors.items():
+                 recv = intermediate_tensors.tensors[k]
+@@ -1893,6 +1991,8 @@
+                 new_tensors[k] = v[:n] if dummy_run else v[:n].copy_(recv[:n])
+             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+             del intermediate_tensors
++            if timing:
++                tracer.cpu_end("pp_intermediate_copy_enqueue", fine_stamp)
+ 
+         # Update the EPLB meta.
+         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+@@ -1904,7 +2004,23 @@
+             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
+         )
+         self.step_timing.forward_start()
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        if debug_step:
++            self.perf_debug.set_meta(
++                graph_mode=batch_desc.cg_mode.name,
++                real_tokens=input_batch.num_tokens,
++                padded_tokens=input_batch.num_tokens_after_padding,
++                model_reqs=input_batch.num_reqs,
++                uniform_tokens=uniform_tok_count,
++                debug_force_eager=debug_force_eager,
++            )
++            target_gpu = self.perf_debug.cuda_begin("target_forward")
++        else:
++            target_gpu = None
+ 
++        if timing:
++            tracer.cpu_end("metadata_and_model_inputs", stamp)
++            stamp = tracer.cpu_start()
+         # Run model.
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Use explicit cudagraph replay for FULL mode.
+@@ -1912,7 +2028,14 @@
+             # because they are already copied to the CUDA graph input buffers.
+             assert self.cudagraph_manager is not None
+             self.kv_connector.pre_forward(scheduler_output)
+-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            if timing:
++                tracer.cpu_end("connector_pre_forward", stamp)
++                stamp = tracer.cpu_start()
++            if debug_step:
++                with self.perf_debug.scope("perf::target_forward"):
++                    model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
++            else:
++                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+         else:
+             # For piecewise and eager mode, just call model().
+             batch_descriptor = BatchDescriptor(
+@@ -1946,12 +2069,27 @@
+                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                     # PIECEWISE after the cudagraph manager exists.
+                     assert self.cudagraph_manager is not None
+-                    model_output = self.cudagraph_manager.run_pw_graph(
+-                        self.model, model_inputs
+-                    )
++                    if debug_step:
++                        with self.perf_debug.scope("perf::target_forward"):
++                            model_output = self.cudagraph_manager.run_pw_graph(
++                                self.model, model_inputs
++                            )
++                    else:
++                        model_output = self.cudagraph_manager.run_pw_graph(
++                            self.model, model_inputs
++                        )
+                 else:
+                     # Eager (NONE): call the raw model directly.
+-                    model_output = self.model(**model_inputs)
++                    if debug_step:
++                        with self.perf_debug.scope("perf::target_forward"):
++                            model_output = self.model(**model_inputs)
++                    else:
++                        model_output = self.model(**model_inputs)
++
++        if timing:
++            tracer.cpu_end("forward_dispatch", stamp)
++        if debug_step:
++            self.perf_debug.cuda_end(target_gpu)
+ 
+         if self.is_last_pp_rank:
+             if self.use_aux_hidden_state_outputs:
+@@ -1985,6 +2123,8 @@
+             ec_connector_output=ec_connector_output,
+             routed_experts=routed_experts,
+             cudagraph_stats=cudagraph_stats,
++            next_draft_k=(scheduler_output.num_spec_tokens_to_schedule
++                          if self._hot_dspark else self.num_speculative_steps),
+         )
+ 
+         if not self.is_last_pp_rank:
+@@ -2027,6 +2167,7 @@
+         ec_connector_output = self.execute_model_state.ec_connector_output
+         routed_experts = self.execute_model_state.routed_experts
+         cudagraph_stats = self.execute_model_state.cudagraph_stats
++        next_draft_k = self.execute_model_state.next_draft_k
+         self.execute_model_state = None
+ 
+         if not self.is_last_pp_rank:
+@@ -2034,7 +2175,13 @@
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+-            all_decode_next = self.pp_handler.receive(input_batch)
++            debug_step = self.perf_debug is not None and self.perf_debug.step_active
++            pp_recv_start = self.perf_debug.cpu_start() if debug_step else 0
++            all_decode_next = self.pp_handler.receive(
++                input_batch, receive_drafts=next_draft_k > 0
++            )
++            if debug_step:
++                self.perf_debug.cpu_end("feedback_receive_enqueue", pp_recv_start)
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -2054,9 +2201,20 @@
+             self.pcp_manager, hidden_states, input_batch
+         )
+ 
+-        sampler_output, num_sampled, num_rejected = self.sample(
+-            hidden_states, input_batch, grammar_output
+-        )
++        debug_step = self.perf_debug is not None and self.perf_debug.step_active
++        sample_gpu = self.perf_debug.cuda_begin("target_sampling") if debug_step else None
++        if debug_step:
++            with self.perf_debug.scope("perf::target_sampling"):
++                sampler_output, num_sampled, num_rejected = self.sample(
++                    hidden_states, input_batch, grammar_output
++                )
++        else:
++            sampler_output, num_sampled, num_rejected = self.sample(
++                hidden_states, input_batch, grammar_output
++            )
++        if debug_step:
++            self.perf_debug.cuda_end(sample_gpu)
++            self.perf_debug.capture_acceptance(num_sampled, num_rejected)
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+@@ -2121,6 +2279,9 @@
+         # ensuring that `copy_event` is recorded before calling postprocess.
+         # This sequencing may slightly reduce latency as async D2H copy does not
+         # need to wait for the postprocess to finish.
++        post_gpu = (
++            self.perf_debug.cuda_begin("target_postprocess") if debug_step else None
++        )
+         self.postprocess_sampled(
+             input_batch.idx_mapping,
+             sampler_output.sampled_token_ids,
+@@ -2128,6 +2289,8 @@
+             num_rejected,
+             input_batch.query_start_loc,
+         )
++        if debug_step:
++            self.perf_debug.cuda_end(post_gpu)
+ 
+         if self.speculator is not None:
+             assert self.sampler is not None
+@@ -2139,24 +2302,43 @@
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            draft_gpu = (
++                self.perf_debug.cuda_begin("draft_propose") if debug_step else None
++            )
+             with use_workspace_lane(self._draft_workspace_lane):
+-                draft_tokens = self.speculator.propose(
+-                    input_batch,
+-                    attn_metadata,
+-                    slot_mappings_by_layer,
+-                    spec_hidden_states,
+-                    aux_hidden_states,
+-                    num_sampled,
+-                    num_rejected,
+-                    self.req_states.last_sampled_tokens,
+-                    self.req_states.next_prefill_tokens,
+-                    self.sampler.sampling_states.temperature.gpu,
+-                    self.sampler.sampling_states.seeds.gpu,
+-                    dp_sync=dp_sync,
+-                    mm_inputs=mm_inputs,
++                draft_scope = (
++                    self.perf_debug.scope("perf::draft_propose")
++                    if debug_step
++                    else nullcontext()
+                 )
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+-            if self.adaptive_verification is not None and not self.use_pp:
++                with draft_scope:
++                    draft_tokens = self.speculator.propose(
++                        input_batch,
++                        attn_metadata,
++                        slot_mappings_by_layer,
++                        spec_hidden_states,
++                        aux_hidden_states,
++                        num_sampled,
++                        num_rejected,
++                        self.req_states.last_sampled_tokens,
++                        self.req_states.next_prefill_tokens,
++                        self.sampler.sampling_states.temperature.gpu,
++                        self.sampler.sampling_states.seeds.gpu,
++                        dp_sync=dp_sync,
++                        mm_inputs=mm_inputs,
++                        **({"context_only": next_draft_k == 0}
++                           if self._hot_dspark else {}),
++                        is_profile=False,
++                    )
++            if debug_step:
++                self.perf_debug.cuda_end(draft_gpu)
++                self.perf_debug.set_meta(next_draft_k=next_draft_k)
++            # Hot K0 proposes nothing usable, so never publish stale drafts and
++            # never feed a confidence row for a step that will verify no drafts:
++            # the scheduler toggle, not the adaptive manager, owns that decision.
++            if next_draft_k:
++                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.adaptive_verification is not None and not self.use_pp and next_draft_k:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+                 )
+@@ -2166,9 +2348,9 @@
+             # not have a speculator (i.e. self.speculator is None)
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+-                self.req_states.draft_tokens[input_batch.idx_mapping],
++                self.req_states.draft_tokens[input_batch.idx_mapping, :next_draft_k],
+             )
+-            if self.pp_handler is not None:
++            if self.pp_handler is not None and next_draft_k:
+                 self.pp_handler.broadcast_drafts(
+                     self.req_states.draft_tokens, input_batch,
+                     self.speculator.draft_token_confidence_probs[:input_batch.num_reqs]
+@@ -2314,6 +2496,7 @@
+     ec_connector_output: ECConnectorOutput | None
+     routed_experts: RoutedExpertsTensors | None
+     cudagraph_stats: CUDAGraphStat | None
++    next_draft_k: int
+ 
+ 
+ class BatchReqState(NamedTuple):
 --- a/vllm/v1/worker/gpu/pp_utils.py
 +++ b/vllm/v1/worker/gpu/pp_utils.py
-@@ -13,6 +13,7 @@ from vllm.platforms import current_platform
+@@ -14,6 +14,7 @@
  from vllm.sequence import IntermediateTensors
  from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
  from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -957,15 +1002,15 @@ index 8c65a23ef..8ac0625d2 100644
  
  
  @dataclass
-@@ -67,6 +68,7 @@ class PPHandler:
-         self.device = device
+@@ -71,6 +72,7 @@
+         self.relay_draft_confidences = relay_draft_confidences
          self.main_stream = torch.cuda.current_stream(device)
          self.broadcast_stream = torch.cuda.Stream(device)
 +        self.perf_debug = get_perf_debug()
  
          # On non-last ranks, a FIFO with one entry per in-flight step: the entry
          # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
-@@ -140,7 +142,15 @@ class PPHandler:
+@@ -145,7 +147,15 @@
              idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
              idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
  
@@ -981,43 +1026,51 @@ index 8c65a23ef..8ac0625d2 100644
          if slot.draft_tokens is not None and draft_tokens_to_update is not None:
              draft_tokens = slot.draft_tokens
              draft_idx_mapping = slot.idx_mapping
-@@ -167,8 +177,14 @@ class PPHandler:
+@@ -180,6 +190,8 @@
          assert self.is_last_rank
          if compute_need_sampled_mask(input_batch) is None:
              return
 +        debug_step = self.perf_debug is not None and self.perf_debug.step_active
 +        draft_broadcast = None
+         if self.relay_draft_confidences:
+             if (draft_confidences is None or draft_confidences.dtype != torch.float32
+                     or draft_confidences.shape != (input_batch.num_reqs, self.num_speculative_steps)
+@@ -192,6 +204,10 @@
+                 draft_confidences.contiguous().view(torch.int32).to(torch.int64)), dim=1)
          with torch.cuda.stream(self.broadcast_stream):
              self.broadcast_stream.wait_stream(self.main_stream)
 +            if debug_step:
 +                draft_broadcast = self.perf_debug.cuda_begin(
 +                    "feedback_draft_broadcast", self.broadcast_stream
 +                )
-             send = draft_tokens[input_batch.idx_mapping].contiguous()
+             if not self.relay_draft_confidences:
+                 send = draft_tokens[input_batch.idx_mapping].contiguous()
              # Must record the idx_mapping tensor since it was allocated
-             # on the main stream.
-@@ -176,10 +192,17 @@ class PPHandler:
-             torch.distributed.broadcast(
+@@ -201,10 +217,20 @@
                  send, src=self.last_rank, group=self.broadcast_group
              )
+             send.record_stream(self.broadcast_stream)
 +            if debug_step:
 +                self.perf_debug.cuda_end(draft_broadcast, self.broadcast_stream)
 +
 +    def receive(self, input_batch: InputBatch, *, receive_drafts: bool = True) -> bool:
 +        """Receive feedback for this target step.
- 
--    def receive(self, input_batch: InputBatch) -> bool:
--        """Returns True iff sampled tokens need to be gathered from *all*
--        requests in the batch."""
++
 +        ``receive_drafts=False`` is the hot-K0 path. Sampled target tokens and
 +        acceptance counts are still required by every PP stage, but a zero-K
 +        step has no draft proposal to consume. All ranks derive the flag from
 +        the same scheduler output, so skipping this collective is symmetric.
+ 
+-    def receive(self, input_batch: InputBatch) -> bool:
+-        """Returns True iff sampled tokens need to be gathered from *all*
+-        requests in the batch."""
++        Returns True iff sampled tokens need to be gathered from *all*
++        requests in the batch.
 +        """
          assert not self.is_last_rank
          need_sampled_mask = compute_need_sampled_mask(input_batch)
          if need_sampled_mask is None:
-@@ -191,8 +214,14 @@ class PPHandler:
+@@ -216,8 +242,14 @@
          gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
  
          num_reqs = input_batch.num_reqs
@@ -1032,25 +1085,25 @@ index 8c65a23ef..8ac0625d2 100644
              sampled_tokens = torch.empty(
                  num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
              )
-@@ -204,7 +233,7 @@ class PPHandler:
-                 combined, src=self.last_rank, group=self.broadcast_group
-             )
+@@ -231,7 +263,7 @@
              draft_tokens = None
+             draft_confidences = None
+             draft_payload = None
 -            if self.num_speculative_steps > 0:
 +            if self.num_speculative_steps > 0 and receive_drafts:
-                 draft_tokens = torch.empty(
+                 draft_payload = torch.empty(
                      num_reqs,
-                     self.num_speculative_steps,
-@@ -215,6 +244,8 @@ class PPHandler:
-                     draft_tokens, src=self.last_rank, group=self.broadcast_group
-                 )
+                     self.num_speculative_steps * (2 if self.relay_draft_confidences else 1),
+@@ -245,6 +277,8 @@
+                 if self.relay_draft_confidences:
+                     draft_confidences = draft_payload[:, self.num_speculative_steps:].to(torch.int32).view(torch.float32)
              event = self.broadcast_stream.record_event()
 +            if debug_step:
 +                self.perf_debug.cuda_end(feedback_receive, self.broadcast_stream)
              num_sampled, num_rejected = combined.unbind(dim=0)
              # Must record_stream since these were allocated on broadcast stream but
              # later used on the main stream.
-@@ -252,8 +283,14 @@ class PPHandler:
+@@ -285,8 +319,14 @@
          if current_platform.is_xpu():
              self.main_stream.synchronize()
  
@@ -1065,17 +1118,15 @@ index 8c65a23ef..8ac0625d2 100644
              send_tokens = torch.nn.functional.pad(
                  sampled_token_ids,
                  (0, self.max_sample_len - sampled_token_ids.shape[-1]),
-@@ -269,3 +306,5 @@ class PPHandler:
+@@ -302,3 +342,5 @@
              )
              for tensor in (sampled_token_ids, num_sampled, num_rejected):
                  tensor.record_stream(self.broadcast_stream)
 +            if debug_step:
 +                self.perf_debug.cuda_end(feedback_broadcast, self.broadcast_stream)
-diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index a3e8df792..b47d85400 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-@@ -6,6 +6,7 @@ from typing import Any
+@@ -6,6 +6,7 @@
  
  import numpy as np
  import torch
@@ -1083,7 +1134,7 @@ index a3e8df792..b47d85400 100644
  import torch.nn as nn
  
  from vllm.config import VllmConfig, replace
-@@ -346,7 +347,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -346,7 +347,12 @@
          skip_attn_for_dummy_run: bool = False,
          mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
          is_profile: bool = False,
@@ -1096,7 +1147,7 @@ index a3e8df792..b47d85400 100644
          num_reqs = input_batch.num_reqs
          num_target_tokens = input_batch.num_tokens
          num_query_tokens = num_reqs * self.num_query_per_req
-@@ -443,6 +449,13 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -443,6 +449,13 @@
              context_slots,
          )
  
@@ -1110,7 +1161,7 @@ index a3e8df792..b47d85400 100644
          batch_sync, num_batch_tokens = (
              self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
              if dp_sync is not None
-@@ -484,6 +497,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -484,6 +497,10 @@
          # so the real token count is num_query_tokens.
          self._prepare_eplb_forward(num_query_tokens)
  
@@ -1121,7 +1172,7 @@ index a3e8df792..b47d85400 100644
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              assert self.query_cudagraph_manager is not None
              self.query_cudagraph_manager.run_fullgraph(batch_desc)
-@@ -497,6 +514,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -497,6 +514,9 @@
                  cudagraph_runtime_mode=batch_desc.cg_mode,
              )
  
@@ -1131,11 +1182,9 @@ index a3e8df792..b47d85400 100644
          return self.draft_tokens[:num_reqs]
  
  
-diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 6c8dda74a..9d4ae4936 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -96,6 +96,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+@@ -96,6 +96,7 @@
  from vllm.v1.worker.workspace import init_workspace_manager
  
  from ...model_executor.model_loader import TensorizerLoader
@@ -1143,7 +1192,7 @@ index 6c8dda74a..9d4ae4936 100644
  from .gpu.warmup import warmup_kernels
  from .utils import request_memory
  
-@@ -152,21 +153,26 @@ class AsyncIntermediateTensors(IntermediateTensors):
+@@ -152,21 +153,26 @@
          tensors: dict[str, torch.Tensor],
          comm_handles: list[Handle] | None = None,
          comm_postprocess: list[Callable[[], None]] | None = None,
@@ -1170,7 +1219,7 @@ index 6c8dda74a..9d4ae4936 100644
          self._comm_waited = True
  
      def __getattribute__(self, name: str):
-@@ -469,6 +475,14 @@ class Worker(WorkerBase):
+@@ -469,6 +475,14 @@
          else:
              raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
  
@@ -1185,7 +1234,7 @@ index 6c8dda74a..9d4ae4936 100644
          # DSpark target and draft CUDA graphs retain workspace views concurrently.
          num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
          init_workspace_manager(
-@@ -1191,23 +1205,42 @@ class Worker(WorkerBase):
+@@ -1191,24 +1205,43 @@
      def sample_tokens(
          self, grammar_output: "GrammarOutput | None"
      ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1225,13 +1274,14 @@ index 6c8dda74a..9d4ae4936 100644
 +            self.perf_debug.cpu_end("pp_previous_send_wait", wait_start)
  
          intermediate_tensors = None
+         verification_kwargs = {}
 -        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
 -        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 +        forward_pass = num_scheduled_tokens > 0
          all_gather_tensors = {}
          compilation_config = self.vllm_config.compilation_config
          parallel_config = self.vllm_config.parallel_config
-@@ -1242,23 +1275,35 @@ class Worker(WorkerBase):
+@@ -1243,12 +1276,15 @@
              }
  
          if forward_pass and not get_pp_group().is_first_rank:
@@ -1245,7 +1295,9 @@ index 6c8dda74a..9d4ae4936 100644
 +            if debug_step:
 +                self.perf_debug.cpu_end("pp_irecv_enqueue", recv_start)
              assert tensor_dict is not None
-             intermediate_tensors = AsyncIntermediateTensors(
+             budget = tensor_dict.pop("__verification_budget", None)
+             lengths = tensor_dict.pop("__verification_lengths", None)
+@@ -1271,12 +1307,21 @@
                  tensor_dict,
                  comm_handles=comm_handles,
                  comm_postprocess=comm_postprocess,
@@ -1255,22 +1307,22 @@ index 6c8dda74a..9d4ae4936 100644
 +        execute_start = self.perf_debug.cpu_start() if debug_step else 0
          with self.annotate_profile(scheduler_output):
 -            output = self.model_runner.execute_model(
--                scheduler_output, intermediate_tensors
+-                scheduler_output, intermediate_tensors, **verification_kwargs
 -            )
 +            if debug_step:
 +                with self.perf_debug.scope("perf::execute_model"):
 +                    output = self.model_runner.execute_model(
-+                        scheduler_output, intermediate_tensors
++                        scheduler_output, intermediate_tensors, **verification_kwargs
 +                    )
 +                self.perf_debug.cpu_end("execute_model", execute_start)
 +            else:
 +                output = self.model_runner.execute_model(
-+                    scheduler_output, intermediate_tensors
++                    scheduler_output, intermediate_tensors, **verification_kwargs
 +                )
              if (
                  self.use_v2_model_runner
                  and self.model_runner.is_pooling_model
-@@ -1280,11 +1325,14 @@ class Worker(WorkerBase):
+@@ -1298,11 +1343,14 @@
          # Non-blocking send of the intermediate tensors. The metadata handle
          # is reaped lazily by the GroupCoordinator; the device handles are
          # waited at the top of the next step.
