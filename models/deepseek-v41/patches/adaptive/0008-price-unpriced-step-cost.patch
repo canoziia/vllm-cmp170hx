@@ -1,0 +1,214 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] adaptive: price the unpriced part of a step in the budget objective
+
+The budget objective divides expected accepted tokens by the profiled draft and
+verify costs only:
+
+    draft_budget = argmax estimated_accepted / (draft_cost_ms + verify_cost_ms)
+
+Those curves come from replaying captured graphs over dummy batches, so they cover
+exactly two phases of a step. Everything else - pipeline wait, sampling, state
+updates, connector work - is absent from the denominator. Expected accepted tokens
+are concave in the budget while the priced cost keeps rising, so a denominator
+missing its constant term peaks too early: the objective systematically under-
+verifies, worst where the unpriced share is largest.
+
+Measured on PP6 with the step tracer, unpriced = step period - priced forward:
+
+    one request per step   period 43.4 ms, forward  5.0 ms -> 38.4 ms unpriced (88%)
+    six requests per step  period 18.1 ms, forward 11.3 ms ->  6.8 ms unpriced (38%)
+
+and the traced consequence matched the bias exactly: at c1 the manager trimmed 69%
+of steps to 4 of 6 rows and prose c1 came out 7.0% below the feature-off baseline,
+while the step period barely moved (42.6 vs 41.1 ms) - work saved that never
+materialised as time.
+
+Add the missing term, estimated online rather than assumed. The gap between
+consecutive budget decisions is one step of wall time on the deciding rank;
+subtracting the priced cost of the step that just ran leaves what no curve
+accounted for. It is kept in a per-request-count ring and used as a median,
+because the quantity is really a property of pipeline saturation, not of row
+count: it fell from 38.4 ms to 6.8 ms as rows grew, so a rows-linear term - the
+form a "fixed plus per-row" decomposition would suggest - has the wrong sign
+here and is not identifiable anyway (inside a bucket the row count barely moves).
+Fewer than 8 samples, an out-of-band gap, or a negative residual all leave the
+objective exactly as upstream wrote it, and VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST=0
+turns the change off wholesale.
+
+Decision locality is unchanged: only the rank that computes the budget observes or
+uses this, so the PP relay keeps every other rank on the shape it published.
+
+Simulated at the measured cost levels, with representative prose-like survival
+probabilities: without the term the optimum is 3 of 5 drafts (the observed 4-row
+trim at c1); with 38.4 ms it is the full 5. At six requests the shift is small
+(6 to 12 of 30 drafts), i.e. trimming behaviour at high concurrency is largely
+preserved, which is the intent - the term is only as loud as the unpriced cost is.
+
+Signed-off-by: canoziia <canoziia@users.noreply.github.com>
+---
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -62,6 +62,7 @@
+     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
++    VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST: bool = True
+     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
+     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
+@@ -1160,6 +1161,14 @@
+     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
+         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+     ),
++    # Include the per-step cost that the adaptive verification draft/verify
++    # curves do not price (pipeline wait, sampling, state updates) in the budget
++    # objective, estimated online per request count. Set to 0 to restore the
++    # original objective, which prices only drafting and target verification.
++    # Default: True
++    "VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST": lambda: bool(
++        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST", "1"))
++    ),
+     # If set, the OpenAI API server will stay alive even after the underlying
+     # AsyncLLMEngine errors and stops serving requests
+     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -2,7 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Adaptive verification for DSpark speculative decoding."""
+ 
+-from collections import defaultdict
++import time
++from collections import defaultdict, deque
+ from collections.abc import Iterable, Iterator
+ from typing import TYPE_CHECKING
+ 
+@@ -25,6 +26,16 @@
+ logger = init_logger(__name__)
+ _PROFILE_REPLAYS = 5
+ 
++# Samples of the unpriced part of a step, per request count.
++_FIXED_COST_RING = 64
++# Below this the estimate is noise, so the objective stays as originally written.
++_FIXED_COST_MIN_SAMPLES = 8
++# A gap wider than this is idle time, not a step.
++_FIXED_COST_MAX_GAP_MS = 2000.0
++# Steps do not vary by this much within a bucket, so a gap outside the band did
++# not span exactly one decision (no drafts in between, or the engine paused).
++_FIXED_COST_BAND = (0.4, 2.5)
++
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+     from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+@@ -164,6 +175,21 @@
+         self._copy_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
+         self._pending_resets: list[int] = []
+         self._stale_idx = 0
++        # Online estimate of the step cost the profiled curves do not price.
++        # The gap between consecutive budget decisions is one step of wall time on
++        # the deciding rank, and the priced cost of the step that just ran is what
++        # the draft/verify curves claim it should have cost; the difference is
++        # everything the model omits. It depends strongly on how many requests
++        # share the step (measured on PP6: ~38 ms at one request, ~7 ms at six),
++        # so it is kept per request count and never pooled across them.
++        self._fixed_cost: defaultdict[int, deque[float]] = defaultdict(
++            lambda: deque(maxlen=_FIXED_COST_RING)
++        )
++        self._fixed_cost_median: dict[int, float] = {}
++        self._fixed_cost_reported: set[int] = set()
++        self._last_decision_ns = 0
++        self._last_priced_cost_ms = 0.0
++        self._last_priced_num_reqs = 0
+         for slot in self._stale_confidences:
+             slot.np.fill(1.0)
+ 
+@@ -275,6 +301,53 @@
+             write_slot.copy_to_cpu()
+             self._copy_events[write_idx].record()
+ 
++    def _observe_unpriced_step_cost(self) -> None:
++        """Record how much of the step that just ran no cost curve priced."""
++        if not envs.VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST:
++            return
++        now_ns = time.monotonic_ns()
++        previous_ns, self._last_decision_ns = self._last_decision_ns, now_ns
++        if not previous_ns or self._last_priced_cost_ms <= 0.0:
++            return
++        gap_ms = (now_ns - previous_ns) / 1e6
++        if not 0.0 < gap_ms < _FIXED_COST_MAX_GAP_MS:
++            return
++        num_reqs = self._last_priced_num_reqs
++        reference = self._fixed_cost_median.get(num_reqs)
++        if reference is not None and not (
++            _FIXED_COST_BAND[0] * reference <= gap_ms <= _FIXED_COST_BAND[1] * reference
++        ):
++            # Not one step of the same kind of batch; no evidence about its cost.
++            return
++        unpriced_ms = gap_ms - self._last_priced_cost_ms
++        if unpriced_ms < 0.0:
++            # The curves over-priced the step (a faster shape, or replay bias).
++            # Nothing to learn from a negative cost.
++            return
++        samples = self._fixed_cost[num_reqs]
++        samples.append(unpriced_ms)
++        if len(samples) < _FIXED_COST_MIN_SAMPLES:
++            return
++        estimate = float(np.median(samples))
++        self._fixed_cost_median[num_reqs] = estimate
++        if num_reqs not in self._fixed_cost_reported:
++            self._fixed_cost_reported.add(num_reqs)
++            logger.info(
++                "Adaptive verification: %.1f ms of per-step cost at %d request(s) "
++                "is not covered by the profiled draft/verify curves; including it "
++                "in the budget objective.",
++                estimate,
++                num_reqs,
++            )
++
++    def unpriced_step_cost_ms(self, num_reqs: int) -> float:
++        """Estimated unpriced cost for a step of this size, 0 until evidence exists."""
++        if not envs.VLLM_ADAPTIVE_VERIFICATION_PRICED_FIXED_COST:
++            return 0.0
++        if len(self._fixed_cost.get(num_reqs, ())) < _FIXED_COST_MIN_SAMPLES:
++            return 0.0
++        return self._fixed_cost_median.get(num_reqs, 0.0)
++
+     def get_num_tokens(
+         self,
+         num_tokens_per_req: dict[str, int],
+@@ -318,6 +391,7 @@
+             return int(num_non_draft_tokens.sum()) + authoritative_budget
+ 
+         assert self.cost_tables is not None
++        self._observe_unpriced_step_cost()
+         stale_confidences = self._stale_confidences[self._stale_idx].np[slots]
+         survival_probability = np.cumprod(stale_confidences.astype(np.float64), axis=1)
+         steps = np.arange(self.num_speculative_steps)
+@@ -337,8 +411,17 @@
+         num_tokens_to_estimated_accepted_tokens = np.concatenate(
+             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
+         )
++        # Dividing by drafting and verification alone assumes a step is nothing
++        # else, which is roughly true where the curves were profiled and is not
++        # true under pipeline parallelism or at low concurrency. Leaving the fixed
++        # part out biases the ratio toward trimming, because accepted tokens are
++        # concave in the budget while the priced cost keeps rising: the smaller the
++        # real denominator's constant, the earlier the ratio peaks. Adding the
++        # measured unpriced cost moves the peak right, and it vanishes on its own
++        # once the estimate is unavailable, restoring the original objective.
+         costs = (
+-            draft_cost_ms[len(req_ids)]
++            self.unpriced_step_cost_ms(len(req_ids))
++            + draft_cost_ms[len(req_ids)]
+             + verify_cost_ms[
+                 num_non_draft_tokens_total : num_non_draft_tokens_total
+                 + max_draft_budget
+@@ -354,6 +437,8 @@
+             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
+         }
+         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
++        self._last_priced_cost_ms = float(costs[draft_budget])
++        self._last_priced_num_reqs = len(req_ids)
+         self._batch_budget = (
+             num_drafts_per_req,
+             num_non_draft_tokens_per_req,
