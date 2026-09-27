@@ -77,10 +77,13 @@ build that uses that runtime.
    - defer structured-output sampling when the *scheduled* draft window itself
      contains `-1`, even with no outstanding output tokens. The existing
      `take_draft_token_ids` / grammar validation path then fills the actual
-     request's window before bitmask construction. Retain the old outstanding
-     output gate, and do not defer normal requests or already-real drafts;
-   - a CPU scheduler regression tests both sides of that boundary, including
-     zero-placeholder structured output and a non-structured control.
+     request's window before bitmask construction. If the older-result queue is
+     empty, the engine backfills directly before queuing the current sample;
+     otherwise the deferred path would pop an empty queue. Retain the old
+     outstanding-output gate, and do not defer normal requests or already-real
+     drafts;
+   - CPU regressions test the zero-placeholder boundary and non-structured
+     control, plus the empty-queue draft/backfill/grammar/sample order.
 
 The first four patches were validated in the DeepSeek default/debug series and
 in the Qwen PP2/MTP3 series. Patch 0005 needs a new-image runtime acceptance
