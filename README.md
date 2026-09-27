@@ -13,7 +13,6 @@ This `main` branch separates shared infrastructure from model-specific files:
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
-│   ├── build-deepseek-v41-lmcache-client.sh  # client payload layer
 │   ├── build-lmcache-server-image.sh         # shared LMCache server image
 │   ├── build-qwen38-image.sh
 │   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
@@ -59,15 +58,10 @@ OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
-Build the shared LMCache server image once - it serves every deployment - then
-inject the identical payload into the DeepSeek client image:
-
-```bash
-bash scripts/build-lmcache-server-image.sh
-
-DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
-bash scripts/build-deepseek-v41-lmcache-client.sh
-```
+The DeepSeek build produces the complete client image in one run: it reuses
+`lmcache-server:latest` (building it only if absent, or when
+`REBUILD_LMCACHE_IMAGE=1`) and copies that image's patched payload. There is
+no separate client-payload build step.
 
 Create a private deployment environment and start it:
 

@@ -19,8 +19,7 @@ Reproducible minimal patches and a Podman Compose deployment for
 | `localhost/deepseek-v41-cmp170hx:latest-debug` | same, **with** the tracing package |
 | `localhost/deepseek-v41-cmp170hx:<shortsha>` | the commit build of `latest` |
 | `localhost/deepseek-v41-cmp170hx:<shortsha>-debug` | the commit build of `latest-debug` |
-| `localhost/deepseek-v41-lmcache:latest` | LMCache server (and the payload both clients use) |
-| `localhost/deepseek-v41-cmp170hx:<shortsha>-stage1`, `<shortsha>-debug-stage1` | intermediates from step 1; never deployed directly |
+| `localhost/lmcache-server:latest` | shared LMCache server and payload source for both clients |
 
 `latest` and `latest-debug` are the only two moving tags. Experimental variants
 get their tag only for the lifetime of the experiment and are deleted afterwards;
@@ -71,14 +70,17 @@ runtime. Build a separate diagnostic image explicitly:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug-stage1 \
+OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
-The build checks out the pinned author revision, verifies that it is clean,
-applies the DeepSeek-specific and shared vLLM series and, only when requested,
-the optional debug series. It validates and compiles the resulting Python files,
-then copies the complete pinned `vllm/` tree over the SM80 image.
+This one build checks out the pinned author revision, applies and verifies the
+DeepSeek-specific and shared vLLM series and, only when requested, the optional
+debug series. It reuses `lmcache-server:latest` (building it if absent or when
+`REBUILD_LMCACHE_IMAGE=1`) and copies its patched LMCache payload alongside the
+complete patched `vllm/` tree into a final client image. Build-time checks
+validate the Python/native imports and LMCache patches; there is no stage1
+client image or separate client-payload step.
 
 To inspect only the source result:
 
@@ -136,20 +138,17 @@ batch the measurements per boot instead of stopping harder.
 
 `compose.yml` is the deployment: PP6 on six CMP 170HX with the LMCache KV tier (engine + `lmcache` server in one file, connector wired by default). LMCache is not an optional overlay any more; there is no `compose.lmcache.yml`. Add `compose.debug.yml` only on top of a `latest-debug` image.
 
-LMCache no longer comes from the third-party DeepSeek image. Build both images
-from the digest-pinned official LMCache v0.5.5 CUDA 13.0 payload:
+LMCache no longer comes from the third-party DeepSeek image. The client build
+uses the shared LMCache server image as the source of the patched official
+v0.5.5 CUDA 13.0 payload:
 
 ```bash
-# Build the client image first, then layer the patched official LMCache payload
-# onto it. The server image is shared by all deployments and built once.
-DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
-  scripts/build-deepseek-v41-lmcache-client.sh
+ENABLE_PERF_DEBUG=1 \
+OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
+  scripts/build-deepseek-v41-image.sh
 
-scripts/build-lmcache-server-image.sh
-
-export VLLM_IMAGE=localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched
-export LMCACHE_IMAGE=localhost/lmcache-server:latest
-export LMCACHE_L2_PATH=/mnt/lmcache-sda/deepseek-v41
+# After verification, set VLLM_IMAGE in models/deepseek-v41/.env to this tag.
+# LMCACHE_IMAGE=localhost/lmcache-server:latest selects the shared server.
 podman compose --podman-run-args=--ipc=host \
   -f models/deepseek-v41/compose.yml \
   -f models/deepseek-v41/compose.debug.yml up -d
@@ -164,7 +163,7 @@ DeepSeek base. Do not promote a build without real store/evict/L2-restore tests.
 ## Combined optional debug package: DSpark compute toggle
 
 ```bash
-ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug-stage1 \
+ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
   bash scripts/build-deepseek-v41-image.sh
 ```
 

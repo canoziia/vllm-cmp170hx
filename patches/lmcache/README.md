@@ -22,11 +22,11 @@ Two scripts carry this package, so every role runs the same tree:
   which revision produced the image, and notes (without rebuilding) when `:latest`
   came from a different revision.
 
-Client images get the tree from that server image rather than extracting and
-patching the official payload again: `scripts/build-deepseek-v41-lmcache-client.sh`
-copies `/opt/lmcache-patched` out of it, and the Qwen build does the same. One
-build, one tree - client and server provably run the same code. Only the server
-build touches the official payload image and applies `series`.
+Both client builds (`scripts/build-deepseek-v41-image.sh` and
+`scripts/build-qwen38-image.sh`) copy `/opt/lmcache-patched` from the shared
+server image into the final client image. Neither extracts or patches the
+official payload again. Only the server build touches the official payload
+image and applies `series`.
 
 The payload is selected with `PYTHONPATH=/opt/lmcache-patched`, so it replaces
 rather than mixes with the base image's bundled LMCache package. Verify at
@@ -84,11 +84,12 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
    - permits multi-block prefill with MTP after fixing its store metadata,
      instead of requiring `max_num_batched_tokens == block_size`.
 
-The server-image build runs `scripts/test-lmcache-patches.py` once. It checks
-native extension ABI, salt isolation, mixed-size native-FS round trips,
-six-rank layout lifetime, and existing-file adoption. The client-image build
-only checks its ABI and vLLM connector import against the DeepSeek runtime.
-These are build gates, not a replacement for real GPU eviction/restore tests.
+The server-image build runs `scripts/test-lmcache-patches.py`. It checks native
+extension ABI, salt isolation, mixed-size native-FS round trips, six-rank
+layout lifetime, and existing-file adoption. The DeepSeek client build also
+checks its ABI, vLLM connector import, and the same patch tests in the client
+environment. These are build gates, not a replacement for real GPU
+eviction/restore tests.
 
 The official v0.5.5 package already contains the native event/completion
 callback design from the merged deadlock fixes. Those fixes are not duplicated
@@ -96,24 +97,19 @@ here.
 
 ## Build
 
-Build the shared server image once, then the client payload layer per model
-(the DeepSeek image has to exist first):
+Build either complete client image in one command. Each reuses the shared
+server `:latest` image, building it only if absent or if explicitly forced:
 
 ```bash
-scripts/build-lmcache-server-image.sh
-
-DEEPSEEK_BASE_IMAGE=localhost/deepseek-v41-cmp170hx:73d0be8-debug-eventfix \
-  scripts/build-deepseek-v41-lmcache-client.sh
+scripts/build-deepseek-v41-image.sh
+scripts/build-qwen38-image.sh
+# Optional: REBUILD_LMCACHE_IMAGE=1 scripts/build-deepseek-v41-image.sh
 ```
 
-Outputs default to:
-
-```text
-localhost/lmcache-server:latest
-localhost/deepseek-v41-cmp170hx:official-lmcache-v0.5.5-patched
-```
-
-Override `OUTPUT_IMAGE` (server) and `CLIENT_OUTPUT_IMAGE` (client) when publishing.
+The DeepSeek client defaults to `localhost/deepseek-v41-cmp170hx:latest` (or
+`:latest-debug` when `ENABLE_PERF_DEBUG=1`); the shared server defaults to
+`localhost/lmcache-server:latest`. Override `OUTPUT_IMAGE` to build an immutable
+commit-tagged client without moving a deployment tag.
 Never replace a running deployment solely because the images build: first run
 the registration, complete-store, eviction, restore, restart-adoption, and
 corrupt-file fallback acceptance tests.
