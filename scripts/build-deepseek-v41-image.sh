@@ -17,10 +17,10 @@ fi
   exit 2
 }
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  OUTPUT_IMAGE=${OUTPUT_IMAGE:-localhost/deepseek-v41-cmp170hx:latest-debug}
+  OUTPUT_IMAGE=${OUTPUT_IMAGE:-${DEFAULT_OUTPUT_IMAGE}-debug}
   PATCH_LABEL=early-pp-primer+hot-perf-debug+hot-dspark
 else
-  OUTPUT_IMAGE=${OUTPUT_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
+  OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_OUTPUT_IMAGE}
   PATCH_LABEL=early-pp-communicator-primer
 fi
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/dsv41-pp6-build.XXXXXX")

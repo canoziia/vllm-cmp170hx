@@ -13,7 +13,7 @@ services:
   deepseek-v41:
     # Client image: author vLLM revision + our patch series + the exact patched
     # official LMCache payload the server below runs. Keep both on one payload.
-    image: ${VLLM_IMAGE:-localhost/deepseek-v41-cmp170hx:latest}
+    image: ${VLLM_IMAGE:-localhost/vllm-backport:deepseek-v41-cmp170hx}
     container_name: deepseek-v41
     restart: "no"
     network_mode: host

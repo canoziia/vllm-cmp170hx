@@ -9,20 +9,20 @@ Reproducible minimal patches and a Podman Compose deployment for
 - Pinned source revision: `d63af5a472dc76b12d7a73d50a5af142844c15d1`
 - Pinned SM80 base image:
   `docker.io/lazymio/vllm-backport@sha256:8094fcbab905a04a480b327f2761255e3d17cd8d39470cac9d76450bbb567f7e`
-- Default output image: `localhost/deepseek-v41-cmp170hx:latest`
+- Default output image: `localhost/vllm-backport:deepseek-v41-cmp170hx`
 
 ### Image naming (fixed convention - do not invent tags)
 
 | tag | meaning |
 |---|---|
-| `localhost/deepseek-v41-cmp170hx:latest` | production image, **no** tracing package |
-| `localhost/deepseek-v41-cmp170hx:latest-debug` | same, **with** the tracing package |
-| `localhost/deepseek-v41-cmp170hx:<shortsha>` | the commit build of `latest` |
-| `localhost/deepseek-v41-cmp170hx:<shortsha>-debug` | the commit build of `latest-debug` |
+| `localhost/vllm-backport:deepseek-v41-cmp170hx` | moving non-debug deployment tag |
+| `localhost/vllm-backport:deepseek-v41-cmp170hx-debug` | moving debug deployment tag |
+| `localhost/vllm-backport:deepseek-v41-cmp170hx-<shortsha>` | versioned non-debug client |
+| `localhost/vllm-backport:deepseek-v41-cmp170hx-<shortsha>-debug` | versioned debug client |
 | `localhost/lmcache-server:latest` | shared LMCache server and payload source for both clients |
 
-`latest` and `latest-debug` are the only two moving tags. Experimental variants
-get their tag only for the lifetime of the experiment and are deleted afterwards;
+The unversioned model tags above are the only moving client tags. Experimental
+variants get their tag only for the lifetime of the experiment and are deleted afterwards;
 a result worth keeping is described by a commit sha, not by an adjective.
 
 The model checkpoint is mounted read-only and is not modified. The two 94.4-GiB
@@ -60,7 +60,7 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -70,7 +70,7 @@ runtime. Build a separate diagnostic image explicitly:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -107,7 +107,7 @@ podman logs -f deepseek-v41
 ```
 
 The DAX-backed 286-GiB VM took about 53 minutes to become healthy in one clean
-load, so the health-check start period is 75 minutes. The container does not
+load; plan accordingly before replacing a running container. The container does not
 auto-restart: a failed load is expensive and GPU passthrough health must be
 verified before trying again.
 
@@ -136,7 +136,7 @@ batch the measurements per boot instead of stopping harder.
 
 ## Optional LMCache deployment
 
-`compose.yml` is the deployment: PP6 on six CMP 170HX with the LMCache KV tier (engine + `lmcache` server in one file, connector wired by default). LMCache is not an optional overlay any more; there is no `compose.lmcache.yml`. Add `compose.debug.yml` only on top of a `latest-debug` image.
+`compose.yml` is the deployment: PP6 on six CMP 170HX with the LMCache KV tier (engine + `lmcache` server in one file, connector wired by default). LMCache is not an optional overlay any more; there is no `compose.lmcache.yml`. Add `compose.debug.yml` only with a debug-tagged image.
 
 LMCache no longer comes from the third-party DeepSeek image. The client build
 uses the shared LMCache server image as the source of the patched official
@@ -144,7 +144,7 @@ v0.5.5 CUDA 13.0 payload:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
   scripts/build-deepseek-v41-image.sh
 
 # After verification, set VLLM_IMAGE in models/deepseek-v41/.env to this tag.
@@ -163,7 +163,7 @@ DeepSeek base. Do not promote a build without real store/evict/L2-restore tests.
 ## Combined optional debug package: DSpark compute toggle
 
 ```bash
-ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:<sha>-debug \
+ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
   bash scripts/build-deepseek-v41-image.sh
 ```
 
