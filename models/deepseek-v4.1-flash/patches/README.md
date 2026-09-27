@@ -5,7 +5,7 @@ Base source: `344303947/dsv41-flash-pp5-170hx` at
 
 ## Default active series
 
-The model-specific `models/deepseek-v41/patches/series` contains two patches.
+The model-specific `models/deepseek-v4.1-flash/patches/series` contains two patches.
 The build then applies the shared runtime fixes in `patches/vllm/series`:
 
 1. `0001-prime-pp-communicators-before-model-load.patch`

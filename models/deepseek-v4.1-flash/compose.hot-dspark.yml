@@ -1,5 +1,4 @@
 services:
-  deepseek-v41:
+  deepseek-v4.1-flash:
     environment:
       VLLM_DSPARK_CONTROL_FILE: /root/.cache/dspark-enabled
-      VLLM_PERF_DEBUG_DIR: /root/.cache/vllm-perf-debug

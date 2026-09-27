@@ -10,11 +10,11 @@ x-podman:
   in_pod: false
 
 services:
-  deepseek-v41:
+  deepseek-v4.1-flash:
     # Client image: author vLLM revision + our patch series + the exact patched
     # official LMCache payload the server below runs. Keep both on one payload.
-    image: ${VLLM_IMAGE:-localhost/vllm-backport:deepseek-v41-cmp170hx}
-    container_name: deepseek-v41
+    image: ${VLLM_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    container_name: deepseek-v4.1-flash
     restart: "no"
     network_mode: host
     # Required for LMCache CUDA-IPC tensor sharing. The pod path can ignore this
@@ -105,12 +105,12 @@ services:
       start_period: 30m
       retries: 3
 
-  deepseek-v41-lmcache:
+  deepseek-v4.1-flash-lmcache:
     # Shared server image: built once by scripts/build-lmcache-server-image.sh from
     # the digest-pinned official LMCache release, and used by every model
     # deployment. The client images layer the identical patched payload.
     image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
-    container_name: deepseek-v41-lmcache
+    container_name: deepseek-v4.1-flash-lmcache
     entrypoint: ["lmcache"]
     restart: "no"
     network_mode: host

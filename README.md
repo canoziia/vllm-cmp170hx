@@ -18,13 +18,13 @@ This `main` branch separates shared infrastructure from model-specific files:
 │   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
 │   └── test-lmcache-patches.py
 └── models/
-    ├── deepseek-v41/
+    ├── deepseek-v4.1-flash/
     │   ├── compose*.yml
     │   ├── manifests/          # pinned DeepSeek source/base image
     │   ├── patches/            # DeepSeek-only vLLM patches
     │   ├── scripts/            # DeepSeek-only diagnostics
     │   └── docs/
-    └── qwen3.8-flash-next/
+    └── qwen3.8-flash-next-nvfp4/
         ├── compose.yml
         ├── manifests/          # pinned Qwen source/base image
         ├── patches/            # Qwen-only PLE/NVMe implementation
@@ -40,21 +40,23 @@ models using that component. Shared official LMCache patches are listed in
 
 Put model implementation patches, Compose files, source pins, and diagnostics
 under `models/<model>/`. DeepSeek's vLLM patch series is therefore under
-`models/deepseek-v41/patches/`.
+`models/deepseek-v4.1-flash/patches/`.
 
-Build entry points stay in root `scripts/` so automation can call them from a
-stable location even as more model directories are added.
+Build entry points stay in root `scripts/` under their existing names so
+existing automation continues to work after the model directory rename. The
+host cache and L2 paths retain their existing locations; renaming a repository
+folder or container must not silently abandon persistent data.
 
 ## DeepSeek V4.1
 
-See [`models/deepseek-v41/README.md`](models/deepseek-v41/README.md) for the
+See [`models/deepseek-v4.1-flash/README.md`](models/deepseek-v4.1-flash/README.md) for the
 complete build, deployment, safety, and debugging guide.
 
 Build the pinned DeepSeek image from the repository root:
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -66,7 +68,7 @@ no separate client-payload build step.
 Create a private deployment environment and start it:
 
 ```bash
-cd models/deepseek-v41
+cd models/deepseek-v4.1-flash
 cp .env.example .env
 chmod 600 .env
 # Set a private VLLM_API_KEY and host paths in .env.
@@ -75,12 +77,20 @@ podman compose --podman-run-args=--ipc=host \
   -f compose.yml up -d
 ```
 
+The repository model directories and Compose service/container names are
+`deepseek-v4.1-flash` and `qwen3.8-flash-next-nvfp4`. On an existing host,
+move each ignored `.env` into its renamed `models/<model>/` directory before
+using Compose; retain its private values. Existing host cache, checkpoint and
+L2 paths are intentionally unchanged. Old Podman containers keep their former
+names/commands until explicitly replaced; changing Compose alone does not
+upgrade or remove them.
+
 Never commit `.env`, API keys, model weights, benchmark results, or host disk
 UUIDs.
 
 ## Qwen3.8 Flash Next
 
-See [`models/qwen3.8-flash-next/README.md`](models/qwen3.8-flash-next/README.md).
+See [`models/qwen3.8-flash-next-nvfp4/README.md`](models/qwen3.8-flash-next-nvfp4/README.md).
 The complete image is built reproducibly from the same pinned author source,
 the shared vLLM and LMCache series, and Qwen's model-specific process-isolated
 NVMe PLE patch:

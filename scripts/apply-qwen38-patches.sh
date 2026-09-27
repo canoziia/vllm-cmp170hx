@@ -4,11 +4,11 @@ set -euo pipefail
 [[ $# -eq 1 ]] || { echo "Usage: $0 SOURCE_TREE" >&2; exit 2; }
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MODEL_DIR="$REPO_ROOT/models/qwen3.8-flash-next"
+MODEL_DIR="$REPO_ROOT/models/qwen3.8-flash-next-nvfp4"
 # shellcheck disable=SC1091
 source "$MODEL_DIR/manifests/source.env"
 
-(cd "$REPO_ROOT" && sha256sum -c models/qwen3.8-flash-next/manifests/files.sha256 >/dev/null)
+(cd "$REPO_ROOT" && sha256sum -c models/qwen3.8-flash-next-nvfp4/manifests/files.sha256 >/dev/null)
 
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {
   echo "SOURCE_TREE must be a git checkout containing vllm/" >&2

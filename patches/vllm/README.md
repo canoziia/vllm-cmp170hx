@@ -32,7 +32,7 @@ build that uses that runtime.
      the DeepSeek evidence, not on a Qwen measurement;
    - concurrency 32 output rate +89% on prose and +184% on counting on the
      six-GPU SM80 PP6 deployment; see
-     `models/deepseek-v41/docs/PP-DECODE-COHORT-BALANCE.md`.
+     `models/deepseek-v4.1-flash/docs/PP-DECODE-COHORT-BALANCE.md`.
    - upstream behavioural test ported into `tests/v1/core/test_async_scheduler.py`
      (CPU only), plus one test for the opt-in deviation.
 
@@ -100,4 +100,4 @@ The first four patches were validated in the DeepSeek default/debug series and
 in the Qwen PP2/MTP3 series. Patch 0005 alone was measured on Qwen PP2 and did
 not restore acceptance; 0006 requires a new-image runtime acceptance A/B before
 claiming a measured gain. Model-specific code such as Qwen's process-isolated
-PLE NVMe backend remains under `models/qwen3.8-flash-next/patches/`.
+PLE NVMe backend remains under `models/qwen3.8-flash-next-nvfp4/patches/`.
