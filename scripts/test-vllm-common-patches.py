@@ -189,5 +189,22 @@ check(
     and 'events == ["take_drafts", "backfill", "grammar", "sample"]' in o5_test,
 )
 
+# ---- 0006 retrieve draft IDs by request, not last batch ----
+print("0006-key-structured-drafts-by-request:")
+check(
+    "engine requests exact scheduled draft request IDs on both deferred paths",
+    engine_src.count("list(deferred_scheduler_output.scheduled_spec_decode_tokens)") == 2,
+)
+check(
+    "worker reads per-request persistent draft state",
+    "self.req_states.draft_tokens[slots].tolist()" in mr
+    and "req_id in self.req_states.req_id_to_index" in mr,
+)
+check(
+    "GPU regression covers unrelated batch and removed request",
+    "def test_request_keyed_drafts_survive_interleaved_batches" in o5_test
+    and 'runner.take_draft_token_ids(["B", "gone"])' in o5_test,
+)
+
 print("VLLM_COMMON_PATCHES", "FAIL: " + ", ".join(failures) if failures else "PASS")
 sys.exit(1 if failures else 0)

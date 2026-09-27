@@ -3,3 +3,4 @@
 0003-balance-async-pp-decode-batches.patch
 0004-grammar-fail-closed-draft-rows.patch
 0005-wait-for-structured-draft-backfill.patch
+0006-key-structured-drafts-by-request.patch
