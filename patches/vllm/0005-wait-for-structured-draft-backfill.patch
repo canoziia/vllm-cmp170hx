@@ -1,0 +1,95 @@
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -39,8 +39,18 @@
+             if request.is_prefill_chunk:
+                 continue
+ 
++            # The scheduled draft ids may still be worker-side -1 placeholders
++            # even when no previous output tokens are outstanding. In that case
++            # the grammar must wait for take_draft_token_ids(): otherwise the
++            # bitmask is built from -1, and fail-closed verification rejects the
++            # entire draft window on every subsequent step.
++            scheduled_drafts = spec_decode_tokens.get(req_id, ())
+             scheduler_output.pending_structured_output_tokens |= (
+-                request.use_structured_output and request.num_output_placeholders > 0
++                request.use_structured_output
++                and (
++                    request.num_output_placeholders > 0
++                    or -1 in scheduled_drafts
++                )
+             )
+             # The request will generate num_sampled_tokens_per_step new tokens
+             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+diff --git a/tests/v1/core/test_async_scheduler.py b/tests/v1/core/test_async_scheduler.py
+--- a/tests/v1/core/test_async_scheduler.py
++++ b/tests/v1/core/test_async_scheduler.py
+@@ -2,12 +2,14 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections import defaultdict, deque
+ from collections.abc import Callable
+-from unittest.mock import Mock
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
+ 
+ import pytest
+ 
+ from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
++from vllm.v1.core.sched.scheduler import Scheduler
+ from vllm.v1.outputs import ModelRunnerOutput
+ from vllm.v1.request import RequestStatus
+ from vllm.v1.structured_output import StructuredOutputGrammar
+@@ -16,6 +18,52 @@
+ from .utils import create_requests, create_scheduler
+ 
+ pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize(
++    ("structured", "prior_placeholders", "drafts", "expected_pending"),
++    [
++        (True, 0, [-1, -1, -1], True),
++        (True, 0, [12, 13, 14], False),
++        (True, 2, [12, 13, 14], True),
++        (False, 0, [-1, -1, -1], False),
++        (True, 0, [], False),
++    ],
++)
++def test_async_structured_draft_handoff_without_prior_output(
++    structured: bool,
++    prior_placeholders: int,
++    drafts: list[int],
++    expected_pending: bool,
++):
++    """A worker-side -1 draft needs backfill even after all outputs settled.
++
++    Under PP async, the previous verification may reject all three drafts and
++    deliver one target token, leaving zero outstanding output placeholders.
++    The next batch still has three worker-side draft placeholders: sampling
++    before taking the real ids would make the fail-closed grammar cap zero and
++    permanently lock the request into one-token steps.
++    """
++    scheduler = object.__new__(AsyncScheduler)
++    request = SimpleNamespace(
++        is_prefill_chunk=False,
++        use_structured_output=structured,
++        num_output_placeholders=prior_placeholders,
++        spec_token_ids=[],
++    )
++    scheduler.requests = {"req": request}
++    scheduler.num_sampled_tokens_per_step = 1
++    scheduler.use_v2_model_runner = False
++    output = SimpleNamespace(
++        num_scheduled_tokens={"req": 1 + len(drafts)},
++        scheduled_spec_decode_tokens={"req": drafts},
++        num_spec_tokens_to_schedule=3,
++        pending_structured_output_tokens=False,
++    )
++    with patch.object(Scheduler, "_update_after_schedule"):
++        scheduler._update_after_schedule(output)
++    assert output.pending_structured_output_tokens is expected_pending
++    assert request.num_output_placeholders == prior_placeholders + 1 + len(drafts)
+ 
+ 
+ def _make_model_runner_output(
