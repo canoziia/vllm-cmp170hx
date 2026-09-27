@@ -9,16 +9,16 @@ Reproducible minimal patches and a Podman Compose deployment for
 - Pinned source revision: `d63af5a472dc76b12d7a73d50a5af142844c15d1`
 - Pinned SM80 base image:
   `docker.io/lazymio/vllm-backport@sha256:8094fcbab905a04a480b327f2761255e3d17cd8d39470cac9d76450bbb567f7e`
-- Default output image: `localhost/vllm-backport:deepseek-v41-cmp170hx`
+- Default output image: `localhost/vllm-backport:deepseek-v4.1-flash`
 
 ### Image naming (fixed convention - do not invent tags)
 
 | tag | meaning |
 |---|---|
-| `localhost/vllm-backport:deepseek-v41-cmp170hx` | moving non-debug deployment tag |
-| `localhost/vllm-backport:deepseek-v41-cmp170hx-debug` | moving debug deployment tag |
-| `localhost/vllm-backport:deepseek-v41-cmp170hx-<shortsha>` | versioned non-debug client |
-| `localhost/vllm-backport:deepseek-v41-cmp170hx-<shortsha>-debug` | versioned debug client |
+| `localhost/vllm-backport:deepseek-v4.1-flash` | moving non-debug deployment tag |
+| `localhost/vllm-backport:deepseek-v4.1-flash-debug` | moving debug deployment tag |
+| `localhost/vllm-backport:deepseek-v4.1-flash-<shortsha>` | versioned non-debug client |
+| `localhost/vllm-backport:deepseek-v4.1-flash-<shortsha>-debug` | versioned debug client |
 | `localhost/lmcache-server:latest` | shared LMCache server and payload source for both clients |
 
 The unversioned model tags above are the only moving client tags. Experimental
@@ -60,17 +60,17 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
-The default build applies `models/deepseek-v41/patches/series` followed by
+The default build applies `models/deepseek-v4.1-flash/patches/series` followed by
 `patches/vllm/series`, and does **not** include the hot performance-debug
 runtime. Build a separate diagnostic image explicitly:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash-<sha>-debug \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -94,7 +94,7 @@ git checkout d63af5a472dc76b12d7a73d50a5af142844c15d1
 ## Deploy
 
 ```bash
-cd models/deepseek-v41
+cd models/deepseek-v4.1-flash
 cp .env.example .env
 # Set VLLM_API_KEY and adjust model/cache paths if needed.
 
@@ -103,7 +103,7 @@ sudo bash scripts/disable-legacy-services.sh
 
 podman compose -f compose.yml config
 podman compose -f compose.yml up -d
-podman logs -f deepseek-v41
+podman logs -f deepseek-v4.1-flash
 ```
 
 The DAX-backed 286-GiB VM took about 53 minutes to become healthy in one clean
@@ -117,8 +117,8 @@ Do not reset the VM or kill the container. A hard stop can leave CMP GSP/ACR
 state set and make the next guest driver probe fail.
 
 ```bash
-podman stop deepseek-v41
-podman rm deepseek-v41
+podman stop deepseek-v4.1-flash
+podman rm deepseek-v4.1-flash
 ```
 
 Nothing in this repository grants a stop timeout any more; Compose carries no
@@ -144,31 +144,31 @@ v0.5.5 CUDA 13.0 payload:
 
 ```bash
 ENABLE_PERF_DEBUG=1 \
-OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash-<sha>-debug \
   scripts/build-deepseek-v41-image.sh
 
-# After verification, set VLLM_IMAGE in models/deepseek-v41/.env to this tag.
+# After verification, set VLLM_IMAGE in models/deepseek-v4.1-flash/.env to this tag.
 # LMCACHE_IMAGE=localhost/lmcache-server:latest selects the shared server.
 podman compose --podman-run-args=--ipc=host \
-  -f models/deepseek-v41/compose.yml \
-  -f models/deepseek-v41/compose.debug.yml up -d
+  -f models/deepseek-v4.1-flash/compose.yml \
+  -f models/deepseek-v4.1-flash/compose.debug.yml up -d
 ```
 
 The explicit Podman argument is required: the automatic pod path can ignore
 Compose `ipc: host` and expose only 63 MiB `/dev/shm`. The complete official
 LMCache manifest, patch rationale, and build details are in
-`patches/lmcache/README.md`. Use `models/deepseek-v41/compose.debug.yml` only with a debug-enabled
+`patches/lmcache/README.md`. Use `models/deepseek-v4.1-flash/compose.debug.yml` only with a debug-enabled
 DeepSeek base. Do not promote a build without real store/evict/L2-restore tests.
 
 ## Combined optional debug package: DSpark compute toggle
 
 ```bash
-ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx-<sha>-debug \
+ENABLE_PERF_DEBUG=1 OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash-<sha>-debug \
   bash scripts/build-deepseek-v41-image.sh
 ```
 
-Use that image with `models/deepseek-v41/compose.yml` plus
-`models/deepseek-v41/compose.debug.yml`. Both performance
+Use that image with `models/deepseek-v4.1-flash/compose.yml` plus
+`models/deepseek-v4.1-flash/compose.debug.yml`. Both performance
 tracing and the DSpark compute toggle are included by this one build flag;
 default builds include neither. The control-file environment must be present
 at startup to capture both K=0 and K=5 target graphs. Performance tracing stays
@@ -190,7 +190,7 @@ context-KV maintenance so ongoing requests can safely resume drafting. Weights,
 aux outputs, fixed-shape PP feedback and draft caches stay resident. This is
 not a zero-overhead non-speculative baseline. Requires MRV2 DSpark, DP=1 and
 adaptive verification disabled. The combined image has been live-validated with ON→OFF→ON transitions; see
-`models/deepseek-v41/docs/INVESTIGATION-20260921.md` for throughput ranges and limits.
+`models/deepseek-v4.1-flash/docs/INVESTIGATION-20260921.md` for throughput ranges and limits.
 
 ## Optional hot performance diagnostics
 
@@ -214,11 +214,11 @@ samples on all PP ranks (the real-step filter is in the next image build, not
 the older running `73d0be8-debug-eventfix` instance):
 
 ```bash
-bash models/deepseek-v41/scripts/perf-debug-control.sh enable decode-ab 10 256 all
+bash models/deepseek-v4.1-flash/scripts/perf-debug-control.sh enable decode-ab 10 256 all
 # Run the benchmark, then inspect or explicitly stop early:
-bash models/deepseek-v41/scripts/perf-debug-control.sh status
-bash models/deepseek-v41/scripts/perf-debug-control.sh disable
-python3 models/deepseek-v41/scripts/summarize-perf-debug.py \
+bash models/deepseek-v4.1-flash/scripts/perf-debug-control.sh status
+bash models/deepseek-v4.1-flash/scripts/perf-debug-control.sh disable
+python3 models/deepseek-v4.1-flash/scripts/summarize-perf-debug.py \
   /root/app/deepseek-v41/cache/vllm-perf-debug/steps-decode-ab-rank*.jsonl
 ```
 
@@ -240,9 +240,9 @@ inside the existing cache mount at `/root/.cache/vllm-perf-debug`.
 After startup, verify:
 
 ```bash
-podman inspect deepseek-v41 --format '{{.State.Healthcheck.Status}}'
+podman inspect deepseek-v4.1-flash --format '{{.State.Healthcheck.Status}}'
 curl -fsS http://127.0.0.1:8000/health
-podman exec deepseek-v41 nvidia-smi -L
+podman exec deepseek-v4.1-flash nvidia-smi -L
 swapon --show
 ```
 

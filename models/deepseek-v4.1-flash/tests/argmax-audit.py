@@ -17,7 +17,7 @@ teacher-forced prefix, DSpark off via the hot control file (single row), so a
 violation cannot be blamed on batch shape.
 
 usage: argmax-audit.py <run0.json> [<run0.json> ...] [--stride N] [--max-pos N]
-       sequences come from models/deepseek-v41/tests/token-id-probe.mjs
+       sequences come from models/deepseek-v4.1-flash/tests/token-id-probe.mjs
 env: VLLM_API_KEY, BASE_URL, MODEL
 """
 import json

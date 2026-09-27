@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONTAINER=${CONTAINER:-deepseek-v41}
+CONTAINER=${CONTAINER:-deepseek-v4.1-flash}
 CACHE_ROOT=${VLLM_CACHE:-/root/app/deepseek-v41/cache}
 DEBUG_DIR=${VLLM_PERF_DEBUG_HOST_DIR:-$CACHE_ROOT/vllm-perf-debug}
 CONTROL=$DEBUG_DIR/control.json

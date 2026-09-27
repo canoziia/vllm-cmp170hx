@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MODEL_DIR="$REPO_ROOT/models/deepseek-v41"
+MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 # shellcheck disable=SC1091
 source "$MODEL_DIR/manifests/source.env"
 ENGINE=${CONTAINER_ENGINE:-podman}

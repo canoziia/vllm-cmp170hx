@@ -2,9 +2,9 @@ x-podman:
   in_pod: false
 
 services:
-  qwen3.8-flash-next:
-    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen38-flash-next-nvfp4}
-    container_name: qwen3.8-flash-next
+  qwen3.8-flash-next-nvfp4:
+    image: ${QWEN_IMAGE:-localhost/vllm-backport:qwen3.8-flash-next-nvfp4}
+    container_name: qwen3.8-flash-next-nvfp4
     restart: "no"
     network_mode: host
     ipc: host
@@ -75,11 +75,11 @@ services:
       timeout: 10s
       start_period: 15m
       retries: 3
-  qwen3.8-flash-next-lmcache:
+  qwen3.8-flash-next-nvfp4-lmcache:
     # Shared server image, the same one the DeepSeek deployment runs; the client
     # image above carries the identical patched payload.
     image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
-    container_name: qwen3.8-flash-next-lmcache
+    container_name: qwen3.8-flash-next-nvfp4-lmcache
     restart: "no"
     entrypoint: ["lmcache"]
     command:

@@ -106,8 +106,8 @@ scripts/build-qwen38-image.sh
 # Optional: REBUILD_LMCACHE_IMAGE=1 scripts/build-deepseek-v41-image.sh
 ```
 
-The DeepSeek client defaults to `localhost/vllm-backport:deepseek-v41-cmp170hx`
-(or `:deepseek-v41-cmp170hx-debug` when `ENABLE_PERF_DEBUG=1`); the shared
+The DeepSeek client defaults to `localhost/vllm-backport:deepseek-v4.1-flash`
+(or `:deepseek-v4.1-flash-debug` when `ENABLE_PERF_DEBUG=1`); the shared
 server defaults to `localhost/lmcache-server:latest`. Override `OUTPUT_IMAGE`
 to build an immutable commit-tagged client without moving a deployment tag.
 Never replace a running deployment solely because the images build: first run

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-MODEL_DIR="$REPO_ROOT/models/qwen3.8-flash-next"
+MODEL_DIR="$REPO_ROOT/models/qwen3.8-flash-next-nvfp4"
 # shellcheck disable=SC1091
 source "$MODEL_DIR/manifests/source.env"
 # shellcheck disable=SC1091

@@ -5,10 +5,10 @@ set -euo pipefail
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck disable=SC1091
-MODEL_DIR="$REPO_ROOT/models/deepseek-v41"
+MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 source "$MODEL_DIR/manifests/source.env"
 
-(cd "$REPO_ROOT" && sha256sum -c models/deepseek-v41/manifests/patches.sha256)
+(cd "$REPO_ROOT" && sha256sum -c models/deepseek-v4.1-flash/manifests/patches.sha256)
 
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {
   echo "SOURCE_TREE must be a git checkout containing vllm/" >&2

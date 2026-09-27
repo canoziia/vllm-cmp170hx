@@ -18,7 +18,7 @@ v0.5.5 payload.
 
 Applied in this order:
 
-1. `models/qwen3.8-flash-next/patches/0001-process-isolated-nvme-ple.patch`
+1. `models/qwen3.8-flash-next-nvfp4/patches/0001-process-isolated-nvme-ple.patch`
    - keeps the 47.68-GiB PLE table disk-backed;
    - performs native parallel `pread` row gathering;
    - owns Python I/O and dynamic H2D scheduling in a dedicated process so CUDA
@@ -28,7 +28,7 @@ Applied in this order:
    - queues old Mamba source-state indices until safe reclamation.
 3. `patches/vllm/0002-mamba-resolved-cache-geometry.patch`
    - restores resumed Mamba state from the resolved per-group block geometry.
-4. `models/qwen3.8-flash-next/patches/0002-generated-history-checkpoints-pp2.patch`
+4. `models/qwen3.8-flash-next-nvfp4/patches/0002-generated-history-checkpoints-pp2.patch`
    - stores finalized generated-history checkpoints every 128 tokens;
    - preserves uniform MTP verification shapes and caps only accepted output;
    - fences optimistic PP2 work at checkpoint boundaries;
@@ -54,7 +54,7 @@ From the repository root:
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-backport:qwen38-flash-next-nvfp4 \
+OUTPUT_IMAGE=localhost/vllm-backport:qwen3.8-flash-next-nvfp4 \
 bash scripts/build-qwen38-image.sh
 ```
 
@@ -93,14 +93,14 @@ reduce that per-call cap or change indexer results.
 ## Deploy
 
 ```bash
-cd models/qwen3.8-flash-next
+cd models/qwen3.8-flash-next-nvfp4
 cp .env.example .env
 chmod 600 .env
 # Set a private API key and host paths. Never commit .env.
 
 podman compose --podman-run-args=--ipc=host \
   -f compose.yml up -d
-podman logs -f qwen3.8-flash-next
+podman logs -f qwen3.8-flash-next-nvfp4
 ```
 
 `QWEN_MTP_TOKENS` changes the model command and may change the resolved KV
