@@ -2,3 +2,4 @@
 0002-mamba-resolved-cache-geometry.patch
 0003-balance-async-pp-decode-batches.patch
 0004-grammar-fail-closed-draft-rows.patch
+0005-wait-for-structured-draft-backfill.patch

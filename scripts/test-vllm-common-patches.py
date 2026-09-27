@@ -160,5 +160,20 @@ check(
     "def test_follow_the_device_layout_under_adaptive_verification" in o4_test,
 )
 
+# ---- 0005 backfill worker-side drafts before masking structured outputs ----
+print("0005-wait-for-structured-draft-backfill:")
+check(
+    "structured requests defer when scheduled drafts are worker-side placeholders",
+    "scheduled_drafts = spec_decode_tokens.get(req_id, ())" in async_src
+    and "or -1 in scheduled_drafts" in async_src
+    and "request.num_output_placeholders > 0" in async_src,
+)
+check(
+    "CPU regression covers zero outstanding outputs and non-structured control",
+    "def test_async_structured_draft_handoff_without_prior_output" in test_src
+    and "(True, 0, [-1, -1, -1], True)" in test_src
+    and "(False, 0, [-1, -1, -1], False)" in test_src,
+)
+
 print("VLLM_COMMON_PATCHES", "FAIL: " + ", ".join(failures) if failures else "PASS")
 sys.exit(1 if failures else 0)

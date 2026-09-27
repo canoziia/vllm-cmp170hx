@@ -67,6 +67,23 @@ build that uses that runtime.
      request from sampling without the grammar. Warmup and the legacy
      `gpu_model_runner` path pass no row limit and keep their behaviour.
 
-The four patches were validated in the DeepSeek default/debug series and in the
-Qwen PP2/MTP3 series. Model-specific code such as Qwen's process-isolated PLE
-NVMe backend remains under `models/qwen3.8-flash-next/patches/`.
+5. `0005-wait-for-structured-draft-backfill.patch`
+   - async scheduling with PP can schedule worker-side `-1` draft placeholders
+     after a prior result has fully settled (`num_output_placeholders == 0`).
+     The upstream pending-grammar gate only checked outstanding output tokens,
+     so it sometimes sampled before fetching the real draft IDs. With 0004's
+     fail-closed check, this produces a zero-acceptance loop: every three-draft
+     window has zero grammar-constrained positions and is rejected;
+   - defer structured-output sampling when the *scheduled* draft window itself
+     contains `-1`, even with no outstanding output tokens. The existing
+     `take_draft_token_ids` / grammar validation path then fills the actual
+     request's window before bitmask construction. Retain the old outstanding
+     output gate, and do not defer normal requests or already-real drafts;
+   - a CPU scheduler regression tests both sides of that boundary, including
+     zero-placeholder structured output and a non-structured control.
+
+The first four patches were validated in the DeepSeek default/debug series and
+in the Qwen PP2/MTP3 series. Patch 0005 needs a new-image runtime acceptance
+A/B before claiming a measured gain. Model-specific code such as Qwen's
+process-isolated PLE NVMe backend remains under
+`models/qwen3.8-flash-next/patches/`.
