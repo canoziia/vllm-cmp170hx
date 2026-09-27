@@ -89,6 +89,7 @@ services:
       # enable_adaptive_verification ships compiled-in and switched off; the code
       # is inert unless this says true (see patches/adaptive/README.md).
       - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true,"enable_adaptive_verification":${VLLM_ADAPTIVE_VERIFICATION:-false}}'
+      - '--observability-config={"per_request_spec_decode_metrics":"detailed"}'
       - --tokenizer-mode=deepseek_v41
       - --enable-auto-tool-choice
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
