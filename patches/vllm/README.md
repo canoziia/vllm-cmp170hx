@@ -85,8 +85,19 @@ build that uses that runtime.
    - CPU regressions test the zero-placeholder boundary and non-structured
      control, plus the empty-queue draft/backfill/grammar/sample order.
 
+6. `0006-key-structured-drafts-by-request.patch`
+   - the async worker's `DraftTokensHandler` keeps only its most recent batch;
+     PP may interleave another batch between draft production and grammar
+     backfill. Backfilling the wrong batch silently leaves a request's scheduled
+     `-1` placeholders untouched, so 0004 rejects every draft;
+   - query the last PP rank for the scheduled request IDs and read each live
+     request's persistent `RequestState.draft_tokens` slot instead of the
+     handler's last-batch copy. The response contains only surviving IDs and
+     the scheduler still validates the grammar and fails closed on missing IDs;
+   - a focused regression tests interleaved A/B batches and a removed request.
+
 The first four patches were validated in the DeepSeek default/debug series and
-in the Qwen PP2/MTP3 series. Patch 0005 needs a new-image runtime acceptance
-A/B before claiming a measured gain. Model-specific code such as Qwen's
-process-isolated PLE NVMe backend remains under
-`models/qwen3.8-flash-next/patches/`.
+in the Qwen PP2/MTP3 series. Patch 0005 alone was measured on Qwen PP2 and did
+not restore acceptance; 0006 requires a new-image runtime acceptance A/B before
+claiming a measured gain. Model-specific code such as Qwen's process-isolated
+PLE NVMe backend remains under `models/qwen3.8-flash-next/patches/`.
