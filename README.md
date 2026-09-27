@@ -54,7 +54,7 @@ Build the pinned DeepSeek image from the repository root:
 
 ```bash
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/deepseek-v41-cmp170hx:latest \
+OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v41-cmp170hx \
 bash scripts/build-deepseek-v41-image.sh
 ```
 
