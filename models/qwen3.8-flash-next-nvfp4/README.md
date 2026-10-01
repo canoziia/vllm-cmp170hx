@@ -155,15 +155,33 @@ of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
   resolve different block sizes (1568 vs 1600) and the shared L2 cannot hold both
   layouts. Similarly the prefill role uses the same `VLLM_PP_LAYER_PARTITION`
   (`26,22`), because the mamba/attention page geometry depends on it.
-- **`--max-num-batched-tokens` equals the block size (1600) on the prefill
-  role.** The patch series notes that for mamba-hybrid models with speculative
-  decoding, a step that advances more than one block stores recurrent-state
-  chunks that corrupt later prefix-cache hits.
+- **`--max-num-batched-tokens` equals the resolved block size (1600) on *both*
+  roles.** The patch series notes that for mamba-hybrid models with speculative
+  decoding a step that advances more than one block stores recurrent-state chunks
+  that corrupt later prefix-cache hits. It is also a stability requirement: with
+  the step size at 4096 the decode role killed its own engine on a cache *miss*
+  (`PP intermediate tensor 'hidden_states' has 40 rows but this step expects
+  1536; the upstream rank likely failed mid-step`), because a 1504-token prefill
+  step plus MTP desynchronised the pipeline ranks. At 1600 the same request is
+  served correctly (observed: `cached_tokens 0`, no crash).
 - **`--ipc=host` is required.** The connector moves KV through CUDA IPC;
   `podman-compose` 1.3.0 silently ignores the `ipc` key, so `scripts/pd-up.sh`
   launches with plain `podman` (node1's working deployment also runs
   `IpcMode=host`). Without it the server never answers `register_kv_caches` and
   the engines time out after 300 s.
+
+### Verified behaviour
+
+| step | request | result |
+|---|---|---|
+| prefill role, first time | prompt (2263 tok) | server A logs `Stored 1600 tokens`; 4 objects (161 MB) land in the L2 directory |
+| decode role, first time | same prompt, after prefill | server B logs `Retrieved 1600 tokens`; `prompt_tokens_details.cached_tokens = 1600` |
+| decode role, cold | unseen prompt, no prefill | `cached_tokens = 0` and the request is served (no crash) |
+
+A cross-role check with a nonce-bearing prompt (created seconds before, delivered
+only to the prefill role) showed the same result, and the decode answer echoed the
+nonce, so the context came from the transferred KV. Evidence logs:
+`/root/app/pd-validation/`.
 
 ### Run
 
