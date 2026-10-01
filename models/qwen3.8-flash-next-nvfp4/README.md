@@ -125,3 +125,55 @@ LMCache HTTP:18557
 After `/health` succeeds, issue a real completion request and verify both PP
 registrations, actual L2 files, nonzero cached tokens on a repeat, and no
 `incomplete read`, degraded transition, or CUDA error.
+
+## Prefill/decode disaggregation (`compose.pd.yml`)
+
+Four GPUs, two roles, and **one LMCache server per role** over a **shared L2
+filesystem**:
+
+| role | GPUs | PP2 partition | speculative | port | LMCache server |
+|---|---|---|---|---|---|
+| prefill | 0,1 | `26,22` | `mtp` (geometry) | 8101 | A `127.0.0.1:5557` |
+| decode | 2,3 | `26,22` | `mtp` | 8102 | B `127.0.0.1:5567` |
+
+Both servers use `base_path=/lmcache-l2` -> `$LMCACHE_L2_PATH`, so prefill stores
+the prompt KV there and decode finds the same chunk keys and loads them instead
+of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
+`Retrieved 1600 tokens`, and the decode response reports
+`prompt_tokens_details.cached_tokens = 1600`.
+
+### Why the topology looks like this
+
+- **One server per role.** The LMCache MP server binds a single engine's KV
+  layout; when a second engine registers against the same server it segfaults in
+  `cuda`/`torch` (exit 139). Each role therefore gets its own server, addressed
+  through `lmcache.mp.server_urls` (the patched connector prefers it over
+  `lmcache.mp.host`/`lmcache.mp.port`). Sharing happens through the L2 tier.
+- **Both roles must resolve the same block geometry.** vLLM derives the block
+  size from `num_speculative_tokens` (the Qwen QSA ring term), so the prefill
+  role declares the same `--speculative-config` as decode. Otherwise the roles
+  resolve different block sizes (1568 vs 1600) and the shared L2 cannot hold both
+  layouts. Similarly the prefill role uses the same `VLLM_PP_LAYER_PARTITION`
+  (`26,22`), because the mamba/attention page geometry depends on it.
+- **`--max-num-batched-tokens` equals the block size (1600) on the prefill
+  role.** The patch series notes that for mamba-hybrid models with speculative
+  decoding, a step that advances more than one block stores recurrent-state
+  chunks that corrupt later prefix-cache hits.
+- **`--ipc=host` is required.** The connector moves KV through CUDA IPC;
+  `podman-compose` 1.3.0 silently ignores the `ipc` key, so `scripts/pd-up.sh`
+  launches with plain `podman` (node1's working deployment also runs
+  `IpcMode=host`). Without it the server never answers `register_kv_caches` and
+  the engines time out after 300 s.
+
+### Run
+
+```bash
+cp .env.example .env          # then merge the values from .env.pd.example
+cp .env.pd.example .env.pd    # or keep them in one file
+./scripts/pd-up.sh both       # prefill first, then decode; waits for /health
+VLLM_API_KEY=... ./scripts/pd-request.sh "..." 64
+./scripts/pd-down.sh
+```
+
+`scripts/pd-request.sh` drives the two-step flow: the prompt goes to the prefill
+server with `max_tokens=1`, then the same prompt goes to the decode server.
