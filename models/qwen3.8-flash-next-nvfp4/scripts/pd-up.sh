@@ -45,7 +45,11 @@ start_engine() { # $1 role
   local role=$1 port kvport cache server batched; local -a gpus
   case $role in
     prefill) port=8101; kvport=14579; cache=$VLLM_CACHE_PREFILL; server=5557; gpus=(0 1); batched=1600;;
-    decode)  port=8102; kvport=14580; cache=$VLLM_CACHE_DECODE;  server=5567; gpus=(2 3); batched=4096;;
+    # step size must equal the resolved block size (1600): a prefill step that
+    # advances more than one block desynchronises the PP ranks with MTP
+    # enabled (observed: "hidden_states has 40 rows but this step expects 1536")
+    # and is also the case the LMCache patch series warns corrupts mamba state.
+    decode)  port=8102; kvport=14580; cache=$VLLM_CACHE_DECODE;  server=5567; gpus=(2 3); batched=1600;;
   esac
   podman rm -f $NS-$role >/dev/null 2>&1 || true
   podman run -d --name $NS-$role --network host --ipc=host --stop-timeout 600 "${SEC[@]}" \

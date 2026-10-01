@@ -156,7 +156,7 @@ services:
       - --trust-remote-code
       - --max-model-len=1000000
       - --max-num-seqs=${PREFILL_MAX_NUM_SEQS:-4}
-      - --max-num-batched-tokens=${PREFILL_MAX_BATCHED_TOKENS:-8192}
+      - --max-num-batched-tokens=${PREFILL_MAX_BATCHED_TOKENS:-1600}
       - --kv-cache-memory=${PREFILL_KV_CACHE_MEMORY:-17179869184}
       - --kv-cache-dtype=bfloat16
       # The KV block geometry is resolved from num_speculative_tokens (via the
@@ -234,7 +234,7 @@ services:
       - --trust-remote-code
       - --max-model-len=1000000
       - --max-num-seqs=${DECODE_MAX_NUM_SEQS:-32}
-      - --max-num-batched-tokens=${DECODE_MAX_BATCHED_TOKENS:-4096}
+      - --max-num-batched-tokens=${DECODE_MAX_BATCHED_TOKENS:-1600}
       - --kv-cache-memory=${DECODE_KV_CACHE_MEMORY:-17179869184}
       - --kv-cache-dtype=bfloat16
       - '--speculative-config={"method":"mtp","num_speculative_tokens":${QWEN_MTP_TOKENS:-3}}'
