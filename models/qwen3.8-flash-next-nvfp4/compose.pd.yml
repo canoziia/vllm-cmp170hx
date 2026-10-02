@@ -262,3 +262,24 @@ services:
       timeout: 10s
       start_period: 15m
       retries: 3
+  qwen3.8-flash-next-nvfp4-pd-proxy:
+    image: ${PROXY_IMAGE:-localhost/vllm-backport:qwen3.8-flash-next-nvfp4}
+    container_name: qwen3.8-flash-next-nvfp4-pd-proxy
+    restart: "no"
+    network_mode: host
+    ipc: host
+    # start with: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+    entrypoint: ["python3", "/proxy/disagg_proxy_server.py"]
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    environment:
+      OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${PD_PROXY_SCRIPT:-/root/app/vllm-cmp170hx/scripts/disagg_proxy_server.py}:/proxy/disagg_proxy_server.py:ro
+    command:
+      - --host=0.0.0.0
+      - --port=9001
+      - --prefiller-host=127.0.0.1
+      - --prefiller-port=8101
+      - --decoder-host=127.0.0.1
+      - --decoder-port=8102

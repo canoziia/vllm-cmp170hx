@@ -251,3 +251,24 @@ services:
       timeout: 10s
       start_period: 30m
       retries: 3
+  deepseek-v4-flash-pd-proxy:
+    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash-debug}
+    container_name: deepseek-v4-flash-pd-proxy
+    restart: "no"
+    network_mode: host
+    ipc: host
+    # start with: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+    entrypoint: ["python3", "/proxy/disagg_proxy_server.py"]
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    environment:
+      OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${PD_PROXY_SCRIPT:-/root/app/vllm-cmp170hx/scripts/disagg_proxy_server.py}:/proxy/disagg_proxy_server.py:ro
+    command:
+      - --host=0.0.0.0
+      - --port=9002
+      - --prefiller-host=127.0.0.1
+      - --prefiller-port=8201
+      - --decoder-host=127.0.0.1
+      - --decoder-port=8202
