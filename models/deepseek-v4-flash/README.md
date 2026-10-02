@@ -94,3 +94,28 @@ curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 # 2) decode the same prompt; the response reports prompt_tokens_details.cached_tokens
 curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY" $DC/v1/chat/completions
 ```
+
+### Single endpoint in front of the pair (``-pd-proxy``)
+
+``podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d`` also starts
+``deepseek-v4-flash-pd-proxy`` on **:9002**. It is vLLM's example disaggregation
+proxy (vendored, unmodified, at ``scripts/disagg_proxy_server.py``): it accepts one
+request, replays it to the prefill role with ``max_tokens=1`` (which computes and stores
+the prompt KV), then sends the original request to the decode role and streams the answer
+back. So the pair is reachable as a single OpenAI-compatible endpoint.
+
+Measured through the proxy: a prompt of the same shape returned
+``usage.prompt_tokens_details.cached_tokens = 3200`` while the prefill server logged
+``Stored 1024 tokens`` per rank and the decode server ``Retrieved`` lines - the decode
+role generated without recomputing the prompt.
+
+Caveats - it is an example, not a production router:
+
+* it always answers with SSE, so a client must parse ``text/event-stream`` even when it
+  sent ``stream: false``;
+* only ``/v1/completions`` and ``/v1/chat/completions`` exist; ``/v1/models`` and any
+  health endpoint return 404 (use the engines' own ports for readiness);
+* it authorises with its own ``OPENAI_API_KEY`` environment variable (wired to
+  ``VLLM_API_KEY`` here) and ignores the caller's Authorization header;
+* no session affinity and no KV-transfer handshake: multi-turn reuse still depends on the
+  shared L2 tier, not on this proxy.
