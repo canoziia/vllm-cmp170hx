@@ -1,3 +1,12 @@
+# NOTE (2026-10-02): do NOT start this stack as-is.
+#   * qwen was shifted to GPUs 1-4, so deepseek's original 4,5,6 / 7,8,9 now
+#     collides on GPU4.
+#   * The only free card is GPU0, and GPU0 is the one behind the degraded x1
+#     link that is implicated in the host's PCI SERR resets, so it must stay
+#     unused.
+#   * Consequence: the deepseek pair needs a free GPU set (e.g. move qwen back
+#     to 0-3 once GPU0 is serviced, or add a card) before it can run next to
+#     qwen. Kept at 4,5,6 / 7,8,9 so the file records the intended layout.
 # DeepSeek-V4-Flash with prefill/decode disaggregation, six GPUs.
 #
 # Model: deepseek-ai/DeepSeek-V4-Flash (model_type deepseek_v4,
