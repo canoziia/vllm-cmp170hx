@@ -155,19 +155,25 @@ of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
   resolve different block sizes (1568 vs 1600) and the shared L2 cannot hold both
   layouts. Similarly the prefill role uses the same `VLLM_PP_LAYER_PARTITION`
   (`26,22`), because the mamba/attention page geometry depends on it.
-- **`--max-num-batched-tokens` equals the resolved block size (1600) on *both*
-  roles.** The patch series notes that for mamba-hybrid models with speculative
-  decoding a step that advances more than one block stores recurrent-state chunks
-  that corrupt later prefix-cache hits. It is also a stability requirement: with
-  the step size at 4096 the decode role killed its own engine on a cache *miss*
-  (`PP intermediate tensor 'hidden_states' has 40 rows but this step expects
-  1536; the upstream rank likely failed mid-step`), because a 1504-token prefill
-  step plus MTP desynchronised the pipeline ranks. At 1600 the same request is
-  served correctly (observed: `cached_tokens 0`, no crash).
+- **The decode role keeps node1's production values** (`--max-num-seqs=32`,
+  `--max-num-batched-tokens=4096`, `FULL_AND_PIECEWISE`). What has to agree
+  between the two roles is the *block geometry* (previous bullet), not the step
+  size. Cold cache misses on the decode role — the decode engine prefilling on
+  its own — were exercised at 886 / 1642 / 3370 prompt tokens, and as the very
+  first request of a freshly started engine (1500 tokens): every one was served
+  normally with `cached_tokens = 0`.
+- **Unreproduced incident, recorded without a cause.** During bring-up one cold
+  request against a decode engine running `--max-num-batched-tokens=4096` and
+  *no* `--max-num-seqs` flag died with `PP intermediate tensor 'hidden_states'
+  has 40 rows but this step expects 1536`. It has not reproduced with the
+  committed configuration, and no mechanism has been established. An earlier
+  revision of this file claimed the step size "must equal the block size" and
+  justified it with a guard that the LMCache patch series actually *removes* —
+  that was an unjustified generalisation and is not a requirement of this stack.
 - **`--ipc=host` is required.** The connector moves KV through CUDA IPC;
-  `podman-compose` 1.3.0 silently ignores the `ipc` key, so `scripts/pd-up.sh`
-  launches with plain `podman` (node1's working deployment also runs
-  `IpcMode=host`). Without it the server never answers `register_kv_caches` and
+  `podman-compose` 1.3.0 silently ignores the `ipc` key, so start the stack with
+  `podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d`, the same
+  flag node1 uses. Without it the server never answers `register_kv_caches` and
   the engines time out after 300 s.
 
 ### Verified behaviour
@@ -186,12 +192,27 @@ nonce, so the context came from the transferred KV. Evidence logs:
 ### Run
 
 ```bash
-cp .env.example .env          # then merge the values from .env.pd.example
-cp .env.pd.example .env.pd    # or keep them in one file
-./scripts/pd-up.sh both       # prefill first, then decode; waits for /health
-VLLM_API_KEY=... ./scripts/pd-request.sh "..." 64
-./scripts/pd-down.sh
+# from this directory
+cp .env.example .env               # set VLLM_API_KEY / machine paths, merge .env.pd.example
+podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+podman compose -f compose.pd.yml ps
+podman compose -f compose.pd.yml down
 ```
 
-`scripts/pd-request.sh` drives the two-step flow: the prompt goes to the prefill
-server with `max_tokens=1`, then the same prompt goes to the decode server.
+`--podman-run-args=--ipc=host` is required: the connector moves KV over CUDA IPC,
+and podman-compose 1.3.0 ignores the compose `ipc` key. node1 starts its
+deployments with the same flag.
+
+### Two-step PD request
+
+```bash
+KEY=$(grep '^VLLM_API_KEY=' .env | cut -d= -f2)
+PF=http://127.0.0.1:8101   # prefill role
+DC=http://127.0.0.1:8102   # decode role
+BODY='{"model":"nvidia/Qwen3.8-Flash-Next-NVFP4","messages":[{"role":"user","content":"your prompt"}],"max_tokens":64}'
+# 1) prefill the prompt so its KV lands in the shared L2 tier
+curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d "${BODY/\"max_tokens\":64/\"max_tokens\":1}" $PF/v1/chat/completions
+# 2) decode the same prompt; the response reports prompt_tokens_details.cached_tokens
+curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY" $DC/v1/chat/completions
+```

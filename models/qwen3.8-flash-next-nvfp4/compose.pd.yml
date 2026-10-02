@@ -14,7 +14,7 @@
 #             CUDA IPC with the server process
 # The model has 48 transformer layers plus a 1-layer MTP module.
 #
-# Request flow is two-step (see scripts/pd-request.sh):
+# Request flow is two-step (prefill with max_tokens=1, then decode the same
 #   1. POST the prompt to the prefill server with max_tokens=1, so only the
 #      prompt is computed and its KV lands in LMCache;
 #   2. POST the same prompt to the decode server, which loads the prompt KV from
@@ -29,10 +29,12 @@ services:
     restart: "no"
     entrypoint: ["lmcache"]
     network_mode: host
-    # podman-compose 1.3.0 ignores this key; scripts/pd-up.sh runs with --ipc=host,
+    # podman-compose 1.3.0 ignores this key; start with
+#   podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
     # which is required because the connector moves KV over CUDA IPC.
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    # (podman-compose 1.3.0 ignores this key; node1 uses the same flag)
     ipc: host
-    shm_size: 16g
     devices:
       - nvidia.com/gpu=0
       - nvidia.com/gpu=1
@@ -70,8 +72,9 @@ services:
     restart: "no"
     entrypoint: ["lmcache"]
     network_mode: host
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    # (podman-compose 1.3.0 ignores this key; node1 uses the same flag)
     ipc: host
-    shm_size: 16g
     devices:
       - nvidia.com/gpu=2
       - nvidia.com/gpu=3
@@ -108,9 +111,9 @@ services:
     container_name: qwen3.8-flash-next-nvfp4-prefill
     restart: "no"
     network_mode: host
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    # (podman-compose 1.3.0 ignores this key; node1 uses the same flag)
     ipc: host
-    # podman-compose 1.3.0 ignores `ipc`, so size /dev/shm explicitly.
-    shm_size: 64g
     stop_grace_period: 10m
     depends_on:
       qwen3.8-flash-next-nvfp4-lmcache-prefill:
@@ -188,9 +191,9 @@ services:
     container_name: qwen3.8-flash-next-nvfp4-decode
     restart: "no"
     network_mode: host
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    # (podman-compose 1.3.0 ignores this key; node1 uses the same flag)
     ipc: host
-    # podman-compose 1.3.0 ignores `ipc`, so size /dev/shm explicitly.
-    shm_size: 64g
     stop_grace_period: 10m
     depends_on:
       qwen3.8-flash-next-nvfp4-lmcache-prefill:
@@ -234,7 +237,7 @@ services:
       - --trust-remote-code
       - --max-model-len=1000000
       - --max-num-seqs=${DECODE_MAX_NUM_SEQS:-32}
-      - --max-num-batched-tokens=${DECODE_MAX_BATCHED_TOKENS:-1600}
+      - --max-num-batched-tokens=${DECODE_MAX_BATCHED_TOKENS:-4096}
       - --kv-cache-memory=${DECODE_KV_CACHE_MEMORY:-17179869184}
       - --kv-cache-dtype=bfloat16
       - '--speculative-config={"method":"mtp","num_speculative_tokens":${QWEN_MTP_TOKENS:-3}}'

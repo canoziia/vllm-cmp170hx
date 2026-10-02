@@ -41,8 +41,9 @@ node2 (CMP 170HX, 63.4 GiB usable per card):
 - KV budget is therefore **4 GiB**, not the 6 GiB used by node1's PP6 V4.1
   deployment: at 6 GiB the engine OOM'd during kernel warmup, and at 4 GiB the
   KV cache still holds ~1.24M tokens (enough for one 1M-token request);
-- **CUDA graphs must be PIECEWISE**: with FULL graphs the capture OOM'd in the
-  ~8 GiB that remains;
+- **CUDA graphs are PIECEWISE**: with FULL graphs the capture OOM'd in the
+  ~8 GiB that remained at the 6 GiB KV setting (the committed 4 GiB setting was
+  not re-tested with FULL graphs);
 - `--max-num-seqs` is reduced (4 prefill / 8 decode) to keep graph buffers small;
 - the two LMCache servers must use a small L1 (`LMCACHE_L1_SIZE_GB=8`): the L1
   tier is host RAM, and 64 GiB per server got both servers OOM-killed while this
@@ -51,7 +52,27 @@ node2 (CMP 170HX, 63.4 GiB usable per card):
 ## Run
 
 ```bash
-cp .env.example .env      # set VLLM_API_KEY and machine paths
-podman-compose -f compose.pd.yml --env-file .env up -d
-VLLM_API_KEY=... ./scripts/pd-request.sh "Explain pipeline parallelism in one paragraph." 64
+# from this directory
+cp .env.example .env               # set VLLM_API_KEY / machine paths, merge .env.pd.example
+podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+podman compose -f compose.pd.yml ps
+podman compose -f compose.pd.yml down
+```
+
+`--podman-run-args=--ipc=host` is required: the connector moves KV over CUDA IPC,
+and podman-compose 1.3.0 ignores the compose `ipc` key. node1 starts its
+deployments with the same flag.
+
+### Two-step PD request
+
+```bash
+KEY=$(grep '^VLLM_API_KEY=' .env | cut -d= -f2)
+PF=http://127.0.0.1:8201   # prefill role
+DC=http://127.0.0.1:8202   # decode role
+BODY='{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"your prompt"}],"max_tokens":64}'
+# 1) prefill the prompt so its KV lands in the shared L2 tier
+curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d "${BODY/\"max_tokens\":64/\"max_tokens\":1}" $PF/v1/chat/completions
+# 2) decode the same prompt; the response reports prompt_tokens_details.cached_tokens
+curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY" $DC/v1/chat/completions
 ```
