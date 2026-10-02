@@ -167,6 +167,10 @@ services:
       - --disable-custom-all-reduce
       - --enable-prefix-caching
       - --tokenizer-mode=${DSFLASH_TOKENIZER_MODE:-deepseek_v4}
+      # Both roles must declare the same speculative depth: the shared L2 key is
+      # (rank, object group) but the object size depends on this geometry, and a
+      # mismatch shows up as "incomplete read ... expected N, got M" (= zero hits).
+      - '--speculative-config=${DSFLASH_SPECULATIVE_CONFIG:-{"method":"mtp","num_speculative_tokens":1}}'
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":["127.0.0.1:5558"]}}'
       - --enable-prompt-tokens-details
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
