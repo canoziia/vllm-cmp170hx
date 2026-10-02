@@ -26,11 +26,29 @@ decode retrieves, then decodes with the speculative decoder.
 
 | step | request | result |
 |---|---|---|
-| prefill role (GPU 4,5,6), first time | prompt (2409 tok) | server A logs `Stored 2048 tokens` on each of the 3 ranks; 12 objects land in the L2 directory |
-| decode role (GPU 7,8,9), first time | same prompt, after prefill | server B logs `Retrieved 2048 tokens`; `prompt_tokens_details.cached_tokens = 2048` |
-| decode role, larger budget | same prompt | answer correctly summarises the transferred passage and echoes the nonce that was only ever sent to the prefill role |
+| prefill role (GPU 4,5,6), first time | prompt (1890 tok) | server A logs `Stored 1024 tokens` per rank; objects land in the L2 directory |
+| decode role (GPU 7,8,9), first time | same prompt, after prefill | server B logs `Retrieved 1024 tokens`; `cached_tokens = 1024` (the remaining 512 tokens were computed and stored) |
+| decode role output | same prompt | answer echoes the injected marker, so the context came from the transferred KV |
 
-Evidence: `/root/app/pd-validation/deepseek-*/`.
+Evidence: `/root/app/pd-validation/`.
+
+## Both roles must declare the same speculative depth
+
+The L2 key is `(model, rank, object group)` — it does **not** include the size of
+the object. The size follows from the KV geometry, and that geometry is resolved
+from `num_speculative_tokens`. So if one role declares `--speculative-config` and
+the other does not, both agree on the key but disagree on the byte count, and
+every lookup fails with:
+
+```
+[LMCache GET] key /models/DeepSeek-V4-Flash@03020302@0@<hash> failed: incomplete read for
+  <hash>.data: expected 4765696, got 4690944
+```
+
+The visible symptom on the engine is `cached_tokens = 0` together with
+`created_cache_tokens > 0`, even though the other role clearly stored the chunk.
+A prefill role therefore declares the same `--speculative-config` as the decode
+role purely so both resolve one geometry; it does not sample draft tokens.
 
 ## Fitting PP3 on 63 GiB cards
 
