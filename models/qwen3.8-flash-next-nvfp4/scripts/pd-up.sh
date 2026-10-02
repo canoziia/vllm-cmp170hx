@@ -33,12 +33,12 @@ start_server() { # $1 role  $2 port  $3 http  $4.. gpus
   local role=$1 port=$2 http=$3; shift 3
   local devs=(); for g in "$@"; do devs+=(--device nvidia.com/gpu=$g); done
   podman rm -f $NS-lmcache-$role >/dev/null 2>&1 || true
-  podman run -d --name $NS-lmcache-$role --network host --ipc=host "${SEC[@]}" "${devs[@]}" \
+  podman run -d --replace --name $NS-lmcache-$role --network host --ipc=host "${SEC[@]}" "${devs[@]}" \
     -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e NVIDIA_DRIVER_CAPABILITIES=compute,utility -e PYTHONUNBUFFERED=1 \
     -v "$LMCACHE_L2_PATH:/lmcache-l2" \
     --entrypoint lmcache "$LMCACHE_IMAGE" server --host=127.0.0.1 --port=$port \
       --http-host=127.0.0.1 --http-port=$http --chunk-size=1600 --separate-object-groups \
-      --l1-size-gb=64 --eviction-policy=LRU --max-workers=8 "$L2ADAPTER" >/dev/null
+      --l1-size-gb=${LMCACHE_L1_SIZE_GB:-8} --eviction-policy=LRU --max-workers=8 "$L2ADAPTER" >/dev/null
 }
 
 start_engine() { # $1 role
@@ -52,7 +52,7 @@ start_engine() { # $1 role
     decode)  port=8102; kvport=14580; cache=$VLLM_CACHE_DECODE;  server=5567; gpus=(2 3); batched=1600;;
   esac
   podman rm -f $NS-$role >/dev/null 2>&1 || true
-  podman run -d --name $NS-$role --network host --ipc=host --stop-timeout 600 "${SEC[@]}" \
+  podman run -d --replace --name $NS-$role --network host --ipc=host --stop-timeout 600 "${SEC[@]}" \
     --device nvidia.com/gpu=${gpus[0]} --device nvidia.com/gpu=${gpus[1]} \
     --ulimit nofile=1048576:1048576 \
     -v "$QWEN_MODEL_CACHE:/root/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-NVFP4:ro" \
