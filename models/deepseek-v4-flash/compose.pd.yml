@@ -111,7 +111,7 @@ services:
       retries: 30
 
   deepseek-v4-flash-prefill:
-    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash-debug}
+    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
     container_name: deepseek-v4-flash-prefill
     restart: "no"
     network_mode: host
@@ -182,7 +182,7 @@ services:
       retries: 3
 
   deepseek-v4-flash-decode:
-    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash-debug}
+    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
     container_name: deepseek-v4-flash-decode
     restart: "no"
     network_mode: host

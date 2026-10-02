@@ -252,3 +252,45 @@ Things worth knowing:
 
 The earlier vendored copy of vLLM's example `disagg_proxy_server.py` was removed in
 favour of this router.
+
+### One LMCache server shared by both PD roles
+
+The pair runs one LMCache server (chunk 1600, `--l1-size-gb=64`, `fs_native` L2)
+instead of one per role, so both engines register against the same layout
+registry (keyed by `(model_name, world_size)`; the roles are homogeneous by
+construction). The server container therefore has to see **all four** GPUs of
+the pair, not just its own role's two.
+
+`patches/lmcache/0008-shared-server-mp-worker-rank.patch` is what makes this
+work: the server prefers the client's `mp_worker_rank` layout hint and otherwise
+falls back to its own device index, which is only a rank when the server sees a
+single engine (indices `0..world_size-1`). With two PP2 engines the second
+engine's GPUs sit at indices 2 and 3 for `world_size=2` and registration aborted
+with `Cannot derive MP worker rank from registered cache device cuda:2`. The
+patch folds the index into `[0, world_size)` and logs the resolution:
+
+```
+device=cuda:0 hint=None -> worker_rank=0     engine A rank 0
+device=cuda:1 hint=None -> worker_rank=1     engine A rank 1
+device=cuda:2 hint=None -> worker_rank=0     engine B rank 0  (2 % 2)
+device=cuda:3 hint=None -> worker_rank=1     engine B rank 1  (3 % 2)
+```
+
+Note the `hint=None`: the vLLM connector does build the hint
+(`vllm_multi_process_adapter._send_register_kv_caches_request` sets
+`layout_hints["mp_worker_rank"] = self.worker_id`), but it does not survive to
+the server in this build, so the rank fold is the path that actually runs.
+
+Both engine services are deliberately **not** `depends_on` the LMCache service:
+restarting LMCache must not restart vLLM.
+
+### Role configuration relative to node1
+
+Both roles mirror the node1 production instance (PP2/TP1, modelopt, MTP-3,
+`--max-num-seqs=32`, `--max-num-batched-tokens=4096`, `kv-cache-memory=16 GiB`,
+cudagraph `FULL_AND_PIECEWISE`, prefix cache `--prefix-match-unit=32`,
+`--prefix-cache-retention-interval=1600`, `--enable-auto-tool-choice` with the
+qwen3_xml/qwen3 parsers, the NCCL/PLE/TORCH_CUDA_ARCH_LIST environment). The
+differences that must remain: two engines rather than one, their ports
+8101/8102, the engine-local `kv_ip`/`kv_port` (14579/14580 - vLLM defaults both
+engines to 14579), `HF_HUB_OFFLINE=1`, and the GPU set.
