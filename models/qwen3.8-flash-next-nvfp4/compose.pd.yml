@@ -234,27 +234,25 @@ services:
       start_period: 15m
       retries: 3
   qwen3.8-flash-next-nvfp4-pd-router:
-    image: ${DEFAULT_ROUTER_IMAGE:-docker.1ms.run/library/python:3.12-slim}
+    # Built from patches/router/ (see scripts/build-router-image.sh): the router
+    # merges both hops' usage into the standard fields before returning.
+    image: ${ROUTER_IMAGE:-localhost/vllm-router:latest}
     container_name: qwen3.8-flash-next-nvfp4-pd-router
     restart: "no"
     network_mode: host
-    # Engine images need apparmor=unconfined for CUDA; a plain Python service needs it
-    # for socketpair() (uvicorn's event loop) - the same AppArmor class of problem.
     security_opt: ["label=disable", "apparmor=unconfined"]
-    # Community-maintained PD front end: vLLM production-stack router, pinned to the
-    # vllm-stack-0.1.13 release, static discovery so no Kubernetes is required.
-    # Routing logic "disaggregated_prefill" orchestrates the two hops AND sends the
-    # backend API key (send_request_to_prefiller/decode). The *orchestrated* variant
-    # injects kv_transfer_params but sends no Authorization header (request.py:833 in
-    # 0.1.13 and in main), so it 401s against engines started with --api-key; we do not
-    # need kv_transfer_params because our KV moves through the shared LMCache tier.
-    entrypoint: ["bash", "-lc"]
+    entrypoint: ["vllm-router"]
     environment:
-      PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
-      SETUPTOOLS_SCM_PRETEND_VERSION: "0.1.13"
       # the router builds the backend Authorization header from OPENAI_API_KEY
       OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
       PYTHONUNBUFFERED: "1"
     command:
-      - >-
-        pip install -q --disable-pip-version-check "vllm-router @ https://codeload.github.com/vllm-project/production-stack/tar.gz/refs/tags/vllm-stack-0.1.13" && exec vllm-router --service-discovery static --static-backends "http://127.0.0.1:8101,http://127.0.0.1:8102" --static-models "nvidia/Qwen3.8-Flash-Next-NVFP4,nvidia/Qwen3.8-Flash-Next-NVFP4" --static-model-labels "prefill,decode" --prefill-model-labels prefill --decode-model-labels decode --routing-logic disaggregated_prefill --host 0.0.0.0 --port 9101
+      - --service-discovery=static
+      - --static-backends=http://127.0.0.1:8101,http://127.0.0.1:8102
+      - --static-models=nvidia/Qwen3.8-Flash-Next-NVFP4,nvidia/Qwen3.8-Flash-Next-NVFP4
+      - --static-model-labels=prefill,decode
+      - --prefill-model-labels=prefill
+      - --decode-model-labels=decode
+      - --routing-logic=disaggregated_prefill
+      - --host=0.0.0.0
+      - --port=9101

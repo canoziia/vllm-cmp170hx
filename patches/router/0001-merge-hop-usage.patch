@@ -1,0 +1,145 @@
+--- a/vllm_router/services/request_service/request.py
++++ b/vllm_router/services/request_service/request.py
+@@ -734,6 +734,108 @@
+         return await response.json()
+ 
+ 
++class _UsageMergeState:
++    """Rewrite the streamed decode usage so the client sees the merged account.
++
++    The client must receive an OpenAI-standard body, so the accounting is baked
++    into `usage` itself; the raw per-hop numbers ride along under `router_hops`.
++
++    input       : the prompt (both hops must agree)
++    cached read : min(prefill cached, decode cached) - what was already cached
++                  before this request; the min removes the intra-request
++                  prefill->decode handoff from the count
++    cache write : every prompt token either hop had to compute,
++                  (p_prompt - p_cached) + (d_prompt - d_cached); chunked PD
++                  recomputes the sub-chunk tail on the decode side
++    output      : the decode hop's completion tokens (untouched)
++    """
++
++    def __init__(self, prefill_usage, request_id):
++        self.prefill_usage = prefill_usage
++        self.request_id = request_id
++        self.buf = bytearray()
++
++    @staticmethod
++    def _merge(decode_usage, prefill_usage, request_id):
++        if not isinstance(decode_usage, dict):
++            return decode_usage
++        d_details = decode_usage.get("prompt_tokens_details")
++        if not isinstance(d_details, dict):
++            d_details = {}
++        p_usage = prefill_usage if isinstance(prefill_usage, dict) else {}
++        p_details = p_usage.get("prompt_tokens_details")
++        if not isinstance(p_details, dict):
++            p_details = {}
++        p_prompt, p_cached = p_usage.get("prompt_tokens"), p_details.get("cached_tokens")
++        d_prompt, d_cached = decode_usage.get("prompt_tokens"), d_details.get("cached_tokens")
++        if p_prompt is not None and d_prompt is not None and p_prompt != d_prompt:
++            logger.warning(
++                f"{request_id} prefill/decode prompt mismatch: "
++                f"prefill={p_prompt} decode={d_prompt}; reporting decode"
++            )
++        input_tokens = d_prompt if d_prompt is not None else p_prompt
++        if p_cached is None:
++            cached_read = d_cached
++        elif d_cached is None:
++            cached_read = p_cached
++        else:
++            cached_read = min(p_cached, d_cached)
++        cache_write = None
++        if None not in (p_prompt, p_cached, d_prompt, d_cached):
++            cache_write = (p_prompt - p_cached) + (d_prompt - d_cached)
++        decode_raw = json.loads(json.dumps(decode_usage))
++        if cached_read is not None:
++            d_details["cached_tokens"] = cached_read
++        if cache_write is not None:
++            d_details["created_cache_tokens"] = cache_write
++        decode_usage["prompt_tokens_details"] = d_details
++        decode_usage["router_hops"] = {
++            "request_id": request_id,
++            "input": input_tokens,
++            "cached_read": cached_read,
++            "cache_write_prefill_compute": cache_write,
++            "prefill_usage": p_usage,
++            "decode_usage": decode_raw,
++        }
++        return decode_usage
++
++    def _rewrite_event(self, event: bytes) -> bytes:
++        head, sep, body = event.partition(b"data:")
++        if not sep:
++            return event
++        body = body.strip()
++        if not body or body == b"[DONE]":
++            return event
++        try:
++            payload = json.loads(body)
++        except Exception:
++            return event
++        if not isinstance(payload, dict) or "usage" not in payload:
++            return event
++        payload["usage"] = self._merge(payload.get("usage"), self.prefill_usage, self.request_id)
++        return head + b"data: " + json.dumps(payload).encode("utf-8")
++
++    def feed(self, chunk: bytes):
++        """Return the rewritten complete SSE events; keep one partial buffered."""
++        self.buf.extend(chunk)
++        out = []
++        while True:
++            idx = self.buf.find(b"\n\n")
++            if idx < 0:
++                break
++            event = bytes(self.buf[:idx])
++            del self.buf[: idx + 2]
++            out.append(self._rewrite_event(event) + b"\n\n")
++        return out
++
++    def flush(self) -> bytes:
++        if not self.buf:
++            return b""
++        rest = self._rewrite_event(bytes(self.buf))
++        self.buf.clear()
++        return rest
++
++
+ async def send_request_to_decode(
+     client: aiohttp.ClientSession, endpoint: str, req_data: dict, request_id: str
+ ):
+@@ -975,9 +1077,12 @@
+ 
+     st = time.time()
+     try:
+-        await send_request_to_prefiller(
++        prefill_response = await send_request_to_prefiller(
+             request.app.state.prefill_client, endpoint, request_json, request_id
+         )
++        prefill_usage = (
++            prefill_response.get("usage") if isinstance(prefill_response, dict) else None
++        )
+         et = time.time()
+         logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
+         logger.info(
+@@ -1012,12 +1117,18 @@
+             headers={"X-Request-Id": request_id},
+         )
+ 
++    merge_state = _UsageMergeState(prefill_usage, request_id)
++
+     async def generate_stream():
+         try:
+             async for chunk in send_request_to_decode(
+                 request.app.state.decode_client, endpoint, request_json, request_id
+             ):
+-                yield chunk
++                for event in merge_state.feed(chunk):
++                    yield event
++            tail = merge_state.flush()
++            if tail:
++                yield tail
+         except aiohttp.ClientResponseError as e:
+             logger.error(f"HTTP error in decoder: {e}", exc_info=True)
+             try:

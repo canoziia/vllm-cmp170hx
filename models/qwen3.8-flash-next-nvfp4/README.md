@@ -294,3 +294,32 @@ qwen3_xml/qwen3 parsers, the NCCL/PLE/TORCH_CUDA_ARCH_LIST environment). The
 differences that must remain: two engines rather than one, their ports
 8101/8102, the engine-local `kv_ip`/`kv_port` (14579/14580 - vLLM defaults both
 engines to 14579), `HF_HUB_OFFLINE=1`, and the GPU set.
+
+### Billing: the router merges both hops' usage
+
+The router (`localhost/vllm-router`, built from `patches/router/` - see
+`scripts/build-router-image.sh`) must hand the client an OpenAI-standard body, so
+the accounting is computed inside the router and written into the standard
+fields; the raw per-hop numbers ride along in the same JSON for reconciliation.
+
+| field | meaning after the merge |
+|---|---|
+| `prompt_tokens` | the prompt (both hops must agree; a mismatch is logged and decode reported) |
+| `prompt_tokens_details.cached_tokens` | `min(prefill cached, decode cached)` - what was cached **before** the request; the min removes the intra-request prefill->decode handoff |
+| `prompt_tokens_details.created_cache_tokens` | `(p_prompt - p_cached) + (d_prompt - d_cached)` - every prompt token either hop computed. Chunked PD recomputes the sub-chunk tail on decode, so this exceeds `prompt - cached` |
+| `completion_tokens` | the decode hop's generation, untouched |
+| `router_hops` | custom block: `input`, `cached_read`, `cache_write_prefill_compute`, plus both hops' raw usage |
+
+Measured on a 54056-token prompt (chunk 1600):
+
+```
+cold: P(prompt 54056, cached 0)      D(prompt 54056, cached 51200)
+      -> cached_tokens=0      created_cache_tokens=56912 (= 54056 + 2856)
+warm: P(prompt 54056, cached 51200)  D(prompt 54056, cached 52800)
+      -> cached_tokens=51200  created_cache_tokens=4112  (= 2856 + 1256)
+```
+
+Both rules are unit-tested by `scripts/test-router-patches.py`, which the image
+build runs. `total_tokens` stays the OpenAI-standard
+`prompt_tokens + completion_tokens`, so it is *not* the sum of the billed lines:
+bill from the explicit fields.
