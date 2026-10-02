@@ -2,7 +2,7 @@
 #
 # Model: deepseek-ai/DeepSeek-V4-Flash (model_type deepseek_v4,
 # 43 transformer layers, num_nextn_predict_layers 1, fp8 e4m3 / fp4 experts).
-# This is NOT DeepSeek-V4.1 (deepseek_v41, 40 layers): the model-specific flags
+# This is NOT DeepSeek-V4.1 (deepseek_v4, 40 layers): the model-specific flags
 # below therefore default to values that can be overridden from .env, and the
 # runtime names (tokenizer mode, parsers, speculative method, KV dtype) must be
 # confirmed against the image that is actually used.
@@ -52,9 +52,9 @@ services:
       - --port=5558
       - --http-host=127.0.0.1
       - --http-port=18558
-      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1024}
       - --separate-object-groups
-      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-8}
       - --eviction-policy=LRU
       - --max-workers=8
       - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
@@ -93,9 +93,9 @@ services:
       - --port=5568
       - --http-host=127.0.0.1
       - --http-port=18568
-      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1024}
       - --separate-object-groups
-      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-8}
       - --eviction-policy=LRU
       - --max-workers=8
       - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
@@ -153,15 +153,16 @@ services:
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${PREFILL_MAX_NUM_SEQS:-4}
-      - --max-num-batched-tokens=${PREFILL_MAX_BATCHED_TOKENS:-8192}
+      - --max-num-seqs=${DSFLASH_PREFILL_MAX_NUM_SEQS:-4}
+      - --max-num-batched-tokens=${PREFILL_MAX_BATCHED_TOKENS:-4096}
       - --kv-cache-dtype=${DSFLASH_KV_CACHE_DTYPE:-fp8_ds_mla}
-      - --kv-cache-memory=${PREFILL_KV_CACHE_MEMORY:-6442450944}
+      - --kv-cache-memory=${PREFILL_KV_CACHE_MEMORY:-4294967296}
       - --prefix-cache-retention-interval=${DSFLASH_PREFIX_RETENTION_INTERVAL:-1024}
+      - '--compilation-config={"cudagraph_mode":"PIECEWISE"}'
       - --trust-remote-code
       - --disable-custom-all-reduce
       - --enable-prefix-caching
-      - --tokenizer-mode=${DSFLASH_TOKENIZER_MODE:-deepseek_v41}
+      - --tokenizer-mode=${DSFLASH_TOKENIZER_MODE:-deepseek_v4}
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":["127.0.0.1:5558"]}}'
       - --enable-prompt-tokens-details
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
@@ -218,20 +219,21 @@ services:
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DECODE_MAX_NUM_SEQS:-32}
+      - --max-num-seqs=${DSFLASH_DECODE_MAX_NUM_SEQS:-8}
       - --max-num-batched-tokens=${DECODE_MAX_BATCHED_TOKENS:-4096}
       - --kv-cache-dtype=${DSFLASH_KV_CACHE_DTYPE:-fp8_ds_mla}
-      - --kv-cache-memory=${DECODE_KV_CACHE_MEMORY:-6442450944}
+      - --kv-cache-memory=${DECODE_KV_CACHE_MEMORY:-4294967296}
       - --prefix-cache-retention-interval=${DSFLASH_PREFIX_RETENTION_INTERVAL:-1024}
+      - '--compilation-config={"cudagraph_mode":"PIECEWISE"}'
       - --trust-remote-code
       - --disable-custom-all-reduce
       - --enable-prefix-caching
-      - --tokenizer-mode=${DSFLASH_TOKENIZER_MODE:-deepseek_v41}
+      - --tokenizer-mode=${DSFLASH_TOKENIZER_MODE:-deepseek_v4}
       - '--speculative-config=${DSFLASH_SPECULATIVE_CONFIG:-{"method":"mtp","num_speculative_tokens":1}}'
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.server_urls":["127.0.0.1:5568"]}}'
       - --enable-auto-tool-choice
-      - --tool-call-parser=${DSFLASH_TOOL_CALL_PARSER:-deepseek_v41}
-      - --reasoning-parser=${DSFLASH_REASONING_PARSER:-deepseek_v41}
+      - --tool-call-parser=${DSFLASH_TOOL_CALL_PARSER:-deepseek_v4}
+      - --reasoning-parser=${DSFLASH_REASONING_PARSER:-deepseek_v4}
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
       - --enable-prompt-tokens-details
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
