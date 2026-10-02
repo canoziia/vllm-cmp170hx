@@ -298,28 +298,41 @@ engines to 14579), `HF_HUB_OFFLINE=1`, and the GPU set.
 ### Billing: the router merges both hops' usage
 
 The router (`localhost/vllm-router`, built from `patches/router/` - see
-`scripts/build-router-image.sh`) must hand the client an OpenAI-standard body, so
-the accounting is computed inside the router and written into the standard
-fields; the raw per-hop numbers ride along in the same JSON for reconciliation.
+`scripts/build-router-image.sh`) hands the client a standard OpenAI body, so the
+accounting is computed in the router and the raw per-hop numbers ride along in
+the same JSON under a namespaced key.
 
 | field | meaning after the merge |
 |---|---|
-| `prompt_tokens` | the prompt (both hops must agree; a mismatch is logged and decode reported) |
+| `prompt_tokens` | the prompt; both hops must agree (a mismatch is logged and decode reported) |
 | `prompt_tokens_details.cached_tokens` | `min(prefill cached, decode cached)` - what was cached **before** the request; the min removes the intra-request prefill->decode handoff |
-| `prompt_tokens_details.created_cache_tokens` | `(p_prompt - p_cached) + (d_prompt - d_cached)` - every prompt token either hop computed. Chunked PD recomputes the sub-chunk tail on decode, so this exceeds `prompt - cached` |
 | `completion_tokens` | the decode hop's generation, untouched |
-| `router_hops` | custom block: `input`, `cached_read`, `cache_write_prefill_compute`, plus both hops' raw usage |
+| `total_tokens` | standard `prompt_tokens + completion_tokens` |
+| `router_hops` | custom block: `input`, `cached_read`, `cache_write_prefill_compute` = `(p_prompt - p_cached) + (d_prompt - d_cached)`, plus both hops' raw usage |
 
-Measured on a 54056-token prompt (chunk 1600):
+Measured on a 36054-token prompt (chunk 1600):
 
 ```
-cold: P(prompt 54056, cached 0)      D(prompt 54056, cached 51200)
-      -> cached_tokens=0      created_cache_tokens=56912 (= 54056 + 2856)
-warm: P(prompt 54056, cached 51200)  D(prompt 54056, cached 52800)
-      -> cached_tokens=51200  created_cache_tokens=4112  (= 2856 + 1256)
+cold: P(prompt 36054, cached 0)      D(prompt 36054, cached 33600)
+      -> cached_tokens=0      router_hops.cache_write_prefill_compute=38508 (= 36054 + 2454)
+warm: P(prompt 36054, cached 33600)  D(prompt 36054, cached 35200)
+      -> cached_tokens=33600  router_hops.cache_write_prefill_compute=3308  (= 2454 + 854)
 ```
 
-Both rules are unit-tested by `scripts/test-router-patches.py`, which the image
-build runs. `total_tokens` stays the OpenAI-standard
-`prompt_tokens + completion_tokens`, so it is *not* the sum of the billed lines:
-bill from the explicit fields.
+The standard fields stay standard on purpose:
+
+* this fork's engines report a non-standard `created_cache_tokens`, and it is
+  stripped from `prompt_tokens_details`;
+* no `cache_write_tokens` alias is emitted either - a client that derives
+  `input = prompt - cached - cache_write` (pi does) would then report
+  `input = 0` for every request, because the prefill compute is always >=
+  `prompt - cached` (chunked PD recomputes the sub-chunk tail on decode).
+
+So a stock OpenAI client sees `in = prompt - cached`, `cache R = cached`,
+`out = completion`, and the prefill-compute line is available only to a billing
+layer that reads `router_hops`. `scripts/test-router-patches.py` (8 tests, run
+during the image build) pins all of this down.
+
+Bill from the explicit fields: with `prompt_tokens` priced at 0 and
+`router_hops.cache_write_prefill_compute` priced non-zero, the bill is
+proportional to the prefill compute.
