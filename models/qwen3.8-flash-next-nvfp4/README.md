@@ -319,6 +319,26 @@ warm: P(prompt 36054, cached 33600)  D(prompt 36054, cached 35200)
       -> cached_tokens=33600  router_hops.cache_write_prefill_compute=3308  (= 2454 + 854)
 ```
 
+### Both response families
+
+The router handles `/v1/chat/completions` and `/v1/responses` (the Responses API
+is what pi speaks). The usage is merged in both, in the family's own field names
+(`prompt_tokens`/`completion_tokens`/`prompt_tokens_details` vs
+`input_tokens`/`output_tokens`/`input_tokens_details`, the latter nested under
+`data["response"]["usage"]` in the SSE stream).
+
+The prefill hop must be capped in both families. The Responses API ignores
+`max_tokens`, so without an explicit `max_output_tokens=1` the prefill engine
+generated the whole answer before the decode hop was asked to start, and the
+client waited for both generations. Measured on a 300-token answer:
+
+```
+before: prefill engine +297 generated tokens, router prefill TTFT 4.69s,
+        client first byte 4.77s / total 9.43s
+after:  prefill engine +1 token,             router prefill TTFT 0.11s,
+        client first byte 0.19s / total 5.00s
+```
+
 The standard fields stay standard on purpose:
 
 * this fork's engines report a non-standard `created_cache_tokens`, and it is
