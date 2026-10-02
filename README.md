@@ -9,14 +9,17 @@ This `main` branch separates shared infrastructure from model-specific files:
 ├── manifests/                  # pinned shared dependency/image metadata
 ├── patches/
 │   ├── lmcache/                # shared LMCache patch series
+│   ├── router/                 # vllm-router (production-stack) patch series
 │   └── vllm/                   # shared vLLM runtime fixes
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
 │   ├── build-lmcache-server-image.sh         # shared LMCache server image
 │   ├── build-qwen38-image.sh
+│   ├── build-router-image.sh   # patched vllm-router image
 │   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
-│   └── test-lmcache-patches.py
+│   ├── test-lmcache-patches.py
+│   └── test-router-patches.py
 └── models/
     ├── deepseek-v4.1-flash/
     │   ├── compose*.yml
@@ -26,6 +29,7 @@ This `main` branch separates shared infrastructure from model-specific files:
     │   └── docs/
     └── qwen3.8-flash-next-nvfp4/
         ├── compose.yml
+        ├── compose.pd.yml      # prefill + decode + LMCache + router
         ├── manifests/          # pinned Qwen source/base image
         ├── patches/            # Qwen-only PLE/NVMe implementation
         └── native/
@@ -132,6 +136,46 @@ Python 3.12 / CUDA 13.0 official image payloads by digest
 
 Patch rationale and validation gates are documented in
 [`patches/lmcache/README.md`](patches/lmcache/README.md).
+
+## Upstream sources
+
+This repository is a deployment layer: it pins upstream sources and adds only the
+patches described above. The two repositories it is built from are:
+
+| Upstream | What we take from it | Where it is pinned |
+| --- | --- | --- |
+| [`344303947/dsv41-flash-pp5-170hx`](https://github.com/344303947/dsv41-flash-pp5-170hx) | the CMP 170HX vLLM backport source that both model images are built from, together with its model/PP deployment recipes | `SOURCE_REPO` / `SOURCE_COMMIT` in `models/*/manifests/source.env` (commit `d63af5a4`) |
+| [`vllm-project/production-stack`](https://github.com/vllm-project/production-stack) | **vllm-router**, the community-maintained single OpenAI-compatible endpoint in front of a prefill/decode pair | `manifests/router.env` (`vllm-stack-0.1.13`) |
+
+The rest of the stack, pinned the same way:
+
+| Upstream | What we take from it | Where it is pinned |
+| --- | --- | --- |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | the engine itself, through the backport source above | `models/*/manifests/source.env` |
+| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | the KV cache engine; `localhost/lmcache-server` plus the shared patch series in `patches/lmcache/` | `manifests/lmcache.env` (v0.5.5, `05a013b2`) |
+| [`ai-dynamo/nixl`](https://github.com/ai-dynamo/nixl) | NIXL 1.5.0 (the `nixl-cu13` wheel), the transfer engine vLLM's `NixlConnector` uses for a PD handoff; layered on as an overlay image | `scripts/build-nixl-overlay-image.sh` (`NIXL_VERSION`) |
+
+### What we add on top of vllm-router
+
+Each model directory carries a disaggregated deployment
+(`models/<model>/compose.pd.yml`): one prefill engine, one decode engine, the
+LMCache server both roles share, and a router that presents them as a single
+endpoint.
+
+We do not run upstream's router unmodified. `patches/router/` is applied on top
+of the pinned release and the result ships as our own image (built by
+`scripts/build-router-image.sh`, self-tested by `scripts/test-router-patches.py`):
+
+* the prefill hop is capped in both response families. The Responses API ignores
+  `max_tokens`, so without an explicit `max_output_tokens=1` the prefill engine
+  generated the whole answer before the decode hop was asked to start, and the
+  client waited for both generations;
+* both hops' usage is merged into the standard fields the client sees
+  (`cached_tokens` = `min(prefill, decode)`), with the raw per-hop numbers
+  attached under `router_hops` for billing.
+
+The router must be started with `--routing-logic disaggregated_prefill`; see the
+model READMEs for the measured behaviour and the pitfalls of the alternatives.
 
 ## License
 
