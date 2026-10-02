@@ -1,0 +1,55 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] lmcache: derive the MP worker rank when one server is shared
+
+One LMCache server can serve several engines of the same (model_name,
+world_size): the layout registry is keyed by that pair, and the PD roles in
+these deployments are homogeneous by construction (identical layer partition,
+identical chunk geometry).
+
+Rank resolution preferred the mp_worker_rank layout hint and otherwise used the
+server-side device index, which only holds when a server sees a single engine
+(indices 0..world_size-1). A server shared by two PP2 engines sees the second
+engine's GPUs at indices 2 and 3, so registration aborted with a bare
+ValueError. Fold the index into [0, world_size) for that case and log the
+resolution (instance, model, device, hint, result) so a mis-derivation is
+diagnosable from the server log.
+
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -992,11 +992,33 @@
+         attn_desc = kv_groups_manager.get_attn_desc()
+         # Prefer the logical rank supplied by the paired vLLM client. The
+         # device-index fallback only supports legacy single-node clients.
+-        worker_rank = (layout_hints or {}).get(
+-            "mp_worker_rank", cache_context.device.index
+-        )
++        hinted_rank = (layout_hints or {}).get("mp_worker_rank")
++        worker_rank = None
++        if hinted_rank is not None:
++            try:
++                worker_rank = int(hinted_rank)
++            except (TypeError, ValueError):
++                worker_rank = None
++            if worker_rank is not None and not 0 <= worker_rank < world_size:
++                worker_rank = None
+         if worker_rank is None and world_size == 1:
+             worker_rank = 0
++        if worker_rank is None:
++            # Shared-server fallback: one server may serve several engines of the
++            # same (model_name, world_size). The server-side device index then runs
++            # past world_size for the later engines while ranks repeat per engine,
++            # so fold the index back into the rank range.
++            worker_rank = cache_context.device.index % world_size
++        logger.info(
++            "register_kv_cache rank resolution: instance=%s model=%s "
++            "world_size=%s device=%s hint=%r -> worker_rank=%s",
++            instance_id,
++            model_name,
++            world_size,
++            cache_context.device,
++            hinted_rank,
++            worker_rank,
++        )
+         if worker_rank is None or not 0 <= worker_rank < world_size:
+             raise ValueError(
+                 "Cannot derive MP worker rank from registered cache device "

@@ -5,3 +5,4 @@
 0005-registration-heartbeat-lifecycle.patch
 0006-adopt-existing-native-fs.patch
 0007-mtp-mamba-relocation.patch
+0008-shared-server-mp-worker-rank.patch
