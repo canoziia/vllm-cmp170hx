@@ -89,6 +89,48 @@ class StreamRewriteTests(unittest.TestCase):
         self.assertEqual(b"".join(state.feed(event)), event)
 
 
+class ResponsesShapeTests(unittest.TestCase):
+    """The Responses API names the fields differently and nests the usage."""
+
+    def test_responses_usage_is_merged(self):
+        decode = {
+            "input_tokens": 100,
+            "output_tokens": 4,
+            "total_tokens": 104,
+            "input_tokens_details": {"cached_tokens": 64},
+        }
+        prefill = {
+            "input_tokens": 100,
+            "output_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 0},
+        }
+        out = _UsageMergeState._merge(decode, prefill, "resp")
+        self.assertEqual(out["input_tokens_details"], {"cached_tokens": 0})
+        self.assertEqual(out["output_tokens"], 4)
+        self.assertEqual(out["router_hops"]["cache_write_prefill_compute"], 100 + 36)
+
+    def test_responses_event_is_rewritten(self):
+        event = (
+            b'event: response.completed\ndata: {"response":{"id":"r1","usage":'
+            b'{"input_tokens":100,"output_tokens":4,"input_tokens_details":'
+            b'{"cached_tokens":64,"created_cache_tokens":0}}}}\n\n'
+        )
+        state = _UsageMergeState(
+            {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 0}}, "rid"
+        )
+        out = b"".join(state.feed(event)) + state.flush()
+        self.assertIn(b"event: response.completed", out)
+        usage = json.loads(out.split(b"data: ", 1)[1])["response"]["usage"]
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 0)
+        self.assertNotIn("created_cache_tokens", usage["input_tokens_details"])
+        self.assertIn("router_hops", usage)
+
+    def test_unrelated_events_pass_through(self):
+        event = b'event: response.output_text.delta\ndata: {"delta":"hi"}\n\n'
+        state = _UsageMergeState({"input_tokens": 1}, "x")
+        self.assertEqual(b"".join(state.feed(event)), event)
+
+
 class PatchLandedTests(unittest.TestCase):
     def test_merge_is_shipped(self):
         import inspect
