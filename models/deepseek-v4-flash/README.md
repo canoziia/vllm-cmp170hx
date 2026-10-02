@@ -95,27 +95,38 @@ curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
 curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY" $DC/v1/chat/completions
 ```
 
-### Single endpoint in front of the pair (``-pd-proxy``)
+### Single endpoint in front of the pair (`-pd-router`)
 
-``podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d`` also starts
-``deepseek-v4-flash-pd-proxy`` on **:9002**. It is vLLM's example disaggregation
-proxy (vendored, unmodified, at ``scripts/disagg_proxy_server.py``): it accepts one
-request, replays it to the prefill role with ``max_tokens=1`` (which computes and stores
-the prompt KV), then sends the original request to the decode role and streams the answer
-back. So the pair is reachable as a single OpenAI-compatible endpoint.
+Each pair is fronted by the **vLLM production-stack router** - community-maintained,
+actively released (pinned here to `vllm-stack-0.1.13`) - running as an ordinary compose
+service on a stock python image, so there is no custom image to build and no Kubernetes:
 
-Measured through the proxy: a prompt of the same shape returned
-``usage.prompt_tokens_details.cached_tokens = 3200`` while the prefill server logged
-``Stored 1024 tokens`` per rank and the decode server ``Retrieved`` lines - the decode
-role generated without recomputing the prompt.
+| model | single endpoint | prefill | decode |
+|---|---|---|---|
+| qwen | `:9101` | `:8101` | `:8102` |
+| deepseek | `:9102` | `:8201` | `:8202` |
 
-Caveats - it is an example, not a production router:
+`--routing-logic disaggregated_prefill` makes the router perform both hops itself
+(request -> prefill with `max_tokens=1` -> decode with the original request) and stream
+the decode response back to the caller.
 
-* it always answers with SSE, so a client must parse ``text/event-stream`` even when it
-  sent ``stream: false``;
-* only ``/v1/completions`` and ``/v1/chat/completions`` exist; ``/v1/models`` and any
-  health endpoint return 404 (use the engines' own ports for readiness);
-* it authorises with its own ``OPENAI_API_KEY`` environment variable (wired to
-  ``VLLM_API_KEY`` here) and ignores the caller's Authorization header;
-* no session affinity and no KV-transfer handshake: multi-turn reuse still depends on the
-  shared L2 tier, not on this proxy.
+Measured through the router: a 5119-token prompt returned
+`prompt_tokens_details.cached_tokens = 4800` while the prefill server logged
+`Stored 1600 tokens` twice and the decode server `Retrieved 4800 tokens`.
+
+Things worth knowing:
+
+* the router does **not** forward the caller's `Authorization` header - it builds its
+  own from `OPENAI_API_KEY`, which the compose service wires to `VLLM_API_KEY`;
+* use `disaggregated_prefill`, **not** `disaggregated_prefill_orchestrated`: the
+  orchestrated variant injects `kv_transfer_params` but sends **no** Authorization
+  header to the backends (`request.py:833` in 0.1.13 and in main), so it returns 401
+  against engines started with `--api-key`. We do not need `kv_transfer_params` because
+  our KV moves through the shared LMCache tier;
+* other policies shipped by the router: `roundrobin`, `session` (add `--session-key`
+  for session affinity), `prefixaware`, `kvaware`, `loadaware`, `priority`;
+* `--static-backend-health-checks` exists but is currently incompatible with
+  authenticated backends (upstream vllm-project/production-stack issue #631).
+
+The earlier vendored copy of vLLM's example `disagg_proxy_server.py` was removed in
+favour of this router.

@@ -251,24 +251,28 @@ services:
       timeout: 10s
       start_period: 30m
       retries: 3
-  deepseek-v4-flash-pd-proxy:
-    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash-debug}
-    container_name: deepseek-v4-flash-pd-proxy
+  deepseek-v4-flash-pd-router:
+    image: ${DEFAULT_ROUTER_IMAGE:-docker.1ms.run/library/python:3.12-slim}
+    container_name: deepseek-v4-flash-pd-router
     restart: "no"
     network_mode: host
-    ipc: host
-    # start with: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
-    entrypoint: ["python3", "/proxy/disagg_proxy_server.py"]
+    # Engine images need apparmor=unconfined for CUDA; a plain Python service needs it
+    # for socketpair() (uvicorn's event loop) - the same AppArmor class of problem.
     security_opt: ["label=disable", "apparmor=unconfined"]
+    # Community-maintained PD front end: vLLM production-stack router, pinned to the
+    # vllm-stack-0.1.13 release, static discovery so no Kubernetes is required.
+    # Routing logic "disaggregated_prefill" orchestrates the two hops AND sends the
+    # backend API key (send_request_to_prefiller/decode). The *orchestrated* variant
+    # injects kv_transfer_params but sends no Authorization header (request.py:833 in
+    # 0.1.13 and in main), so it 401s against engines started with --api-key; we do not
+    # need kv_transfer_params because our KV moves through the shared LMCache tier.
+    entrypoint: ["bash", "-lc"]
     environment:
+      PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+      SETUPTOOLS_SCM_PRETEND_VERSION: "0.1.13"
+      # the router builds the backend Authorization header from OPENAI_API_KEY
       OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
       PYTHONUNBUFFERED: "1"
-    volumes:
-      - ${PD_PROXY_SCRIPT:-/root/app/vllm-cmp170hx/scripts/disagg_proxy_server.py}:/proxy/disagg_proxy_server.py:ro
     command:
-      - --host=0.0.0.0
-      - --port=9002
-      - --prefiller-host=127.0.0.1
-      - --prefiller-port=8201
-      - --decoder-host=127.0.0.1
-      - --decoder-port=8202
+      - >-
+        pip install -q --disable-pip-version-check "vllm-router @ https://codeload.github.com/vllm-project/production-stack/tar.gz/refs/tags/vllm-stack-0.1.13" && exec vllm-router --service-discovery static --static-backends "http://127.0.0.1:8201,http://127.0.0.1:8202" --static-models "deepseek-ai/DeepSeek-V4-Flash,deepseek-ai/DeepSeek-V4-Flash" --static-model-labels "prefill,decode" --prefill-model-labels prefill --decode-model-labels decode --routing-logic disaggregated_prefill --host 0.0.0.0 --port 9102
