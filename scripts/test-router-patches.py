@@ -131,6 +131,51 @@ class ResponsesShapeTests(unittest.TestCase):
         self.assertEqual(b"".join(state.feed(event)), event)
 
 
+class NonStreamingBodyTests(unittest.TestCase):
+    """Non-streaming clients get a single JSON body instead of SSE events."""
+
+    def test_chat_completions_body_is_merged(self):
+        payload = {
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 4,
+                "total_tokens": 104,
+                "prompt_tokens_details": {"cached_tokens": 64, "created_cache_tokens": 0},
+            },
+        }
+        usage = _UsageMergeState._find_usage(payload)
+        self.assertIsNotNone(usage)
+        _UsageMergeState._merge(
+            usage, {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 0}}, "ns"
+        )
+        self.assertEqual(payload["usage"]["prompt_tokens_details"], {"cached_tokens": 0})
+        self.assertIn("router_hops", payload["usage"])
+
+    def test_responses_body_is_merged(self):
+        payload = {
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 4,
+                    "input_tokens_details": {"cached_tokens": 64, "created_cache_tokens": 0},
+                }
+            }
+        }
+        usage = _UsageMergeState._find_usage(payload)
+        self.assertIsNotNone(usage)
+        _UsageMergeState._merge(
+            usage, {"input_tokens": 100, "input_tokens_details": {"cached_tokens": 0}}, "ns2"
+        )
+        details = payload["response"]["usage"]["input_tokens_details"]
+        self.assertEqual(details, {"cached_tokens": 0})
+        self.assertIn("router_hops", payload["response"]["usage"])
+
+    def test_find_usage_returns_none_without_usage(self):
+        self.assertIsNone(_UsageMergeState._find_usage({"choices": []}))
+        self.assertIsNone(_UsageMergeState._find_usage("not a dict"))
+
+
 class PatchLandedTests(unittest.TestCase):
     def test_merge_is_shipped(self):
         import inspect

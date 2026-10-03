@@ -52,6 +52,8 @@ import { randomUUID } from "node:crypto";
 
 const defaults = {
   mode: "decode",
+  reasoningEffort: "none",
+  saveDir: null,
   baseUrl: process.env.VLLM_BASE_URL || "http://127.0.0.1:8000",
   model: process.env.VLLM_MODEL || "",
   concurrency: "1",
@@ -65,12 +67,16 @@ const defaults = {
 function help() {
   console.log(`Usage: node scripts/benchmark-vllm.mjs [options]
 
-  --mode decode|prefill|counting
+  --mode decode|prefill|counting|prose|code
   --base-url URL
   --model MODEL                 Discover from /v1/models if omitted
   --concurrency LIST            e.g. 1,2,4,8,16,32
   --input-tokens N              Required override for prefill approximation
-  --max-tokens N                Override mode default (decode=500, prefill=1, counting=1000)
+  --max-tokens N                Override mode default (decode=500, prefill=1, counting=1000,
+                                prose=600, code=1500)
+  --reasoning-effort LEVEL      none|low|medium|high for chat modes (default none: without it
+                                the model spends the whole budget thinking)
+  --save-dir DIR                Write each request's visible text to DIR/<mode>-c<N>-<i>.txt
   --timeout-ms N
   --seed N
   --output PATH                 Append one JSON object per concurrency
@@ -96,11 +102,13 @@ function parseArgs(argv) {
     else if (arg === "--timeout-ms") c.timeoutMs = Number(take());
     else if (arg === "--seed") c.seed = Number(take());
     else if (arg === "--output") c.output = take();
+    else if (arg === "--reasoning-effort") c.reasoningEffort = take();
+    else if (arg === "--save-dir") c.saveDir = take();
     else if (arg === "--help" || arg === "-h") { help(); process.exit(0); }
     else throw new Error(`Unknown option: ${arg}`);
   }
-  if (!["decode", "prefill", "counting"].includes(c.mode)) {
-    throw new Error("--mode must be decode, prefill, or counting");
+  if (!["decode", "prefill", "counting", "prose", "code"].includes(c.mode)) {
+    throw new Error("--mode must be decode, prefill, counting, prose, or code");
   }
   c.concurrencies = String(c.concurrency).split(",").map(Number);
   if (c.concurrencies.some(n => !Number.isInteger(n) || n <= 0)) {
@@ -150,6 +158,15 @@ const COUNTING_PROMPT =
   "Output numbers only, without any explanation or punctuation. Begin exactly as follows:\n" +
   "1 2 3 4 5 6 7 8 9 10";
 const DECODE_PROMPT = "Write a 500-word article.";
+const PROSE_PROMPT =
+  "写一篇约600字的散文，主题：秋日午后的旧书店。不要提前结束。";
+// Verifiable: the caller extracts the fenced block and executes it (see the
+// prose/count/code example in the file header).
+const CODE_PROMPT =
+  "用 Python 写一个完整可直接运行的程序：实现 LRU 缓存类 LRUCache(capacity)，" +
+  "提供 get(key) 与 put(key, value)（容量满时淘汰最久未使用），" +
+  "并在 if __name__ == '__main__': 中用 assert 写 3 个自测（get 命中/未命中、put 淘汰、更新值）。" +
+  "只输出代码，不要解释。";
 
 async function discoverModel(c) {
   if (c.model) return c.model;
@@ -166,20 +183,26 @@ async function discoverModel(c) {
 async function oneRequest(c, model, concurrency, index) {
   const prompt = c.mode === "prefill"
     ? prefillPrompt(c.inputTokens, c.seed + concurrency * 1000 + index)
-    : c.mode === "counting" ? COUNTING_PROMPT : DECODE_PROMPT;
-  const endpoint = c.mode === "decode" ? "/v1/chat/completions" : "/v1/completions";
+    : c.mode === "counting" ? COUNTING_PROMPT
+    : c.mode === "prose" ? PROSE_PROMPT
+    : c.mode === "code" ? CODE_PROMPT : DECODE_PROMPT;
+  const chat = ["decode", "prose", "code"].includes(c.mode);
+  const endpoint = chat ? "/v1/chat/completions" : "/v1/completions";
+  // code must be allowed to stop on its own; the decode-shaped modes want a
+  // fixed token count.
+  const ignoreEos = c.mode !== "code";
   const body = {
     model,
     max_tokens: c.maxTokens,
     temperature: 0,
     top_p: 1,
-    ignore_eos: true,
+    ignore_eos: ignoreEos,
     cache_salt: randomUUID(),
     return_token_ids: true,
     stream: true,
     stream_options: { include_usage: true },
-    ...(endpoint.includes("chat")
-      ? { messages: [{ role: "user", content: prompt }] }
+    ...(chat
+      ? { messages: [{ role: "user", content: prompt }], reasoning_effort: c.reasoningEffort }
       : { prompt }),
   };
   const startMs = nowMs();
@@ -191,7 +214,7 @@ async function oneRequest(c, model, concurrency, index) {
   });
   if (!response.ok) throw new Error(`request ${index} returned ${response.status}: ${await response.text()}`);
 
-  let buffer = "", firstMs = null, lastMs = null, usage = null;
+  let buffer = "", firstMs = null, lastMs = null, usage = null, text = "", reasoning = "";
   const events = [];
   const decoder = new TextDecoder();
   const consume = raw => {
@@ -207,6 +230,9 @@ async function oneRequest(c, model, concurrency, index) {
           .some(v => typeof v === "string" && v.length > 0);
         const ids = Array.isArray(choice.token_ids) ? choice.token_ids :
           Array.isArray(d.token_ids) ? d.token_ids : null;
+        if (typeof d.content === "string") text += d.content;
+        if (typeof d.reasoning === "string") reasoning += d.reasoning;
+        if (typeof d.reasoning_content === "string") reasoning += d.reasoning_content;
         if (visible || (ids && ids.length)) {
           const t = nowMs(); firstMs ??= t; lastMs = t;
           events.push({ timestampMs: t, tokenCount: ids?.length ?? 1, exact: ids !== null });
@@ -222,11 +248,16 @@ async function oneRequest(c, model, concurrency, index) {
   buffer += decoder.decode(); if (buffer.trim()) consume(buffer);
   const endMs = nowMs();
   if (!usage) throw new Error(`request ${index}: missing usage`);
-  if (usage.completion_tokens !== c.maxTokens) {
+  if (ignoreEos && usage.completion_tokens !== c.maxTokens) {
     throw new Error(`request ${index}: completion_tokens=${usage.completion_tokens}, expected ${c.maxTokens}`);
   }
   const cached = usage.prompt_tokens_details?.cached_tokens ?? null;
   if (cached !== 0) throw new Error(`request ${index}: cached_tokens=${cached}, expected 0`);
+  if (c.saveDir) {
+    mkdirSync(c.saveDir, { recursive: true });
+    appendFileSync(`${c.saveDir}/${c.mode}-c${concurrency}-${index}.txt`,
+      `--- visible text ---\n${text}\n--- reasoning ---\n${reasoning}\n`);
+  }
   firstMs ??= endMs; lastMs ??= firstMs;
   const decodeSeconds = Math.max(0, (lastMs - firstMs) / 1000);
   return {
@@ -244,6 +275,8 @@ async function oneRequest(c, model, concurrency, index) {
     decode_tok_s: decodeSeconds > 0 ? (usage.completion_tokens - 1) / decodeSeconds : null,
     step_s: decodeSeconds > 0 && events.length > 1 ? (events.length - 1) / decodeSeconds : null,
     accepted_tokens_per_step: events.length ? usage.completion_tokens / events.length : null,
+    text_chars: text.length,
+    reasoning_chars: reasoning.length,
     exact_token_ids: events.every(e => e.exact),
     events,
   };
