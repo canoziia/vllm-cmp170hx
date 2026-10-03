@@ -1,9 +1,9 @@
 From: canoziia <canoziia@users.noreply.github.com>
-Subject: [PATCH] router: merge both PD hops usage, for both response families
+Subject: [PATCH] router: merge both PD hops usage, streaming and non-streaming
 
 The client must receive a standard OpenAI body, so the accounting is computed in
-the router: the prefill hop response (already fetched, formerly discarded) now
-feeds the streamed decode usage.
+the router: the prefill hop response (already fetched, formerly discarded) feeds
+the decode hop's usage.
 
   prompt_tokens / input_tokens                       = the prompt (hops must agree)
   ..._tokens_details.cached_tokens                   = min(prefill, decode) cached
@@ -12,24 +12,30 @@ feeds the streamed decode usage.
   completion_tokens / output_tokens                  = the decode hop's generation
 
 Everything else - including the total prefill compute,
-(p_prompt - p_cached) + (d_prompt - d_cached) - is reported under `router_hops`.
+(p_prompt - p_cached) + (d_prompt - d_cached) - is reported under router_hops.
 The standard fields stay standard: this fork's created_cache_tokens is stripped
-and no cache_write_tokens alias is emitted, because such an alias makes a
-client's derived input collapse to 0 for every request.
+and no cache_write_tokens alias is emitted (such an alias drives a client's
+derived input to 0 for every request).
 
-Both /v1/chat/completions and /v1/responses are handled: the Responses API
-nests its usage under data["response"]["usage"] and names the fields
-input_tokens / output_tokens / input_tokens_details.
+Both response families and both delivery modes are handled:
 
-The prefill hop is capped for both families. The Responses API ignores
+  * chat completions keep the usage at the top level of a `data:` event; the
+    Responses API nests it under data["response"]["usage"] and names the fields
+    input_tokens / output_tokens / input_tokens_details;
+  * a streaming client gets rewritten SSE events, and a non-streaming client
+    gets a single JSON body merged in place. Rewriting only the stream left the
+    non-streaming path leaking created_cache_tokens (measured on
+    /v1/chat/completions through the router).
+
+The prefill hop is capped for both families: the Responses API ignores
 max_tokens, so without max_output_tokens=1 the prefill engine generated the
-whole answer before the decode hop was even asked to start: measured +297
-generated tokens on the prefill engine for a 300-token answer and a TTFT of
-4.7s instead of 0.11s, while the client waited for both generations.
+whole answer before the decode hop was asked to start (measured: +297 tokens on
+the prefill engine and 4.7s TTFT for a 300-token answer, versus +1 token and
+0.11s once capped).
 
 --- a/vllm_router/services/request_service/request.py
 +++ b/vllm_router/services/request_service/request.py
-@@ -734,6 +734,141 @@
+@@ -734,6 +734,155 @@
          return await response.json()
  
  
@@ -125,6 +131,23 @@ generated tokens on the prefill engine for a 300-token answer and a TTFT of
 +        }
 +        return decode_usage
 +
++    @staticmethod
++    def _find_usage(payload):
++        """Locate the usage object in a decoded body, or None.
++
++        Chat completions keep it at the top level; the Responses API nests it
++        under `response`.
++        """
++        if not isinstance(payload, dict):
++            return None
++        usage = payload.get("usage")
++        if isinstance(usage, dict):
++            return usage
++        response = payload.get("response")
++        if isinstance(response, dict) and isinstance(response.get("usage"), dict):
++            return response["usage"]
++        return None
++
 +    def _rewrite_event(self, event: bytes) -> bytes:
 +        head, sep, body = event.partition(b"data:")
 +        if not sep:
@@ -138,11 +161,8 @@ generated tokens on the prefill engine for a 300-token answer and a TTFT of
 +            return event
 +        if not isinstance(payload, dict):
 +            return event
-+        usage = payload.get("usage")
-+        if not isinstance(usage, dict):
-+            response = payload.get("response")
-+            usage = response.get("usage") if isinstance(response, dict) else None
-+        if not isinstance(usage, dict):
++        usage = self._find_usage(payload)
++        if usage is None:
 +            return event
 +        self._merge(usage, self.prefill_usage, self.request_id)
 +        return head + b"data: " + json.dumps(payload).encode("utf-8")
@@ -171,7 +191,7 @@ generated tokens on the prefill engine for a 300-token answer and a TTFT of
  async def send_request_to_decode(
      client: aiohttp.ClientSession, endpoint: str, req_data: dict, request_id: str
  ):
-@@ -972,12 +1107,20 @@
+@@ -972,12 +1121,20 @@
      # so we must remove it to ensure prefill generates only 1 token)
      request_json["max_tokens"] = 1
      request_json.pop("max_completion_tokens", None)
@@ -193,11 +213,63 @@ generated tokens on the prefill engine for a 300-token answer and a TTFT of
          et = time.time()
          logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
          logger.info(
-@@ -1012,12 +1155,18 @@
+@@ -1012,12 +1169,70 @@
              headers={"X-Request-Id": request_id},
          )
  
 +    merge_state = _UsageMergeState(prefill_usage, request_id)
++
++    if not orig_request_json.get("stream", False):
++        # A non-streaming client receives a single JSON body, and the engines
++        # return it without SSE framing - so the stream rewriter would pass it
++        # through untouched, leaking the decode hop's own non-standard fields
++        # (created_cache_tokens) and omitting router_hops. Merge it here.
++        body = bytearray()
++        try:
++            async for chunk in send_request_to_decode(
++                request.app.state.decode_client, endpoint, request_json, request_id
++            ):
++                body.extend(chunk)
++        except aiohttp.ClientResponseError as e:
++            logger.error(f"HTTP error in decoder: {e}", exc_info=True)
++            return JSONResponse(
++                status_code=e.status,
++                content={
++                    "error": {
++                        "message": f"Decoder error: {e.message}",
++                        "type": "decoder_error",
++                        "code": e.status,
++                    }
++                },
++                headers={"X-Request-Id": request_id},
++            )
++        except Exception as e:
++            logger.error(f"Unexpected error in decoder: {e}", exc_info=True)
++            return JSONResponse(
++                status_code=500,
++                content={
++                    "error": {
++                        "message": f"Decoder error: {str(e)}",
++                        "type": "decoder_error",
++                        "code": 500,
++                    }
++                },
++                headers={"X-Request-Id": request_id},
++            )
++        try:
++            payload = json.loads(bytes(body))
++        except Exception:
++            return Response(
++                content=bytes(body),
++                media_type="application/json",
++                headers={"X-Request-Id": request_id},
++            )
++        usage = _UsageMergeState._find_usage(payload)
++        if usage is not None:
++            _UsageMergeState._merge(usage, prefill_usage, request_id)
++        return JSONResponse(
++            status_code=200, content=payload, headers={"X-Request-Id": request_id}
++        )
 +
      async def generate_stream():
          try:
