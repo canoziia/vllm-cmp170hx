@@ -206,5 +206,29 @@ check(
     and 'runner.take_draft_token_ids(["B", "gone"])' in o5_test,
 )
 
+# ---- 0007 NVFP4 Marlin scale factor without the boolean gather ----
+fp4_path = root / "vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py"
+fp4_src = fp4_path.read_text()
+fp4_fn = next(
+    (n for n in ast.parse(fp4_src).body
+     if isinstance(n, ast.FunctionDef) and n.name == "_nvfp4_compute_scale_factor"),
+    None,
+)
+fp4_fn_src = ast.get_source_segment(fp4_src, fp4_fn) if fp4_fn else ""
+print("0007-nvfp4-marlin-scale-factor-amax:")
+check("scale factor function present", bool(fp4_fn_src))
+check("max is an in-place amax()", "max_val = marlin_scales.amax().float() * (2**7)" in fp4_fn_src)
+check(
+    "no float copy, mask or boolean gather of the whole scale tensor",
+    "marlin_scales.float()" not in fp4_fn_src
+    and "nonzero_mask" not in fp4_fn_src
+    and "[nonzero_mask]" not in fp4_fn_src,
+)
+check(
+    "non-positive maxima still fall back to 1.0",
+    "if max_val > 0 and max_val < 448 * (2**7):" in fp4_fn_src
+    and fp4_fn_src.rstrip().endswith("return 1.0"),
+)
+
 print("VLLM_COMMON_PATCHES", "FAIL: " + ", ".join(failures) if failures else "PASS")
 sys.exit(1 if failures else 0)
