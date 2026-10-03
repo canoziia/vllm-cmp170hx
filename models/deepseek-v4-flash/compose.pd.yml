@@ -59,7 +59,7 @@ services:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
       - ${DSFLASH_MODEL_CACHE:?set DSFLASH_MODEL_CACHE}:/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro
-      - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache/vllm
+      - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -74,7 +74,8 @@ services:
       NCCL_PROTO: Simple
       NCCL_IB_DISABLE: "1"
       PYTHONUNBUFFERED: "1"
-      TMPDIR: /root/.cache/vllm/tmp
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      TMPDIR: /root/.cache/tmp
     command:
       - deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
@@ -85,16 +86,17 @@ services:
       - --tensor-parallel-size=1
       - --trust-remote-code
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-10}
-      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-2048}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3435973632}
+      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-1536}
+      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
       # the LMCache fork needs a state checkpoint at every chunk boundary
       - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
-      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8],"max_cudagraph_capture_size":8}'
-      - '--speculative-config={"method":"dspark","num_speculative_tokens":6}'
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":3}'
       - --per-request-spec-decode-metrics=detailed
       - --tokenizer-mode=deepseek_v4
       - --enable-auto-tool-choice
@@ -128,7 +130,7 @@ services:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
       - ${DSFLASH_MODEL_CACHE:?set DSFLASH_MODEL_CACHE}:/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro
-      - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache/vllm
+      - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -141,7 +143,8 @@ services:
       NCCL_PROTO: Simple
       NCCL_IB_DISABLE: "1"
       PYTHONUNBUFFERED: "1"
-      TMPDIR: /root/.cache/vllm/tmp
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      TMPDIR: /root/.cache/tmp
     command:
       - deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
@@ -152,15 +155,16 @@ services:
       - --tensor-parallel-size=1
       - --trust-remote-code
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-10}
-      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-2048}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3435973632}
+      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-1536}
+      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
       - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
-      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8],"max_cudagraph_capture_size":8}'
-      - '--speculative-config={"method":"dspark","num_speculative_tokens":6}'
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":3}'
       - --per-request-spec-decode-metrics=detailed
       - --tokenizer-mode=deepseek_v4
       - --enable-auto-tool-choice
