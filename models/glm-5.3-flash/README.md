@@ -105,11 +105,19 @@ podman compose -f compose.pd.yml ps
 `--podman-run-args=--ipc=host` is required (the connector shares the KV cache
 over CUDA IPC and podman-compose ignores the compose `ipc` key).
 
-Restart the LMCache server together with the engines: stop both engines,
-restart the server, then start the engines. The server keeps an engine's KV
-cache mapped over CUDA IPC after that engine is gone. When only the decode role
-was replaced, the server still held 4.6 GiB on two of its GPUs, and the new
-engine failed vLLM's startup check (`Free memory on device ... is less than
-desired GPU memory utilization`). The model is
-addressed by repository ID and revision; `GLM_MODEL_CACHE` is the HF hub
-directory mounted read-only at the same path inside the containers.
+Both engines run with `--shutdown-timeout=30`. LMCache maps each worker's KV
+cache over CUDA IPC, and that memory stays allocated until the worker
+unregisters or the server reaps it. Reaping happens after 120 s without a
+heartbeat (`worker_reap_timeout_seconds`); in practice the measured gap was
+143.8 s. vLLM's default (`0`, abort) kills EngineCore the moment it receives
+SIGTERM. The workers then exit when they notice their parent has gone, and
+when the API server (PID 1) exits, the container's remaining processes are
+killed too. In one measured `podman stop` of the decode role, PP2 lost that race and never
+unregistered. Its 4.3 GiB of KV stayed allocated on GPU 7, now charged to the
+LMCache process, until the server reaped it 143.8 s later. A replacement
+engine started within that window fails vLLM's startup check (`Free memory on
+device ... is less than desired GPU memory utilization`). With a non-zero
+timeout the engine drains, all four workers unregister, and the memory is free
+as soon as `podman stop` returns (8 s). A role can then be replaced on its own,
+without restarting the LMCache server. After a crash or `podman kill`, wait for
+the server to log `Reaped GPU instance` before starting the replacement.
