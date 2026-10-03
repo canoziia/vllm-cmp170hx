@@ -1,0 +1,211 @@
+services:
+  glm-5.3-flash-lmcache:
+    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    container_name: glm-5.3-flash-lmcache
+    restart: "no"
+    entrypoint: ["lmcache"]
+    network_mode: host
+    # start with: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+    ipc: host
+    devices:
+      - nvidia.com/gpu=1
+      - nvidia.com/gpu=2
+      - nvidia.com/gpu=3
+      - nvidia.com/gpu=4
+      - nvidia.com/gpu=5
+      - nvidia.com/gpu=6
+      - nvidia.com/gpu=7
+      - nvidia.com/gpu=8
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:?set LMCACHE_L2_PATH}:/lmcache-l2
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=5559
+      - --http-host=127.0.0.1
+      - --http-port=18559
+      # the unified KV block under PP (full recurrent state per rank) is 4480 tokens
+      - --chunk-size=4480
+      - --separate-object-groups
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      - --eviction-policy=LRU
+      - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-200},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18559/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+
+  glm-5.3-flash-prefill:
+    image: ${GLM_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    container_name: glm-5.3-flash-prefill
+    restart: "no"
+    network_mode: host
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    ipc: host
+    stop_grace_period: 10m
+    devices:
+      - nvidia.com/gpu=1
+      - nvidia.com/gpu=2
+      - nvidia.com/gpu=3
+      - nvidia.com/gpu=4
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${GLM_MODEL_CACHE:?set GLM_MODEL_CACHE}:/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-Flash-NVFP4:ro
+      - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_PP_LAYER_PARTITION: "13,12,12,8"   # must match decode; the last rank
+      #   also carries the 13.8 GiB BF16 MTP layer and lm_head
+      VLLM_PP_DECODE_COHORT_BALANCE: "1"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      PYTHONUNBUFFERED: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      TMPDIR: /root/.cache/tmp
+    command:
+      - nvidia/GLM-5.3-Flash-NVFP4
+      - --revision=${GLM_REVISION:-da920bb0b9f4a06727223a349e55468e38352348}
+      - --host=0.0.0.0
+      - --port=8301
+      - --served-model-name=nvidia/GLM-5.3-Flash-NVFP4
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --quantization=modelopt
+      - --trust-remote-code
+      - --max-model-len=${GLM_MAX_MODEL_LEN:-1048576}
+      - --max-num-seqs=${GLM_MAX_NUM_SEQS:-8}
+      # Mamba-hybrid + LMCache: every prefill step must advance a full 4480-token block
+      - --max-num-batched-tokens=4480
+      - --kv-cache-memory=${GLM_PREFILL_KV_CACHE_MEMORY:-4294967296}
+      - --kv-cache-dtype=bfloat16
+      - --disable-custom-all-reduce
+      - --no-enable-flashinfer-autotune
+      - --enable-prefix-caching
+      - --mamba-cache-mode=align
+      # the LMCache fork needs a recurrent-state checkpoint at every chunk boundary
+      - --prefix-cache-retention-interval=4480
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+      - --per-request-spec-decode-metrics=detailed
+      - --enable-auto-tool-choice
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm45
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --enable-prompt-tokens-details
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14591,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8301/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+
+  glm-5.3-flash-decode:
+    image: ${GLM_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    container_name: glm-5.3-flash-decode
+    restart: "no"
+    network_mode: host
+    # start with: podman compose --podman-run-args=--ipc=host up -d
+    ipc: host
+    stop_grace_period: 10m
+    devices:
+      - nvidia.com/gpu=5
+      - nvidia.com/gpu=6
+      - nvidia.com/gpu=7
+      - nvidia.com/gpu=8
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${GLM_MODEL_CACHE:?set GLM_MODEL_CACHE}:/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-Flash-NVFP4:ro
+      - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_PP_LAYER_PARTITION: "13,12,12,8"
+      VLLM_PP_DECODE_COHORT_BALANCE: "1"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      PYTHONUNBUFFERED: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      TMPDIR: /root/.cache/tmp
+    command:
+      - nvidia/GLM-5.3-Flash-NVFP4
+      - --revision=${GLM_REVISION:-da920bb0b9f4a06727223a349e55468e38352348}
+      - --host=0.0.0.0
+      - --port=8302
+      - --served-model-name=nvidia/GLM-5.3-Flash-NVFP4
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --quantization=modelopt
+      - --trust-remote-code
+      - --max-model-len=${GLM_MAX_MODEL_LEN:-1048576}
+      - --max-num-seqs=${GLM_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=4480
+      - --kv-cache-memory=${GLM_DECODE_KV_CACHE_MEMORY:-4294967296}
+      - --kv-cache-dtype=bfloat16
+      - --disable-custom-all-reduce
+      - --no-enable-flashinfer-autotune
+      - --enable-prefix-caching
+      - --mamba-cache-mode=align
+      - --prefix-cache-retention-interval=4480
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+      - --per-request-spec-decode-metrics=detailed
+      - --enable-auto-tool-choice
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm45
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --enable-prompt-tokens-details
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14592,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8302/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+
+  glm-5.3-flash-pd-router:
+    # Built from patches/router/ (see scripts/build-router-image.sh): the router
+    # merges both hops' usage into the standard fields before returning.
+    image: ${ROUTER_IMAGE:-localhost/vllm-router:latest}
+    container_name: glm-5.3-flash-pd-router
+    restart: "no"
+    network_mode: host
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    entrypoint: ["vllm-router"]
+    environment:
+      # the router builds the backend Authorization header from OPENAI_API_KEY
+      OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+      PYTHONUNBUFFERED: "1"
+    command:
+      - --service-discovery=static
+      - --static-backends=http://127.0.0.1:8301,http://127.0.0.1:8302
+      - --static-models=nvidia/GLM-5.3-Flash-NVFP4,nvidia/GLM-5.3-Flash-NVFP4
+      - --static-model-labels=prefill,decode
+      - --prefill-model-labels=prefill
+      - --decode-model-labels=decode
+      - --routing-logic=disaggregated_prefill
+      - --host=0.0.0.0
+      - --port=9103
