@@ -109,6 +109,9 @@ services:
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
       - --enable-prompt-tokens-details
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14591,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      # drain on stop so every worker unregisters its KV cache from LMCache;
+      # the default (0) kills EngineCore at once and a worker can miss it
+      - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8301/health"]
@@ -178,6 +181,9 @@ services:
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
       - --enable-prompt-tokens-details
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14592,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      # drain on stop so every worker unregisters its KV cache from LMCache;
+      # the default (0) kills EngineCore at once and a worker can miss it
+      - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8302/health"]
