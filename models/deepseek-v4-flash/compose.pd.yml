@@ -87,8 +87,9 @@ services:
       - --trust-remote-code
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
-      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-1536}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
+      - --max-num-batched-tokens=${DSFLASH_PREFILL_MAX_BATCHED_TOKENS:-1536}
+      - --long-prefill-token-threshold=1024
+      - --kv-cache-memory=${DSFLASH_PREFILL_KV_CACHE_MEMORY:-2684354560}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
@@ -156,8 +157,8 @@ services:
       - --trust-remote-code
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
-      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-1536}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
+      - --max-num-batched-tokens=${DSFLASH_DECODE_MAX_BATCHED_TOKENS:-512}
+      - --kv-cache-memory=${DSFLASH_DECODE_KV_CACHE_MEMORY:-3006267392}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
