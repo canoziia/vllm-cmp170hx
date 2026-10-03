@@ -27,6 +27,10 @@ This `main` branch separates shared infrastructure from model-specific files:
     │   ├── patches/            # DeepSeek-only vLLM patches
     │   ├── scripts/            # DeepSeek-only diagnostics
     │   └── docs/
+    ├── deepseek-v4-flash/      # PD pair on the DeepSeek V4.1 image
+    │   └── compose.pd.yml
+    ├── glm-5.3-flash/          # PD pair on the DeepSeek V4.1 image
+    │   └── compose.pd.yml
     └── qwen3.8-flash-next-nvfp4/
         ├── compose.yml
         ├── compose.pd.yml      # prefill + decode + LMCache + router
@@ -102,6 +106,14 @@ NVMe PLE patch:
 ```bash
 bash scripts/build-qwen38-image.sh
 ```
+
+## GLM-5.3 Flash
+
+See [`models/glm-5.3-flash/README.md`](models/glm-5.3-flash/README.md).
+`nvidia/GLM-5.3-Flash-NVFP4` runs as a PP4 prefill/decode pair on the DeepSeek
+V4.1 image: the pinned author source already implements `glm5next`, and the
+image's shared vLLM series carries the NVFP4 load fix the model needs
+(`patches/vllm/0007-nvfp4-marlin-scale-factor-amax.patch`).
 
 ## Benchmark client
 
