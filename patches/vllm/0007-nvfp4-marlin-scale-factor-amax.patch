@@ -1,0 +1,44 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] marlin fp4: find the NVFP4 scale factor without a gather
+
+_nvfp4_compute_scale_factor wants the largest positive scale. It got it with
+ws_float[ws_float > 0].max(), which materialises a float32 copy of every
+scale, a bool mask and, for the boolean gather, int64 indices of shape
+[nnz, ndim]. The NVFP4 MoE path calls it on a whole layer's expert scales at
+load time: for a 288-expert layer (w13 scales: 288 x 4096 x 256 =
+301,989,888 entries) the gather alone asks for 301,989,888 x 24 B =
+7,247,757,312 bytes, plus 1.12 GiB for the float copy. On 64 GiB cards
+carrying ~50 GiB of weights per pipeline stage that is an OOM during
+process_weights_after_loading (seen with nvidia/GLM-5.3-Flash-NVFP4, PP4).
+
+Whenever a positive value exists it is also the overall maximum, so an
+in-place amax() gives the same answer: the same max_val when any value is
+positive, and 1.0 otherwise (amax <= 0), exactly as before. Checked against
+the original on 72 cases (bf16/fp16/fp32; zeros, all-zero, negative,
+all-negative, above-threshold, tiny, exactly 448; all three a_dtype values).
+
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -49,13 +49,14 @@
+     if a_dtype is not None and a_dtype == torch.half:
+         return 1.0
+ 
+-    ws_float = marlin_scales.float() * (2**7)
+-    nonzero_mask = ws_float > 0
+-    if nonzero_mask.any():
+-        max_val = ws_float[nonzero_mask].max()
+-        if max_val < 448 * (2**7):
+-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
+-            return sf.item()
++    # Whenever a positive value exists it is also the overall maximum, so
++    # reduce in place rather than build a float copy, a mask and a boolean
++    # gather: the gather materialises int64 [nnz, ndim] indices, ~6.7 GiB for
++    # one MoE layer of a 288-expert model at load time.
++    max_val = marlin_scales.amax().float() * (2**7)
++    if max_val > 0 and max_val < 448 * (2**7):
++        sf = (448 * (2**7) / max_val).log2().floor().exp2()
++        return sf.item()
+     return 1.0
+ 
+ 
