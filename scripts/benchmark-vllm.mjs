@@ -46,12 +46,13 @@
  * - output_tok_s includes TTFT and tail drain; full_batch_tok_s does not.
  */
 
-import { mkdirSync, appendFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const defaults = {
   mode: "decode",
+  promptFile: null,
   reasoningEffort: "none",
   saveDir: null,
   baseUrl: process.env.VLLM_BASE_URL || "http://127.0.0.1:8000",
@@ -77,7 +78,10 @@ function help() {
   --reasoning-effort LEVEL      none|low|medium|high for chat modes (default none: without it
                                 the model spends the whole budget thinking)
   --save-dir DIR                Write each request's visible text to DIR/<mode>-c<N>-<i>.txt
-  --timeout-ms N
+  --prompt-file PATH            Use this prompt text instead of the mode's built-in one
+  --timeout-ms N                Above 300 s, install the undici package next to this script
+                                (npm install undici); Node's built-in fetch otherwise drops a
+                                request that has no response headers after 300 s
   --seed N
   --output PATH                 Append one JSON object per concurrency
   --help
@@ -104,6 +108,7 @@ function parseArgs(argv) {
     else if (arg === "--output") c.output = take();
     else if (arg === "--reasoning-effort") c.reasoningEffort = take();
     else if (arg === "--save-dir") c.saveDir = take();
+    else if (arg === "--prompt-file") c.promptFile = take();
     else if (arg === "--help" || arg === "-h") { help(); process.exit(0); }
     else throw new Error(`Unknown option: ${arg}`);
   }
@@ -181,7 +186,8 @@ async function discoverModel(c) {
 }
 
 async function oneRequest(c, model, concurrency, index) {
-  const prompt = c.mode === "prefill"
+  const prompt = c.promptFile ? readFileSync(c.promptFile, "utf8").trim()
+    : c.mode === "prefill"
     ? prefillPrompt(c.inputTokens, c.seed + concurrency * 1000 + index)
     : c.mode === "counting" ? COUNTING_PROMPT
     : c.mode === "prose" ? PROSE_PROMPT
@@ -231,6 +237,7 @@ async function oneRequest(c, model, concurrency, index) {
         const ids = Array.isArray(choice.token_ids) ? choice.token_ids :
           Array.isArray(d.token_ids) ? d.token_ids : null;
         if (typeof d.content === "string") text += d.content;
+        if (typeof d.text === "string") text += d.text;
         if (typeof d.reasoning === "string") reasoning += d.reasoning;
         if (typeof d.reasoning_content === "string") reasoning += d.reasoning_content;
         if (visible || (ids && ids.length)) {
@@ -322,8 +329,26 @@ function summarize(c, concurrency, results, wallSeconds) {
   };
 }
 
+// Node's built-in fetch gives up after 300 s without response headers, and the
+// PD router only sends headers once the prefill hop is done, so a long prefill
+// is cut off client-side. The bundled undici is not importable; when the undici
+// package is installed next to the script, its global dispatcher (which the
+// built-in fetch also reads) gets the --timeout-ms budget instead.
+async function extendFetchTimeouts(c) {
+  try {
+    const { Agent, setGlobalDispatcher } = await import("undici");
+    setGlobalDispatcher(new Agent({ headersTimeout: c.timeoutMs, bodyTimeout: c.timeoutMs }));
+  } catch {
+    if (c.timeoutMs > 300_000) {
+      console.error("warning: undici not installed; requests without response headers " +
+        "for 300 s will fail regardless of --timeout-ms");
+    }
+  }
+}
+
 async function main() {
   const c = parseArgs(process.argv.slice(2));
+  await extendFetchTimeouts(c);
   const model = await discoverModel(c);
   mkdirSync(dirname(c.output), { recursive: true });
   for (const concurrency of c.concurrencies) {
