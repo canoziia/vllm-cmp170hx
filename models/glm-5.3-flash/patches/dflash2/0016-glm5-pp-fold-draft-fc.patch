@@ -1,0 +1,456 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: fold the DFlash drafter fc into the PP stages
+
+VLLM_GLM5_PP_FOLD_DRAFT_FC (default 0 = unchanged). Each stage multiplies its
+own aux states by its column block of the drafter fc.weight and forwards one
+fp32 partial sum instead of the aux states; the last stage's drafter skips
+fc and casts once to bf16. Only the fp32 summation order of fc changes. The
+last stage cross-checks its block against the loaded drafter weight.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 8c3a4e1..f44494d 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -64,6 +64,7 @@ if TYPE_CHECKING:
+     VLLM_GLM5_PP_KDA_PREFILL: bool = False
+     VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS: int = 2312
+     VLLM_GLM5_THIN_GEMM: bool = False
++    VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
+     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
+     VLLM_GLM5_PP_MARLIN_PREFILL: bool = False
+@@ -1025,6 +1026,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # has <= VLLM_GLM5_THIN_GEMM_MAX_TOKENS rows. Default off: with it unset
+     # dispatch_unquantized_gemm returns exactly what it returned before.
+     "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
++    # DFlash under PP: every stage multiplies its own aux hidden states by
++    # their column blocks of the drafter's fc.weight and forwards one fp32
++    # partial sum instead of relaying the aux states; the last stage's
++    # drafter skips its fc. Port of Morrowmake's switch of the same name
++    # (spec_decode/eagle/aux_fc_fold.py). Default off. Changes only the fp32
++    # summation order of fc.
++    "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
++        int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
++    ),
+     "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
+         os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
+     ),
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index ce3884a..a08ae82 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -777,6 +777,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+     ) -> torch.Tensor:
+         if not self.model.use_aux_hidden_state:
+             return hidden_states
++        if getattr(self, "aux_fc_folded", False):
++            # Pipeline stages already applied fc (VLLM_GLM5_PP_FOLD_DRAFT_FC,
++            # patch 0023): this is its fp32 output; round once to the model
++            # dtype, as the fc GEMM does.
++            assert hidden_states.shape[-1] == self.model.fc.output_size, (
++                hidden_states.shape
++            )
++            return hidden_states.to(self.model.fc.weight.dtype)
+         needs_squeeze = hidden_states.dim() == 1
+         if needs_squeeze:
+             hidden_states = hidden_states.unsqueeze(0)
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index efcbed5..fc76fbb 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -99,6 +99,31 @@ from .multimodal import (
+ 
+ logger = init_logger(__name__)
+ 
++# torch.mm(..., out_dtype=torch.float32) for bf16 inputs (fp32 output, no
++# rounding to bf16). None until probed; False -> upcast fallback.
++_MM_OUT_DTYPE_OK: bool | None = None
++
++
++def _mm_fp32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
++    """``x @ w.T`` with fp32 output (fp32 accumulation, no rounding to the
++    input dtype), as the drafter fc accumulates before its single rounding.
++    Used by the PP fc fold (VLLM_GLM5_PP_FOLD_DRAFT_FC, patch 0023)."""
++    global _MM_OUT_DTYPE_OK
++    if x.is_cuda and _MM_OUT_DTYPE_OK is not False:
++        try:
++            out = torch.mm(x, w.t(), out_dtype=torch.float32)
++            _MM_OUT_DTYPE_OK = True
++            return out
++        except (TypeError, RuntimeError):
++            if _MM_OUT_DTYPE_OK:
++                raise
++            _MM_OUT_DTYPE_OK = False
++            logger.warning(
++                "torch.mm(out_dtype=float32) unavailable; the PP fc fold "
++                "upcasts to fp32 instead (same products, slower)"
++            )
++    return torch.mm(x.float(), w.float().t())
++
+ 
+ # Which per-layer tensor is handed to an EAGLE3/DFlash drafter as the "hidden
+ # state" of an auxiliary layer. GLM-5.3-Flash runs mHC with
+@@ -615,6 +640,10 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+     # [num_tokens, hidden_size] tensor, the width the relay slots reserve
+     # (eagle3_utils.reserve_aux_intermediate_tensor_slots).
+     supports_aux_hidden_states_over_pp: ClassVar[bool] = True
++    # Drafter fc fold under PP (enable_aux_fc_fold, patch 0023): aux slot ->
++    # this stage's [hidden, hidden] block of the drafter's fc.weight.
++    # None when off.
++    aux_fc_blocks: dict[int, torch.Tensor] | None = None
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -707,6 +736,55 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
++    def enable_aux_fc_fold(self, blocks: dict[int, torch.Tensor]) -> None:
++        """Fold the drafter's fc into this stage (VLLM_GLM5_PP_FOLD_DRAFT_FC):
++        ``blocks`` maps each local aux slot to its fc.weight column block. The
++        boundary then carries one fp32 partial sum instead of aux states."""
++        self.aux_fc_blocks = blocks
++        # Nothing to collect as separate aux states on the last stage.
++        self._aux_upstream_total_cached = 0
++
++    def _fold_aux_fc(
++        self,
++        partial: torch.Tensor | None,
++        aux_hidden_states: list[torch.Tensor],
++        num_tokens: int,
++    ) -> torch.Tensor:
++        """Return partial + sum_j aux_j @ W_(base+j)^T (products in fp32)."""
++        assert self.aux_fc_blocks is not None
++        if partial is None:
++            ref = aux_hidden_states[0] if aux_hidden_states else None
++            partial = torch.zeros(
++                (num_tokens, self.config.hidden_size),
++                dtype=torch.float32,
++                device=ref.device if ref is not None else self.device,
++            )
++        base = self._aux_slot_base_cached
++        for j, aux in enumerate(aux_hidden_states):
++            partial = partial + _mm_fp32(aux, self.aux_fc_blocks[base + j])
++        return partial
++
++    def _boundary_aux_tensors(
++        self,
++        partial: torch.Tensor | None,
++        aux_hidden_states: list[torch.Tensor],
++        num_tokens: int,
++    ) -> dict[str, torch.Tensor]:
++        """Aux keys for a non-last stage's boundary: the fp32 fc partial
++        under the fold, else aux_hidden_states_<global slot> ({} without a
++        drafter)."""
++        if self.aux_fc_blocks is None:
++            return self.pack_local_aux_hidden_states(aux_hidden_states)
++        from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
++            AUX_FC_PARTIAL_KEY,
++        )
++
++        return {
++            AUX_FC_PARTIAL_KEY: self._fold_aux_fc(
++                partial, aux_hidden_states, num_tokens
++            )
++        }
++
+     def _capture_aux_hidden_state(
+         self,
+         layer: nn.Module,
+@@ -801,6 +879,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+         remote_aux_hidden_states = self.collect_remote_aux_hidden_states(
+             intermediate_tensors
+         )
++        fold_partial_in: torch.Tensor | None = None
++        if self.aux_fc_blocks is not None and not get_pp_group().is_first_rank:
++            from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
++                AUX_FC_PARTIAL_KEY,
++            )
++
++            assert intermediate_tensors is not None
++            fold_partial_in = intermediate_tensors[AUX_FC_PARTIAL_KEY]
+         aux_hidden_states: list[torch.Tensor] = []
+         aux_layers = self.aux_hidden_state_layers
+         if aux_layers:
+@@ -846,7 +932,9 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+             return IntermediateTensors(
+                 {
+                     "hidden_states": hidden_states,
+-                    **self.pack_local_aux_hidden_states(aux_hidden_states),
++                    **self._boundary_aux_tensors(
++                        fold_partial_in, aux_hidden_states, full_num_tokens
++                    ),
+                 }
+             )
+ 
+@@ -857,6 +945,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
+         if aux_layers:
+             # Remote states come from earlier layers, so they go first. The
+             # runner expects the tuple whenever aux layers are configured.
++            if self.aux_fc_blocks is not None:
++                # The drafter receives the finished fc output (fp32) in place
++                # of the concatenated aux states (patch 0023).
++                return hidden_states, [
++                    self._fold_aux_fc(
++                        fold_partial_in, aux_hidden_states, full_num_tokens
++                    )
++                ]
+             return hidden_states, remote_aux_hidden_states + aux_hidden_states
+         return hidden_states
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f813934..d4ab4f9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -271,6 +271,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Speculative decoding.
+         self.speculator = None
+         self.use_aux_hidden_state_outputs = False
++        # VLLM_GLM5_PP_FOLD_DRAFT_FC (patch 0023), set in load_model.
++        self.aux_fc_folded = False
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+@@ -413,12 +415,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     )
+                     assert self.pp_handler is not None
+                     self.pp_handler.configure_aux_hidden_state_relay(self.model)
++                    # VLLM_GLM5_PP_FOLD_DRAFT_FC (patch 0023): each stage
++                    # applies its slice of the drafter's fc and forwards one
++                    # fp32 partial sum instead of relaying the aux states.
++                    from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
++                        maybe_configure_aux_fc_fold,
++                    )
++
++                    self.aux_fc_folded = maybe_configure_aux_fc_fold(
++                        self.model,
++                        self.speculative_config,
++                        self.pp_handler,
++                        load_dummy_weights=load_dummy_weights,
++                        dtype=self.dtype,
++                    )
+             if isinstance(self.speculator, DraftModelSpeculator):
+                 with use_workspace_lane(self._draft_workspace_lane):
+                     self.speculator.load_model(self.model)
+                     eplb_models_added = self.eplb.maybe_register_speculator(
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
++                if self.aux_fc_folded:
++                    from vllm.v1.worker.gpu.spec_decode.eagle.aux_fc_fold import (
++                        mark_drafter_aux_fc_folded,
++                    )
++
++                    mark_drafter_aux_fc_folded(
++                        self.speculator,
++                        None if load_dummy_weights else self.model,
++                    )
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/aux_fc_fold.py b/vllm/v1/worker/gpu/spec_decode/eagle/aux_fc_fold.py
+new file mode 100644
+index 0000000..0bfecdb
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/aux_fc_fold.py
+@@ -0,0 +1,201 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fold a DFlash drafter's input projection into the pipeline stages.
++
++Port of Morrowmake's ``spec_decode/eagle/aux_fc_fold.py``
++(``VLLM_GLM5_PP_FOLD_DRAFT_FC``), patch 0023.
++
++The drafter's first op is ``fc(cat(aux_0, ..., aux_{n-1}))``: one linear map
++over the concatenated aux hidden states, i.e. ``sum_i aux_i @ W_i^T`` with
++``W_i`` the i-th column block of ``fc.weight``. Under PP the aux states are
++produced on several stages and, by default, relayed one key per state to the
++last stage (``PPHandler.relay_aux_hidden_states``), which concatenates them and
++runs the full ``[T, n*H] x [n*H, H]`` GEMM.
++
++With the switch on, every stage multiplies its own aux states by their column
++blocks (bf16 inputs, fp32 output) and adds them to a running fp32 partial sum
++that crosses the boundary under one key instead of the aux states. The last
++stage hands the finished sum to the drafter in place of the concatenation and
++the drafter skips its ``fc`` (one cast to the model dtype). The products and
++the sum are the numbers the single fc GEMM accumulates in fp32 before its one
++rounding, so the result differs only in fp32 summation order.
++
++Each stage loads only its own ``W_i`` (H x H per aux layer) from the drafter
++checkpoint. The last stage cross-checks its blocks against the loaded drafter.
++"""
++
++import glob
++import os
++from typing import Any
++
++import torch
++import torch.nn as nn
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++AUX_FC_PARTIAL_KEY = "aux_fc_partial"
++# Checkpoint names of the drafter fc (qwen3_dflash.py maps "encoder.fc." to
++# "fc."; some exports keep a "model." prefix).
++_FC_WEIGHT_NAMES = ("fc.weight", "model.fc.weight", "encoder.fc.weight")
++
++
++def _inner(model: nn.Module) -> nn.Module | None:
++    from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import _inner_decoder
++
++    return _inner_decoder(model)
++
++
++def _draft_checkpoint_files(spec_config: Any) -> list[str]:
++    path = spec_config.draft_model_config.model
++    if not os.path.isdir(path):
++        from huggingface_hub import snapshot_download
++
++        path = snapshot_download(
++            path, allow_patterns=["*.safetensors"], local_files_only=True
++        )
++    return sorted(glob.glob(os.path.join(path, "*.safetensors")))
++
++
++def load_fc_column_blocks(
++    files: list[str], indices: list[int], hidden_size: int, num_aux: int
++) -> dict[int, torch.Tensor]:
++    """``{i: fc.weight[:, i*H:(i+1)*H]}`` for the requested aux indices."""
++    from safetensors import safe_open
++
++    for f in files:
++        with safe_open(f, framework="pt") as st:
++            names = set(st.keys())
++            name = next((n for n in _FC_WEIGHT_NAMES if n in names), None)
++            if name is None:
++                continue
++            sl = st.get_slice(name)
++            shape = tuple(sl.get_shape())
++            if shape != (hidden_size, num_aux * hidden_size):
++                raise ValueError(
++                    f"{name} has shape {shape}, expected "
++                    f"({hidden_size}, {num_aux * hidden_size})"
++                )
++            out = {
++                i: sl[:, i * hidden_size : (i + 1) * hidden_size].contiguous()
++                for i in indices
++            }
++            for w in out.values():
++                if not w.is_floating_point():
++                    raise ValueError(f"{name} is not a float tensor ({w.dtype})")
++            return out
++    raise FileNotFoundError(f"none of {_FC_WEIGHT_NAMES} found in {files}")
++
++
++def maybe_configure_aux_fc_fold(
++    model: nn.Module,
++    spec_config: Any,
++    pp_handler: Any,
++    load_dummy_weights: bool = False,
++    files: list[str] | None = None,
++    dtype: torch.dtype | None = None,
++) -> bool:
++    """Enable the fold on this stage if VLLM_GLM5_PP_FOLD_DRAFT_FC=1 and the
++    model supports it. Must run after the aux layers and the relay are
++    configured (set_eagle3_aux_hidden_state_layers,
++    configure_aux_hidden_state_relay) and before the persistent receive
++    buffer is allocated (make_empty_intermediate_tensors in the runner).
++
++    Every stage must reach the same decision: the gate only reads the env,
++    the PP world size, the spec method and the model class, which are equal
++    on all stages."""
++    if not envs.VLLM_GLM5_PP_FOLD_DRAFT_FC:
++        return False
++    from vllm.distributed.parallel_state import get_pp_group
++
++    pp = get_pp_group()
++    inner = _inner(model)
++    reason = None
++    if pp.world_size < 2:
++        reason = "no pipeline parallelism"
++    elif spec_config is None or spec_config.method != "dflash":
++        reason = "only the DFlash drafter is supported"
++    elif inner is None or not hasattr(inner, "enable_aux_fc_fold"):
++        reason = f"{type(inner).__name__} does not support it"
++    elif getattr(inner, "is_sequence_parallel", False):
++        reason = "sequence parallelism"
++    elif not getattr(inner, "aux_hidden_state_layers", ()):
++        reason = "no aux hidden-state layers"
++    if reason is not None:
++        logger.warning("VLLM_GLM5_PP_FOLD_DRAFT_FC ignored: %s", reason)
++        return False
++
++    hidden = inner.config.hidden_size
++    num_aux = len(inner.aux_hidden_state_layers)
++    base = inner._aux_slot_base_cached
++    # Aux id i is captured after layer i - 1 (forward: layer_idx + 1 in
++    # aux_layers), so this stage owns the ids in (start_layer, end_layer];
++    # they follow the upstream ones in slot order.
++    num_local = sum(
++        inner.start_layer < i <= inner.end_layer for i in inner.aux_hidden_state_layers
++    )
++    local = list(range(base, base + num_local))
++    device = next(inner.parameters()).device
++    if dtype is None:
++        dtype = torch.bfloat16
++    if load_dummy_weights:
++        blocks = {i: torch.zeros(hidden, hidden, dtype=dtype) for i in local}
++    else:
++        files = files if files is not None else _draft_checkpoint_files(spec_config)
++        blocks = load_fc_column_blocks(files, local, hidden, num_aux)
++    inner.enable_aux_fc_fold(
++        {i: w.to(device=device, dtype=dtype) for i, w in blocks.items()}
++    )
++
++    # The boundary now carries the fp32 partial sum instead of aux states.
++    # Built on the inner model's factory, so the aux slots that
++    # reserve_aux_intermediate_tensor_slots added to the outer one are gone
++    # (the runner indexes every receive-buffer key in the received dict).
++    if not pp.is_first_rank:
++        base_make = inner.make_empty_intermediate_tensors
++
++        def make_empty_with_partial(batch_size, dtype, device):
++            tensors = base_make(batch_size, dtype, device)
++            tensors[AUX_FC_PARTIAL_KEY] = torch.zeros(
++                (batch_size, hidden), dtype=torch.float32, device=device
++            )
++            return tensors
++
++        model.make_empty_intermediate_tensors = make_empty_with_partial
++    if pp_handler is not None:
++        pp_handler.aux_hidden_state_relay_keys = ()
++    logger.info(
++        "DFlash fc folded into the pipeline: this stage applies aux block(s) %s "
++        "of %d and forwards an fp32 partial sum",
++        local,
++        num_aux,
++    )
++    return True
++
++
++def mark_drafter_aux_fc_folded(
++    speculator: Any, target_model: nn.Module | None = None
++) -> None:
++    """Tell the last stage's drafter that its aux input is already the fc
++    output (DFlashQwen3ForCausalLM.combine_hidden_states). With the target
++    model given, check this stage's blocks against the loaded drafter fc."""
++    draft_model = getattr(speculator, "model", None)
++    if draft_model is None:
++        raise RuntimeError("fc fold: the speculator has no draft model")
++    if target_model is not None:
++        inner = _inner(target_model)
++        blocks = getattr(inner, "aux_fc_blocks", None) or {}
++        fc = getattr(getattr(draft_model, "model", None), "fc", None)
++        weight = getattr(fc, "weight", None)
++        if weight is not None and weight.is_floating_point():
++            h = weight.shape[0]
++            for i, w in blocks.items():
++                ref = weight[:, i * h : (i + 1) * h]
++                if ref.shape != w.shape or not torch.equal(ref.to(w.dtype), w):
++                    raise RuntimeError(
++                        f"fc fold: aux block {i} on this stage differs from the "
++                        "loaded drafter fc.weight (wrong checkpoint name/layout?)"
++                    )
++    draft_model.aux_fc_folded = True

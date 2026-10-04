@@ -1,0 +1,930 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: sm_80 thin-M BF16 GEMM for unquantized linears
+
+VLLM_GLM5_THIN_GEMM (default 0 = unchanged), _MAX_TOKENS (32). Morrowmake's
+split-K Triton GEMM behind a custom op for unquantized BF16 linears with
+M <= 32 (target projections, shared experts, lm_head, drafter), plus the
+kpool-gate call site and a pre-capture warmup. Not bitwise equal to cuBLAS
+(summation order).
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 517d36e..657c942 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -57,6 +57,8 @@ if TYPE_CHECKING:
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
++    VLLM_GLM5_THIN_GEMM: bool = False
++    VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_ENGRAM_EXACT_PIN: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+@@ -958,6 +960,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR": lambda: float(
+         os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR", "0.75")
+     ),
++    # sm_80 thin-M BF16 GEMM (vllm/models/glm5next/nvidia/ops/thin_gemm.py,
++    # ported from Morrowmake/vllm-cmp170hx). Routes the unquantized BF16
++    # linears (every non-expert projection of a W4A16 GLM-5.x checkpoint,
++    # lm_head and the DFlash drafter) to a split-K Triton kernel when the batch
++    # has <= VLLM_GLM5_THIN_GEMM_MAX_TOKENS rows. Default off: with it unset
++    # dispatch_unquantized_gemm returns exactly what it returned before.
++    "VLLM_GLM5_THIN_GEMM": lambda: bool(int(os.getenv("VLLM_GLM5_THIN_GEMM", "0"))),
++    "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
++        os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
++    ),
+     # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+     # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+     # loaded pipeline stages can offload more than lighter ones.
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 3e19c2b..bae5603 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -560,6 +560,25 @@ def dispatch_unquantized_gemm(
+     elif not current_platform.is_cuda():
+         return default_unquantized_gemm
+ 
++    # sm_80 thin-M BF16 GEMM (vllm/models/glm5next/nvidia/ops/thin_gemm.py),
++    # for the layers a W4A16 GLM-5.x checkpoint leaves in BF16. The env check
++    # comes first, so with the flag unset nothing (triton included) is
++    # imported and the code below runs exactly as before. Ahead of the
++    # FlashInfer backends, which need sm_100 and so never co-apply.
++    if envs.VLLM_GLM5_THIN_GEMM:
++        from vllm.models.glm5next.nvidia.ops.thin_gemm import (
++            glm5_thin_unquantized_gemm,
++            use_thin_gemm,
++        )
++
++        if use_thin_gemm():
++            logger.info_once(
++                "VLLM_GLM5_THIN_GEMM: sm_80 thin-M BF16 GEMM for unquantized "
++                "linears with <= %d rows.",
++                envs.VLLM_GLM5_THIN_GEMM_MAX_TOKENS,
++            )
++            return glm5_thin_unquantized_gemm
++
+     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
+     if backend_spec is None:
+         return default_unquantized_gemm
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index c9c740f..9d7bf3b 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -193,6 +193,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+     compilation_config = worker.vllm_config.compilation_config
+     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+ 
++    # sm_80 thin-M BF16 GEMM: compile and allocate its split-K workspace for
++    # every (M, N, K) the decode graphs can replay. Must precede capture.
++    # No-op (nothing imported) unless VLLM_GLM5_THIN_GEMM=1.
++    if envs.VLLM_GLM5_THIN_GEMM:
++        from vllm.models.glm5next.nvidia.ops.thin_gemm import warmup_thin_gemm
++
++        warmup_thin_gemm(worker, cudagraph_capture_sizes)
++
+     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+     # layer per token; warm them across token sizes first so the first real
+     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index ff79e35..9d9abb1 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -1,10 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import functools
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ 
++import vllm.envs as envs
+ from vllm.config import (
+     CacheConfig,
+     VllmConfig,
+@@ -38,6 +41,17 @@ from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+ 
+ logger = init_logger(__name__)
+ 
++
++@functools.cache
++def _thin_gemm_enabled() -> bool:
++    """VLLM_GLM5_THIN_GEMM on an sm_80 part (read once; off = F.linear)."""
++    if not envs.VLLM_GLM5_THIN_GEMM:
++        return False
++    from vllm.models.glm5next.nvidia.ops.thin_gemm import use_thin_gemm
++
++    return use_thin_gemm()
++
++
+ # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
+ # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
+ # fusion of the surrounding eager ops; carving each cluster into its own
+@@ -414,7 +428,15 @@ class Indexer(nn.Module):
+         # kpool: per-token gate score driving the softmax-weighted pool. Computed
+         # from the same hidden_states that produced `k`, so it stays token-aligned.
+         # F.linear(x, gate) = x @ gate.T  with gate [head_dim, hidden_size].
+-        gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
++        if _thin_gemm_enabled():
++            # VLLM_GLM5_THIN_GEMM: this site never builds a LinearBase, so the
++            # dispatch_unquantized_gemm hook cannot reach it (N=128, K=4096,
++            # one call per MLA layer and step).
++            from vllm.models.glm5next.nvidia.ops.thin_gemm import thin_linear
++
++            gate_score = thin_linear(hidden_states, self.index_kpool_compress_gate)
++        else:
++            gate_score = F.linear(hidden_states, self.index_kpool_compress_gate)
+ 
+         # DeepGEMM's MQA-logits kernels (fp8_mqa_logits /
+         # fp8_fp4_paged_mqa_logits) require num_heads in {32, 64}; this
+diff --git a/vllm/models/glm5next/nvidia/ops/thin_gemm.py b/vllm/models/glm5next/nvidia/ops/thin_gemm.py
+new file mode 100644
+index 0000000..06d9e49
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/thin_gemm.py
+@@ -0,0 +1,783 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""sm_80 thin-M BF16 GEMM for the layers a W4A16 GLM-5.x checkpoint leaves BF16.
++
++Ported from Morrowmake/vllm-cmp170hx ``ampere-glm53`` @ 3a2bf16dae
++(``vllm/ampere_thin_gemm/thin_gemm.py`` + ``__init__.py`` + ``warmup.py``).
++The Triton kernel, the measured schedule table and the fallback heuristic are
++copied verbatim; the integration around them is ours (see "Differences from
++MM" below).
++
++    thin_linear(x[M, K] bf16, w[N, K] bf16) -> y[M, N] bf16   == F.linear(x, w)
++
++Why: at M <= 32 a BF16 linear is weight-bandwidth bound. cuBLAS picks few,
++large CTAs for these skinny shapes (or splits K and runs a second reduce
++launch); this kernel splits K across many small CTAs and reduces the FP32
++partials in the last-arriving CTA of each output tile, in a fixed order
++(bitwise run-to-run deterministic, no extra launch). Semantics are exactly
++``F.linear(x, w)`` without bias: BF16 x BF16 products, FP32 accumulation, one
++rounding to BF16. The *summation order* differs from cuBLAS, so results are
++not bitwise equal to cuBLAS; they are equally close to an FP32/FP64 reference.
++
++Default OFF (``VLLM_GLM5_THIN_GEMM=0``): nothing here is imported and
++``dispatch_unquantized_gemm`` returns exactly the callable it returned before.
++
++Differences from MM [deliberate]:
++  * The kernel is reached through a registered custom op
++    (``torch.ops.vllm.glm5_thin_linear``) instead of being called directly, so
++    torch.compile'd modules (the DFlash drafter is ``@support_torch_compile``)
++    see one opaque op and the row-count branch is taken at run time / capture
++    time, never baked into a Dynamo guard.
++  * Workspace (split-K partials and arrival counters) is keyed per (N, K, M,
++    SPLIT_K) and per device instead of per byte size with explicit "lanes".
++    Two thin GEMMs only share a buffer if they have the same shape, so a
++    shared-expert GEMM on the MoE aux stream can never race a different-shape
++    GEMM on the main stream. (Same shape on two streams at once does not occur
++    in our decode graphs.)
++  * Inside a CUDA-graph capture, a (M, N, K) that was never run eagerly (so
++    its Triton binary or workspace would be created inside the capture) falls
++    back to ``F.linear`` and logs once, instead of compiling/allocating in the
++    capture. The warmup below normally makes this unreachable.
++"""
++
++import functools
++
++import torch
++
++from vllm import envs
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++# Below this K the weight is too small to amortise the launch and cuBLAS wins
++# outright; also keeps the split-K heuristic out of its degenerate corner.
++_MIN_K = 128
++
++# (N, K) -> smallest M sent to cuBLAS instead. Measured by MM under pipeline
++# parallel, where kda_o_proj runs at full width (K = 64 heads * 128): past
++# M = 16 no thin-M schedule beats cuBLAS on it.
++_CUBLAS_FROM_M: dict[tuple[int, int], int] = {(4096, 8192): 17}
++
++# --------------------------------------------------------------------------
++# Tuning knobs (verbatim from MM).
++# --------------------------------------------------------------------------
++_CTA_PER_SM_TARGET = 1.8
++_MIN_K_PER_SPLIT = 256
++_MAX_SMEM = 150 * 1024
++
++# Measured overrides, keyed by (N, K, M) with an (N, K, None) any-M fallback.
++# Value is (BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages). Numbers in the
++# comments are MM's measurements on a CMP 170HX (CUDA-graph replay, weight
++# rotation), not ours.
++_CONFIG_OVERRIDES: dict = {
++    # kda_in_proj_qkvbfg_a  N=6416 K=4096
++    (6416, 4096, 1): (32, 128, 1, 2, 3),  # 34.82 us vs cuBLAS 40.03 (1.150x), separate timing 34.82 us
++    (6416, 4096, 2): (32, 128, 1, 2, 3),  # 35.19 us vs cuBLAS 38.35 (1.090x), separate timing 35.19 us
++    (6416, 4096, 4): (32, 128, 1, 2, 3),  # 35.28 us vs cuBLAS 38.35 (1.087x), separate timing 35.28 us
++    (6416, 4096, 8): (32, 128, 1, 2, 3),  # 35.75 us vs cuBLAS 38.82 (1.086x), separate timing 35.75 us
++    (6416, 4096, 16): (32, 128, 1, 2, 3),  # 36.03 us vs cuBLAS 39.19 (1.088x), separate timing 36.03 us
++    (6416, 4096, 24): (128, 128, 1, 4, 3),  # 37.33 us vs cuBLAS 44.78 (1.200x), fallback was 38.73
++    (6416, 4096, 32): (128, 128, 1, 4, 3),  # 37.42 us vs cuBLAS 45.71 (1.221x), separate timing 37.42 us
++    (6416, 4096, None): (32, 128, 1, 2, 3),
++    # dense_mlp_gate_up  N=6144 K=4096
++    (6144, 4096, 1): (32, 128, 1, 2, 3),  # 33.98 us vs cuBLAS 37.52 (1.104x), separate timing 33.98 us
++    (6144, 4096, 2): (32, 128, 1, 2, 3),  # 34.26 us vs cuBLAS 37.33 (1.090x), separate timing 34.26 us
++    (6144, 4096, 4): (32, 128, 1, 2, 3),  # 34.44 us vs cuBLAS 37.70 (1.095x), separate timing 34.44 us
++    (6144, 4096, 8): (128, 128, 1, 4, 3),  # 34.54 us vs cuBLAS 37.79 (1.094x), separate timing 34.54 us
++    (6144, 4096, 16): (128, 128, 1, 4, 3),  # 34.72 us vs cuBLAS 38.07 (1.097x), separate timing 34.72 us
++    (6144, 4096, 24): (128, 128, 1, 4, 3),  # 35.56 us vs cuBLAS 44.22 (1.243x), fallback was 37.89
++    (6144, 4096, 32): (128, 128, 1, 4, 3),  # 36.40 us vs cuBLAS 44.78 (1.230x), separate timing 36.40 us
++    (6144, 4096, None): (32, 128, 1, 2, 3),
++    # mla_o_proj  N=4096 K=4096
++    (4096, 4096, 1): (32, 128, 1, 2, 4),  # 23.55 us vs cuBLAS 25.02 (1.062x), separate timing 23.55 us
++    (4096, 4096, 2): (32, 128, 1, 4, 4),  # 23.42 us vs cuBLAS 25.79 (1.101x), separate timing 24.26 us
++    (4096, 4096, 4): (32, 128, 1, 4, 4),  # 23.42 us vs cuBLAS 25.66 (1.096x), separate timing 24.19 us
++    (4096, 4096, 8): (32, 128, 1, 4, 4),  # 23.68 us vs cuBLAS 25.79 (1.089x), separate timing 24.51 us
++    (4096, 4096, 16): (32, 128, 1, 4, 4),  # 24.13 us vs cuBLAS 26.05 (1.080x), separate timing 24.19 us
++    (4096, 4096, 24): (64, 128, 1, 8, 5),  # 24.45 us vs cuBLAS 25.73 (1.052x), fallback was 25.79
++    (4096, 4096, 32): (64, 128, 1, 8, 5),  # 24.58 us vs cuBLAS 25.98 (1.057x), separate timing 27.97 us
++    (4096, 4096, None): (32, 128, 1, 4, 4),
++    # dense_mlp_down  N=4096 K=3072
++    (4096, 3072, 1): (32, 128, 1, 2, 4),  # 18.85 us vs cuBLAS 20.20 (1.072x), separate timing 18.85 us
++    (4096, 3072, 2): (64, 256, 1, 4, 3),  # 18.66 us vs cuBLAS 20.57 (1.102x), separate timing 19.55 us
++    (4096, 3072, 4): (64, 256, 1, 4, 3),  # 18.71 us vs cuBLAS 20.53 (1.097x), separate timing 19.60 us
++    (4096, 3072, 8): (32, 128, 1, 4, 4),  # 19.08 us vs cuBLAS 20.81 (1.090x), separate timing 19.97 us
++    (4096, 3072, 16): (32, 128, 1, 4, 4),  # 19.55 us vs cuBLAS 21.09 (1.079x), separate timing 19.69 us
++    (4096, 3072, 24): (64, 128, 1, 8, 4),  # 20.15 us vs cuBLAS 20.99 (1.042x), fallback was 21.18
++    (4096, 3072, 32): (64, 128, 1, 8, 4),  # 20.48 us vs cuBLAS 21.22 (1.036x), separate timing 20.53 us
++    (4096, 3072, None): (32, 128, 1, 4, 4),
++    # mla_fused_qkv_a_proj  N=2048 K=4096
++    (2048, 4096, 1): (32, 256, 1, 4, 4),  # 13.73 us vs cuBLAS 16.67 (1.214x), separate timing 14.69 us
++    (2048, 4096, 2): (32, 128, 1, 4, 5),  # 13.70 us vs cuBLAS 16.54 (1.208x), separate timing 14.53 us
++    (2048, 4096, 4): (32, 128, 1, 4, 5),  # 13.79 us vs cuBLAS 17.86 (1.295x), separate timing 14.82 us
++    (2048, 4096, 8): (32, 128, 1, 4, 5),  # 13.89 us vs cuBLAS 17.02 (1.226x), separate timing 14.91 us
++    (2048, 4096, 16): (32, 256, 1, 4, 4),  # 13.95 us vs cuBLAS 17.38 (1.245x), separate timing 15.36 us
++    (2048, 4096, 32): (32, 128, 1, 4, 5),  # 15.74 us vs cuBLAS 18.02 (1.144x), separate timing 16.93 us
++    (2048, 4096, None): (32, 128, 1, 4, 5),
++    # kda_o_proj  N=4096 K=2048
++    (4096, 2048, 1): (64, 128, 1, 4, 4),  # 13.15 us vs cuBLAS 14.75 (1.122x), separate timing 13.15 us
++    (4096, 2048, 2): (16, 128, 1, 2, 4),  # 13.70 us vs cuBLAS 15.04 (1.098x), separate timing 13.70 us
++    (4096, 2048, 4): (16, 128, 1, 2, 4),  # 13.70 us vs cuBLAS 15.01 (1.096x), separate timing 13.70 us
++    (4096, 2048, 8): (64, 256, 1, 4, 4),  # 13.86 us vs cuBLAS 15.17 (1.095x), separate timing 13.89 us
++    (4096, 2048, 16): (64, 128, 1, 8, 4),  # 13.66 us vs cuBLAS 15.20 (1.112x), separate timing 13.76 us
++    (4096, 2048, 24): (64, 128, 1, 8, 4),  # 14.66 us vs cuBLAS 15.39 (1.050x), separate timing 14.53 us, fallback was 19.55
++    (4096, 2048, 32): (64, 128, 1, 4, 4),  # 14.50 us vs cuBLAS 15.52 (1.071x), separate timing 14.50 us
++    (4096, 2048, None): (16, 128, 1, 2, 4),
++    # mla_q_b_proj+idx_wq_b  N=4096 K=1536
++    (4096, 1536, 1): (64, 128, 1, 4, 4),  # 10.53 us vs cuBLAS 12.31 (1.170x), separate timing 10.53 us
++    (4096, 1536, 2): (64, 256, 1, 4, 3),  # 11.05 us vs cuBLAS 12.48 (1.129x), separate timing 11.05 us
++    (4096, 1536, 4): (64, 256, 1, 4, 3),  # 11.10 us vs cuBLAS 12.53 (1.129x), separate timing 11.10 us
++    (4096, 1536, 8): (64, 256, 1, 4, 3),  # 11.24 us vs cuBLAS 12.69 (1.129x), separate timing 11.24 us
++    (4096, 1536, 16): (64, 128, 1, 8, 4),  # 11.31 us vs cuBLAS 12.91 (1.141x), separate timing 11.43 us
++    (4096, 1536, 24): (64, 128, 1, 8, 4),  # 12.12 us vs cuBLAS 12.88 (1.063x), fallback was 12.69
++    (4096, 1536, 32): (64, 128, 1, 4, 4),  # 12.15 us vs cuBLAS 13.00 (1.071x), separate timing 12.15 us
++    (4096, 1536, None): (64, 256, 1, 4, 3),
++    # shared_gate_up  N=1024 K=4096
++    (1024, 4096, 1): (32, 512, 2, 2, 3),  # 9.28 us vs cuBLAS 10.98 (1.183x), separate timing 9.58 us
++    (1024, 4096, 2): (64, 128, 4, 4, 4),  # 9.41 us vs cuBLAS 11.04 (1.173x), separate timing 9.79 us
++    (1024, 4096, 4): (64, 64, 4, 4, 5),  # 9.68 us vs cuBLAS 10.82 (1.117x), separate timing 9.98 us
++    (1024, 4096, 8): (64, 64, 4, 4, 5),  # 9.89 us vs cuBLAS 11.02 (1.115x), separate timing 10.02 us
++    (1024, 4096, 16): (32, 64, 4, 2, 5),  # 9.94 us vs cuBLAS 11.23 (1.130x), separate timing 9.94 us
++    (1024, 4096, 24): (64, 256, 4, 4, 3),  # 10.51 us vs cuBLAS 11.38 (1.082x), fallback was 11.42
++    (1024, 4096, 32): (64, 64, 4, 4, 5),  # 11.36 us vs cuBLAS 11.65 (1.025x), separate timing 12.54 us
++    (1024, 4096, None): (64, 64, 4, 4, 5),
++    # mla_kv_b_proj  N=8192 K=512
++    (8192, 512, 1): (32, 64, 1, 2, 4),  # 8.11 us vs cuBLAS 9.57 (1.179x), separate timing 8.11 us
++    (8192, 512, 2): (64, 64, 1, 4, 4),  # 8.26 us vs cuBLAS 11.92 (1.444x), separate timing 8.26 us
++    (8192, 512, 4): (64, 64, 1, 4, 4),  # 8.27 us vs cuBLAS 12.00 (1.451x), separate timing 8.27 us
++    (8192, 512, 8): (64, 64, 1, 4, 4),  # 8.42 us vs cuBLAS 12.18 (1.447x), separate timing 8.42 us
++    (8192, 512, 16): (64, 64, 1, 4, 4),  # 8.62 us vs cuBLAS 12.34 (1.430x), separate timing 8.62 us
++    (8192, 512, 32): (64, 64, 1, 4, 4),  # 9.42 us vs cuBLAS 10.26 (1.088x), separate timing 9.42 us
++    (8192, 512, None): (64, 64, 1, 4, 4),
++    # shared_down  N=4096 K=512
++    (4096, 512, 1): (32, 64, 1, 2, 5),  # 5.33 us vs cuBLAS 6.60 (1.239x), separate timing 5.33 us
++    (4096, 512, 2): (32, 64, 1, 2, 5),  # 5.47 us vs cuBLAS 6.62 (1.211x), separate timing 5.47 us
++    (4096, 512, 4): (32, 64, 1, 2, 5),  # 5.50 us vs cuBLAS 6.60 (1.201x), separate timing 5.50 us
++    (4096, 512, 8): (32, 64, 1, 2, 5),  # 5.60 us vs cuBLAS 6.70 (1.196x), separate timing 5.60 us
++    (4096, 512, 16): (32, 64, 1, 2, 5),  # 5.71 us vs cuBLAS 6.80 (1.190x), separate timing 5.71 us
++    (4096, 512, 24): (64, 64, 1, 8, 5),  # 6.02 us vs cuBLAS 7.04 (1.169x), fallback was 6.53
++    (4096, 512, 32): (64, 64, 1, 8, 5),  # 6.19 us vs cuBLAS 7.20 (1.163x), separate timing 6.37 us
++    (4096, 512, None): (32, 64, 1, 2, 5),
++    # moe_router_gate  N=288 K=4096
++    (288, 4096, 1): (16, 128, 8, 2, 3),  # 5.86 us vs cuBLAS 6.30 (1.076x), separate timing 6.27 us
++    (288, 4096, 2): (16, 64, 8, 2, 5),  # 5.94 us vs cuBLAS 7.86 (1.324x), separate timing 6.24 us
++    (288, 4096, 4): (16, 64, 8, 2, 5),  # 5.82 us vs cuBLAS 7.98 (1.371x), separate timing 6.39 us
++    (288, 4096, 8): (16, 64, 8, 2, 5),  # 5.79 us vs cuBLAS 8.12 (1.401x), separate timing 6.01 us
++    (288, 4096, 16): (16, 64, 8, 2, 5),  # 6.00 us vs cuBLAS 8.35 (1.391x), separate timing 6.51 us
++    (288, 4096, 24): (32, 256, 4, 4, 3),  # 7.01 us vs cuBLAS 8.36 (1.193x), fallback was 7.25
++    (288, 4096, 32): (32, 256, 4, 4, 3),  # 7.16 us vs cuBLAS 8.65 (1.208x), separate timing 7.50 us
++    (288, 4096, None): (16, 64, 8, 2, 5),
++    # idx_wk_weights_proj  N=160 K=4096
++    (160, 4096, 1): (16, 128, 8, 2, 4),  # 4.96 us vs cuBLAS 5.50 (1.108x), separate timing 5.18 us
++    (160, 4096, 2): (32, 128, 8, 4, 4),  # 5.12 us vs cuBLAS 7.01 (1.369x), separate timing 5.26 us
++    (160, 4096, 4): (32, 128, 8, 4, 4),  # 5.19 us vs cuBLAS 6.53 (1.257x), separate timing 5.41 us
++    (160, 4096, 8): (32, 128, 8, 4, 4),  # 5.19 us vs cuBLAS 6.71 (1.294x), separate timing 5.40 us
++    (160, 4096, 16): (16, 128, 8, 2, 4),  # 5.49 us vs cuBLAS 6.90 (1.257x), separate timing 5.80 us
++    (160, 4096, 32): (32, 64, 8, 2, 5),  # 6.07 us vs cuBLAS 9.10 (1.499x), separate timing 6.23 us
++    (160, 4096, None): (32, 128, 8, 4, 4),
++    # idx_kpool_compress_gate  N=128 K=4096
++    (128, 4096, 1): (16, 128, 16, 2, 3),  # 5.00 us vs cuBLAS 5.42 (1.085x), separate timing 5.15 us
++    (128, 4096, 2): (16, 128, 8, 4, 4),  # 4.85 us vs cuBLAS 7.04 (1.450x), separate timing 5.16 us
++    (128, 4096, 4): (16, 128, 16, 4, 4),  # 4.94 us vs cuBLAS 6.30 (1.275x), separate timing 5.08 us
++    (128, 4096, 8): (16, 128, 8, 4, 4),  # 4.96 us vs cuBLAS 6.39 (1.290x), separate timing 5.08 us
++    (128, 4096, 16): (16, 128, 8, 4, 4),  # 5.03 us vs cuBLAS 6.62 (1.315x), separate timing 5.20 us
++    (128, 4096, 32): (16, 128, 8, 4, 4),  # 5.76 us vs cuBLAS 7.11 (1.233x), separate timing 6.14 us
++    (128, 4096, None): (16, 128, 8, 4, 4),
++    # dflash_fc  N=4096 K=20480 (DFlash drafter input projection, replicated).
++    # One schedule wins or ties at every M; M=16 is within noise of the old
++    # fallback but kept equal to the any-M row below.
++    (4096, 20480, 1): (128, 128, 2, 4, 4),  # 105.73 us vs cuBLAS 111.23 (1.052x), separate timing 105.86 us, fallback was 109.31
++    (4096, 20480, 2): (128, 128, 2, 4, 4),  # 106.50 us vs cuBLAS 112.64 (1.058x), separate timing 106.50 us, fallback was 110.98
++    (4096, 20480, 4): (128, 128, 2, 4, 4),  # 107.01 us vs cuBLAS 112.77 (1.054x), separate timing 107.01 us, fallback was 110.21
++    (4096, 20480, 8): (128, 128, 2, 4, 4),  # 107.52 us vs cuBLAS 113.02 (1.051x), separate timing 107.65 us, fallback was 111.23
++    (4096, 20480, 16): (128, 128, 2, 4, 4),  # 108.54 us vs cuBLAS 113.66 (1.047x), separate timing 108.54 us, fallback was 109.95
++    (4096, 20480, 24): (128, 128, 2, 4, 4),  # 112.51 us vs cuBLAS 150.78 (1.340x), separate timing 112.64 us, fallback was 130.05
++    (4096, 20480, 32): (128, 128, 2, 4, 4),  # 112.77 us vs cuBLAS 151.94 (1.347x), separate timing 112.64 us, fallback was 142.59
++    (4096, 20480, None): (128, 128, 2, 4, 4),
++    # lm_head_verify+lm_head_dflash_draft  N=38720 K=4096
++    (38720, 4096, 1): (64, 256, 1, 4, 3),  # 193.66 us vs cuBLAS 213.89 (1.104x), fallback was 199.94
++    (38720, 4096, 2): (64, 256, 1, 4, 3),  # 193.79 us vs cuBLAS 211.71 (1.092x), fallback was 200.06
++    (38720, 4096, 4): (64, 256, 1, 4, 3),  # 195.07 us vs cuBLAS 214.27 (1.098x), fallback was 201.47
++    (38720, 4096, 8): (64, 256, 1, 4, 3),  # 196.86 us vs cuBLAS 218.50 (1.110x), fallback was 203.26
++    (38720, 4096, 16): (128, 128, 1, 4, 4),  # 199.68 us vs cuBLAS 223.74 (1.121x), fallback was 208.26
++    (38720, 4096, 24): (64, 128, 1, 4, 3),  # 202.75 us vs cuBLAS 216.58 (1.068x), fallback was 213.38
++    (38720, 4096, 32): (64, 128, 1, 4, 4),  # 210.56 us vs cuBLAS 220.16 (1.046x), fallback was 216.83
++    (38720, 4096, None): (64, 256, 1, 4, 3),
++    # dflash_qkv  N=1536 K=4096 (M <= 8 keeps the fallback schedule, which ties)
++    (1536, 4096, 16): (32, 64, 4, 2, 5),  # 12.93 us vs cuBLAS 15.05 (1.164x), fallback was 14.19
++    (1536, 4096, 24): (32, 64, 4, 4, 4),  # 14.19 us vs cuBLAS 15.38 (1.084x), fallback was 17.46
++    (1536, 4096, 32): (32, 128, 4, 2, 3),  # 14.91 us vs cuBLAS 15.55 (1.043x), fallback was 19.00
++    # dflash_o  N=4096 K=1024
++    (4096, 1024, 1): (64, 128, 1, 4, 4),  # 7.74 us vs cuBLAS 9.09 (1.174x), fallback was 8.00
++    (4096, 1024, 2): (32, 64, 1, 2, 5),  # 8.16 us vs cuBLAS 9.42 (1.155x), fallback was 8.51
++    (4096, 1024, 4): (32, 64, 1, 2, 5),  # 8.22 us vs cuBLAS 9.47 (1.152x), fallback was 8.54
++    (4096, 1024, 8): (32, 64, 1, 2, 5),  # 8.32 us vs cuBLAS 9.54 (1.146x), fallback was 8.72
++    (4096, 1024, 16): (64, 128, 1, 4, 4),  # 8.42 us vs cuBLAS 9.73 (1.156x), fallback was 8.80
++    (4096, 1024, 24): (64, 64, 1, 8, 4),  # 9.20 us vs cuBLAS 9.89 (1.075x), fallback was 10.88
++    (4096, 1024, 32): (64, 128, 1, 4, 3),  # 9.25 us vs cuBLAS 10.05 (1.087x), fallback was 11.49
++    (4096, 1024, None): (64, 128, 1, 4, 4),
++    # kda_f_b_proj+kda_g_b_proj  N=2048 K=128
++    (2048, 128, 1): (32, 64, 1, 2, 5),  # 2.50 us vs cuBLAS 3.39 (1.353x), separate timing 2.50 us
++    (2048, 128, 2): (32, 128, 1, 4, 2),  # 2.55 us vs cuBLAS 3.49 (1.370x), separate timing 2.57 us
++    (2048, 128, 4): (32, 128, 1, 4, 3),  # 2.55 us vs cuBLAS 3.48 (1.364x), separate timing 2.60 us
++    (2048, 128, 8): (32, 128, 1, 4, 2),  # 2.61 us vs cuBLAS 3.55 (1.358x), separate timing 2.63 us
++    (2048, 128, 16): (32, 128, 1, 4, 2),  # 2.66 us vs cuBLAS 3.59 (1.349x), separate timing 2.70 us
++    (2048, 128, 32): (32, 128, 1, 4, 4),  # 2.85 us vs cuBLAS 3.60 (1.262x), separate timing 2.90 us
++    (2048, 128, None): (32, 128, 1, 4, 3),
++    #
++    # Pipeline parallel (TP=1): one card runs whole layers, so the column- and
++    # row-parallel projections are at full width. Only the (N, K) that exist
++    # under PP alone are listed; an (N, K) shared with TP=4 keeps its rows
++    # above. Same sweep and acceptance rule (>= 2.5 % over the fallback
++    # schedule); an M not listed keeps the heuristic.
++    # PP4 lm_head_verify+lm_head_dflash_draft  N=154880 K=4096
++    (154880, 4096, 1): (128, 128, 1, 4, 4),  # 747.39 us vs cuBLAS 948.35 (1.269x), was 887.94
++    (154880, 4096, 32): (128, 256, 1, 4, 2),  # 793.34 us vs cuBLAS 1051.52 (1.325x), was 1491.46
++    # PP4 kda_in_proj_qkvbfg_a  N=24896 K=4096
++    (24896, 4096, 1): (128, 128, 2, 4, 3),  # 129.15 us vs cuBLAS 144.77 (1.121x), was 132.48
++    (24896, 4096, 8): (128, 128, 1, 4, 4),  # 130.43 us vs cuBLAS 130.69 (1.002x), was 134.66
++    (24896, 4096, 16): (128, 128, 1, 4, 4),  # 131.20 us vs cuBLAS 132.99 (1.014x), was 136.96
++    (24896, 4096, 24): (128, 128, 1, 4, 2),  # 132.99 us vs cuBLAS 148.48 (1.116x), was 141.70
++    (24896, 4096, 32): (128, 128, 1, 4, 2),  # 133.89 us vs cuBLAS 149.76 (1.119x), was 144.51
++    # PP4 dense_mlp_gate_up+dflash_gate_up  N=24576 K=4096
++    (24576, 4096, 1): (128, 128, 1, 4, 4),  # 126.85 us vs cuBLAS 141.44 (1.115x), was 131.07
++    (24576, 4096, 4): (128, 128, 1, 4, 4),  # 128.00 us vs cuBLAS 128.38 (1.003x), was 132.22
++    (24576, 4096, 8): (128, 128, 1, 4, 2),  # 129.02 us vs cuBLAS 129.79 (1.006x), was 132.99
++    (24576, 4096, 16): (128, 128, 1, 4, 4),  # 129.41 us vs cuBLAS 131.20 (1.014x), was 136.58
++    (24576, 4096, 24): (128, 128, 1, 4, 2),  # 131.33 us vs cuBLAS 147.07 (1.120x), was 140.16
++    (24576, 4096, 32): (128, 128, 1, 4, 2),  # 131.84 us vs cuBLAS 148.61 (1.127x), was 142.59
++    # PP4 mla_o_proj  N=4096 K=16384
++    (4096, 16384, 24): (32, 128, 1, 4, 4),  # 88.32 us vs cuBLAS 118.78 (1.345x), was 105.09
++    (4096, 16384, 32): (128, 64, 2, 4, 4),  # 91.01 us vs cuBLAS 119.17 (1.309x), was 114.69
++    # PP4 dense_mlp_down+dflash_down  N=4096 K=12288
++    (4096, 12288, 24): (128, 128, 2, 4, 4),  # 70.14 us vs cuBLAS 96.90 (1.381x), was 80.00
++    (4096, 12288, 32): (128, 128, 2, 4, 3),  # 70.40 us vs cuBLAS 98.05 (1.393x), was 87.55
++    # PP4 dflash_ctx_kv  N=10240 K=4096
++    (10240, 4096, 1): (32, 128, 1, 2, 2),  # 54.91 us vs cuBLAS 64.90 (1.182x), was 62.72
++    (10240, 4096, 2): (32, 128, 1, 2, 2),  # 55.30 us vs cuBLAS 65.54 (1.185x), was 64.90
++    (10240, 4096, 4): (32, 128, 1, 2, 2),  # 55.81 us vs cuBLAS 66.43 (1.190x), was 65.41
++    (10240, 4096, 8): (32, 128, 1, 2, 2),  # 55.81 us vs cuBLAS 67.07 (1.202x), was 65.79
++    (10240, 4096, 16): (32, 128, 1, 2, 3),  # 56.58 us vs cuBLAS 69.12 (1.222x), was 66.94
++    (10240, 4096, 24): (64, 128, 1, 4, 3),  # 59.78 us vs cuBLAS 76.54 (1.281x), was 76.80
++    (10240, 4096, 32): (64, 128, 1, 4, 3),  # 60.42 us vs cuBLAS 75.90 (1.256x), was 75.39
++    # PP4 mla_q_b_proj  N=16384 K=1536
++    (16384, 1536, 8): (128, 128, 1, 4, 4),  # 35.10 us vs cuBLAS 39.66 (1.130x), was 36.03
++    # PP4 mla_kv_b_proj  N=32768 K=512
++    (32768, 512, 4): (64, 256, 1, 4, 3),  # 24.90 us vs cuBLAS 29.06 (1.167x), was 25.54
++    (32768, 512, 8): (64, 256, 1, 4, 3),  # 25.22 us vs cuBLAS 29.57 (1.173x), was 26.05
++    (32768, 512, 16): (128, 128, 1, 4, 3),  # 26.05 us vs cuBLAS 30.21 (1.160x), was 27.07
++    (32768, 512, 24): (128, 128, 1, 4, 3),  # 27.58 us vs cuBLAS 31.42 (1.139x), was 28.99
++    (32768, 512, 32): (128, 128, 1, 4, 3),  # 27.52 us vs cuBLAS 30.85 (1.121x), was 29.50
++    # PP4 kda_f_b_proj+kda_g_b_proj  N=8192 K=128
++    (8192, 128, 1): (64, 32, 1, 4, 4),  # 3.84 us vs cuBLAS 5.08 (1.320x), was 3.95
++    (8192, 128, 24): (128, 32, 1, 4, 4),  # 4.29 us vs cuBLAS 5.43 (1.265x), was 4.65
++    (8192, 128, 32): (128, 32, 1, 4, 4),  # 4.42 us vs cuBLAS 5.48 (1.240x), was 4.74
++}
++
++
++_num_sms_cache = None
++
++
++def num_sms() -> int:
++    global _num_sms_cache
++    if _num_sms_cache is None:
++        _num_sms_cache = torch.cuda.get_device_properties(
++            torch.cuda.current_device()).multi_processor_count
++    return _num_sms_cache
++
++
++def _pow2_at_least(x, lo=16):
++    v = lo
++    while v < x:
++        v *= 2
++    return v
++
++
++def _heuristic(M, N, K, BLOCK_M):
++    """Fallback for any (N, K) the sweep did not measure.
++
++    Same principle the measured table encodes: pick the *largest* BLOCK_N that
++    still yields ~_CTA_PER_SM_TARGET CTAs per SM from the N dimension alone, so
++    SPLIT_K stays 1 and no reduction kernel runs; only split K when N cannot
++    fill the machine by itself.
++    """
++    BLOCK_K = 128 if K >= 1024 else _pow2_at_least(min(K, 64), 16)
++    want = max(1, int(_CTA_PER_SM_TARGET * num_sms()))
++
++    BLOCK_N = 16
++    for cand in (128, 64, 32):
++        if triton.cdiv(N, cand) >= want:
++            BLOCK_N = cand
++            break
++
++    tiles_n = triton.cdiv(N, BLOCK_N)
++    max_split = max(1, min(triton.cdiv(K, BLOCK_K), K // _MIN_K_PER_SPLIT))
++    SPLIT_K = max(1, min(max_split, -(-want // tiles_n)))
++
++    num_warps = 4 if BLOCK_N >= 64 else 2
++    num_stages = 4 if BLOCK_N * BLOCK_K <= 8192 else 3
++    return BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
++
++
++def _nearest_pinned_same_block_m(M, N, K, BLOCK_M):
++    """Pinned (N, K, m) row with the same BLOCK_M as M, nearest m; or None."""
++    best = None
++    for (n, k, m), cfg in _CONFIG_OVERRIDES.items():
++        if n != N or k != K or m is None:
++            continue
++        if min(64, _pow2_at_least(m, 16)) != BLOCK_M:
++            continue
++        d = abs(m - M)
++        if best is None or d < best[0] or (d == best[0] and m < best[1]):
++            best = (d, m, cfg)
++    return None if best is None else best[2]
++
++
++@functools.cache
++def _select_config(M, N, K):
++    """-> (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages)."""
++    # tl.dot needs M >= 16 on Ampere (m16n8k16), so M is padded up to 16 and
++    # masked.  The cap at 64 is a shared-memory bound, NOT a bound on M: the
++    # kernel tiles M over grid dim 2, so any M is covered.
++    BLOCK_M = min(64, _pow2_at_least(M, 16))
++
++    cfg = _CONFIG_OVERRIDES.get((N, K, M))
++    if cfg is None:
++        cfg = _CONFIG_OVERRIDES.get((N, K, None))
++    if cfg is None:
++        # [ours] MM pinned the PP4 full-width shapes only at some M and has no
++        # any-M row for them, so e.g. kda in_proj at M=4 or lm_head at M=8
++        # (our k=3 / k=7 verify sizes) fell to the heuristic, which MM's own
++        # sweep shows losing to cuBLAS on the large shapes ("was" column).
++        # A pinned row with the same BLOCK_M runs the identical grid and tiles
++        # (only the row mask differs), so reuse the nearest such row first.
++        cfg = _nearest_pinned_same_block_m(M, N, K, BLOCK_M)
++    if cfg is None:
++        cfg = _heuristic(M, N, K, BLOCK_M)
++    BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = cfg
++
++    # A pinned config was measured at a small BLOCK_M; a larger M grows the
++    # pipelined operand tiles, so trim the pipeline depth instead of asking for
++    # more shared memory than an SM has.
++    while num_stages > 2 and \
++            num_stages * (BLOCK_N + BLOCK_M) * BLOCK_K * 2 > _MAX_SMEM:
++        num_stages -= 1
++    return BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
++
++
++# --------------------------------------------------------------------------
++# Kernels
++# --------------------------------------------------------------------------
++
++@triton.jit
++def _thin_gemm_kernel(
++    X, W, Y, P, LOCK,
++    M, N, K,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    stride_pk, stride_pm, stride_pn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    EVEN_N: tl.constexpr,
++    TILED_M: tl.constexpr,
++):
++    """One CTA per (M tile, N tile, K split).  Reads its K-blocks of W once.
++
++    When SPLIT_K > 1 the FP32 partials are reduced by whichever CTA of the
++    column arrives last, not by a second launch: the second launch cost 2-3.5 us
++    per call (a bare in-graph launch is ~0.9 us on this part, and the rest is
++    the drain plus one full HBM latency round with nothing left to overlap it).
++
++    The reduction stays bitwise deterministic because the *order* is fixed -
++    always partial 0, then 1, ... SPLIT_K-1 - even though *which* CTA performs
++    it varies run to run.  That is the whole reason this is not an atomic_add
++    into Y, which would not be reproducible.
++    """
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++
++    # BLOCK_M is capped by shared memory, so a caller with more rows than one
++    # tile gets several M tiles over grid dim 2.  Masking alone is NOT enough:
++    # with a pinned BLOCK_M and no pid_m, rows past BLOCK_M were never written.
++    # Every M the model uses (1..64) is a single tile, and there the row offset
++    # must stay a compile-time zero -- a runtime `pid_m * BLOCK_M` in the
++    # address arithmetic costs 0.5-4.5 % on every shape (measured), so the
++    # one-tile case is specialized rather than paying for generality.
++    if TILED_M:
++        pid_m = tl.program_id(2)
++        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    else:
++        pid_m = 0
++        offs_m = tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    # Clamping the row/column index keeps every address inside the tensor, so
++    # the masked-off lanes of a ragged tile cannot fault even before the mask
++    # is applied.
++    x_m = tl.where(m_mask, offs_m, 0)
++    w_n = tl.where(n_mask, offs_n, 0)
++
++    x_ptrs = X + x_m[:, None] * stride_xm + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_xk
++    w_ptrs = W + w_n[:, None] * stride_wn + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_wk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    step = BLOCK_K * SPLIT_K
++    n_iter = tl.cdiv(K, step)
++    for i in range(n_iter):
++        if EVEN_K:
++            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++            w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
++        else:
++            k_now = i * step + pid_k * BLOCK_K + offs_k
++            k_mask = k_now < K
++            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++            w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
++        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
++        x_ptrs += step * stride_xk
++        w_ptrs += step * stride_wk
++
++    y_ptrs = Y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
++    if SPLIT_K == 1:
++        if EVEN_N:
++            tl.store(y_ptrs, acc.to(Y.dtype.element_ty), mask=m_mask[:, None])
++        else:
++            tl.store(y_ptrs, acc.to(Y.dtype.element_ty),
++                     mask=m_mask[:, None] & n_mask[None, :])
++    else:
++        p_mask = m_mask[:, None] & n_mask[None, :]
++        p_off = offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
++        # ".cg" keeps the partial out of the non-coherent per-SM L1 so the
++        # reducing CTA, which runs on a different SM, can see it in L2.
++        tl.store(P + pid_k * stride_pk + p_off, acc, mask=p_mask,
++                 cache_modifier=".cg")
++        # Release the store, then count arrivals for this N column.  No CTA
++        # ever spins, so this cannot deadlock however the grid is scheduled.
++        # One counter per (M tile, N tile) output block; grid dim 0 is the
++        # number of N tiles, so this indexes the column within this M tile.
++        if TILED_M:
++            lock = LOCK + pid_m * tl.num_programs(0) + pid_n
++        else:
++            lock = LOCK + pid_n
++        arrived = tl.atomic_add(lock, 1, sem="acq_rel", scope="gpu")
++        if arrived == SPLIT_K - 1:
++            tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            for k in tl.static_range(SPLIT_K):
++                tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
++                               other=0.0, cache_modifier=".cv")
++            tl.store(y_ptrs, tot.to(Y.dtype.element_ty), mask=p_mask)
++            # Leave the counter at zero for the next launch.  Launches on one
++            # stream are serialized, so no later CTA can race this reset.
++            tl.atomic_xchg(lock, 0, sem="release", scope="gpu")
++
++
++
++
++# --------------------------------------------------------------------------
++# Workspace
++# --------------------------------------------------------------------------
++# Allocated once, never freed: a captured graph records the pointers. The
++# kernel always leaves the arrival counters at zero, so a buffer is reusable
++# across launches and replays of the same shape.
++
++_WORKSPACE: dict = {}
++# (device index, M, N, K) that have run at least once outside a capture, i.e.
++# whose Triton binary and workspace exist.
++_READY: set = set()
++
++
++def _partials(split_k, M, N, K, device):
++    key = (device.index, "p", split_k, M, N, K)
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.empty((split_k, M, N), dtype=torch.float32, device=device)
++        _WORKSPACE[key] = buf
++    return buf
++
++
++def _locks(tiles, M, N, K, device):
++    key = (device.index, "lock", M, N, K, tiles)
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.zeros(tiles, dtype=torch.int32, device=device)
++        _WORKSPACE[key] = buf
++    return buf
++
++
++def _dummy(device):
++    key = (device.index, "dummy")
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = (
++            torch.zeros(1, dtype=torch.float32, device=device),
++            torch.zeros(1, dtype=torch.int32, device=device),
++        )
++        _WORKSPACE[key] = buf
++    return buf
++
++
++# --------------------------------------------------------------------------
++# Kernel entry point
++# --------------------------------------------------------------------------
++
++
++def thin_gemm(
++    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None
++) -> torch.Tensor:
++    """y = x @ w.T for BF16 x [M, K] and BF16 w [N, K], FP32 accumulate."""
++    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
++    assert x.ndim == 2 and w.ndim == 2 and x.shape[1] == w.shape[1]
++    M, K = x.shape
++    N = w.shape[0]
++    if out is None:
++        out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
++    if M == 0 or N == 0:
++        return out
++
++    BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = _select_config(
++        M, N, K
++    )
++    even_k = (K % (BLOCK_K * SPLIT_K)) == 0
++    even_n = (N % BLOCK_N) == 0
++    tiles_n = triton.cdiv(N, BLOCK_N)
++    tiles_m = triton.cdiv(M, BLOCK_M)
++    if SPLIT_K == 1:
++        # Unused by the kernel (constexpr-folded away) but must be pointers.
++        p, lock = _dummy(x.device)
++        sp = (0, 0, 0)
++    else:
++        p = _partials(SPLIT_K, M, N, K, x.device)
++        sp = (p.stride(0), p.stride(1), p.stride(2))
++        lock = _locks(tiles_n * tiles_m, M, N, K, x.device)
++
++    _thin_gemm_kernel[(tiles_n, SPLIT_K, tiles_m)](
++        x, w, out, p, lock,
++        M, N, K,
++        x.stride(0), x.stride(1),
++        w.stride(0), w.stride(1),
++        out.stride(0), out.stride(1),
++        sp[0], sp[1], sp[2],
++        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=SPLIT_K,
++        EVEN_K=even_k, EVEN_N=even_n, TILED_M=(tiles_m > 1),
++        num_warps=num_warps, num_stages=num_stages,
++    )  # fmt: skip
++    return out
++
++
++# --------------------------------------------------------------------------
++# Gates
++# --------------------------------------------------------------------------
++
++
++@functools.cache
++def _device_supported() -> bool:
++    """sm_80 (GA100: A100 / CMP 170HX) only; the table was measured there."""
++    return current_platform.is_cuda() and current_platform.is_device_capability(80)
++
++
++def use_thin_gemm() -> bool:
++    """True only when the operator opted in AND the part is sm_80."""
++    if not envs.VLLM_GLM5_THIN_GEMM:
++        return False
++    return _device_supported()
++
++
++@functools.cache
++def dispatch_threshold() -> int:
++    """Largest M sent to the kernel (MM measured 32; above it cuBLAS wins).
++
++    Read once per process (``dispatch_threshold.cache_clear()`` in tests)."""
++    return envs.VLLM_GLM5_THIN_GEMM_MAX_TOKENS
++
++
++def static_supported(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
++) -> bool:
++    """Shape-independent part of the gate (dtype/layout only, no M).
++
++    2-D only, so no reshape copy can appear on the captured path; any bias,
++    non-BF16 or K-strided weight falls through to F.linear.
++    """
++    return (
++        bias is None
++        and x.ndim == 2
++        and weight.ndim == 2
++        and x.dtype is torch.bfloat16
++        and weight.dtype is torch.bfloat16
++        and weight.stride(1) == 1
++        and x.shape[1] == weight.shape[1]
++        and weight.shape[1] >= _MIN_K
++    )
++
++
++def rows_supported(M: int, N: int, K: int) -> bool:
++    """Row-count part of the gate."""
++    return 1 <= M <= dispatch_threshold() and M < _CUBLAS_FROM_M.get(
++        (N, K), 1 << 30
++    )
++
++
++# --------------------------------------------------------------------------
++# Custom op (opaque to torch.compile; the row branch runs at call time)
++# --------------------------------------------------------------------------
++
++_capture_fallback_logged: set = set()
++
++
++def _glm5_thin_linear_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    M, K = x.shape
++    N = weight.shape[0]
++    if not rows_supported(M, N, K) or x.stride(1) != 1:
++        return torch.nn.functional.linear(x, weight)
++    key = (x.device.index, M, N, K)
++    if key not in _READY:
++        if torch.cuda.is_current_stream_capturing():
++            # Never compile or allocate inside a capture.
++            if key not in _capture_fallback_logged:
++                _capture_fallback_logged.add(key)
++                logger.warning(
++                    "VLLM_GLM5_THIN_GEMM: (M=%d, N=%d, K=%d) was not warmed up "
++                    "before CUDA-graph capture; this graph uses F.linear.",
++                    M,
++                    N,
++                    K,
++                )
++            return torch.nn.functional.linear(x, weight)
++        out = thin_gemm(x, weight)
++        _READY.add(key)
++        return out
++    return thin_gemm(x, weight)
++
++
++def _glm5_thin_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    return x.new_empty((x.shape[0], weight.shape[0]))
++
++
++direct_register_custom_op(
++    op_name="glm5_thin_linear",
++    op_func=_glm5_thin_linear_impl,
++    fake_impl=_glm5_thin_linear_fake,
++)
++
++
++def thin_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    """``F.linear(x, weight)`` with the thin-M kernel when eligible.
++
++    For call sites that never build a LinearBase (the kpool compress gate in
++    ``attention.py``). Callers must only reach this when ``use_thin_gemm()``.
++    """
++    if static_supported(x, weight, None):
++        return torch.ops.vllm.glm5_thin_linear(x, weight)
++    return torch.nn.functional.linear(x, weight)
++
++
++def glm5_thin_unquantized_gemm(
++    layer: torch.nn.Module,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Drop-in for ``default_unquantized_gemm`` (same signature)."""
++    if static_supported(x, weight, bias):
++        return torch.ops.vllm.glm5_thin_linear(x, weight)
++    return torch.nn.functional.linear(x, weight, bias)
++
++
++# --------------------------------------------------------------------------
++# Warmup (must run before CUDA-graph capture)
++# --------------------------------------------------------------------------
++
++# Small M an eager decode step can hit outside the capture sizes.
++_EXTRA_MS = (1, 2, 3, 4, 5, 6, 7, 8)
++
++
++def _candidate_models(worker) -> list[torch.nn.Module]:
++    models = []
++    try:
++        models.append(worker.get_model())
++    except Exception:  # pragma: no cover - worker shape varies
++        pass
++    runner = getattr(worker, "model_runner", None)
++    for attr in ("drafter", "speculator"):
++        obj = getattr(runner, attr, None)
++        if obj is None:
++            continue
++        for inner in (getattr(obj, "model", None), obj):
++            if isinstance(inner, torch.nn.Module):
++                models.append(inner)
++                break
++    return models
++
++
++def discover_weights(models) -> dict[tuple[int, int], torch.Tensor]:
++    """One live weight per (N, K) that can reach the thin path.
++
++    The real weights are used for the warmup launches, so nothing of weight
++    size is allocated (kernel_warmup runs after the KV cache is allocated).
++    """
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        UnquantizedEmbeddingMethod,
++    )
++
++    unquant = (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
++    found: dict[tuple[int, int], torch.Tensor] = {}
++    for model in models:
++        for _name, module in model.named_modules():
++            w = None
++            if isinstance(getattr(module, "quant_method", None), unquant):
++                w = getattr(module, "weight", None)
++            elif hasattr(module, "index_kpool_compress_gate"):
++                w = module.index_kpool_compress_gate
++            if (
++                isinstance(w, torch.Tensor)
++                and w.is_cuda
++                and w.ndim == 2
++                and w.dtype is torch.bfloat16
++                and w.stride(1) == 1
++                and w.shape[1] >= _MIN_K
++            ):
++                found.setdefault((int(w.shape[0]), int(w.shape[1])), w)
++    return found
++
++
++def warmup_thin_gemm(worker, capture_sizes) -> None:
++    """Compile and preallocate every (M, N, K) a graph can replay.
++
++    Must run before capture (called from kernel_warmup). Outputs are discarded;
++    the inputs are zeros, so nothing reads uninitialised memory.
++    """
++    if not use_thin_gemm():
++        return
++    bound = dispatch_threshold()
++    ms = {int(s) for s in capture_sizes if 1 <= int(s) <= bound}
++    ms.update(m for m in _EXTRA_MS if m <= bound)
++    weights = discover_weights(_candidate_models(worker))
++    n = 0
++    for (N, K), w in sorted(weights.items()):
++        for M in sorted(ms):
++            if not rows_supported(M, N, K):
++                continue
++            x = torch.zeros((M, K), dtype=torch.bfloat16, device=w.device)
++            _glm5_thin_linear_impl(x, w)
++            n += 1
++    torch.cuda.synchronize()
++    logger.info(
++        "VLLM_GLM5_THIN_GEMM: warmed %d (M, N, K) over %d weight shapes, M in %s "
++        "(bound %d).",
++        n,
++        len(weights),
++        sorted(ms),
++        bound,
++    )

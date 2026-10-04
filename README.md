@@ -14,6 +14,7 @@ This `main` branch separates shared infrastructure from model-specific files:
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
+│   ├── build-glm53-dflash2-image.sh          # GLM W4A16 + DFlash2 image
 │   ├── build-lmcache-server-image.sh         # shared LMCache server image
 │   ├── build-qwen38-image.sh
 │   ├── build-router-image.sh   # patched vllm-router image
@@ -29,8 +30,13 @@ This `main` branch separates shared infrastructure from model-specific files:
     │   └── docs/
     ├── deepseek-v4-flash/      # PD pair on the DeepSeek V4.1 image
     │   └── compose.pd.yml
-    ├── glm-5.3-flash/          # PD pair on the DeepSeek V4.1 image
-    │   └── compose.pd.yml
+    ├── glm-5.3-flash/          # NVFP4 PD pair on the DeepSeek V4.1 image;
+    │   │                       # W4A16 + DFlash2 PP4 on its own image
+    │   ├── compose.pd.yml, compose.w4a16-dflash2.yml
+    │   ├── manifests/          # GLM pins + SHA256 of the dflash2 stack
+    │   ├── patches/dflash2/    # GLM DFlash2 vLLM series (on top of DeepSeek's)
+    │   ├── native/ampere_marlin/  # compiled sm_80 Marlin decode (Apache-2.0)
+    │   └── tests/
     └── qwen3.8-flash-next-nvfp4/
         ├── compose.yml
         ├── compose.pd.yml      # prefill + decode + LMCache + router

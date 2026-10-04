@@ -1,0 +1,625 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: compiled sm_80 W4A16 Marlin MoE decode
+
+VLLM_GLM5_MARLIN_DECODE_CUDA (default 0 = unchanged), _VARIANT (orig),
+_TOKENS (4,8), _LIB. Loads and validates the _ampere_marlin_C library
+(models/glm-5.3-flash/native/ampere_marlin; the DFlash2 image installs it as
+vllm._ampere_marlin_C, so _LIB stays empty), hooks MarlinExperts.apply for
+small decode batches, warms up and self-checks against fused_marlin_moe
+before graph capture, and fails early in Worker.init_device when the flag
+is on but the library is missing or mismatched. No silent fallback. Not
+bitwise equal to Marlin.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 657c942..3196bea 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -59,6 +59,10 @@ if TYPE_CHECKING:
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
+     VLLM_GLM5_THIN_GEMM: bool = False
+     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
++    VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
++    VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
++    VLLM_GLM5_MARLIN_DECODE_TOKENS: str = "4,8"
++    VLLM_GLM5_MARLIN_DECODE_LIB: str = ""
+     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_ENGRAM_EXACT_PIN: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+@@ -970,6 +974,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
+         os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
+     ),
++    # Compiled sm_80 W4A16 MoE decode (vllm/models/glm5next/nvidia/ops/
++    # marlin_decode.py, ported from Morrowmake/vllm-cmp170hx). Routes the
++    # routed-expert Marlin MoE of decode batches with M in
++    # VLLM_GLM5_MARLIN_DECODE_TOKENS to the prebuilt _ampere_marlin_C library.
++    # Default off: MarlinExperts.apply is unchanged. When on, startup fails if
++    # the library is missing/incompatible, the GPU is not sm_80, or the
++    # startup self-check against fused_marlin_moe fails.
++    "VLLM_GLM5_MARLIN_DECODE_CUDA": lambda: bool(
++        int(os.getenv("VLLM_GLM5_MARLIN_DECODE_CUDA", "0"))
++    ),
++    # "orig" (default, faster): W13 split four ways along K, different fp32
++    # summation order. "exact": MM's re-creation of the Marlin stripe order.
++    "VLLM_GLM5_MARLIN_DECODE_VARIANT": env_with_choices(
++        "VLLM_GLM5_MARLIN_DECODE_VARIANT", "orig", ["orig", "exact"]
++    ),
++    # Comma-separated token counts (1..32) that take the compiled path.
++    "VLLM_GLM5_MARLIN_DECODE_TOKENS": lambda: os.getenv(
++        "VLLM_GLM5_MARLIN_DECODE_TOKENS", "4,8"
++    ),
++    # Explicit path of _ampere_marlin_C*.so; empty = import vllm._ampere_marlin_C.
++    "VLLM_GLM5_MARLIN_DECODE_LIB": lambda: os.getenv(
++        "VLLM_GLM5_MARLIN_DECODE_LIB", ""
++    ),
+     # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+     # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+     # loaded pipeline stages can offload more than lighter ones.
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 1206729..9a48863 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Fused MoE utilities for GPTQ."""
+ 
++import functools
+ import math
+ from collections.abc import Callable
+ 
+@@ -57,6 +58,14 @@ from vllm.platforms import current_platform
+ from vllm.scalar_type import ScalarType, scalar_types
+ 
+ 
++@functools.cache
++def _glm5_marlin_decode_enabled() -> bool:
++    """VLLM_GLM5_MARLIN_DECODE_CUDA, read once (off: apply is unchanged)."""
++    import vllm.envs as envs
++
++    return envs.VLLM_GLM5_MARLIN_DECODE_CUDA
++
++
+ def _fused_marlin_moe(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -735,6 +744,19 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
+ 
+         ctx = self._lora_context
+         if ctx is None:
++            if _glm5_marlin_decode_enabled():
++                # Compiled sm_80 decode for small M; returns False (nothing
++                # written) outside its token regime.
++                from vllm.models.glm5next.nvidia.ops.marlin_decode import (
++                    maybe_apply as glm5_marlin_decode,
++                )
++
++                if glm5_marlin_decode(
++                    self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                    activation, global_num_experts, expert_map,
++                    apply_router_weight_on_input,
++                ):
++                    return
+             fused_marlin_moe(
+                 hidden_states=hidden_states,
+                 w1=w1,
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index 9d7bf3b..95386b4 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -201,6 +201,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+ 
+         warmup_thin_gemm(worker, cudagraph_capture_sizes)
+ 
++    # Compiled sm_80 Marlin MoE decode: allocate its work counters and run the
++    # startup self-check against fused_marlin_moe before any graph capture.
++    # No-op (nothing imported) unless VLLM_GLM5_MARLIN_DECODE_CUDA=1.
++    if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
++        from vllm.models.glm5next.nvidia.ops.marlin_decode import (
++            warmup_from_worker as glm5_marlin_decode_warmup,
++        )
++
++        glm5_marlin_decode_warmup(worker)
++
+     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+     # layer per token; warm them across token sizes first so the first real
+     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+diff --git a/vllm/models/glm5next/nvidia/ops/marlin_decode.py b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+new file mode 100644
+index 0000000..3eefb7a
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+@@ -0,0 +1,477 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compiled sm_80 W4A16 MoE decode (VLLM_GLM5_MARLIN_DECODE_CUDA).
++
++Ported from Morrowmake vllm-cmp170hx (@ 3a2bf16dae): ``vllm/ampere_marlin.py``
++(loader/validation) and ``vllm/ampere_decode/marlin_moe.py`` (gate/run). The
++CUDA source is ``csrc/libtorch_stable/moe/ampere_marlin/decode*.cu``; it is
++built out of tree (``models/glm-5.3-flash/native/ampere_marlin/build.py`` in
++vllm-cmp170hx) into ``_ampere_marlin_C*.so``; the GLM DFlash2 image installs
++it as ``vllm/_ampere_marlin_C.abi3.so``. Nothing is compiled at runtime.
++
++What it replaces: for small decode batches, the two ``moe_wna16_marlin_gemm``
++calls plus the activation of ``fused_marlin_moe`` with a weight-streaming
++kernel that reads the same Marlin-packed uint4b8 / group-128 / bf16-scale
++tensors directly (tokens are the mma N dimension, every warp pulls
++(block, 64-column tile) items from an atomic work queue), followed by a fused
++fp32-sum -> clamp-SiLU-mul kernel and the second projection with the router
++weight applied in the epilogue. The slot sum stays ``layer.moe_sum``.
++
++Differences from MM (deliberate):
++- Alignment is our own ``moe_align_block_size`` with block 8, i.e. exactly
++  what ``fused_marlin_moe`` does for these M (VLLM_DETERMINISTIC_MOE_ALIGN
++  honoured), instead of MM's preallocated/fused alignment.
++- Intermediates (fp32 partials, h, c3) come from the caching allocator per
++  call like every other intermediate in the forward (graph-pool safe). Only the
++  two int32 work counters are persistent (one pair per device); they must be
++  zero before the first call and each GEMM re-zeroes the other's counter.
++- The token regime is configurable (VLLM_GLM5_MARLIN_DECODE_TOKENS, default
++  ``4,8`` = MM's PP4 choice), N=2048 (PP whole experts) and N=512 (TP4 shards).
++- Strict: the flag on with a missing/incompatible library, a non-sm_80 device,
++  no eligible MoE layer, or a startup self-check mismatch against
++  ``fused_marlin_moe`` raises during startup. There is no silent fallback for
++  those; batches outside the token regime (prefill, other k) use the normal
++  Marlin path, as in MM.
++"""
++
++from __future__ import annotations
++
++import functools
++import importlib
++import importlib.util
++import os
++
++import torch
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++EXT_NAME = "_ampere_marlin_C"
++_ABI_VERSION = 1
++BLOCK = 8                    # the kernels consume block-8 alignment only
++K_SUPPORTED = 4096
++N_SUPPORTED = (512, 2048)    # instantiated (K, N) pairs in decode*.cu
++MAX_TOKENS = 32
++_W13_ROWS = 64
++_PLANES = {"orig": 4, "exact": 1}
++
++_SCHEMAS = {
++    name: (
++        "a w s sorted eids ntpp topk_w topk n_slots K N w13 rows cfg ctr out",
++        "Tensor Tensor Tensor Tensor Tensor Tensor Tensor int int int int bool "
++        "int int Tensor Tensor",
++        "int",
++    )
++    for name in ("decode_gemm", "decode_gemm_orig")
++}
++_SCHEMAS.update({
++    name: ("part ids ksplit n_slots Nh limit h",
++           "Tensor Tensor int int int float Tensor", "")
++    for name in ("decode_act", "decode_act_orig")
++})
++
++_OPS = None
++_CTR: dict[str, torch.Tensor] = {}
++
++
++# --------------------------------------------------------------------------
++# loading
++# --------------------------------------------------------------------------
++def _runtime_build_info() -> dict:
++    cuda = torch.version.cuda
++    major, minor = (int(v) for v in cuda.split(".")[:2]) if cuda else (0, 0)
++    return {
++        "abi_version": _ABI_VERSION,
++        "torch_version": torch.__version__.split("+")[0],
++        "cuda_version": major * 1000 + minor * 10,
++        "cxx11_abi": int(torch._C._GLIBCXX_USE_CXX11_ABI),
++    }
++
++
++def _validate(module) -> None:
++    built = module.build_info()
++    for key, expected in _runtime_build_info().items():
++        actual = built.get(key)
++        if key == "cuda_version" and isinstance(actual, int):
++            # one CUDA major shares the runtime ABI
++            actual, expected = actual // 1000, expected // 1000
++        if actual != expected:
++            raise ValueError(
++                f"{key} mismatch: extension {built.get(key)!r}, runtime "
++                f"{_runtime_build_info()[key]!r}")
++    for name, (names, types, returns) in _SCHEMAS.items():
++        qualified = f"{EXT_NAME}::{name}"
++        schema = torch._C._dispatch_find_schema_or_throw(qualified, "").schema()
++        actual = (
++            " ".join(a.name for a in schema.arguments),
++            " ".join(str(a.type) for a in schema.arguments),
++            " ".join(str(a.type) for a in schema.returns),
++        )
++        if actual != (names, types, returns):
++            raise ValueError(f"incompatible operator schema: {qualified}")
++        if not torch._C._dispatch_has_kernel_for_dispatch_key(qualified, "CUDA"):
++            raise ValueError(f"missing CUDA implementation: {qualified}")
++
++
++def _import_extension():
++    path = envs.VLLM_GLM5_MARLIN_DECODE_LIB
++    if path:
++        if not os.path.isfile(path):
++            raise ImportError(f"VLLM_GLM5_MARLIN_DECODE_LIB={path!r} does not exist")
++        spec = importlib.util.spec_from_file_location(f"vllm.{EXT_NAME}", path)
++        if spec is None or spec.loader is None:
++            raise ImportError(f"cannot load {path!r} as an extension module")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module
++    return importlib.import_module(f"vllm.{EXT_NAME}")
++
++
++def require_extension():
++    """Return the validated ``torch.ops._ampere_marlin_C`` or raise.
++
++    Success is cached. Loading registers the operators exactly once.
++    """
++    global _OPS
++    if _OPS is not None:
++        return _OPS
++    try:
++        module = _import_extension()
++        _validate(module)
++    except (ImportError, OSError, AttributeError, RuntimeError, ValueError,
++            TypeError) as exc:
++        raise RuntimeError(
++            "VLLM_GLM5_MARLIN_DECODE_CUDA=1 was requested, but the compiled "
++            f"sm_80 Marlin decode library ({EXT_NAME}) is missing or "
++            "incompatible with this PyTorch/CUDA. The GLM-5.3 DFlash2 image "
++            f"installs it as vllm.{EXT_NAME}; otherwise build it inside this "
++            "image with `python3 build.py --out <dir>` "
++            "(models/glm-5.3-flash/native/ampere_marlin) and either set "
++            f"VLLM_GLM5_MARLIN_DECODE_LIB=<dir>/{EXT_NAME}.abi3.so or copy "
++            "the file into the installed vllm package directory. To run "
++            "without it, unset "
++            f"VLLM_GLM5_MARLIN_DECODE_CUDA. Runtime: {_runtime_build_info()}. "
++            f"Detail: {type(exc).__name__}: {exc}"
++        ) from exc
++    _OPS = getattr(torch.ops, EXT_NAME)
++    return _OPS
++
++
++def check_startup(parallel_config=None) -> None:
++    """Fail before model load when the flag is on and cannot be honoured."""
++    require_extension()
++    regime_tokens()
++    if parallel_config is not None and getattr(parallel_config, "enable_dbo", False):
++        raise RuntimeError(
++            "VLLM_GLM5_MARLIN_DECODE_CUDA does not support dual-batch overlap "
++            "(--enable-dbo): its work counters are shared per device and the "
++            "two micro-batches would interleave on them.")
++
++
++# --------------------------------------------------------------------------
++# gate
++# --------------------------------------------------------------------------
++def variant() -> str:
++    return envs.VLLM_GLM5_MARLIN_DECODE_VARIANT
++
++
++@functools.cache
++def regime_tokens() -> frozenset[int]:
++    raw = envs.VLLM_GLM5_MARLIN_DECODE_TOKENS
++    try:
++        tokens = frozenset(int(t) for t in raw.replace(" ", "").split(",") if t)
++    except ValueError as exc:
++        raise ValueError(f"VLLM_GLM5_MARLIN_DECODE_TOKENS={raw!r}: {exc}") from exc
++    if not tokens or min(tokens) < 1 or max(tokens) > MAX_TOKENS:
++        raise ValueError(
++            f"VLLM_GLM5_MARLIN_DECODE_TOKENS={raw!r}: need 1..{MAX_TOKENS}")
++    return tokens
++
++
++@functools.cache
++def _is_sm80(index: int) -> bool:
++    return torch.cuda.get_device_capability(index) == (8, 0)
++
++
++def _clamp_limit(cfg) -> float | None:
++    """Kernel clamp limit, or None when the activation config is unsupported."""
++    if cfg.alpha != 1.0 or cfg.beta != 0.0:
++        return None
++    if (getattr(cfg, "activation_situ_beta", None) is not None
++            or getattr(cfg, "activation_situ_linear_beta", None) is not None):
++        return None
++    return float("inf") if cfg.clamp_limit is None else float(cfg.clamp_limit)
++
++
++def structural_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
++                      activation, global_num_experts, expert_map,
++                      apply_router_weight_on_input) -> str | None:
++    """None when a layer/call may use the kernels (token count aside)."""
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    from vllm.scalar_type import scalar_types
++
++    if getattr(layer, "_lora_context", None) is not None:
++        return "LoRA"
++    if expert_map is not None:
++        return "expert map (expert parallelism)"
++    if w1.dim() != 3 or w2.dim() != 3:
++        return "weights are not 3-D Marlin MoE tensors"
++    E = w1.size(0)
++    if global_num_experts not in (-1, E):
++        return f"global experts {global_num_experts} != local {E}"
++    if layer.quant_type_id != scalar_types.uint4b8.id:
++        return "weight type is not uint4b8 (symmetric INT4)"
++    if getattr(layer, "input_dtype", None) is not None:
++        return f"activation quantisation to {layer.input_dtype}"
++    for name in ("w1_zp", "w2_zp", "w1_bias", "w2_bias", "g1_alphas",
++                 "g2_alphas", "a1_gscale", "a2_gscale"):
++        if getattr(layer, name, None) is not None:
++            return f"{name} is set"
++    if hidden_states.dim() != 2 or hidden_states.size(1) != K_SUPPORTED:
++        return f"hidden size {tuple(hidden_states.shape)[1:]} != {K_SUPPORTED}"
++    K = K_SUPPORTED
++    N = w2.size(1) * 16
++    if N not in N_SUPPORTED:
++        return f"intermediate size N={N} not in {N_SUPPORTED}"
++    if tuple(w1.shape) != (E, K // 16, N * 4) or tuple(w2.shape) != (E, N // 16, K * 2):
++        return (f"packed weight layout {tuple(w1.shape)}/{tuple(w2.shape)} is not "
++                f"Marlin 4-bit ({E},{K // 16},{N * 4})/({E},{N // 16},{K * 2})")
++    s1, s2 = layer.w1_scale, layer.w2_scale
++    if (s1 is None or s2 is None or s1.dtype != torch.bfloat16
++            or s2.dtype != torch.bfloat16
++            or tuple(s1.shape) != (E, K // 128, 2 * N)
++            or tuple(s2.shape) != (E, N // 128, K)):
++        return "scales are not bf16 group-128"
++    if w1.dtype != torch.int32 or w2.dtype != torch.int32:
++        return "packed weights are not int32"
++    if apply_router_weight_on_input:
++        return "router weight applied on the input"
++    if activation != MoEActivation.SILU or _clamp_limit(layer.activation_config) is None:
++        return f"activation {activation} / {layer.activation_config}"
++    topk = topk_ids.size(1) if topk_ids.dim() == 2 else -1
++    if topk < 1 or topk & (topk - 1):
++        return f"top-k {topk} is not a power of two"
++    if topk_ids.dtype != torch.int32 or topk_weights.dtype != torch.float32:
++        return "routing is not int32 ids / fp32 weights"
++    if tuple(topk_weights.shape) != tuple(topk_ids.shape):
++        return "routing shape mismatch"
++    if topk_ids.size(0) != hidden_states.size(0):
++        return "routing token count mismatch"
++    if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
++        return "activations are not contiguous bf16"
++    tensors = (w1, w2, s1, s2, topk_ids, topk_weights)
++    if any(not t.is_contiguous() for t in tensors):
++        return "non-contiguous weights, scales or routing"
++    if not hidden_states.is_cuda:
++        return "not CUDA"
++    if not _is_sm80(hidden_states.device.index
++                    if hidden_states.device.index is not None
++                    else torch.cuda.current_device()):
++        return "not sm_80"
++    return None
++
++
++def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                activation, global_num_experts, expert_map,
++                apply_router_weight_on_input) -> bool:
++    """Run into ``output`` and return True, or return False untouched."""
++    if hidden_states.size(0) not in regime_tokens():
++        return False
++    why = structural_reason(
++        layer, hidden_states, w1, w2, topk_weights, topk_ids, activation,
++        global_num_experts, expert_map, apply_router_weight_on_input)
++    if why is not None:
++        # Every eligible GLM layer was checked at startup (warmup); reaching
++        # this means a layer the self-check did not cover.
++        logger.warning_once(
++            "VLLM_GLM5_MARLIN_DECODE_CUDA: a MoE call is not eligible (%s); it "
++            "uses the regular Marlin kernels.", why)
++        return False
++    run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids)
++    return True
++
++
++# --------------------------------------------------------------------------
++# run
++# --------------------------------------------------------------------------
++def _config(num_tokens: int) -> tuple[int, int]:
++    """(cfg w13, cfg w2): MM's measured choice. cfg&15: TW1/TW2; >>4: CTA cap."""
++    return (49 if num_tokens >= 16 else 0, 49 if num_tokens > 16 else 0)
++
++
++def _counters(device: torch.device) -> torch.Tensor:
++    key = str(device)
++    ctr = _CTR.get(key)
++    if ctr is None:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "VLLM_GLM5_MARLIN_DECODE_CUDA: work counters were not allocated "
++                "before CUDA-graph capture (kernel_warmup did not run the "
++                "compiled Marlin decode warmup).")
++        ctr = torch.zeros(2, device=device, dtype=torch.int32)
++        _CTR[key] = ctr
++    return ctr
++
++
++def _ops_for(ops, name: str):
++    if name == "orig":
++        return ops.decode_gemm_orig, ops.decode_act_orig
++    return ops.decode_gemm, ops.decode_act
++
++
++def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
++        variant_name: str | None = None):
++    """Compiled MoE for one call; writes ``output`` [M, K] (bf16)."""
++    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
++        moe_align_block_size,
++    )
++
++    name = variant_name or variant()
++    gemm, act = _ops_for(require_extension(), name)
++    M, K = hidden_states.shape
++    E = w1.size(0)
++    N = w2.size(1) * 16
++    topk = topk_ids.size(1)
++    slots = M * topk
++    dev = hidden_states.device
++    ctr = _counters(dev)
++    sorted_ids, expert_ids, ntpp = moe_align_block_size(
++        topk_ids, BLOCK, E, None, ignore_invalid_experts=True)
++    part = torch.empty(_PLANES[name] * slots * 2 * N, device=dev, dtype=torch.float32)
++    h = torch.empty(slots, N, device=dev, dtype=torch.bfloat16)
++    c3 = torch.empty(slots, K, device=dev, dtype=torch.bfloat16)
++    tw = topk_weights.view(-1)
++    c13, c2 = _config(M)
++    ksplit = gemm(hidden_states, w1, layer.w1_scale, sorted_ids, expert_ids, ntpp,
++                  tw, topk, slots, K, 2 * N, True, _W13_ROWS, c13, ctr, part)
++    act(part, topk_ids.view(-1), ksplit, slots, N,
++        _clamp_limit(layer.activation_config), h)
++    gemm(h, w2, layer.w2_scale, sorted_ids, expert_ids, ntpp, tw, topk, slots,
++         N, K, False, N // 16, c2, ctr, c3)
++    layer.moe_sum(c3.view(M, topk, K), output, topk_ids, None)
++    return output
++
++
++def reference(layer, hidden_states, w1, w2, topk_weights, topk_ids, activation):
++    """The regular path (``fused_marlin_moe``) for the same call."""
++    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
++        fused_marlin_moe,
++    )
++
++    out = torch.empty_like(hidden_states)
++    ret = fused_marlin_moe(
++        hidden_states=hidden_states, w1=w1, w2=w2, bias1=None, bias2=None,
++        w1_scale=layer.w1_scale, w2_scale=layer.w2_scale,
++        topk_weights=topk_weights, topk_ids=topk_ids,
++        quant_type_id=layer.quant_type_id, global_num_experts=w1.size(0),
++        activation=activation, activation_func=layer.activation,
++        activation_config=layer.activation_config, moe_sum=layer.moe_sum,
++        output=out, workspace=layer.marlin_workspace(hidden_states.device),
++    )
++    return out if ret is None else ret
++
++
++# --------------------------------------------------------------------------
++# warmup / startup self-check
++# --------------------------------------------------------------------------
++def _eligible_layers(model):
++    """(module, MarlinExperts, w13, w2, activation) for routed-expert layers."""
++    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
++
++    seen = set()
++    for _, module in model.named_modules():
++        qm = getattr(module, "quant_method", None)
++        kernel = getattr(qm, "moe_kernel", None)
++        experts = getattr(getattr(kernel, "impl", None), "fused_experts", None)
++        if not isinstance(experts, MarlinExperts) or id(experts) in seen:
++            continue
++        w13 = getattr(module, "w13_weight", None)
++        w2 = getattr(module, "w2_weight", None)
++        if w13 is None or w2 is None:
++            continue
++        seen.add(id(experts))
++        yield module, experts, w13, w2, getattr(module, "activation", None)
++
++
++def _random_routing(M, topk, E, device, gen):
++    ids = torch.stack([torch.randperm(E, generator=gen, device="cpu")[:topk]
++                       for _ in range(M)]).to(torch.int32)
++    w = torch.rand(M, topk, generator=gen).softmax(-1).to(torch.float32)
++    return ids.to(device), w.to(device)
++
++
++def self_check(experts, w13, w2, activation, tokens, *, tol: float = 2e-2) -> dict:
++    """Compiled vs fused_marlin_moe on random routing for every M in ``tokens``.
++
++    Returns {M: relative L2 error}; raises when the gate rejects the layer or
++    an error exceeds ``tol`` (a layout mismatch gives ~1, rounding ~1e-3).
++    """
++    dev = w13.device
++    gen = torch.Generator().manual_seed(1234)
++    E, K = w13.size(0), w13.size(1) * 16
++    errors = {}
++    for M in sorted(tokens):
++        topk = experts.moe_config.experts_per_token
++        ids, tw = _random_routing(M, topk, E, dev, gen)
++        x = (torch.randn(M, K, generator=gen) * 0.5).to(torch.bfloat16).to(dev)
++        why = structural_reason(experts, x, w13, w2, tw, ids, activation, -1,
++                                None, False)
++        if why is not None:
++            raise RuntimeError(
++                f"VLLM_GLM5_MARLIN_DECODE_CUDA=1 but this model's MoE layer is not "
++                f"supported by the compiled kernels: {why}")
++        out = torch.empty_like(x)
++        run(experts, out, x, w13, w2, tw, ids)
++        ref = reference(experts, x, w13, w2, tw, ids, activation)
++        err = ((out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-30)).item()
++        if not torch.isfinite(out).all() or not err <= tol:
++            raise RuntimeError(
++                f"VLLM_GLM5_MARLIN_DECODE_CUDA self-check failed at M={M}: relative "
++                f"L2 error {err:.3e} vs fused_marlin_moe (tolerance {tol}). The "
++                "weight layout or the library does not match this vLLM.")
++        errors[M] = err
++    return errors
++
++
++def warmup_from_worker(worker) -> None:
++    """Before capture: allocate counters, JIT-free first launches, self-check."""
++    device = torch.device(worker.device)
++    if device.type != "cuda":
++        raise RuntimeError("VLLM_GLM5_MARLIN_DECODE_CUDA requires a CUDA device")
++    index = device.index if device.index is not None else torch.cuda.current_device()
++    if not _is_sm80(index):
++        raise RuntimeError(
++            "VLLM_GLM5_MARLIN_DECODE_CUDA=1 requires an sm_80 GPU; this device is "
++            f"sm_{''.join(map(str, torch.cuda.get_device_capability(index)))}.")
++    require_extension()
++    tokens = regime_tokens()
++    layers = list(_eligible_layers(worker.get_model()))
++    if not layers:
++        raise RuntimeError(
++            "VLLM_GLM5_MARLIN_DECODE_CUDA=1 but no Marlin (MarlinExperts) MoE "
++            "layer was found on this rank; unset the flag for this model.")
++    with torch.cuda.device(device), torch.inference_mode():
++        _counters(device)
++        # Every layer is gated (cheap); the numerical check runs on the first.
++        _, experts, w13, w2, act = layers[0]
++        errors = self_check(experts, w13, w2, act, tokens)
++        for _, ex, a, b, ac in layers[1:]:
++            M = min(tokens)
++            topk = ex.moe_config.experts_per_token
++            ids = torch.zeros(M, topk, dtype=torch.int32, device=device)
++            tw = torch.zeros(M, topk, dtype=torch.float32, device=device)
++            x = torch.zeros(M, a.size(1) * 16, dtype=torch.bfloat16, device=device)
++            why = structural_reason(ex, x, a, b, tw, ids, ac, -1, None, False)
++            if why is not None:
++                raise RuntimeError(
++                    "VLLM_GLM5_MARLIN_DECODE_CUDA=1 but a MoE layer is not "
++                    f"supported by the compiled kernels: {why}")
++        torch.cuda.synchronize(device)
++    logger.info(
++        "VLLM_GLM5_MARLIN_DECODE_CUDA: compiled sm_80 Marlin MoE decode active "
++        "for M in %s, variant=%s, %d MoE layers (N=%d); self-check rel. L2 "
++        "error vs fused_marlin_moe: %s",
++        sorted(tokens), variant(), len(layers), layers[0][3].size(1) * 16,
++        {m: f"{e:.1e}" for m, e in errors.items()})
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 4686217..697d50c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -355,6 +355,12 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Init device")
+     def init_device(self):
++        if envs.VLLM_GLM5_MARLIN_DECODE_CUDA:
++            # Fail before model load if the compiled Marlin decode library is
++            # missing or does not match this torch/CUDA (no silent fallback).
++            from vllm.models.glm5next.nvidia.ops.marlin_decode import check_startup
++
++            check_startup(self.parallel_config)
+         # Give every worker process its own Triton JIT cache. By default all
+         # local ranks share one cache directory; concurrent compile+load of
+         # the same freshly-written kernel across ranks can read a partially

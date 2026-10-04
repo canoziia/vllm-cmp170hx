@@ -1,0 +1,16 @@
+0001-glm5next-aux-hidden-states-pp.patch
+0002-glm5next-kpool-tail-ring-spec-decode.patch
+0003-glm5next-kv-layout-dflash-drafter-groups.patch
+0004-glm5-dflash-adaptive-depth.patch
+0005-glm5-thin-m-bf16-gemm.patch
+0006-glm5-compiled-marlin-moe-decode.patch
+0007-dflash-fused-grouped-conv.patch
+0008-glm5-deterministic-router-alignment.patch
+0009-glm5-sparse-mla-mm-experimental.patch
+0010-glm5-moe-route-v2-fused-topk-align.patch
+0011-glm5-indexer-gather-clamp.patch
+0012-glm5-pp-sparse-mla-prefill.patch
+0013-glm5-pp-marlin-moe-prefill-split.patch
+0014-glm5-pp-kda-prefill.patch
+0015-glm5-indexer-jit-warmup.patch
+0016-glm5-pp-fold-draft-fc.patch

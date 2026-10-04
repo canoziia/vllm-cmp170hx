@@ -1,0 +1,613 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: split-block Marlin W4A16 MoE prefill
+
+VLLM_GLM5_PP_MARLIN_PREFILL (default 0 = unchanged), _MIN_TOKENS (384).
+Morrowmake's split-block schedule: routed rows are aligned into 64/48/32/16
+row block lists (cheapest cover per expert) and each list is one stock
+Marlin launch. Gate: sm_80, E=288, top-8, K=4096, N=2048, uint4b8 g128,
+bf16, no expert map or LoRA. Not bitwise equal to fused_marlin_moe
+(stream-K split).
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 99bfe54..a54d9f5 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -63,6 +63,8 @@ if TYPE_CHECKING:
+     VLLM_GLM5_THIN_GEMM: bool = False
+     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
++    VLLM_GLM5_PP_MARLIN_PREFILL: bool = False
++    VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS: int = 384
+     VLLM_GLM5_MARLIN_DECODE_VARIANT: str = "orig"
+     VLLM_GLM5_MARLIN_DECODE_TOKENS: str = "4,8"
+     VLLM_GLM5_MARLIN_DECODE_LIB: str = ""
+@@ -1011,6 +1013,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_MARLIN_DECODE_CUDA": lambda: bool(
+         int(os.getenv("VLLM_GLM5_MARLIN_DECODE_CUDA", "0"))
+     ),
++    # Split-block Marlin W4A16 MoE prefill (PP, TP=1, whole experts, sm_80;
++    # glm5next/nvidia/ops/marlin_prefill_split.py, ported from Morrowmake):
++    # 64/48/32/16-row block lists per expert instead of one padded block size,
++    # one Marlin launch per list. Only M >= MIN_TOKENS with E=288, top-8,
++    # K=4096, N=2048, uint4b8 g128; else fused_marlin_moe. Default off. Not
++    # bitwise equal to fused_marlin_moe (stream-K split changes).
++    "VLLM_GLM5_PP_MARLIN_PREFILL": lambda: bool(
++        int(os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL", "0"))
++    ),
++    "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS": lambda: int(
++        os.getenv("VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "384")
++    ),
+     # "orig" (default, faster): W13 split four ways along K, different fp32
+     # summation order. "exact": MM's re-creation of the Marlin stripe order.
+     "VLLM_GLM5_MARLIN_DECODE_VARIANT": env_with_choices(
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index 9a48863..5e355f9 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -66,6 +66,14 @@ def _glm5_marlin_decode_enabled() -> bool:
+     return envs.VLLM_GLM5_MARLIN_DECODE_CUDA
+ 
+ 
++@functools.cache
++def _glm5_pp_marlin_prefill_enabled() -> bool:
++    """VLLM_GLM5_PP_MARLIN_PREFILL, read once (off: apply is unchanged)."""
++    import vllm.envs as envs
++
++    return envs.VLLM_GLM5_PP_MARLIN_PREFILL
++
++
+ def _fused_marlin_moe(
+     hidden_states: torch.Tensor,
+     w1: torch.Tensor,
+@@ -757,6 +765,19 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
+                     apply_router_weight_on_input,
+                 ):
+                     return
++            if _glm5_pp_marlin_prefill_enabled():
++                # Split-block prefill for M >= MIN_TOKENS; returns False
++                # (nothing written) outside its gate.
++                from vllm.models.glm5next.nvidia.ops.marlin_prefill_split import (
++                    maybe_apply as glm5_pp_marlin_prefill,
++                )
++
++                if glm5_pp_marlin_prefill(
++                    self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                    activation, global_num_experts, expert_map,
++                    apply_router_weight_on_input, workspace13, workspace2,
++                ):
++                    return
+             fused_marlin_moe(
+                 hidden_states=hidden_states,
+                 w1=w1,
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index 23d0ae3..d0a7f4a 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -222,6 +222,17 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+ 
+         glm5_marlin_decode_warmup(worker)
+ 
++    # Split-block Marlin MoE prefill: allocate its block-list buffers and JIT
++    # the alignment kernels before any graph capture.
++    # No-op (nothing imported) unless VLLM_GLM5_PP_MARLIN_PREFILL=1.
++    if envs.VLLM_GLM5_PP_MARLIN_PREFILL:
++        from vllm.models.glm5next.nvidia.ops.marlin_prefill_split import (
++            warmup_from_worker as glm5_pp_marlin_prefill_warmup,
++        )
++
++        if glm5_pp_marlin_prefill_warmup(worker):
++            logger.info("Warmed up the split-block Marlin MoE prefill lists.")
++
+     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+     # layer per token; warm them across token sizes first so the first real
+     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+diff --git a/vllm/models/glm5next/nvidia/ops/marlin_prefill_split.py b/vllm/models/glm5next/nvidia/ops/marlin_prefill_split.py
+new file mode 100644
+index 0000000..48427fb
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/marlin_prefill_split.py
+@@ -0,0 +1,268 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Split-block Marlin W4A16 MoE prefill for PP (TP=1, whole experts), sm_80.
++
++Port of Morrowmake ``vllm/ampere_prefill/pp_marlin_prefill.py`` (the released
++Python schedule only; the optional compiled ``VLLM_GLM5_MARLIN_PREFILL_CUDA``
++"wide" kernels and the TP4 N=512 variant are not ported).
++
++WHAT.  ``fused_marlin_moe`` picks one ``block_size_m`` (64 at M=2304, top-8,
++E=288: ~64 rows per expert) and pads every expert up to a multiple of it, so
++an expert with 65 rows costs two 64-row blocks.  Here the routed rows are
++aligned by ``moe_split_align`` into four block lists (64/48/32/16 rows), each
++expert covered by its cheapest multiset of block sizes, and each Marlin GEMM
++(w13 and w2) runs once per list: 8 launches per MoE call instead of 2.  The
++64-row list is forced onto (thread_k 64, thread_n 256, 1 block/SM); the other
++lists use Marlin's own exec-config choice.  Activation (``layer.activation``),
++router-weight multiply (in the w2 GEMM, as in fused_marlin_moe), slot sum
++(``layer.moe_sum``), fp32 global reduce and workspaces are the incumbent's.
++
++NUMERICS.  Every routed row is computed once, by the same kernel family, with
++the same K-group scales and fp32 accumulation.  It is NOT bitwise equal to
++fused_marlin_moe: Marlin MoE runs "DP + two-tile stream-K"
++(marlin_template.h: ``global_mn_tiles = parallel * n_tiles``; tiles beyond a
++multiple of gridDim.x are K-split and reduced in fp32 through C_tmp), so which
++tiles are K-split, and where, depends on the per-launch tile count and grid
++(blocks_per_sm), both of which change here.  Expect rounding-level (bf16 ulp)
++differences on some rows; Morrowmake reports error vs an fp64 reference equal
++to the incumbent's.  The slot-order sum is unchanged.
++
++GATE.  Only: flag on, M >= MIN_TOKENS, sm_80, bf16 contiguous activations,
++uint4b8 group-128 without zp/bias/global scales/act-quant, E=288 (global ==
++local, no expert map), top-8, K=4096, N=2048, SiLU (alpha 1, beta 0, any
++clamp_limit: the activation callback is the layer's own), router weight on
++output, no LoRA.  Anything else returns False and fused_marlin_moe runs.
++Decode (M=4/8, 0006) and spec verify never reach MIN_TOKENS (384).
++
++CUDA GRAPHS.  No host sync, no per-call allocation in steady state: list
++buffers are allocated per (device, E) for max_num_batched_tokens*topk rows in
++``warmup_from_worker`` (kernel_warmup, before capture_model).  A call during a
++capture that would need a new/larger buffer falls back to fused_marlin_moe.
++One buffer set per device: calls must be serialised on one stream (true for
++the model forward).
++"""
++
++import functools
++
++import torch
++
++import vllm._custom_ops as ops
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++E_GATE = 288
++TOPK_GATE = 8
++K_GATE = 4096
++N_GATE = 2048
++GROUP_SIZE = 128
++
++# (thread_k, thread_n, blocks_per_sm) per list block size; absent = Marlin's
++# own exec-config.  (64, 256) at 256 threads exists for m-blocks 2..4.
++THREAD_CFG = {64: (64, 256, 1)}
++
++_BUFFERS: dict = {}
++_RETIRED: list = []  # buffers a captured graph may still reference
++
++
++@functools.cache
++def enabled() -> bool:
++    return envs.VLLM_GLM5_PP_MARLIN_PREFILL
++
++
++@functools.cache
++def _min_tokens() -> int:
++    return envs.VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS
++
++
++@functools.cache
++def _is_sm80(index: int) -> bool:
++    return torch.cuda.get_device_capability(index) == (8, 0)
++
++
++def _buffers(device: torch.device, E: int, rows: int, create: bool):
++    from vllm.models.glm5next.nvidia.ops import moe_split_align
++
++    key = (str(device), E)
++    buf = _BUFFERS.get(key)
++    if buf is not None and buf["t_max"] >= rows:
++        return buf
++    if not create:
++        return None
++    if buf is not None:
++        _RETIRED.append(buf)
++    buf = moe_split_align.buffers(rows, E, device)
++    _BUFFERS[key] = buf
++    return buf
++
++
++def gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
++                activation, global_num_experts, expert_map,
++                apply_router_weight_on_input) -> str | None:
++    """None when the split path may run, else why not."""
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++        marlin_moe_intermediate_size,
++    )
++    from vllm.scalar_type import scalar_types
++
++    if expert_map is not None:
++        return "expert map (expert parallelism)"
++    E = w1.size(0)
++    if E != E_GATE or global_num_experts not in (-1, E):
++        return f"E={E} (global {global_num_experts}) != {E_GATE}"
++    if topk_ids.dim() != 2 or topk_ids.size(1) != TOPK_GATE:
++        return f"top-k {tuple(topk_ids.shape)[1:]} != {TOPK_GATE}"
++    if hidden_states.dim() != 2 or hidden_states.size(1) != K_GATE:
++        return f"hidden size {tuple(hidden_states.shape)[1:]} != {K_GATE}"
++    N = marlin_moe_intermediate_size(w1, w2)
++    if N != N_GATE:
++        return f"intermediate size N={N} != {N_GATE} (TP-sharded experts)"
++    if getattr(layer, "input_dtype", None) is not None:
++        return f"activation quantisation to {layer.input_dtype}"
++    if hidden_states.dtype != torch.bfloat16:
++        return f"activation dtype {hidden_states.dtype}"
++    for name in ("w1_zp", "w2_zp", "w1_bias", "w2_bias", "g1_alphas",
++                 "g2_alphas", "a1_gscale", "a2_gscale"):
++        if getattr(layer, name, None) is not None:
++            return f"{name} is set"
++    if layer.quant_type_id != scalar_types.uint4b8.id:
++        return "weight type is not uint4b8"
++    s1, s2 = layer.w1_scale, layer.w2_scale
++    if (s1 is None or s2 is None or s1.dtype != torch.bfloat16
++            or tuple(s1.shape) != (E, K_GATE // GROUP_SIZE, 2 * N)
++            or tuple(s2.shape) != (E, N // GROUP_SIZE, K_GATE)):
++        return "scales are not bf16 group-128"
++    if apply_router_weight_on_input:
++        return "router weight applied on the input"
++    cfg = layer.activation_config
++    if activation != MoEActivation.SILU or cfg.alpha != 1.0 or cfg.beta != 0.0:
++        return f"activation {activation}"
++    if topk_weights.dtype != torch.float32 or not hidden_states.is_contiguous():
++        return "topk weights not fp32 or hidden states not contiguous"
++    if not (w1.is_contiguous() and w2.is_contiguous()):
++        return "weights not contiguous"
++    if not hidden_states.is_cuda:
++        return "not CUDA"
++    dev = hidden_states.device
++    if not _is_sm80(dev.index if dev.index is not None
++                    else torch.cuda.current_device()):
++        return "not sm_80"
++    return None
++
++
++def maybe_apply(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                activation, global_num_experts, expert_map,
++                apply_router_weight_on_input, workspace13, workspace2) -> bool:
++    """Run the split path into ``output`` and return True, or return False
++    (nothing written) so the caller runs fused_marlin_moe."""
++    M = hidden_states.size(0)
++    if M < _min_tokens():
++        return False
++    why = gate_reason(layer, hidden_states, w1, w2, topk_weights, topk_ids,
++                      activation, global_num_experts, expert_map,
++                      apply_router_weight_on_input)
++    buf = None
++    if why is None:
++        capturing = torch.cuda.is_current_stream_capturing()
++        buf = _buffers(hidden_states.device, w1.size(0),
++                       M * topk_ids.size(1), create=not capturing)
++        if buf is None:
++            why = f"no list buffers for {M * topk_ids.size(1)} rows in capture"
++    if why is not None:
++        logger.info_once("VLLM_GLM5_PP_MARLIN_PREFILL is set but the gate is "
++                         "closed (%s); using fused_marlin_moe.", why)
++        return False
++    logger.info_once("PP Marlin MoE prefill active: split 64/48/32/16-row "
++                     "block lists for M >= %d.", _min_tokens())
++    run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
++        activation, workspace13, workspace2, buf)
++    return True
++
++
++def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
++        activation, workspace13, workspace2, buf, thread_cfg=None):
++    """Split path.  Workspaces as MarlinExperts.apply passes them to
++    fused_marlin_moe (workspace2: w13 out then w2 out; workspace13: act)."""
++    from vllm.model_executor.layers.fused_moe.utils import _resize_cache
++    from vllm.models.glm5next.nvidia.ops.moe_split_align import split_align
++    from vllm.scalar_type import scalar_types
++
++    table = THREAD_CFG if thread_cfg is None else thread_cfg
++
++    def cfg(bs, n, k):
++        c = table.get(bs)
++        if c is not None and n % c[1] == 0 and k % c[0] == 0:
++            return c
++        return (-1, -1, -1)
++
++    M, K = hidden_states.shape
++    topk = topk_ids.size(1)
++    N = w2.size(1) * 16
++    rows = M * topk
++    qt = scalar_types.uint4b8
++    workspace = layer.marlin_workspace(hidden_states.device)
++    c1 = _resize_cache(workspace2, (rows, 2 * N))
++    c3 = _resize_cache(workspace2, (rows, K))
++    c2 = _resize_cache(workspace13, (rows, N))
++
++    lists = split_align(topk_ids, w1.size(0), buf)
++    for bs, sorted_ids, expert_ids, ntpp in lists:
++        tk, tn, bps = cfg(bs, 2 * N, K)
++        ops.moe_wna16_marlin_gemm(
++            hidden_states, c1, w1, None, layer.w1_scale, None, None, None,
++            workspace, sorted_ids, expert_ids, ntpp, topk_weights,
++            moe_block_size=bs, top_k=topk, mul_topk_weights=False,
++            b_q_type=qt, size_m=M, size_n=2 * N, size_k=K,
++            use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
++            thread_k=tk, thread_n=tn, blocks_per_sm=bps)
++    layer.activation(activation, c2, c1, topk_ids=topk_ids, expert_map=None)
++    for bs, sorted_ids, expert_ids, ntpp in lists:
++        tk, tn, bps = cfg(bs, K, N)
++        ops.moe_wna16_marlin_gemm(
++            c2, c3, w2, None, layer.w2_scale, None, None, None,
++            workspace, sorted_ids, expert_ids, ntpp, topk_weights,
++            moe_block_size=bs, top_k=1, mul_topk_weights=True,
++            b_q_type=qt, size_m=rows, size_n=K, size_k=N,
++            use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False,
++            thread_k=tk, thread_n=tn, blocks_per_sm=bps)
++    layer.moe_sum(c3.view(M, topk, K), output, topk_ids, None)
++
++
++def warmup(device, num_experts: int, max_tokens: int, topk: int) -> None:
++    """Allocate list buffers and JIT the alignment kernels (before capture)."""
++    from vllm.models.glm5next.nvidia.ops.moe_split_align import split_align
++
++    device = torch.device(device)
++    if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
++        return
++    with torch.cuda.device(device):
++        buf = _buffers(device, num_experts, max_tokens * topk, create=True)
++        ids = torch.zeros(1, topk, device=device, dtype=torch.int32)
++        split_align(ids, num_experts, buf)
++        torch.cuda.synchronize(device)
++
++
++def warmup_from_worker(worker) -> int:
++    """kernel_warmup hook; returns experts warmed (0 = gate closed)."""
++    if not enabled():
++        return 0
++    device = torch.device(worker.device)
++    if device.type != "cuda" or not _is_sm80(
++            device.index if device.index is not None
++            else torch.cuda.current_device()):
++        return 0
++    model_config = worker.vllm_config.model_config
++    cfg = getattr(model_config, "hf_text_config", None) or model_config.hf_config
++    E = int(getattr(cfg, "n_routed_experts", 0) or 0)
++    topk = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
++    tp = worker.vllm_config.parallel_config.tensor_parallel_size
++    N = int(getattr(cfg, "moe_intermediate_size", 0) or 0) // max(tp, 1)
++    if E != E_GATE or topk != TOPK_GATE or N != N_GATE:
++        return 0
++    max_tokens = int(worker.scheduler_config.max_num_batched_tokens)
++    if max_tokens < _min_tokens():
++        return 0
++    warmup(device, E, max_tokens, topk)
++    return E
+diff --git a/vllm/models/glm5next/nvidia/ops/moe_split_align.py b/vllm/models/glm5next/nvidia/ops/moe_split_align.py
+new file mode 100644
+index 0000000..bd639c1
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/moe_split_align.py
+@@ -0,0 +1,230 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Split MoE block alignment for the Marlin W4A16 MoE at whole-expert prefill.
++
++Ported verbatim (kernels and cost table) from Morrowmake vllm
++`vllm/ampere_prefill/moe_split_align.py` for patch 0019.  Note: the ORDER
++paragraph below holds for the row lists (deterministic, same rows) but the
++Marlin GEMMs run on them are NOT bitwise equal to the single-list launch:
++Marlin's DP + two-tile stream-K split depends on the tile count per launch
++(see marlin_prefill_split.py, NUMERICS).
++
++``moe_align_block_size`` pads every expert's rows up to one block size, so at
++whole-expert prefill (288 experts, top-8, ~64 rows per expert at 2304 tokens)
++the last, mostly empty block of each expert costs ~1.5x the useful work.  This
++module instead sorts the routed (token, slot) rows by expert into one block
++list per size in ``SIZES`` (64, 48, 32, 16); one Marlin launch per list then
++computes every routed row exactly once.
++
++COVER.  An expert with r rows is covered by the cheapest multiset of blocks
++(sizes from ``SIZES``, total >= r) under a measured per-block cost model
++(``COST``: one Marlin m-block pass over all n-tiles of w13 plus w2, in
++microseconds at 2304 tokens on sm_80).  The table is a DP over r, built once
++per buffer set on the CPU.  Blocks are filled largest size first; only the
++last (smallest) block of an expert is padded, and a cost-optimal cover pads
++less than the smallest block it uses, so every block holds at least one valid
++row.  A list can be empty (e.g. no 64-row block at small M); the Marlin
++kernel then has no work item and returns without touching memory.
++
++ORDER.  Rows keep the stable counting-sort order (flattened token*topk+slot
++index within an expert); there are no atomics, so the lists are bitwise
++deterministic.  Padded slots hold the sentinel T = M*topk, which Marlin skips
++on read and on write.  Marlin's per-row result does not depend on the block
++a row lands in, so the output equals the single-list layout bit for bit.
++
++LAUNCHES.  Five small Triton kernels (per-chunk histogram, chunk prefix, plan,
++per-expert fill, scatter), no host sync, fixed buffers: CUDA-graph
++capturable.  Integer sizes are not specialised, so one compiled variant
++serves every M.  One buffer set is shared by every call that is handed it,
++so those calls must be serialised on one stream.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++SIZES = (64, 48, 32, 16)
++COST = {64: 33.3, 48: 26.4, 32: 20.3, 16: 14.1}
++CHUNK = 128
++
++
++@triton.jit(do_not_specialize=["T", "E"])
++def _hist_kernel(ids_ptr, hist_ptr, T, E, C: tl.constexpr, NB: tl.constexpr):
++    pid = tl.program_id(0)
++    offs = pid * C + tl.arange(0, C)
++    e = tl.load(ids_ptr + offs, mask=offs < T, other=E)
++    e = tl.where((e >= 0) & (e < E), e, E)
++    h = tl.histogram(e, NB)
++    b = tl.arange(0, NB)
++    tl.store(hist_ptr + pid * E + b, h, mask=b < E)
++
++
++@triton.jit(do_not_specialize=["nch", "E"])
++def _prefix_kernel(hist_ptr, info_ptr, nch, E, EB: tl.constexpr, CB: tl.constexpr):
++    """Exclusive prefix of the per-chunk histograms over chunks (in place), for EB
++    experts per program; totals r -> info[7*E + e]."""
++    eb = tl.program_id(0) * EB + tl.arange(0, EB)
++    em = eb < E
++    carry = tl.zeros([EB], dtype=tl.int32)
++    for c0 in range(0, nch, CB):
++        c = c0 + tl.arange(0, CB)
++        m = (c[:, None] < nch) & em[None, :]
++        ptr = hist_ptr + c[:, None] * E + eb[None, :]
++        h = tl.load(ptr, mask=m, other=0)
++        inc = tl.cumsum(h, 0)
++        tl.store(ptr, inc - h + carry[None, :], mask=m)
++        carry += tl.sum(h, 0)
++    tl.store(info_ptr + 7 * E + eb, carry, mask=em)
++
++
++@triton.jit(do_not_specialize=["E"])
++def _plan_kernel(E, tab_ptr, info_ptr, ntpp_ptr,
++                 B0: tl.constexpr, B1: tl.constexpr, B2: tl.constexpr,
++                 B3: tl.constexpr, NB: tl.constexpr):
++    """Per expert: block counts from the cover table, list offsets (prefix over
++    experts), rank boundaries; list sizes -> ntpp."""
++    b = tl.arange(0, NB)
++    em = b < E
++    r = tl.load(info_ptr + 7 * E + b, mask=em, other=0)
++    n0 = tl.load(tab_ptr + r * 4 + 0, mask=em, other=0)
++    n1 = tl.load(tab_ptr + r * 4 + 1, mask=em, other=0)
++    n2 = tl.load(tab_ptr + r * 4 + 2, mask=em, other=0)
++    n3 = tl.load(tab_ptr + r * 4 + 3, mask=em, other=0)
++    rows0 = n0 * B0
++    rows1 = n1 * B1
++    rows2 = n2 * B2
++    rows3 = n3 * B3
++    tl.store(info_ptr + 0 * E + b, tl.cumsum(rows0, 0) - rows0, mask=em)
++    tl.store(info_ptr + 1 * E + b, tl.cumsum(rows1, 0) - rows1, mask=em)
++    tl.store(info_ptr + 2 * E + b, tl.cumsum(rows2, 0) - rows2, mask=em)
++    tl.store(info_ptr + 3 * E + b, tl.cumsum(rows3, 0) - rows3, mask=em)
++    # rank boundaries: list k holds ranks [lo_k, lo_k + rows_k)
++    tl.store(info_ptr + 4 * E + b, rows0, mask=em)
++    tl.store(info_ptr + 5 * E + b, rows0 + rows1, mask=em)
++    tl.store(info_ptr + 6 * E + b, rows0 + rows1 + rows2, mask=em)
++    tl.store(ntpp_ptr + 0, tl.sum(rows0, 0))
++    tl.store(ntpp_ptr + 1, tl.sum(rows1, 0))
++    tl.store(ntpp_ptr + 2, tl.sum(rows2, 0))
++    tl.store(ntpp_ptr + 3, tl.sum(rows3, 0))
++
++
++@triton.jit
++def _fill_list(e, r, off, lo, hi, is_last, T, s_ptr, e_ptr, BS: tl.constexpr,
++               JB: tl.constexpr):
++    rows = hi - lo
++    pad = tl.where(is_last, hi - r, 0)
++    j = tl.arange(0, 64)                   # pad < BS <= 64
++    tl.store(s_ptr + off + rows - pad + j, T, mask=j < pad)
++    nblk = rows // BS
++    for j0 in range(0, nblk, JB):
++        jb = j0 + tl.arange(0, JB)
++        tl.store(e_ptr + off // BS + jb, e, mask=jb < nblk)
++
++
++@triton.jit(do_not_specialize=["E", "T"])
++def _fill_kernel(info_ptr, E, T, s0, s1, s2, s3, e0, e1, e2, e3,
++                 B0: tl.constexpr, B1: tl.constexpr, B2: tl.constexpr,
++                 B3: tl.constexpr):
++    """One program per expert: sentinel padding of its last block and its expert
++    ids. Only the last (smallest) nonempty list of an expert is padded."""
++    e = tl.program_id(0)
++    r = tl.load(info_ptr + 7 * E + e)
++    lo1 = tl.load(info_ptr + 4 * E + e)
++    lo2 = tl.load(info_ptr + 5 * E + e)
++    lo3 = tl.load(info_ptr + 6 * E + e)
++    hi3 = lo3 + (r + B3 - 1 - lo3) // B3 * B3 * (r > lo3).to(tl.int32)
++    last3 = hi3 > lo3
++    last2 = (lo3 > lo2) & ~last3
++    last1 = (lo2 > lo1) & (lo3 == lo2) & ~last3
++    last0 = (lo1 > 0) & (lo2 == lo1) & (lo3 == lo2) & ~last3
++    _fill_list(e, r, tl.load(info_ptr + e), 0, lo1, last0, T, s0, e0, B0, 64)
++    _fill_list(e, r, tl.load(info_ptr + E + e), lo1, lo2, last1, T, s1, e1, B1, 64)
++    _fill_list(e, r, tl.load(info_ptr + 2 * E + e), lo2, lo3, last2, T, s2, e2, B2,
++               64)
++    _fill_list(e, r, tl.load(info_ptr + 3 * E + e), lo3, hi3, last3, T, s3, e3, B3,
++               64)
++
++
++@triton.jit(do_not_specialize=["T", "E"])
++def _scatter_kernel(ids_ptr, hist_ptr, info_ptr, s0, s1, s2, s3, T, E,
++                    C: tl.constexpr):
++    pid = tl.program_id(0)
++    i = tl.arange(0, C)
++    offs = pid * C + i
++    valid = offs < T
++    e = tl.load(ids_ptr + offs, mask=valid, other=-1)
++    valid = valid & (e >= 0) & (e < E)
++    e = tl.where(valid, e, E + 1 + i)          # distinct dummies never match
++    eq = (e[:, None] == e[None, :]) & (i[None, :] < i[:, None])
++    rank_in = tl.sum(eq.to(tl.int32), 1)
++    es = tl.where(valid, e, 0)
++    rank = tl.load(hist_ptr + pid * E + es, mask=valid, other=0) + rank_in
++    lo1 = tl.load(info_ptr + 4 * E + es, mask=valid, other=0)
++    lo2 = tl.load(info_ptr + 5 * E + es, mask=valid, other=0)
++    lo3 = tl.load(info_ptr + 6 * E + es, mask=valid, other=0)
++    in3 = rank >= lo3
++    in2 = (rank >= lo2) & ~in3
++    in1 = (rank >= lo1) & ~in3 & ~in2
++    in0 = ~in3 & ~in2 & ~in1
++    o0 = tl.load(info_ptr + 0 * E + es, mask=valid & in0, other=0)
++    o1 = tl.load(info_ptr + 1 * E + es, mask=valid & in1, other=0)
++    o2 = tl.load(info_ptr + 2 * E + es, mask=valid & in2, other=0)
++    o3 = tl.load(info_ptr + 3 * E + es, mask=valid & in3, other=0)
++    tl.store(s0 + o0 + rank, offs, mask=valid & in0)
++    tl.store(s1 + o1 + rank - lo1, offs, mask=valid & in1)
++    tl.store(s2 + o2 + rank - lo2, offs, mask=valid & in2)
++    tl.store(s3 + o3 + rank - lo3, offs, mask=valid & in3)
++
++
++def cover_table(R: int) -> torch.Tensor:
++    """[R+1, len(SIZES)] int32 (CPU): blocks of each size in the cheapest cover
++    of r rows, for r = 0..R."""
++    best = [0.0] * (R + 1)
++    pick = [0] * (R + 1)
++    for r in range(1, R + 1):
++        c, p = min((COST[s] + best[max(r - s, 0)], s) for s in SIZES)
++        best[r], pick[r] = c, p
++    tab = [[0] * len(SIZES) for _ in range(R + 1)]
++    for r in range(1, R + 1):
++        tab[r] = list(tab[max(r - pick[r], 0)])
++        tab[r][SIZES.index(pick[r])] += 1
++    return torch.tensor(tab, dtype=torch.int32)
++
++
++def buffers(t_max: int, E: int, device: torch.device) -> dict:
++    """All scratch for ``split_align`` at up to ``t_max`` = M*topk routed rows."""
++    nch = triton.cdiv(t_max, CHUNK)
++    return {
++        "t_max": t_max,
++        "E": E,
++        "hist": torch.empty(nch * E, device=device, dtype=torch.int32),
++        "info": torch.empty(8 * E, device=device, dtype=torch.int32),
++        "tab": cover_table(t_max).to(device),
++        "s": [torch.empty(t_max + bs * E, device=device, dtype=torch.int32)
++              for bs in SIZES],
++        "e": [torch.empty((t_max + bs * E) // bs + 1, device=device,
++                          dtype=torch.int32) for bs in SIZES],
++        "ntpp": torch.empty(len(SIZES), device=device, dtype=torch.int32),
++    }
++
++
++def split_align(topk_ids: torch.Tensor, E: int, buf: dict):
++    """-> [(block_size, sorted_ids, expert_ids, ntpp_1elem)], one per size in
++    SIZES, into the fixed buffers ``buf`` (from ``buffers``)."""
++    ids = topk_ids.reshape(-1)
++    if ids.dtype != torch.int32:
++        ids = ids.to(torch.int32)
++    T = ids.numel()
++    assert 0 < T <= buf["t_max"] and E == buf["E"], "split_align buffers too small"
++    nch = triton.cdiv(T, CHUNK)
++    NB = max(triton.next_power_of_2(E + 1), 16)
++    s, e, ntpp = buf["s"], buf["e"], buf["ntpp"]
++    _hist_kernel[(nch,)](ids, buf["hist"], T, E, C=CHUNK, NB=NB)
++    B = dict(B0=SIZES[0], B1=SIZES[1], B2=SIZES[2], B3=SIZES[3])
++    _prefix_kernel[(triton.cdiv(E, 32),)](buf["hist"], buf["info"], nch, E, EB=32,
++                                          CB=64, num_warps=4)
++    _plan_kernel[(1,)](E, buf["tab"], buf["info"], ntpp, NB=NB, num_warps=4, **B)
++    _fill_kernel[(E,)](buf["info"], E, T, *s, *e, num_warps=1, **B)
++    _scatter_kernel[(nch,)](ids, buf["hist"], buf["info"], *s, T, E, C=CHUNK,
++                            num_warps=4)
++    return [(bs, s[k], e[k], ntpp[k:k + 1]) for k, bs in enumerate(SIZES)]

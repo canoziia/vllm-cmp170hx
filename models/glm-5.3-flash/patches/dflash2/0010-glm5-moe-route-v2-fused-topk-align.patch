@@ -1,0 +1,663 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: MoE route v2 (fused top-k + alignment)
+
+VLLM_GLM5_ROUTE_V2 (default 0 = unchanged), VLLM_GLM5_ROUTE_V2_GEMV
+(gate | tc, default gate). One launch does grouped top-8 and the block-8
+alignment and hands the alignment to the compiled Marlin decode; in tc mode
+it also does the gate GEMV. Gate mode is bitwise equal to the existing
+router. Any unsupported layer or a missed handoff falls back to the
+deterministic alignment or upstream.
+
+diff --git a/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py b/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
+index 2df3489..4647688 100644
+--- a/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
++++ b/vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py
+@@ -25,6 +25,19 @@ from vllm.model_executor.utils import maybe_disable_graph_partition
+ from vllm.platforms import current_platform
+ 
+ 
++_GLM5_ROUTE_V2: bool | None = None
++
++
++def _glm5_route_v2_enabled() -> bool:
++    """VLLM_GLM5_ROUTE_V2=1 (default off; read once)."""
++    global _GLM5_ROUTE_V2
++    if _GLM5_ROUTE_V2 is None:
++        import os
++
++        _GLM5_ROUTE_V2 = os.getenv("VLLM_GLM5_ROUTE_V2", "0") == "1"
++    return _GLM5_ROUTE_V2
++
++
+ def fused_grouped_topk(
+     hidden_states: torch.Tensor,
+     gating_output: torch.Tensor,
+@@ -293,6 +306,17 @@ class GroupedTopKRouter(BaseRouter):
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Compute routing using grouped top-k."""
+ 
++        if _glm5_route_v2_enabled():
++            # The fused sm_80 router already routed exactly these logits at
++            # the gate call site (VLLM_GLM5_ROUTE_V2); identity-checked.
++            from vllm.models.glm5next.nvidia.ops.route_v2_decode import (
++                take_routing,
++            )
++
++            pre = take_routing(router_logits, indices_type)
++            if pre is not None:
++                return pre
++
+         def valid_grouping() -> bool:
+             # Check if num_experts is greater than num_expert_group
+             # and is divisible by num_expert_group
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index daaff3b..45227f7 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -55,6 +55,19 @@ from vllm.utils.torch_utils import (
+ logger = init_logger(__name__)
+ 
+ 
++def _glm5_route_v2_enabled() -> bool:
++    """VLLM_GLM5_ROUTE_V2=1 (default off; read once)."""
++    global _GLM5_ROUTE_V2
++    if _GLM5_ROUTE_V2 is None:
++        import os
++
++        _GLM5_ROUTE_V2 = os.getenv("VLLM_GLM5_ROUTE_V2", "0") == "1"
++    return _GLM5_ROUTE_V2
++
++
++_GLM5_ROUTE_V2: bool | None = None
++
++
+ def register_layer_for_moe_forward_op(
+     vllm_config: VllmConfig,
+     layer: "MoERunner",
+@@ -906,7 +919,19 @@ class MoERunner(MoERunnerInterface):
+                 self._maybe_fuse_gate_weights()
+                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
+             else:
+-                router_logits, _ = self.gate(hidden_states)
++                router_logits = None
++                if _glm5_route_v2_enabled():
++                    # sm_80 decode: top-8 + Marlin block alignment fused into
++                    # one launch (VLLM_GLM5_ROUTE_V2); None = original path.
++                    from vllm.models.glm5next.nvidia.ops.route_v2_decode import (
++                        maybe_route,
++                    )
++
++                    router_logits = maybe_route(
++                        self.gate, self.router, hidden_states
++                    )
++                if router_logits is None:
++                    router_logits, _ = self.gate(hidden_states)
+ 
+         with self._sequence_parallel_context():
+             # TODO(bnell): parts of the dispatch/combine steps will go away once
+diff --git a/vllm/models/glm5next/nvidia/ops/marlin_decode.py b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+index be13012..0cb7385 100644
+--- a/vllm/models/glm5next/nvidia/ops/marlin_decode.py
++++ b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+@@ -338,7 +338,13 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
+     dev = hidden_states.device
+     ctr = _counters(dev)
+     from .router_align_decode import maybe_align
+-    aligned = maybe_align(topk_ids, E)
++    aligned = None
++    if os.getenv("VLLM_GLM5_ROUTE_V2", "0") == "1":
++        # route v2 (0013) already aligned exactly these ids, else None
++        from .route_v2_decode import take_align
++        aligned = take_align(topk_ids, E)
++    if aligned is None:
++        aligned = maybe_align(topk_ids, E)
+     if aligned is None:
+         aligned = moe_align_block_size(
+             topk_ids, BLOCK, E, None, ignore_invalid_experts=True)
+diff --git a/vllm/models/glm5next/nvidia/ops/route_v2_decode.py b/vllm/models/glm5next/nvidia/ops/route_v2_decode.py
+new file mode 100644
+index 0000000..78a30a9
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/route_v2_decode.py
+@@ -0,0 +1,541 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLM-5 MoE router v2 for sm_80 decode (VLLM_GLM5_ROUTE_V2, default off).
++
++Ported from Morrowmake vllm-cmp170hx @ 3a2bf16dae
++``vllm/ampere_decode/moe_route.py`` (``_moe_route_kernel``) and the stash/take
++handoff of ``vllm/ampere_decode/__init__.py``.  ONE launch per MoE layer
++replaces ``single_group_topk_block_kernel`` (fused_grouped_topk) and the
++separate block alignment (``moe_align_block_size`` or 00010's ``_align``);
++with ``VLLM_GLM5_ROUTE_V2_GEMV=tc`` it also replaces the gate GEMV.
++
++Modes
++  gate (default)  the gate runs exactly as before (``GateLinear``: Triton
++                  ``_bf16_gemv_kernel`` for M <= 8, cuBLAS above); the launch
++                  routes those very logits.  Expert ids, their order and the
++                  weights are meant to be BITWISE the incumbent's (same fp32
++                  keys, same tie rule, same renormalisation arithmetic).
++  tc              MM's split-K tensor-core GEMV CTAs in the same launch.  The
++                  logits differ from the incumbent's in the last bits (other
++                  reduction order), so a near-tie between the 8th and 9th
++                  expert can flip and the weights differ by ~1e-7 relative.
++
++Differences from MM (deliberate)
++  * Weights follow the incumbent CUDA kernel, not MM:
++      scale = rsf / (sum + 1e-20) (IEEE div), w = u * scale,
++      sum in the warp-butterfly order ((u0+u4)+(u2+u6))+((u1+u5)+(u3+u7)),
++      non-finite logit/bias -> key -inf, u = 0; all non-finite -> 1/topk;
++      key -0.0 normalised to +0.0.  MM computes w / (sum+1e-20) * rsf.
++  * No padding mask: ours has no MoE padding mask (padding rows are routed
++    like real rows, exactly as the incumbent does).
++  * Scratch (bitmask columns + counters) is per (device, stream); the split-K
++    partials and every output come from the caching allocator per call.
++  * Handoff checks object identity AND, where available, the tensor version
++    counter; an in-place edit of topk_ids between router and consumer would
++    therefore miss (or the editor must call ``drop``).
++  * A graph capture never compiles: a shape/mode not launched eagerly on this
++    device before uses the original path for that capture.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++
++try:
++    from triton.language.extra import libdevice
++except ImportError:  # pragma: no cover - older triton layout
++    from triton.language.extra.cuda import libdevice
++
++logger = init_logger(__name__)
++
++BLOCK = 8          # compiled Marlin decode consumes block-8 alignment only
++TOPK = 8
++MAX_TOKENS = 32
++_K = 4096
++_E_MIN, _E_MAX = 16, 512
++_INT64_MIN = tl.constexpr(-0x8000000000000000)
++
++
++# ---------------------------------------------------------------------------
++# kernels
++# ---------------------------------------------------------------------------
++@triton.jit
++def _gemv_tc_part(x_ptr, w_ptr, part_ptr, done_ptr, pid_n, pid_s,
++                  stride_xm, stride_wn,
++                  M: tl.constexpr, K: tl.constexpr, E: tl.constexpr,
++                  BLOCK_M: tl.constexpr, BLOCK_E: tl.constexpr,
++                  BLOCK_K: tl.constexpr, SPLIT: tl.constexpr):
++    """MM `_gemv_tc_part` verbatim: one split-K fp32 partial on bf16 tensor
++    cores, fresh accumulator per BLOCK_K chunk joined by add.rn, published by
++    a release increment of done_ptr."""
++    KS: tl.constexpr = K // SPLIT
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_e = pid_n * BLOCK_E + tl.arange(0, BLOCK_E)
++    offs_k = tl.arange(0, BLOCK_K)
++    mask_m = offs_m < M
++    mask_e = offs_e < E
++    x_m = tl.where(mask_m, offs_m, 0)
++    w_e = tl.where(mask_e, offs_e, 0)
++    k0 = pid_s * KS
++    x_ptrs = x_ptr + x_m[:, None] * stride_xm + (k0 + offs_k)[None, :]
++    w_ptrs = w_ptr + w_e[:, None] * stride_wn + (k0 + offs_k)[None, :]
++    acc = tl.zeros([BLOCK_M, BLOCK_E], tl.float32)
++    for i in range(KS // BLOCK_K):
++        xk = tl.load(x_ptrs, mask=mask_m[:, None], other=0.0)
++        wk = tl.load(w_ptrs)
++        d = tl.dot(xk, tl.trans(wk), out_dtype=tl.float32)
++        acc = tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r",
++                                        [acc, d], dtype=tl.float32,
++                                        is_pure=True, pack=1)
++        x_ptrs += BLOCK_K
++        w_ptrs += BLOCK_K
++    p_off = offs_m[:, None] * E + offs_e[None, :]
++    tl.store(part_ptr + pid_s * (M * E) + p_off, acc,
++             mask=mask_m[:, None] & mask_e[None, :], cache_modifier=".cg")
++    tl.debug_barrier()
++    tl.atomic_add(done_ptr, 1, sem="release", scope="gpu")
++
++
++@triton.jit
++def _ld_acquire(ptr):
++    return tl.inline_asm_elementwise(
++        "ld.acquire.gpu.global.b32 $0, [$1];", "=r,l", [ptr],
++        dtype=tl.int32, is_pure=False, pack=1)
++
++
++@triton.jit
++def _finite(v):
++    return (v == v) & (tl.abs(v) < float("inf"))
++
++
++@triton.jit
++def _sigmoid(x):
++    # the incumbent's sigmoid_accurate: 0.5f * tanhf(0.5f * x) + 0.5f
++    return 0.5 * libdevice.tanh(0.5 * x) + 0.5
++
++
++@triton.jit
++def _keys(logits_ptr, bias_ptr, row, stride_lm, e0,
++          E: tl.constexpr, EW: tl.constexpr):
++    """[1, EW] packed (monotone(key) << 32 | E-1-e) for experts [e0, e0+EW).
++
++    key = sigmoid(x) + bias, the incumbent's preprocess_score: non-finite
++    logit or bias -> -inf, -0.0 -> +0.0.  Lanes past E -> INT64_MIN (never
++    selected; also guards the negative low word E-1-e).
++    """
++    offs_e = e0 + tl.arange(0, EW)
++    valid_e = offs_e < E
++    b = tl.load(bias_ptr + offs_e, mask=valid_e, other=0.0).to(tl.float32)
++    x = tl.load(logits_ptr + row * stride_lm + offs_e, mask=valid_e,
++                other=0.0).to(tl.float32)
++    key = _sigmoid(x) + b
++    key = tl.where(key == 0.0, 0.0, key)
++    key = tl.where(_finite(x) & _finite(b), key, float("-inf"))
++    b32 = key.to(tl.int32, bitcast=True)
++    mono = b32 ^ ((b32 >> 31) & 0x7FFFFFFF)
++    packed = (mono.to(tl.int64) << 32) | (E - 1 - offs_e).to(tl.int64)
++    packed = tl.where(valid_e, packed, tl.full([EW], _INT64_MIN, tl.int64))
++    return tl.reshape(packed, [1, EW])
++
++
++@triton.jit
++def _route_row(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, row,
++               stride_lm, rsf,
++               E: tl.constexpr, EA: tl.constexpr, EB: tl.constexpr,
++               RENORM: tl.constexpr):
++    """Top-8 of one row; stores ids (descending key, lower index on ties)
++    and weights with the incumbent's arithmetic.  Returns ids [1, 8]."""
++    pa = _keys(logits_ptr, bias_ptr, row, stride_lm, 0, E, EA)
++    if EB > 0:
++        pb = _keys(logits_ptr, bias_ptr, row, stride_lm, EA, E, EB)
++    ta = tl.topk(pa, 8)
++    if EB > 0:
++        tb = tl.topk(pb, 8)
++        top = tl.topk(tl.reshape(tl.join(ta, tb), [1, 16]), 8)
++    else:
++        top = ta
++    sel = (E - 1 - (top & 0xFFFFFFFF)).to(tl.int32)          # [1, 8]
++    xg = tl.load(logits_ptr + row * stride_lm + sel).to(tl.float32)
++    bg = tl.load(bias_ptr + sel).to(tl.float32)
++    fin = _finite(xg) & _finite(bg)
++    u = tl.where(fin, _sigmoid(xg), 0.0)
++    # cg::reduce(plus) over a warp = xor butterfly 16,8,4,2,1; lanes >= 8 are
++    # +0, so lane sums are ((u0+u4)+(u2+u6)) + ((u1+u5)+(u3+u7)).
++    s4 = tl.sum(tl.reshape(u, [1, 2, 4]), axis=1)
++    s2 = tl.sum(tl.reshape(s4, [1, 2, 2]), axis=1)
++    s1 = tl.sum(s2, axis=1)                                   # [1]
++    rs = tl.full([1], 0.0, tl.float32) + rsf
++    if RENORM:
++        scale = libdevice.div_rn(rs, s1 + 1e-20)
++    else:
++        scale = rs
++    w = tl.where(fin, u * scale[:, None], 0.0)
++    if RENORM:
++        anyf = tl.max(fin.to(tl.int32), axis=1) > 0
++        w = tl.where(anyf[:, None], w, 0.125)
++    offs_k = tl.arange(0, 8)
++    tl.store(topk_ids_ptr + row * 8 + offs_k[None, :], sel)
++    tl.store(topk_w_ptr + row * 8 + offs_k[None, :], w)
++    return sel
++
++
++@triton.jit
++def _route_v2_kernel(
++    x_ptr, w_ptr, logits_ptr, part_ptr, bias_ptr,
++    topk_w_ptr, topk_ids_ptr, sorted_ptr, eids_ptr, ntpp_ptr,
++    col_ptr, arrive_ptr,
++    stride_xm, stride_wn, stride_lm, rsf,
++    M: tl.constexpr, K: tl.constexpr, E: tl.constexpr, BS: tl.constexpr,
++    MNP: tl.constexpr, NBLK: tl.constexpr,
++    HAS_GEMV: tl.constexpr, GBM: tl.constexpr, GBE: tl.constexpr,
++    GBK: tl.constexpr, SPLIT: tl.constexpr,
++    BLOCK_E: tl.constexpr, BLOCK_N: tl.constexpr, FILL_P: tl.constexpr,
++    EA: tl.constexpr, EB: tl.constexpr, RENORM: tl.constexpr,
++    BLOCK_J: tl.constexpr,
++):
++    """grid (NGEMV + M,).  CTAs [0, NGEMV) GEMV partials (HAS_GEMV only);
++    the last M CTAs route one row each; the last routing CTA to arrive builds
++    the block alignment from per-(row-group, expert) bitmask columns (MM
++    `_route_align_rows`).  The routing CTAs only wait on GEMV CTAs, which wait
++    on nothing, so the spin cannot deadlock (<= 32 waiting CTAs)."""
++    NUMEL: tl.constexpr = M * 8
++    NG: tl.constexpr = (M + 31) // 32
++    NT: tl.constexpr = (E + GBE - 1) // GBE
++    NGEMV: tl.constexpr = NT * SPLIT if HAS_GEMV else 0
++    pid = tl.program_id(0)
++    if HAS_GEMV:
++        if pid < NGEMV:
++            _gemv_tc_part(x_ptr, w_ptr, part_ptr, arrive_ptr + 1,
++                          pid % NT, pid // NT, stride_xm, stride_wn,
++                          M, K, E, GBM, GBE, GBK, SPLIT)
++    if pid >= NGEMV:
++        row = pid - NGEMV
++        offs_e = tl.arange(0, BLOCK_E)
++        valid_e = offs_e < E
++        if HAS_GEMV:
++            done = _ld_acquire(arrive_ptr + 1)
++            while done < NGEMV:
++                done = _ld_acquire(arrive_ptr + 1)
++            tl.debug_barrier()
++            tot = tl.zeros([BLOCK_E], tl.float32)
++            for s in tl.static_range(SPLIT):
++                tot += tl.load(part_ptr + s * (M * E) + row * E + offs_e,
++                               mask=valid_e, other=0.0, cache_modifier=".cg")
++            tl.store(logits_ptr + row * stride_lm + offs_e, tot, mask=valid_e)
++            tl.debug_barrier()
++        sel = _route_row(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, row,
++                         stride_lm, rsf, E, EA, EB, RENORM)
++        # sentinel fill of this CTA's slice
++        p = row * FILL_P + tl.arange(0, FILL_P)
++        tl.store(sorted_ptr + p, tl.full([FILL_P], NUMEL, tl.int32),
++                 mask=p < MNP)
++        tl.store(eids_ptr + p, tl.full([FILL_P], -1, tl.int32), mask=p < NBLK)
++        bits = tl.full([1, 8], 1, tl.int32) << (row % 32)
++        tl.atomic_or(col_ptr + (row // 32) * E + sel, bits,
++                     sem="relaxed", scope="gpu")
++        tl.debug_barrier()
++        arrived = tl.atomic_add(arrive_ptr, 1, sem="acq_rel", scope="gpu")
++        if arrived == M - 1:
++            i = tl.arange(0, BLOCK_N)
++            vi = i < NUMEL
++            e = tl.load(topk_ids_ptr + i, mask=vi, other=0,
++                        cache_modifier=".cg")
++            m = i // 8
++            low = (tl.full([BLOCK_N], 1, tl.int32) << (m % 32)) - 1
++            cnt = tl.zeros([BLOCK_E], tl.int32)
++            rank = tl.zeros([BLOCK_N], tl.int32)
++            for g in tl.static_range(NG):
++                wv = tl.load(col_ptr + g * E + offs_e, mask=valid_e, other=0,
++                             cache_modifier=".cg")
++                cnt += libdevice.popc(wv)
++                wg = tl.gather(wv, e, 0)
++                wg = tl.where(g < m // 32, wg,
++                              tl.where(g == m // 32, wg & low, 0))
++                rank += libdevice.popc(wg)
++            padded = tl.where(valid_e, ((cnt + BS - 1) // BS) * BS, 0)
++            excl = tl.cumsum(padded, axis=0) - padded
++            tl.store(ntpp_ptr, tl.sum(padded))
++            nblk_e = padded // BS
++            blk0 = excl // BS
++            jj = tl.arange(0, BLOCK_J)
++            tl.store(eids_ptr + blk0[:, None] + jj[None, :],
++                     offs_e.to(tl.int32)[:, None]
++                     + tl.zeros([BLOCK_E, BLOCK_J], tl.int32),
++                     mask=valid_e[:, None] & (jj[None, :] < nblk_e[:, None]))
++            ex = tl.gather(excl, e, 0)
++            tl.store(sorted_ptr + ex + rank, i.to(tl.int32), mask=vi)
++            tl.debug_barrier()
++            for g in tl.static_range(NG):
++                tl.store(col_ptr + g * E + offs_e,
++                         tl.zeros([BLOCK_E], tl.int32), mask=valid_e)
++            tl.store(arrive_ptr + 1, 0)
++            tl.store(arrive_ptr, 0)
++
++
++# ---------------------------------------------------------------------------
++# host side
++# ---------------------------------------------------------------------------
++def _p2(n: int) -> int:
++    return 1 << max(0, int(n) - 1).bit_length()
++
++
++def align_sizes(numel: int, num_experts: int, block: int = BLOCK):
++    """moe_align_block_size's host sizes (MM align_sizes)."""
++    mnp = numel + num_experts * (block - 1)
++    if numel < num_experts:
++        mnp = min(numel * block, mnp)
++    return mnp, -(-mnp // block)
++
++
++_SCRATCH: dict = {}
++_WARM: set = set()
++_STATS = {"launch": 0, "routing_hit": 0, "routing_miss": 0,
++          "align_hit": 0, "align_miss": 0, "capture_fallback": 0}
++
++
++def _scratch(device: torch.device, stream: int, E: int):
++    """(col [2*E] i32, arrive [2] i32): zero on entry, zero on exit of every
++    launch.  Per (device, stream, E): two streams never share counters.
++    Allocated on first use; under capture the zero-fill is captured too."""
++    key = (device.index, stream, E)
++    s = _SCRATCH.get(key)
++    if s is None:
++        s = (torch.zeros(2 * E, dtype=torch.int32, device=device),
++             torch.zeros(2, dtype=torch.int32, device=device))
++        _SCRATCH[key] = s
++    return s
++
++
++def mode() -> str:
++    m = os.getenv("VLLM_GLM5_ROUTE_V2_GEMV", "gate").strip().lower()
++    if m not in ("gate", "tc"):
++        raise ValueError(f"VLLM_GLM5_ROUTE_V2_GEMV={m!r}: expected gate|tc")
++    return m
++
++
++def route_v2(bias: torch.Tensor, *, logits: torch.Tensor | None = None,
++             x: torch.Tensor | None = None, weight: torch.Tensor | None = None,
++             renormalize: bool = True, routed_scaling_factor: float = 1.0):
++    """One launch.  Exactly one of ``logits`` (gate mode) or ``x``+``weight``
++    (tc mode).  Returns (logits, topk_w, topk_ids, sorted_ids, expert_ids,
++    num_tokens_post_pad); alignment block 8, sentinel numel, tail -1.
++
++    No validation beyond asserts; callers use :func:`maybe_route`.
++    """
++    has_gemv = logits is None
++    if has_gemv:
++        M, K = x.shape
++        E = weight.shape[0]
++        dev = x.device
++        logits = torch.empty((M, E), dtype=torch.float32, device=dev)
++    else:
++        M, E = logits.shape
++        K = _K
++        dev = logits.device
++        assert logits.dtype == torch.float32 and logits.stride(1) == 1
++    assert 1 <= M <= MAX_TOKENS and _E_MIN <= E <= _E_MAX
++    numel = M * TOPK
++    mnp, nblk = align_sizes(numel, E)
++    topk_w = torch.empty((M, TOPK), dtype=torch.float32, device=dev)
++    topk_ids = torch.empty((M, TOPK), dtype=torch.int32, device=dev)
++    sorted_ids = torch.empty((mnp,), dtype=torch.int32, device=dev)
++    expert_ids = torch.empty((nblk,), dtype=torch.int32, device=dev)
++    ntpp = torch.empty((1,), dtype=torch.int32, device=dev)
++    col, arrive = _scratch(dev, torch.cuda.current_stream(dev).cuda_stream, E)
++
++    ea = max(16, _p2(E) // 2)
++    if ea >= E:
++        ea, eb = max(16, _p2(E)), 0
++    else:
++        eb = max(16, _p2(E - ea))
++    gbm, gbe, gbk, split = max(16, _p2(M)), 32, 128, 8
++    if has_gemv:
++        assert K % (gbk * split) == 0
++        part = torch.empty(split * M * E, dtype=torch.float32, device=dev)
++        ngemv = triton.cdiv(E, gbe) * split
++        xs, ws = x.stride(0), weight.stride(0)
++    else:
++        part, x, weight, ngemv, xs, ws = logits, logits, logits, 0, 0, 0
++    _route_v2_kernel[(ngemv + M,)](
++        x, weight, logits, part, bias,
++        topk_w, topk_ids, sorted_ids, expert_ids, ntpp, col, arrive,
++        xs, ws, logits.stride(0), float(routed_scaling_factor),
++        M=M, K=K, E=E, BS=BLOCK, MNP=mnp, NBLK=nblk,
++        HAS_GEMV=has_gemv, GBM=gbm, GBE=gbe, GBK=gbk, SPLIT=split,
++        BLOCK_E=max(64, _p2(E)), BLOCK_N=max(16, _p2(numel)),
++        FILL_P=_p2(triton.cdiv(max(mnp, nblk), M)),
++        EA=ea, EB=eb, RENORM=bool(renormalize),
++        BLOCK_J=_p2(triton.cdiv(M, BLOCK)),
++        num_warps=4, num_stages=3)
++    _STATS["launch"] += 1
++    return logits, topk_w, topk_ids, sorted_ids, expert_ids, ntpp
++
++
++# ---------------------------------------------------------------------------
++# gate / handoff
++# ---------------------------------------------------------------------------
++_ENABLED: bool | None = None
++_PENDING_ROUTING: tuple | None = None
++_PENDING_ALIGN: tuple | None = None
++_ANNOUNCED = False
++
++
++def enabled() -> bool:
++    global _ENABLED
++    if _ENABLED is None:
++        _ENABLED = os.getenv("VLLM_GLM5_ROUTE_V2", "0") == "1"
++    return _ENABLED
++
++
++def _version(t: torch.Tensor):
++    try:
++        return t._version
++    except Exception:  # inference tensors carry no version counter
++        return None
++
++
++def reason(gate, router, x: torch.Tensor) -> str | None:
++    """None if this gate call may take route v2 (host-side, static per shape)."""
++    import vllm.envs as envs
++    from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
++        GroupedTopKRouter,
++    )
++
++    if not getattr(envs, "VLLM_GLM5_MARLIN_DECODE_CUDA", False):
++        return "compiled Marlin decode (0006) is off: nobody consumes the alignment"
++    from .marlin_decode import _is_sm80, regime_tokens
++
++    M = x.shape[0] if x.dim() == 2 else -1
++    if M not in regime_tokens() or M > MAX_TOKENS:
++        return f"M={M} outside the compiled Marlin token regime"
++    if type(router) is not GroupedTopKRouter:
++        return f"router {type(router).__name__} is not GroupedTopKRouter"
++    if not envs.VLLM_USE_FUSED_MOE_GROUPED_TOPK:
++        return "VLLM_USE_FUSED_MOE_GROUPED_TOPK=0 (torch grouped_topk semantics)"
++    from vllm._aiter_ops import rocm_aiter_ops
++    if rocm_aiter_ops.is_fused_moe_enabled():
++        return "ROCm aiter"
++    if router.scoring_func != "sigmoid":
++        return "scoring is not sigmoid"
++    if router.num_expert_group != 1 or router.topk_group != 1:
++        return "expert groups != 1"
++    if router.top_k != TOPK:
++        return f"top_k {router.top_k} != {TOPK}"
++    if getattr(router, "num_fused_shared_experts", 0):
++        return "fused shared experts"
++    if router.eplb_state is not None:
++        return "EPLB"
++    bias = router.e_score_correction_bias
++    w = getattr(gate, "weight", None)
++    if w is None or w.dim() != 2:
++        return "no 2-D gate weight"
++    E = w.shape[0]
++    if (bias is None or bias.dtype != torch.float32
++            or tuple(bias.shape) != (E,) or not bias.is_contiguous()):
++        return "correction bias is not fp32 [E] contiguous"
++    if not _E_MIN <= E <= _E_MAX or router.global_num_experts != E:
++        return f"num_experts {E}"
++    if (w.dtype != torch.bfloat16 or w.shape[1] != _K
++            or not w.is_contiguous()):
++        return "gate weight is not contiguous bf16 [E, 4096]"
++    if getattr(gate, "bias", None) is not None:
++        return "gate bias"
++    if getattr(gate, "out_dtype", None) != torch.float32:
++        return "gate out_dtype is not fp32"
++    if (not x.is_cuda or x.dtype != torch.bfloat16 or x.shape[1] != _K
++            or not x.is_contiguous() or x.device != w.device):
++        return "activations are not contiguous bf16 [M, 4096] on the gate device"
++    index = x.device.index if x.device.index is not None else torch.cuda.current_device()
++    if not _is_sm80(index):
++        return "not sm_80"
++    return None
++
++
++def maybe_route(gate, router, x: torch.Tensor):
++    """At the MoE runner's gate call site.  Returns router logits (and stashes
++    the routing + alignment for the router and the compiled Marlin), or None:
++    the caller then runs the gate exactly as before."""
++    global _PENDING_ROUTING, _PENDING_ALIGN, _ANNOUNCED
++    why = reason(gate, router, x)
++    if why is not None:
++        logger.debug_once("VLLM_GLM5_ROUTE_V2 not used: %s", why)
++        return None
++    m = mode()
++    E = gate.weight.shape[0]
++    key = (x.device.index, x.shape[0], E, m, bool(router.renormalize))
++    if torch.cuda.is_current_stream_capturing() and key not in _WARM:
++        _STATS["capture_fallback"] += 1
++        logger.warning_once(
++            "VLLM_GLM5_ROUTE_V2: %s not launched eagerly before CUDA-graph "
++            "capture; this graph keeps the original router.", key)
++        return None
++    bias = router.e_score_correction_bias.data
++    rsf = float(router.routed_scaling_factor)
++    if m == "tc":
++        out = route_v2(bias, x=x, weight=gate.weight, renormalize=router.renormalize,
++                       routed_scaling_factor=rsf)
++    else:
++        logits, _ = gate(x)
++        if (logits.dtype != torch.float32 or tuple(logits.shape) != (x.shape[0], E)
++                or logits.stride(1) != 1):
++            return logits  # unexpected gate output: route it the normal way
++        out = route_v2(bias, logits=logits, renormalize=router.renormalize,
++                       routed_scaling_factor=rsf)
++    _WARM.add(key)
++    logits, topk_w, topk_ids, sorted_ids, expert_ids, ntpp = out
++    _PENDING_ROUTING = (logits, topk_w, topk_ids)
++    _PENDING_ALIGN = (topk_ids, E, (sorted_ids, expert_ids, ntpp),
++                      _version(topk_ids))
++    if not _ANNOUNCED:
++        _ANNOUNCED = True
++        logger.info("VLLM_GLM5_ROUTE_V2 active: mode=%s (gate GEMV %s), fused "
++                    "top-8 + block-8 alignment, one launch per MoE layer",
++                    m, "fused tensor-core" if m == "tc" else "unchanged")
++    return logits
++
++
++def take_routing(router_logits: torch.Tensor, indices_type):
++    """(topk_weights, topk_ids) computed from exactly these logits, or None."""
++    global _PENDING_ROUTING, _PENDING_ALIGN
++    p = _PENDING_ROUTING
++    if p is None:
++        return None
++    _PENDING_ROUTING = None
++    if p[0] is not router_logits or indices_type not in (None, torch.int32):
++        _PENDING_ALIGN = None
++        _STATS["routing_miss"] += 1
++        return None
++    _STATS["routing_hit"] += 1
++    return p[1], p[2]
++
++
++def take_align(topk_ids: torch.Tensor, num_experts: int):
++    """The fused alignment for exactly this ``topk_ids`` (identity, expert
++    count and, if tracked, unchanged version), else None.  Always clears."""
++    global _PENDING_ALIGN
++    p = _PENDING_ALIGN
++    if p is None:
++        return None
++    _PENDING_ALIGN = None
++    ids, E, aligned, ver = p
++    if ids is not topk_ids or E != int(num_experts) or ver != _version(topk_ids):
++        _STATS["align_miss"] += 1
++        return None
++    _STATS["align_hit"] += 1
++    return aligned
++
++
++def drop(topk_ids: torch.Tensor | None = None) -> None:
++    """Forget the stashed alignment (call after editing topk_ids in place)."""
++    global _PENDING_ALIGN
++    if topk_ids is None or (_PENDING_ALIGN is not None
++                            and _PENDING_ALIGN[0] is topk_ids):
++        _PENDING_ALIGN = None
++
++
++def stats() -> dict:
++    return dict(_STATS)
