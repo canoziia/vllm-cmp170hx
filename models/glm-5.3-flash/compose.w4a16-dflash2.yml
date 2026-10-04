@@ -1,0 +1,116 @@
+# GLM-5.3-Flash W4A16 + DFlash2, PP4 on four CMP 170HX GPUs (single engine).
+# Image: scripts/build-glm53-dflash2-image.sh. Nothing from the host source tree
+# is mounted; the compiled Marlin decode library is inside the image
+# (vllm._ampere_marlin_C).
+#
+# The DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) is CC BY-NC-ND 4.0:
+# non-commercial testing only.
+#
+# .env (ignored) next to this file:
+#   VLLM_API_KEY=...                     (required)
+#   GLM_DFLASH2_CACHE=/root/app/vllm/cache/glm53f-w4a16-dflash2   (required)
+#   GLM_GPU_0..GLM_GPU_3                 default 5,6,7,8 (test GPUs);
+#                                        production prefill runs on 1,2,3,4
+#   GLM_PORT                             default 8303
+# Start: podman compose -f compose.w4a16-dflash2.yml up -d
+services:
+  glm-5.3-flash-w4a16-dflash2:
+    image: ${GLM_DFLASH2_IMAGE:-localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2}
+    container_name: ${GLM_CONTAINER_NAME:-glm-5.3-flash-w4a16-dflash2}
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${GLM_GPU_0:-5}
+      - nvidia.com/gpu=${GLM_GPU_1:-6}
+      - nvidia.com/gpu=${GLM_GPU_2:-7}
+      - nvidia.com/gpu=${GLM_GPU_3:-8}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      # target (canada-quant/GLM-5.3-Flash-W4A16-MTP@5723f4d0) and drafter
+      # (incoai/GLM-5.3-Flash-DFlash2@bf582e4e), both read-only
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP:/root/app/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - /root/app/models/GLM-5.3-Flash-DFlash2:/root/app/models/GLM-5.3-Flash-DFlash2:ro
+      # vLLM compile cache, Triton/Gluon and Inductor caches, tmp
+      - ${GLM_DFLASH2_CACHE:?set GLM_DFLASH2_CACHE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      # 45 layers; the last stage also holds the drafter, lm_head and the second
+      # embed table. 12,12,12,9: c8 about +10%, KV pool 1.68M -> 1.24M tokens.
+      VLLM_PP_LAYER_PARTITION: ${GLM_PP_LAYER_PARTITION:-13,11,11,10}
+      VLLM_PP_DECODE_COHORT_BALANCE: "1"
+      # dflash2/0001: drafter aux = mean of the mHC streams (default anyway)
+      VLLM_GLM5_AUX_HIDDEN_TENSOR: stream_mean
+      # dflash2/0004: verify up to 7 at 1 request, 5 at 2, 3 (=num_speculative_tokens) beyond
+      VLLM_GLM5_DFLASH_ADAPTIVE_K: "1"
+      VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: "7,5"
+      # Load-only depth choice (7 at one request, 5 at two, 3 otherwise); this is
+      # the setting all published numbers were measured with.
+      VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: "0"
+      # dflash2/0005 thin GEMM, 0006 compiled Marlin decode (orig variant)
+      VLLM_GLM5_THIN_GEMM: "1"
+      VLLM_GLM5_MARLIN_DECODE_CUDA: "1"
+      VLLM_GLM5_MARLIN_DECODE_VARIANT: orig
+      # dflash2/0007 fused grouped conv
+      VLLM_DFLASH2_FUSED_GROUPED_CONV: "1"
+      # dflash2/0008 deterministic alignment (route v2 fallback), 0010 route v2 (gate mode)
+      VLLM_GLM5_ROUTER_ALIGN_DECODE: "1"
+      VLLM_GLM5_ROUTE_V2: "1"
+      VLLM_GLM5_ROUTE_V2_GEMV: gate
+      # dflash2/0009 sparse MLA decode schedule
+      VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL: "1"
+      # dflash2/0011 indexer gather clamp + 128 MiB logits budget (KV pool +25%)
+      VLLM_GLM5_INDEXER_GATHER_CLAMP: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      # dflash2/0012-0014 PP prefill kernels
+      VLLM_GLM5_PP_SPARSE_MLA_PREFILL: "1"
+      VLLM_GLM5_PP_MARLIN_PREFILL: "1"
+      VLLM_GLM5_PP_KDA_PREFILL: "1"
+      # dflash2/0015 indexer JIT warmup is on by default
+      # dflash2/0016 drafter fc fold
+      VLLM_GLM5_PP_FOLD_DRAFT_FC: "1"
+    command:
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP
+      - --host=0.0.0.0
+      - --port=${GLM_PORT:-8303}
+      - --served-model-name=${GLM_SERVED_MODEL_NAME:-glm-5.3-flash}
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --enable-prompt-tokens-details
+      - '--speculative-config={"method":"dflash","model":"/root/app/models/GLM-5.3-Flash-DFlash2","num_speculative_tokens":3}'
+      # required by dflash2/0003 (multiple of 256; 4480 does not work)
+      - --block-size=4608
+      - --max-model-len=${GLM_MAX_MODEL_LEN:-262144}
+      - --max-num-seqs=${GLM_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=2312
+      - --long-prefill-token-threshold=0
+      - --gpu-memory-utilization=0.95
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - --enable-prefix-caching
+      - --mamba-cache-mode=align
+      - --enable-auto-tool-choice
+      - --tool-call-parser=glm47
+      - --reasoning-parser=${GLM_REASONING_PARSER:-glm47}
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:${GLM_PORT:-8303}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3

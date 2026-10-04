@@ -1,0 +1,182 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: pre-compile the kpool indexer prefill kernels
+
+VLLM_GLM5_INDEXER_JIT_WARMUP (default 1; 0 disables). At boot, compile every
+Triton specialization the kpool indexer prefill reaches
+(_fp8_mqa_logits_kernel KV_GROUP x N%16 classes, and the prefill chunk
+metadata kernel's JIT keys), removing ~6 s mid-request JIT stalls at the
+first long-context chunk after a cold start. Compile-only; outputs are
+bit-identical.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 413a1cd..8c3a4e1 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -58,6 +58,7 @@ if TYPE_CHECKING:
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
+     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = False
++    VLLM_GLM5_INDEXER_JIT_WARMUP: bool = True
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL_MIN_TOKENS: int = 384
+     VLLM_GLM5_PP_KDA_PREFILL: bool = False
+@@ -981,6 +982,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
+         int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "0"))
+     ),
++    # Pre-compile, at model construction, every Triton specialization the
++    # GLM5Next kpool indexer prefill reaches (MQA-logits KV_GROUP x N % 16, and
++    # the prefill-chunk metadata kernel's query-slice classes) instead of
++    # JIT-compiling them mid-request at long context. Compile-only: no kernel
++    # or argument changes, outputs bit-identical. Default on; 0 disables.
++    "VLLM_GLM5_INDEXER_JIT_WARMUP": lambda: bool(
++        int(os.getenv("VLLM_GLM5_INDEXER_JIT_WARMUP", "1"))
++    ),
+     # Sparse-MLA prefill with all 64 heads on one card (PP, TP=1): Gluon kernel
+     # ported from Morrowmake (glm5next/nvidia/ops/sparse_prefill_mla_pp.py) that
+     # gathers each selected cache row once for all heads and skips invalid
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index 210041b..4701b62 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -967,6 +967,31 @@ def sparse_attn_indexer_kpool(
+     return topk_indices_buffer
+ 
+ 
++_PREFILL_LOGITS_WARMED: set[tuple[int, int, str]] = set()
++
++
++def _warmup_prefill_logits_once(
++    num_heads: int, head_dim: int, device: torch.device
++) -> None:
++    # One indexer per layer constructs this op; compile once per process.
++    key = (num_heads, head_dim, str(device))
++    if key in _PREFILL_LOGITS_WARMED:
++        return
++    from vllm.v1.attention.ops.mqa_logits_triton import (
++        warmup_fp8_mqa_logits_triton_all_variants,
++    )
++
++    n = warmup_fp8_mqa_logits_triton_all_variants(num_heads, head_dim, device)
++    _PREFILL_LOGITS_WARMED.add(key)
++    logger.info_once(
++        "kpool indexer: pre-compiled %d prefill MQA-logits specializations "
++        "(num_heads=%d, head_dim=%d).",
++        n,
++        num_heads,
++        head_dim,
++    )
++
++
+ @CustomOp.register("sparse_attn_indexer_kpool")
+ class SparseAttnIndexerKpool(CustomOp):
+     """Sparse Attention Indexer Custom Op Layer. This layer is extracted as a
+@@ -993,6 +1018,7 @@ class SparseAttnIndexerKpool(CustomOp):
+         skip_k_cache_insert: bool = False,
+         use_fp4_cache: bool = False,
+         tail_cache=None,
++        num_heads: int | None = None,
+     ):
+         super().__init__()
+         self.k_cache = k_cache
+@@ -1024,6 +1050,15 @@ class SparseAttnIndexerKpool(CustomOp):
+                 "Sparse Attention Indexer: DeepGEMM unavailable on this GPU; "
+                 "using the Triton fp8 MQA-logits fallback."
+             )
++            # Compile every prefill-logits specialization now (patch 0022).
++            # Here, not in a warmup hook: the autotuner's synchronizing
++            # benchmark is illegal under cudagraph capture, which memory
++            # profiling runs before any hook (same reason as the upstream
++            # SparseAttnIndexer.__init__). Compile-only, output-neutral.
++            if envs.VLLM_GLM5_INDEXER_JIT_WARMUP and num_heads is not None:
++                _warmup_prefill_logits_once(
++                    num_heads, head_dim, topk_indices_buffer.device
++                )
+ 
+     def forward_native(
+         self,
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index c19a39b..0780843 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -370,7 +370,24 @@ class Indexer(nn.Module):
+             self.max_total_seq_len,
+             self.topk_indices_buffer,
+             tail_cache=self.tail_cache,
++            # Heads as the logits kernel sees them (padded to >= 32 in
++            # forward); used only to pre-compile its specializations.
++            num_heads=max(self.n_head, 32),
+         )
++        # The indexer prefill-chunk metadata kernel specializes on
++        # query_slice_start/stop (== 1 / % 16 classes). Sub-chunking under the
++        # logits budget makes new classes appear only at long context, so warm
++        # them at boot like DeepSeek-V4 does (deepseek_v4/attention.py).
++        # Compile-only; patch 0022.
++        if (
++            vllm_config.kernel_config.enable_jit_warmup
++            and envs.VLLM_GLM5_INDEXER_JIT_WARMUP
++        ):
++            from vllm.v1.attention.backends.mla.indexer import (
++                _BUILD_PREFILL_CHUNK_METADATA_KERNEL,
++            )
++
++            _BUILD_PREFILL_CHUNK_METADATA_KERNEL.register_warmup()
+ 
+     def forward(
+         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 094d4ee..f3b7385 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -654,6 +654,51 @@ def warmup_fp8_mqa_logits_triton(
+         )
+ 
+ 
++# Integer kernel arguments are specialized by Triton on value: == 1 and
++# % 16 == 0 each get their own binary. In `_fp8_mqa_logits_kernel` that is `N`
++# and `stride_l_m` (== N for the contiguous logits buffer), so one KV_GROUP
++# value needs one binary for a 16-divisible N and one for any other N. The N
++# offsets below pick one representative of each class; == 1 cannot occur (a
++# prefill that short takes the short-prefill path and never gets here).
++_PREFILL_WARMUP_N_CLASSES = (0, 1)
++
++
++def warmup_fp8_mqa_logits_triton_all_variants(
++    num_heads: int,
++    head_dim: int,
++    device: torch.device,
++) -> int:
++    """Compile every specialization serving can reach, at tiny shapes.
++
++    `warmup_fp8_mqa_logits_triton` covers only 16-divisible N, so the first
++    chunk whose gathered length N is not a multiple of 16 (a ragged final
++    chunk), and on SM80 the first chunk with N >= _KV_GROUP_MIN_N
++    (KV_GROUP=8), each JIT-compiled in the middle of a request. This adds the
++    missing classes: KV_GROUP in {1, 8 on SM80} x N % 16 in {0, != 0}.
++    Compilation only: the kernels and their arguments are unchanged, so the
++    serving outputs are bit-identical. Returns the number of shapes launched.
++    """
++    # Runs the autotune sweep once at the upstream warmup shape (key is
++    # (num_heads, head_dim); later launches reuse the cached config).
++    warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
++    launched = 0
++    groups = [(1, _PREFILL_WARMUP_N)]
++    if _IS_SM80:
++        groups.append((_KV_GROUP, _KV_GROUP_MIN_N))
++    for kv_group, base_n in groups:
++        for extra in _PREFILL_WARMUP_N_CLASSES:
++            _warmup_fp8_mqa_logits_shape(
++                num_heads,
++                head_dim,
++                _PREFILL_WARMUP_M,
++                base_n + extra,
++                device,
++                kv_group_override=kv_group,
++            )
++            launched += 1
++    return launched
++
++
+ def _warmup_fp8_mqa_logits_shape(
+     num_heads: int,
+     head_dim: int,

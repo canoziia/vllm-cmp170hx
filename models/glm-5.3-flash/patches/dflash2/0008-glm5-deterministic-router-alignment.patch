@@ -1,0 +1,109 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: deterministic small-M MoE block alignment
+
+VLLM_GLM5_ROUTER_ALIGN_DECODE (default 0 = unchanged). A single-CTA Triton
+alignment for the compiled Marlin decode path (block 8, experts ascending,
+lanes in row order), replacing the atomic-ranked moe_align_block_size so the
+block layout is deterministic. Also the fallback of the route v2 handoff
+(next patches).
+
+diff --git a/vllm/models/glm5next/nvidia/ops/marlin_decode.py b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+index 3eefb7a..be13012 100644
+--- a/vllm/models/glm5next/nvidia/ops/marlin_decode.py
++++ b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+@@ -337,8 +337,12 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
+     slots = M * topk
+     dev = hidden_states.device
+     ctr = _counters(dev)
+-    sorted_ids, expert_ids, ntpp = moe_align_block_size(
+-        topk_ids, BLOCK, E, None, ignore_invalid_experts=True)
++    from .router_align_decode import maybe_align
++    aligned = maybe_align(topk_ids, E)
++    if aligned is None:
++        aligned = moe_align_block_size(
++            topk_ids, BLOCK, E, None, ignore_invalid_experts=True)
++    sorted_ids, expert_ids, ntpp = aligned
+     part = torch.empty(_PLANES[name] * slots * 2 * N, device=dev, dtype=torch.float32)
+     h = torch.empty(slots, N, device=dev, dtype=torch.bfloat16)
+     c3 = torch.empty(slots, K, device=dev, dtype=torch.bfloat16)
+diff --git a/vllm/models/glm5next/nvidia/ops/router_align_decode.py b/vllm/models/glm5next/nvidia/ops/router_align_decode.py
+new file mode 100644
+index 0000000..de25e18
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/router_align_decode.py
+@@ -0,0 +1,75 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small-M deterministic alignment candidate; NOT fused gate/router v2.
++
++Integer counting/ranking follows MM moe_align_kernel.py. Outputs are owned by
++one captured invocation, not a device/global scratch cache. Eager reuse is
++stream-local; capture always allocates fresh graph-pool buffers, preventing
++multi-shape graph aliases. No ids/data_ptr handoff cache exists.
++"""
++import os
++import torch
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _align(ids, sorted_ids, experts, ntpp, S: tl.constexpr, E: tl.constexpr,
++           R: tl.constexpr, B: tl.constexpr, CAP: tl.constexpr, NB: tl.constexpr):
++    i = tl.arange(0, R)
++    e = tl.load(ids + i, i < S, other=-1)
++    valid = (i < S) & (e >= 0) & (e < E)
++    es = tl.arange(0, B)
++    counts = tl.sum(((es[:, None] == e[None, :]) & valid[None, :]).to(tl.int32), 1)
++    padded = ((counts + 7) // 8) * 8
++    start = tl.cumsum(padded) - padded
++    total = tl.sum(padded)
++    # Fill before scatter within the same CTA; no cross-CTA ordering assumption.
++    p = tl.arange(0, CAP)
++    tl.store(sorted_ids + p, S)
++    rank = tl.sum(((e[:, None] == e[None, :]) &
++                   (i[None, :] < i[:, None]) & valid[None, :]).to(tl.int32), 1)
++    offset = tl.sum(tl.where(es[:, None] == e[None, :], start[:, None], 0), 0)
++    tl.debug_barrier()
++    tl.store(sorted_ids + offset + rank, i, valid)
++    b = tl.arange(0, NB)
++    owner = tl.sum(((start[:, None] // 8 <= b[None, :]) &
++                    (es[:, None] < E)).to(tl.int32), 0) - 1
++    tl.store(experts + b, tl.where(b * 8 < total, owner, -1))
++    tl.store(ntpp, total)
++
++
++_EAGER = {}
++
++
++def maybe_align(ids, num_experts):
++    """Return None on unsupported metadata, leaving the original path intact.
++
++    Call only at the consumer, AFTER graph padding masks have modified ids.
++    Preallocation means graph-owned outputs fixed at capture, not fused routing.
++    """
++    if os.getenv('VLLM_GLM5_ROUTER_ALIGN_DECODE', '0') != '1':
++        return None
++    if (not ids.is_cuda or ids.ndim != 2 or ids.shape[0] not in (4, 8)
++            or ids.shape[1] not in (1, 2, 4, 8) or not ids.is_contiguous()
++            or ids.dtype not in (torch.int32, torch.int64)
++            or not 0 < num_experts <= 512):
++        return None
++    if torch.cuda.get_device_capability(ids.device) != (8, 0):
++        return None
++    s = ids.numel()
++    # Each nonempty expert costs <= count + 7 slots. Power-of-two capacity
++    # makes every output lane initialized, including invalid/padded tails.
++    cap = triton.next_power_of_2(s * 8)
++    with torch.cuda.device(ids.device):
++        capturing = torch.cuda.is_current_stream_capturing()
++        key = (ids.device, torch.cuda.current_stream().cuda_stream, s, num_experts)
++        out = None if capturing else _EAGER.get(key)
++        if out is None:
++            out = (torch.empty(cap, device=ids.device, dtype=torch.int32),
++                   torch.empty(cap // 8, device=ids.device, dtype=torch.int32),
++                   torch.empty(1, device=ids.device, dtype=torch.int32))
++            if not capturing:
++                _EAGER[key] = out
++        _align[(1,)](ids, *out, s, num_experts, triton.next_power_of_2(s),
++                     triton.next_power_of_2(num_experts), cap, cap // 8,
++                     num_warps=4)
++    return out

@@ -1,0 +1,156 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5next: clamp the kpool indexer gather workspace
+
+VLLM_GLM5_INDEXER_GATHER_CLAMP (default 0 = unchanged). Size the K-gather
+workspace and the indexer metadata chunk limit to
+max_num_seqs * cdiv(max_model_len, kpool) instead of the
+min(max_model_len, 131072) * 40 heuristic (~0.6 GiB per card returned to the
+KV pool). Always on and output-neutral: free each prefill logits buffer
+before the next chunk, and raise if a chunk would gather more rows than the
+workspace holds.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 3196bea..39a90b2 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -57,6 +57,7 @@ if TYPE_CHECKING:
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
++    VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = False
+     VLLM_GLM5_THIN_GEMM: bool = False
+     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+     VLLM_GLM5_MARLIN_DECODE_CUDA: bool = False
+@@ -964,6 +965,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR": lambda: float(
+         os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR", "0.75")
+     ),
++    # Size the GLM5Next kpool indexer's K-gather workspace (and the indexer
++    # metadata builder's chunk limit) by what one step can gather,
++    # max_num_seqs * cdiv(max_model_len, compress_ratio), instead of the
++    # min(max_model_len, 131072) * 40 heuristic. Port of Morrowmake's switch
++    # of the same name (MM default on; here default off). Frees ~0.6 GiB of
++    # profiled workspace per card at max_model_len 262144, max_num_seqs 8,
++    # kpool 4, which goes to the KV pool. Chunk formation is unchanged.
++    "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
++        int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "0"))
++    ),
+     # sm_80 thin-M BF16 GEMM (vllm/models/glm5next/nvidia/ops/thin_gemm.py,
+     # ported from Morrowmake/vllm-cmp170hx). Routes the unquantized BF16
+     # linears (every non-expert projection of a W4A16 GLM-5.x checkpoint,
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index 22d0232..210041b 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -496,6 +496,16 @@ def sparse_attn_indexer_kpool(
+             scales_spec,
+         )
+         for chunk in prefill_metadata.chunks if not short_prefill else ():
++            # Host-side int compare: the gather below writes chunk.total_seq_lens
++            # rows into a workspace of total_seq_lens rows. The metadata builder
++            # keeps every chunk within it; fail loudly instead of writing out of
++            # bounds if the two ever disagree (e.g. a compress-ratio mismatch
++            # under VLLM_GLM5_INDEXER_GATHER_CLAMP).
++            if chunk.total_seq_lens > total_seq_lens:
++                raise RuntimeError(
++                    f"kpool indexer: prefill chunk gathers {chunk.total_seq_lens} "
++                    f"index-K rows but the workspace holds {total_seq_lens}"
++                )
+             k_quant = k_quant_full[: chunk.total_seq_lens]
+             k_scale = k_scale_full[: chunk.total_seq_lens]
+ 
+@@ -615,6 +625,12 @@ def sparse_attn_indexer_kpool(
+                     select_k,
+                 )
+ 
++            # Free the fp32 logits before the next chunk allocates its own:
++            # the builder sizes chunk rows up to VLLM_SPARSE_INDEXER_MAX_LOGITS_MB,
++            # and the profile run reserves exactly one such buffer, so holding
++            # two live across the loop edge would exceed it at long context.
++            del logits
++
+             if index_kpool > 1:
+                 pool_ids = pool_topk.to(torch.int64)
+                 if positions is not None:
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 9d9abb1..c19a39b 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -349,9 +349,17 @@ class Indexer(nn.Module):
+         )
+         self.max_model_len = vllm_config.model_config.max_model_len
+         self.prefix = prefix
+-        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
++        from vllm.v1.attention.backends.mla.indexer import (
++            get_indexer_gather_workspace_size,
++        )
+ 
+-        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)
++        # The gathered index-K is pool-granular (compress_ratio ==
++        # index_kpool == tokens_per_state of the indexer cache spec), and the
++        # metadata builder clamps its chunk limit with the same helper, so
++        # chunks still fit. Unchanged unless VLLM_GLM5_INDEXER_GATHER_CLAMP=1.
++        self.max_total_seq_len = get_indexer_gather_workspace_size(
++            vllm_config, self.index_kpool
++        )
+         self.indexer_op = SparseAttnIndexerKpool(
+             self.k_cache,
+             self.quant_block_size,
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 7662948..009f0ad 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -845,6 +845,40 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     return min(max_model_len, 131072) * 40
+ 
+ 
++def get_indexer_gather_workspace_size(
++    vllm_config: VllmConfig, compress_ratio: int = 1
++) -> int:
++    """Rows of index-K a single prefill chunk can ever gather.
++
++    ``get_max_prefill_buffer_size`` is a heuristic, not a bound on what a step
++    can produce. A prefill chunk never spans more requests than
++    ``max_num_seqs``, and each request contributes at most
++    ``cdiv(max_model_len, compress_ratio)`` compressed entries, so the clamp
++    leaves chunk formation unchanged and is never below one full-length
++    request (the single-request escape hatch in
++    ``_split_indexer_prefill_chunks`` still fits). Ported from
++    Morrowmake/vllm-cmp170hx. With ``VLLM_GLM5_INDEXER_GATHER_CLAMP`` unset
++    (default) this returns the heuristic unchanged.
++    """
++    legacy = get_max_prefill_buffer_size(vllm_config)
++    if not envs.VLLM_GLM5_INDEXER_GATHER_CLAMP:
++        return legacy
++    ratio = max(1, int(compress_ratio))
++    max_len = vllm_config.model_config.max_model_len
++    clamped = min(
++        legacy,
++        vllm_config.scheduler_config.max_num_seqs * (-(-max_len // ratio)),
++    )
++    logger.info_once(
++        "VLLM_GLM5_INDEXER_GATHER_CLAMP: indexer gather rows %d -> %d "
++        "(compress_ratio %d).",
++        legacy,
++        clamped,
++        ratio,
++    )
++    return clamped
++
++
+ def _supports_varlen_paged_mqa_logits() -> bool:
+     return (
+         current_platform.is_cuda()
+@@ -1056,6 +1090,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 "DCP is not supported with sparse indexer KV compression "
+                 f"(compress_ratio={self.compress_ratio})."
+             )
++        # Must stay in step with the indexer op's gather workspace, which is
++        # sized by the same helper (glm5next attention.py). Identical to the
++        # assignment above unless VLLM_GLM5_INDEXER_GATHER_CLAMP=1.
++        self.max_prefill_buffer_size = get_indexer_gather_workspace_size(
++            self.vllm_config, self.compress_ratio
++        )
+ 
+         # Pre-allocate buffers for CUDA graph compatibility when
+         if self.compress_ratio > 1:

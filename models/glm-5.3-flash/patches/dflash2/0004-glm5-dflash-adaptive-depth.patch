@@ -1,0 +1,947 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] spec decode: adaptive DFlash verification depth
+
+VLLM_GLM5_DFLASH_ADAPTIVE_K (default 0 = unchanged), with _DEPTHS, _ACCEPT,
+_COSTS, _COSTS_MULTI, _HYST, _PRIOR, _LOG. The drafter drafts the deepest
+depth; the scheduler verifies a load- and acceptance-chosen prefix; the
+target captures uniform decode CUDA graphs per depth. Port of Morrowmake's
+policy. Needs the V2 model runner and an explicit "method":"dflash".
+Performance only; the output stays lossless.
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 0a22b51..f97bb51 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -540,6 +540,17 @@ class SpeculativeConfig:
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
++    adaptive_k: dict[str, Any] | None = None
++    """Load-/acceptance-adaptive verification depth (host-side), normally set
++    from VLLM_GLM5_DFLASH_ADAPTIVE_K. Keys: ``by_load`` (depth for 1, 2, ...
++    requests in the server; the last covers the rest), optional ``accept``
++    (``costs``, ``costs_multi``, ``hysteresis``, ``prior``, ``decay``,
++    ``strength``) and ``log_interval``. The drafter always drafts
++    num_speculative_tokens; only the verified prefix varies."""
++
++    adaptive_k_config: SkipValidation[Any] = None  # AdaptiveKConfig | None
++    """Validated form of ``adaptive_k``; None when the feature is off."""
++
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+         """Mean acceptance length to unconditional per-position rates, using
+@@ -1125,6 +1136,8 @@ class SpeculativeConfig:
+             )
+             self.method = "mtp"
+ 
++        self._maybe_enable_glm5_load_adaptive_depth()
++
+         if self.model is None and self.num_speculative_tokens is not None:
+             if self.method == "mtp":
+                 if self.target_model_config is None:
+@@ -1820,10 +1833,135 @@ class SpeculativeConfig:
+                 "omit it."
+             )
+ 
++        if self.adaptive_k is not None:
++            from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKConfig
++
++            if self.uses_dynamic_speculative_decoding():
++                raise ValueError(
++                    "adaptive_k and num_speculative_tokens_per_batch_size both "
++                    "choose the per-step draft count; enable only one."
++                )
++            if self.enable_adaptive_verification:
++                raise ValueError(
++                    "adaptive_k and enable_adaptive_verification both size the "
++                    "verification budget; enable only one."
++                )
++            self.adaptive_k_config = AdaptiveKConfig.from_dict(
++                self.adaptive_k, self.num_speculative_tokens
++            )
++
+         if not self.use_heterogeneous_vocab:
+             self.verify_equal_vocab_size_if_draft_model()
+         return self
+ 
++    def _maybe_enable_glm5_load_adaptive_depth(self) -> None:
++        """VLLM_GLM5_DFLASH_ADAPTIVE_K: rewrite the config before anything is
++        derived from it. The drafted width (num_speculative_tokens) becomes the
++        deepest depth in VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS, so every buffer,
++        KV lookahead slot and the GLM kpool tail ring are sized for it, and
++        ``adaptive_k`` verifies DEPTHS[0] at 1 request, DEPTHS[1] at 2, ...,
++        and the configured num_speculative_tokens beyond. Idempotent."""
++        import vllm.envs as envs
++
++        if not envs.VLLM_GLM5_DFLASH_ADAPTIVE_K:
++            if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
++                logger.warning_once(
++                    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: it "
++                    "needs VLLM_GLM5_DFLASH_ADAPTIVE_K=1."
++                )
++            return
++        if isinstance(self.adaptive_k, dict) and "by_load" in self.adaptive_k:
++            return
++
++        def closed(reason: str) -> None:
++            logger.warning_once(
++                "VLLM_GLM5_DFLASH_ADAPTIVE_K=1 set but load-adaptive DFlash "
++                "depth is off: %s.",
++                reason,
++            )
++
++        if self.method != "dflash":
++            return closed(f"needs the DFlash drafter (method is {self.method!r})")
++        if self.num_speculative_tokens is None or self.num_speculative_tokens < 1:
++            return closed("num_speculative_tokens is not set")
++        if self.adaptive_k is not None:
++            return closed("adaptive_k is already configured")
++        if self.num_speculative_tokens_per_batch_size is not None:
++            return closed("num_speculative_tokens_per_batch_size is configured")
++        if self.enable_adaptive_verification:
++            return closed("enable_adaptive_verification is on")
++        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS
++        try:
++            depths = [int(x) for x in raw.replace(" ", "").split(",") if x]
++        except ValueError:
++            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is not a list")
++        if not depths or min(depths) < 1:
++            return closed(f"VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} is empty or < 1")
++        base = int(self.num_speculative_tokens)
++        if max(depths) <= base:
++            return closed(
++                f"no depth in VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS={raw!r} "
++                f"exceeds num_speculative_tokens={base}"
++            )
++        by_load = depths + [base]
++        self.num_speculative_tokens = max(by_load)
++        self.adaptive_k = {
++            "by_load": by_load,
++            "log_interval": max(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG, 0),
++        }
++        if envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT:
++            accept = self._glm5_accept_depth_config(by_load)
++            if accept is not None:
++                self.adaptive_k["accept"] = accept
++
++    def _glm5_accept_depth_config(self, by_load: list[int]) -> dict | None:
++        """VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: per-depth step costs for every
++        depth from the shallowest to the deepest load width. Default when
++        _COSTS is unset: +8 % per extra depth (TP), +10.5 % (PP) -- the
++        Morrowmake layout defaults; calibrate on the target hardware."""
++        import vllm.envs as envs
++
++        allowed = list(range(min(by_load), max(by_load) + 1))
++
++        def parse(raw: str) -> list[float] | None:
++            try:
++                return [float(x) for x in raw.replace(" ", "").split(",") if x]
++            except ValueError:
++                return None
++
++        raw = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS
++        costs = parse(raw)
++        if not raw:
++            pp = getattr(self.target_parallel_config, "pipeline_parallel_size", 1)
++            per_depth = 0.105 if (pp or 1) > 1 else 0.08
++            costs = [round(1.0 + per_depth * (k - allowed[0]), 4) for k in allowed]
++        raw_multi = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI
++        costs_multi = parse(raw_multi) if raw_multi else []
++
++        def valid(c) -> bool:
++            return bool(c) and len(c) == len(allowed) and min(c) > 0
++
++        if not valid(costs) or (raw_multi and not valid(costs_multi)):
++            logger.warning_once(
++                "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT=1 set but off: "
++                "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS=%r / _COSTS_MULTI=%r need one "
++                "positive cost per depth %s.",
++                raw,
++                raw_multi,
++                str(allowed),
++            )
++            return None
++        config: dict[str, Any] = {
++            "costs": costs,
++            "hysteresis": max(0.0, min(envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST, 0.5)),
++        }
++        prior = envs.VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR
++        if prior != 0.75:
++            config["prior"] = min(max(prior, 0.01), 0.99)
++        if costs_multi:
++            config["costs_multi"] = costs_multi
++        return config
++
+     def verify_equal_vocab_size_if_draft_model(self):
+         if (
+             self.method == "draft_model"
+@@ -1917,6 +2055,13 @@ class SpeculativeConfig:
+     def uses_dynamic_speculative_decoding(self) -> bool:
+         return self.num_speculative_tokens_per_batch_size is not None
+ 
++    def uses_adaptive_k(self) -> bool:
++        return self.adaptive_k_config is not None
++
++    def adaptive_k_draft_counts(self) -> tuple[int, ...]:
++        """Depths the scheduler may verify, so decode graphs can be captured."""
++        return self.adaptive_k_config.allowed if self.adaptive_k_config else ()
++
+     def uses_draft_model(self) -> bool:
+         return self.method == "draft_model"
+ 
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index badc723..2b0edab 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -993,6 +993,29 @@ class VllmConfig:
+         )
+         speculative_config.num_speculative_tokens_per_batch_size = None
+ 
++    def _maybe_disable_adaptive_k(self) -> None:
++        """Adaptive DFlash depth needs Model Runner V2 (per-depth full decode
++        graphs, prefix verification of the drafted block) and no DP (ranks
++        could pick different depths and diverge)."""
++        speculative_config = self.speculative_config
++        if speculative_config is None or not speculative_config.uses_adaptive_k():
++            return
++        reason = None
++        if self.parallel_config.data_parallel_size > 1:
++            reason = "data parallelism"
++        elif not self.use_v2_model_runner:
++            reason = "the V1 model runner (needs VLLM_USE_V2_MODEL_RUNNER=1)"
++        if reason is None:
++            return
++        logger.warning_once(
++            "Adaptive DFlash depth is not supported with %s; disabling it and "
++            "verifying a fixed num_speculative_tokens=%d.",
++            reason,
++            speculative_config.num_speculative_tokens,
++        )
++        speculative_config.adaptive_k = None
++        speculative_config.adaptive_k_config = None
++
+     def _post_init_kv_transfer_config(self) -> None:
+         """Update KVTransferConfig based on top-level configs in VllmConfig.
+ 
+@@ -1542,6 +1565,7 @@ class VllmConfig:
+             )
+ 
+         self._maybe_disable_dynamic_sd_for_data_parallel()
++        self._maybe_disable_adaptive_k()
+         self._maybe_override_dynamic_sd_cudagraph_mode()
+ 
+         if (
+@@ -2158,6 +2182,25 @@ class VllmConfig:
+                             ):
+                                 widest_batch[num_spec + 1] = batch_size
+                             decode_tiers = list(widest_batch.items())
++                    adaptive_k_config = (
++                        speculative_config.adaptive_k_config
++                        if speculative_config is not None
++                        else None
++                    )
++                    if adaptive_k_config is not None:
++                        # Adaptive DFlash depth: depth k is verified only up to
++                        # the request count where the load width still allows
++                        # it, so each depth gets decode sizes up to there.
++                        decode_tiers = [
++                            (k + 1, tier_max_reqs)
++                            for k in adaptive_k_config.allowed
++                            if (
++                                tier_max_reqs := adaptive_k_config.max_reqs_for(
++                                    k, max_num_seqs
++                                )
++                            )
++                            > 0
++                        ]
+ 
+                     uniform_decode_sizes = sorted(
+                         {
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5494590..517d36e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -49,6 +49,14 @@ if TYPE_CHECKING:
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
+     VLLM_PP_DECODE_COHORT_BALANCE: bool = True
++    VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "7,5"
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: bool = False
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS: str = ""
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
++    VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
+     VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
+     VLLM_ENGRAM_EXACT_PIN: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = 0
+@@ -914,6 +922,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
+         int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1"))
+     ),
++    # Adaptive DFlash verification depth (port of Morrowmake's switch of the
++    # same name). With 1: the drafter drafts the deepest depth listed in
++    # _DEPTHS (it becomes num_speculative_tokens) and each step verifies the
++    # depth for the number of requests in the server: _DEPTHS[0] at 1,
++    # _DEPTHS[1] at 2, ..., the configured num_speculative_tokens beyond.
++    # Default off: behaviour identical to a fixed num_speculative_tokens.
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K": lambda: bool(
++        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K", "0"))
++    ),
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": lambda: os.getenv(
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS", "7,5"
++    ),
++    # Every N decode steps, log the histogram of chosen depths (0: never).
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG": lambda: int(
++        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG", "0")
++    ),
++    # With VLLM_GLM5_DFLASH_ADAPTIVE_K: within the load width, choose the depth
++    # that maximises expected tokens per unit step cost from each request's
++    # acceptance. _COSTS: relative step cost of every depth from the shallowest
++    # to the deepest load width (one request); _COSTS_MULTI: the same for steps
++    # of two or more requests (empty: _COSTS).
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT": lambda: bool(
++        int(os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT", "0"))
++    ),
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS": lambda: os.getenv(
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS", ""
++    ),
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI": lambda: os.getenv(
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI", ""
++    ),
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST": lambda: float(
++        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST", "0.03")
++    ),
++    "VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR": lambda: float(
++        os.getenv("VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR", "0.75")
++    ),
+     # Per-PP-rank UVA offload budget (GiB, comma-separated, indexed by PP
+     # rank). Overrides --cpu-offload-gb for the matching rank so heavily
+     # loaded pipeline stages can offload more than lighter ones.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2880a1b..26c2494 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -68,6 +68,7 @@ from vllm.v1.metrics.stats import (
+ )
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
++from vllm.v1.spec_decode.dynamic.adaptive_k import AdaptiveKPolicy
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
+@@ -271,6 +272,33 @@ class Scheduler(SchedulerInterface):
+         # reserve between a chunk boundary and the prefill end.
+         self.num_prefill_lookahead = 0
+         self.dynamic_sd_lookup: list[int] | None = None
++        # Adaptive DFlash depth (VLLM_GLM5_DFLASH_ADAPTIVE_K). The drafter
++        # always drafts num_spec_tokens; cur_num_spec_tokens is the prefix this
++        # step verifies. Equal to num_spec_tokens when the feature is off.
++        self.adaptive_k: AdaptiveKPolicy | None = None
++        self.cur_num_spec_tokens = self.num_spec_tokens
++        if (
++            speculative_config is not None
++            and getattr(speculative_config, "adaptive_k_config", None) is not None
++        ):
++            self.adaptive_k = AdaptiveKPolicy(speculative_config.adaptive_k_config)
++            cfg = self.adaptive_k.config
++            logger.info(
++                "Adaptive DFlash depth active (VLLM_GLM5_DFLASH_ADAPTIVE_K): "
++                "drafts %d per step, verifies %s requests%s",
++                self.num_spec_tokens,
++                ", ".join(
++                    f"{k} at {n}" if n < len(cfg.by_load) else f"{k} at >= {n}"
++                    for n, k in enumerate(cfg.by_load, start=1)
++                ),
++                (
++                    f"; acceptance-aware within that width, costs "
++                    f"{cfg.accept_costs} (multi {cfg.accept_costs_multi or '-'}) "
++                    f"for depths {cfg.allowed}"
++                    if cfg.accept
++                    else ""
++                ),
++            )
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+@@ -561,6 +589,49 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    def _select_adaptive_k(self) -> int:
++        """Adaptive DFlash depth: this step's verification width.
++
++        Load width from every request the server holds (running + waiting),
++        narrowed by acceptance when enabled, then capped by the drafts the
++        step's requests actually carry (a uniform batch needs one width).
++        Only requests that may be scheduled in this step are looked at and
++        truncated: under PP + async scheduling the others are still in flight
++        and get fresh full-width placeholders when they are next scheduled.
++        Truncating ``spec_token_ids`` only drops drafts from verification;
++        it never adds or alters a token, so the output stays the target's.
++        """
++        policy = self.adaptive_k
++        assert policy is not None
++        eligible = [
++            r
++            for r in self.running
++            if self.current_step >= r.next_decode_eligible_step
++        ]
++        if not eligible:
++            return self.num_spec_tokens
++        num_reqs = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
++        decoding = [
++            r.request_id
++            for r in eligible
++            if not r.is_prefill_chunk and r.spec_token_ids
++        ]
++        k_want = policy.want(num_reqs, decoding)
++        available = min(
++            (len(r.spec_token_ids) for r in eligible if r.spec_token_ids),
++            default=k_want,
++        )
++        k = k_want if available >= k_want else policy.snap(available)
++        for request in eligible:
++            if len(request.spec_token_ids) > k:
++                # Rebind, never mutate: AsyncScheduler shares one placeholder
++                # list between requests.
++                request.spec_token_ids = request.spec_token_ids[:k]
++        if decoding:
++            policy.record_choice(k)
++            policy.maybe_log()
++        return k
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+@@ -611,6 +682,14 @@ class Scheduler(SchedulerInterface):
+ 
+         self.kv_cache_manager.new_step_starts()
+ 
++        # Adaptive DFlash depth: one verification width for the whole step,
++        # chosen before any request is sized, so the truncated draft lists and
++        # the uniform-decode padding agree and the batch stays inside a
++        # captured full CUDA graph for that width.
++        self.cur_num_spec_tokens = self.num_spec_tokens
++        if self.adaptive_k is not None and self.num_spec_tokens > 0:
++            self.cur_num_spec_tokens = self._select_adaptive_k()
++
+         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
+         # all prefill compute unless saturated.
+         defer_prefills = (
+@@ -1069,7 +1148,7 @@ class Scheduler(SchedulerInterface):
+                         and not prefill_scheduled
+                         and (scheduled_running_reqs or num_computed_tokens > 0)
+                     ):
+-                        padded_num_tokens = 1 + self.num_spec_tokens
++                        padded_num_tokens = 1 + self.cur_num_spec_tokens
+                         # Pad only when there is room for the sampled token(s).
+                         if (
+                             num_computed_tokens
+@@ -1112,7 +1191,7 @@ class Scheduler(SchedulerInterface):
+                             break
+                         if (
+                             pad_spec_decode
+-                            and num_new_tokens != 1 + self.num_spec_tokens
++                            and num_new_tokens != 1 + self.cur_num_spec_tokens
+                         ):
+                             # Alignment clipped the placeholder rows. The split
+                             # aligns prefill chunks, but the padded tail rows are
+@@ -1302,10 +1381,14 @@ class Scheduler(SchedulerInterface):
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 if pad_spec_decode:
+-                    assert num_new_tokens == 1 + self.num_spec_tokens
++                    assert num_new_tokens == 1 + self.cur_num_spec_tokens
+                     scheduled_spec_decode_tokens[request_id] = [
+                         -1
+-                    ] * self.num_spec_tokens
++                    ] * self.cur_num_spec_tokens
++                    if self.adaptive_k is not None:
++                        # Placeholder drafts are rejected by construction;
++                        # keep them out of the acceptance statistics.
++                        self.adaptive_k.mark_padded(request_id)
+                 # Only track requests that will still be prefilling after this chunk.
+                 if num_computed_tokens + num_new_tokens < request.num_tokens:
+                     self._inflight_prefills.add(request)
+@@ -2041,6 +2124,16 @@ class Scheduler(SchedulerInterface):
+                         request.num_computed_tokens -= num_rejected
+                     if request.num_output_placeholders > 0:
+                         request.num_output_placeholders -= num_rejected
++                if self.adaptive_k is not None and not output_is_stale:
++                    # Grammar-invalidated drafts were never really proposed.
++                    num_invalid = (
++                        scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
++                        if scheduler_output.num_invalid_spec_tokens
++                        else 0
++                    )
++                    self.adaptive_k.observe(
++                        req_id, num_draft_tokens - num_invalid, num_accepted
++                    )
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+                     spec_decoding_stats,
+                     num_draft_tokens=num_draft_tokens,
+@@ -2643,6 +2736,8 @@ class Scheduler(SchedulerInterface):
+ 
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
++        if self.adaptive_k is not None:
++            self.adaptive_k.forget(request_id)
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+             self.finished_req_ids_dict[request.client_index].add(request_id)
+diff --git a/vllm/v1/spec_decode/dynamic/adaptive_k.py b/vllm/v1/spec_decode/dynamic/adaptive_k.py
+new file mode 100644
+index 0000000..5dacb79
+--- /dev/null
++++ b/vllm/v1/spec_decode/dynamic/adaptive_k.py
+@@ -0,0 +1,341 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Load- and acceptance-adaptive DFlash verification depth (host-side).
++
++Ported from Morrowmake vllm-cmp170hx (``VLLM_GLM5_DFLASH_ADAPTIVE_K``),
++trimmed to the two modes the GLM-5.3-Flash + DFlash2 deployment uses:
++
++* **load mode** (``by_load``): the verification depth for 1, 2, ... requests
++  in the server (running + waiting); the last entry covers every larger count;
++* **acceptance-aware choice** (``accept``, optional, on top of load mode):
++  within the load width, the depth that maximises the batch's expected
++  committed tokens per unit of measured step cost, from each request's own
++  per-draft acceptance (a decayed geometric model).
++
++Everything here is pure Python on the scheduler thread. Nothing changes on the
++device: the drafter always drafts ``num_speculative_tokens`` (the deepest
++depth) in one fixed-shape pass, and the scheduler only decides how many of
++those drafts the target *verifies* this step (a prefix). Rejection sampling is
++untouched, so every committed token still comes from the target's
++verification -- the choice changes speed, never which tokens are accepted.
++
++Decode runs as uniform full CUDA graphs, so a step uses one depth for all its
++requests; ``allowed`` lists the depths that may be chosen and hence the query
++lengths the target captures decode graphs for (see ``max_reqs_for``).
++"""
++
++from dataclasses import dataclass, field
++from typing import Any
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_CONFIG_KEYS = frozenset({"by_load", "accept", "log_interval"})
++_ACCEPT_KEYS = frozenset(
++    {"costs", "costs_multi", "hysteresis", "prior", "decay", "strength"}
++)
++
++
++@dataclass
++class AdaptiveKConfig:
++    """Validated form of ``SpeculativeConfig.adaptive_k``."""
++
++    # Verification width for 1, 2, ... requests; the last covers the rest.
++    by_load: tuple[int, ...] = ()
++    # Depths that may be chosen (= decode query lengths - 1 to capture).
++    allowed: tuple[int, ...] = ()
++    min_k: int = 1
++    max_k: int = 1
++    log_interval: int = 0
++    # Acceptance-aware choice within the load width.
++    accept: bool = False
++    # accept_costs[i]: relative step cost of verifying allowed[i] drafts with
++    # one request in the step; accept_costs_multi for two or more (empty:
++    # accept_costs).
++    accept_costs: tuple[float, ...] = ()
++    accept_costs_multi: tuple[float, ...] = ()
++    accept_hysteresis: float = 0.03
++    accept_prior: float = 0.75
++    accept_decay: float = 0.9
++    accept_strength: float = 2.0
++
++    @property
++    def load_mode(self) -> bool:
++        return bool(self.by_load)
++
++    def k_for_load(self, num_reqs: int) -> int:
++        """Verification width for ``num_reqs`` requests (0 counts as 1)."""
++        return self.by_load[min(max(num_reqs, 1), len(self.by_load)) - 1]
++
++    def max_reqs_for(self, k: int, max_num_reqs: int) -> int:
++        """Largest request count at which depth ``k`` can be verified, so the
++        decode CUDA graphs for ``k`` are needed only up to it (0: never)."""
++        if k not in self.allowed:
++            return 0
++        if k <= self.by_load[-1]:
++            return max_num_reqs
++        widest = 0
++        for n, value in enumerate(self.by_load, start=1):
++            if value >= k:
++                widest = n
++        return min(widest, max_num_reqs)
++
++    @classmethod
++    def from_dict(cls, raw: Any, num_speculative_tokens: int) -> "AdaptiveKConfig":
++        """``num_speculative_tokens`` is the drafted width (the deepest
++        depth); every depth must lie in ``[1, num_speculative_tokens]``."""
++        if not isinstance(raw, dict):
++            raise ValueError(
++                "speculative_config.adaptive_k must be a mapping, e.g. "
++                '{"by_load": [7, 5, 3]}.'
++            )
++        unknown = set(raw) - _CONFIG_KEYS
++        if unknown:
++            raise ValueError(
++                f"Unknown adaptive_k keys {sorted(unknown)}; "
++                f"expected a subset of {sorted(_CONFIG_KEYS)}."
++            )
++        if num_speculative_tokens is None or num_speculative_tokens <= 0:
++            raise ValueError("adaptive_k requires num_speculative_tokens > 0.")
++        raw_by_load = raw.get("by_load")
++        if not isinstance(raw_by_load, (list, tuple)) or not raw_by_load:
++            raise ValueError(
++                "adaptive_k.by_load must be a non-empty list of draft counts "
++                "(for 1, 2, ... requests; the last covers the rest)."
++            )
++        by_load = tuple(int(k) for k in raw_by_load)
++        illegal = sorted({k for k in by_load if not 1 <= k <= num_speculative_tokens})
++        if illegal:
++            raise ValueError(
++                f"adaptive_k.by_load contains {illegal}, outside "
++                f"[1, num_speculative_tokens={num_speculative_tokens}]."
++            )
++        log_interval = int(raw.get("log_interval", 0))
++        if log_interval < 0:
++            raise ValueError("adaptive_k.log_interval must be >= 0.")
++
++        allowed = tuple(sorted(set(by_load)))
++        kwargs: dict[str, Any] = {}
++        raw_accept = raw.get("accept")
++        if raw_accept is not None:
++            if not isinstance(raw_accept, dict):
++                raise ValueError("adaptive_k.accept must be a mapping.")
++            unknown = set(raw_accept) - _ACCEPT_KEYS
++            if unknown:
++                raise ValueError(f"Unknown adaptive_k.accept keys {sorted(unknown)}.")
++            # The acceptance-aware choice may pick any depth between the
++            # shallowest and the deepest load width.
++            allowed = tuple(range(min(by_load), max(by_load) + 1))
++            costs = tuple(float(c) for c in raw_accept.get("costs", ()))
++            if len(costs) != len(allowed) or min(costs, default=0.0) <= 0:
++                raise ValueError(
++                    f"adaptive_k.accept.costs needs one positive cost per "
++                    f"draft count {list(allowed)}, got {list(costs)}."
++                )
++            costs_multi = tuple(
++                float(c) for c in raw_accept.get("costs_multi", ()) or ()
++            )
++            if costs_multi and (
++                len(costs_multi) != len(allowed) or min(costs_multi) <= 0
++            ):
++                raise ValueError(
++                    f"adaptive_k.accept.costs_multi needs one positive cost "
++                    f"per draft count {list(allowed)}, got {list(costs_multi)}."
++                )
++            hysteresis = float(raw_accept.get("hysteresis", 0.03))
++            prior = float(raw_accept.get("prior", 0.75))
++            decay = float(raw_accept.get("decay", 0.9))
++            strength = float(raw_accept.get("strength", 2.0))
++            if not 0.0 <= hysteresis < 1.0:
++                raise ValueError("adaptive_k.accept.hysteresis must be in [0, 1).")
++            if not 0.0 < prior < 1.0 or not 0.0 <= decay < 1.0 or strength <= 0:
++                raise ValueError(
++                    "adaptive_k.accept.prior must be in (0, 1), decay in [0, 1) "
++                    "and strength > 0."
++                )
++            kwargs = dict(
++                accept=True,
++                accept_costs=costs,
++                accept_costs_multi=costs_multi,
++                accept_hysteresis=hysteresis,
++                accept_prior=prior,
++                accept_decay=decay,
++                accept_strength=strength,
++            )
++        return cls(
++            by_load=by_load,
++            allowed=allowed,
++            min_k=min(by_load),
++            max_k=max(by_load),
++            log_interval=log_interval,
++            **kwargs,
++        )
++
++
++@dataclass
++class AdaptiveKPolicy:
++    """Per-request acceptance statistics and the per-step depth choice.
++
++    A request's depth depends only on its own history and on the batch it runs
++    in: new requests start from the fixed configured prior and the hysteresis
++    reference is per request, so an identical request run alone repeats the
++    same depth sequence whatever ran before it.
++    """
++
++    config: AdaptiveKConfig
++    # req_id -> in-flight steps whose drafts were the scheduler's ``[-1] * k``
++    # uniform-decode padding (rejected by construction; not evidence).
++    _pending_padded: dict[str, int] = field(default_factory=dict)
++    # req_id -> decayed accepted-draft count / decayed rejection count.
++    _acc_s: dict[str, float] = field(default_factory=dict)
++    _acc_f: dict[str, float] = field(default_factory=dict)
++    # req_id -> depth this request last ran at (hysteresis reference).
++    _accept_last: dict[str, int] = field(default_factory=dict)
++    # Model-wide observed counts, for the log line only.
++    _obs_s: float = 0.0
++    _obs_f: float = 0.0
++    _k_counts: dict[int, int] = field(default_factory=dict)
++    _steps_since_log: int = 0
++
++    # ---------------------------------------------------------------- feedback
++
++    def mark_padded(self, req_id: str) -> None:
++        """This step's drafts for ``req_id`` are scheduler padding; skip the
++        matching :meth:`observe`. Outputs of a request arrive in the order its
++        steps were scheduled, so a counter suffices even with PP in flight."""
++        self._pending_padded[req_id] = self._pending_padded.get(req_id, 0) + 1
++
++    def observe(self, req_id: str, num_draft_tokens: int, num_accepted: int) -> None:
++        """One verification result: ``num_accepted`` draft tokens (bonus
++        excluded) out of ``num_draft_tokens`` verified."""
++        if num_draft_tokens <= 0:
++            return
++        pending = self._pending_padded.get(req_id)
++        if pending:
++            if pending == 1:
++                del self._pending_padded[req_id]
++            else:
++                self._pending_padded[req_id] = pending - 1
++            return
++        if not self.config.accept:
++            return
++        accepted = min(max(num_accepted, 0), num_draft_tokens)
++        # Geometric model: all-accepted adds successes and no failure, so a
++        # right-censored step needs no correction.
++        rejected = 1.0 if accepted < num_draft_tokens else 0.0
++        d = self.config.accept_decay
++        self._acc_s[req_id] = d * self._acc_s.get(req_id, 0.0) + accepted
++        self._acc_f[req_id] = d * self._acc_f.get(req_id, 0.0) + rejected
++        gd = 0.999
++        self._obs_s = gd * self._obs_s + accepted
++        self._obs_f = gd * self._obs_f + rejected
++
++    def forget(self, req_id: str) -> None:
++        self._pending_padded.pop(req_id, None)
++        self._acc_s.pop(req_id, None)
++        self._acc_f.pop(req_id, None)
++        self._accept_last.pop(req_id, None)
++
++    # ------------------------------------------------- acceptance-aware depth
++
++    def accept_prior(self) -> float:
++        return self.config.accept_prior
++
++    def observed_acceptance(self) -> float:
++        total = self._obs_s + self._obs_f
++        return self._obs_s / total if total else float("nan")
++
++    def accept_rate(self, req_id: str) -> float:
++        """Per-draft acceptance of ``req_id``, shrunk towards the prior."""
++        a = self.config.accept_strength
++        p0 = self.accept_prior()
++        s = self._acc_s.get(req_id, 0.0)
++        f = self._acc_f.get(req_id, 0.0)
++        return (s + a * p0) / (s + f + a)
++
++    @staticmethod
++    def expected_tokens(p: float, k: int) -> float:
++        """Tokens a step commits at depth k (bonus included) when each draft
++        is accepted with probability p given the earlier ones were."""
++        p = min(max(p, 0.0), 0.999)
++        return (1.0 - p ** (k + 1)) / (1.0 - p)
++
++    def select_by_acceptance(self, req_ids: list[str], cap: int) -> int:
++        """The allowed depth <= ``cap`` that maximises the batch's expected
++        tokens per unit step cost; keeps the requests' last depth unless
++        another beats it by the hysteresis margin."""
++        cfg = self.config
++        table = (
++            cfg.accept_costs_multi
++            if len(req_ids) > 1 and cfg.accept_costs_multi
++            else cfg.accept_costs
++        )
++        candidates = [(k, c) for k, c in zip(cfg.allowed, table) if k <= cap]
++        if not candidates or not req_ids:
++            return cap
++        rates = [self.accept_rate(r) for r in req_ids]
++        scores = {
++            k: sum(self.expected_tokens(p, k) for p in rates) / c
++            for k, c in candidates
++        }
++        best = max(scores, key=lambda k: (scores[k], -k))
++        lasts = {self._accept_last.get(r) for r in req_ids}
++        last = lasts.pop() if len(lasts) == 1 else None
++        if (
++            last is not None
++            and last in scores
++            and last != best
++            and scores[best] <= scores[last] * (1.0 + cfg.accept_hysteresis)
++        ):
++            best = last
++        for r in req_ids:
++            self._accept_last[r] = best
++        return best
++
++    # ------------------------------------------------------------------ policy
++
++    def snap(self, k: int) -> int:
++        """Round ``k`` down to the nearest allowed depth (one with graphs);
++        the smallest allowed depth if ``k`` is below all of them."""
++        best = self.config.allowed[0]
++        for value in self.config.allowed:
++            if value > k:
++                break
++            best = value
++        return best
++
++    def want(self, num_reqs_in_server: int, decoding_req_ids: list[str]) -> int:
++        """Depth wanted for a step: the load width, narrowed by acceptance."""
++        k = self.config.k_for_load(num_reqs_in_server)
++        if self.config.accept and decoding_req_ids:
++            k = self.select_by_acceptance(decoding_req_ids, k)
++        return k
++
++    # ----------------------------------------------------------------- logging
++
++    def record_choice(self, k: int) -> None:
++        self._k_counts[k] = self._k_counts.get(k, 0) + 1
++        self._steps_since_log += 1
++
++    def maybe_log(self) -> None:
++        interval = self.config.log_interval
++        if not interval or self._steps_since_log < interval:
++            return
++        total = sum(self._k_counts.values()) or 1
++        hist = " ".join(
++            f"k={k}:{n}({100 * n / total:.0f}%)"
++            for k, n in sorted(self._k_counts.items())
++        )
++        mean_k = sum(k * n for k, n in self._k_counts.items()) / total
++        logger.info(
++            "Adaptive DFlash depth: %d steps, mean k=%.2f, per-draft "
++            "acceptance observed=%.3f (prior %.2f), %s",
++            total,
++            mean_k,
++            self.observed_acceptance(),
++            self.accept_prior(),
++            hist,
++        )
++        self._k_counts.clear()
++        self._steps_since_log = 0
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index c8d79c4..5114f34 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -145,6 +145,7 @@ class CudaGraphManager:
+         decode_query_len: int,
+         lora_capture_cases: list[int] | None = None,
+         varlen_decode: bool = False,
++        adaptive_k_capture: bool = False,
+     ):
+         self.vllm_config = vllm_config
+         self.device = device
+@@ -154,6 +155,9 @@ class CudaGraphManager:
+         self.cudagraph_mode = cudagraph_mode
+         self.decode_query_len = decode_query_len
+         self.varlen_decode = varlen_decode
++        # Adaptive DFlash depth varies only the target's verification width;
++        # the drafter's own graphs keep their fixed shape.
++        self.adaptive_k_capture = adaptive_k_capture
+ 
+         self.dp_size = vllm_config.parallel_config.data_parallel_size
+         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+@@ -187,6 +191,15 @@ class CudaGraphManager:
+ 
+         self._init_candidates()
+ 
++    def _adaptive_k_draft_counts(self) -> tuple[int, ...]:
++        """Depths adaptive DFlash depth may verify (target manager only)."""
++        if not self.adaptive_k_capture:
++            return ()
++        speculative_config = self.vllm_config.speculative_config
++        if not (speculative_config and speculative_config.uses_adaptive_k()):
++            return ()
++        return tuple(speculative_config.adaptive_k_draft_counts())
++
+     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
+         """Precompute actual num_active_loras -> effective captured case.
+ 
+@@ -234,6 +247,9 @@ class CudaGraphManager:
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
++        # Query length -> most requests a uniform decode graph of that length
++        # needs (adaptive DFlash depth); absent means max_num_reqs.
++        decode_max_reqs: dict[int, int] = {}
+         if (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+@@ -255,6 +271,21 @@ class CudaGraphManager:
+                     for num_spec in dense_schedule[1:]
+                 }
+             )
++        elif adaptive_k_counts := self._adaptive_k_draft_counts():
++            # Adaptive DFlash depth: one uniform decode graph set per depth the
++            # scheduler may verify, each only up to the request count at which
++            # that depth can run (deep depths only at low load).
++            num_new_sampled_tokens_per_step = (
++                self.decode_query_len - self.vllm_config.num_speculative_tokens
++            )
++            adaptive_k_config = speculative_config.adaptive_k_config
++            decode_query_lens = []
++            for num_spec in adaptive_k_counts:
++                query_len = num_spec + num_new_sampled_tokens_per_step
++                decode_query_lens.append(query_len)
++                decode_max_reqs[query_len] = adaptive_k_config.max_reqs_for(
++                    num_spec, self.max_num_reqs
++                )
+         else:
+             decode_query_lens = [self.decode_query_len]
+ 
+@@ -295,6 +326,8 @@ class CudaGraphManager:
+                         rounded_num_tokens > max_decode_tokens
+                         or rounded_num_tokens > max_cg_capture_size
+                         or rounded_num_reqs > self.max_num_reqs
++                        or rounded_num_reqs
++                        > decode_max_reqs.get(decode_query_len, self.max_num_reqs)
+                     ):
+                         continue
+ 
+@@ -600,6 +633,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+         decode_query_len: int,
+         lora_capture_cases: list[int] | None = None,
+         varlen_decode: bool = False,
++        adaptive_k_capture: bool = False,
+     ):
+         super().__init__(
+             vllm_config,
+@@ -608,6 +642,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+             decode_query_len,
+             lora_capture_cases=lora_capture_cases,
+             varlen_decode=varlen_decode,
++            adaptive_k_capture=adaptive_k_capture,
+         )
+         self.hidden_states: torch.Tensor | None = None
+         self.aux_hidden_states: list[torch.Tensor] = []
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6a515e7..f813934 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -703,6 +703,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             decode_query_len=self.decode_query_len,
+             lora_capture_cases=self.lora_capture_cases,
+             varlen_decode=self.adaptive_verification is not None,
++            adaptive_k_capture=True,
+         )
+         check_attention_cp_compatibility(self.vllm_config)
+         if isinstance(self.speculator, DraftModelSpeculator):
