@@ -25,6 +25,11 @@ What it checks, without torch or a GPU:
    `envs.VLLM_GLM5_THIN_GEMM` and imports lazily; the kernel_warmup hook and
    the kpool-gate site are guarded the same way, and the off branch of the
    kpool gate is the original `F.linear` line.
+6. 0029 (VLLM_GLM5_IDX_DUAL_GEMM): default "0"; the attention.py off branch
+   is the original merged GEMM + fp32 sgemm, verbatim; the module is never
+   imported at module scope; the dual kernel's N_LO = head_dim (128) is a
+   multiple of BLOCK_N for the indexer shape (160, 4096) at every M <= 32,
+   so the gate never refuses it on GLM-5.3-Flash.
 """
 
 import os
@@ -208,6 +213,45 @@ def test_default_off_invariants():
     # the kernel module is never imported at attention.py module scope
     top = ast.parse(attn).body
     assert not any(isinstance(n, ast.ImportFrom) and n.module == mod for n in top)
+
+
+def test_0029_idx_dual_gemm_gate_and_default_off():
+    sel = NS["_select_config"]
+    for M in range(1, 33):
+        BN = sel(M, 160, 4096)[1]
+        assert 128 % BN == 0, (M, BN)
+    dual = (PATCHED / "models/glm5next/nvidia/ops/idx_dual_gemm.py").read_text()
+    assert 'os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1"' in dual
+    attn = _src("models/glm5next/nvidia/attention.py")
+    assert 'os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1"' in attn
+    off = ("        else:\n"
+           "            kw, _ = self.wk_weights_proj(hidden_states)\n"
+           "            k = kw[:, : self.head_dim]\n"
+           "            if self._wp_fp32 is None:\n"
+           "                self._wp_fp32 = (\n"
+           "                    self.wk_weights_proj.weight.data[self.head_dim :, :]\n"
+           "                    .t()\n"
+           "                    .contiguous()\n"
+           "                    .float()\n"
+           "                )\n"
+           "            weights = torch.mm(hidden_states.float(), self._wp_fp32)\n")
+    assert off in attn
+    assert "        if _idx_dual_gemm_enabled() and hidden_states.dim() == 2:\n" in attn
+    mod = "vllm.models.glm5next.nvidia.ops.idx_dual_gemm"
+    for rel in ("models/glm5next/nvidia/attention.py",
+                "model_executor/warmup/kernel_warmup.py"):
+        top = ast.parse(_src(rel)).body
+        assert not any(isinstance(n, ast.ImportFrom) and n.module == mod
+                       for n in top), rel
+    warm = _src("model_executor/warmup/kernel_warmup.py")
+    assert 'if os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() == "1":' in warm
+    # the dual kernel's low block is the thin kernel's loop: same loads, dot,
+    # accumulate and split-K reduce lines
+    for line in ("acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)",
+                 "x_ptrs += step * stride_xk",
+                 'arrived = tl.atomic_add(lock, 1, sem="acq_rel", scope="gpu")',
+                 'tl.atomic_xchg(lock, 0, sem="release", scope="gpu")'):
+        assert line in dual and line in TG.read_text(), line
 
 
 if __name__ == "__main__":

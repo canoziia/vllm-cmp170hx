@@ -26,3 +26,4 @@
 0026-glm5-moe-sum-add-fuse.patch
 0027-glm5-shared-expert-reorder.patch
 0028-mhc-prenorm-bf16x3-prefill.patch
+0029-glm5-idx-dual-thin-gemm.patch

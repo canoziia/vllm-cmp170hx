@@ -67,10 +67,12 @@ services:
       VLLM_GLM5_MARLIN_DECODE_VARIANT: orig
       # dflash2/0007 fused grouped conv
       VLLM_DFLASH2_FUSED_GROUPED_CONV: "1"
-      # dflash2/0008 deterministic alignment (route v2 fallback), 0010 route v2 (gate mode)
+      # dflash2/0008 deterministic alignment (route v2 fallback), 0010 route v2 (tc mode, see below)
       VLLM_GLM5_ROUTER_ALIGN_DECODE: "1"
       VLLM_GLM5_ROUTE_V2: "1"
-      VLLM_GLM5_ROUTE_V2_GEMV: gate
+      # tc: router logits bitwise MM's _moe_route_kernel (not our old gate
+      # path); one 80-CTA launch leaves SMs for the shared experts (STEP-GAP-2 §7)
+      VLLM_GLM5_ROUTE_V2_GEMV: tc
       # dflash2/0009 sparse MLA decode schedule
       VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL: "1"
       # dflash2/0011 indexer gather clamp + 128 MiB logits budget (KV pool +25%)
@@ -106,6 +108,8 @@ services:
       # dflash2/0026 fused moe_sum + shared add, 0027 shared experts after routed
       VLLM_GLM5_MOE_SUM_ADD: "1"
       VLLM_GLM5_SHARED_EXPERT_REORDER: "1"
+      # dflash2/0029: indexer wk+weights as one dual thin GEMM (needs THIN_GEMM)
+      VLLM_GLM5_IDX_DUAL_GEMM: "1"
     command:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0

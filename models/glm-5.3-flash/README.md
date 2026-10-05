@@ -167,7 +167,7 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0007 | DFlash2 融合 grouped conv | `VLLM_DFLASH2_FUSED_GROUPED_CONV` | 小幅有效 |
 | 0008 | 确定性小 M MoE 对齐（route v2 的回退路径） | `VLLM_GLM5_ROUTER_ALIGN_DECODE` | 约 1% |
 | 0009 | sparse MLA decode 调度 | `VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL` | 有效 |
-| 0010 | MoE route v2（gate 模式与原路由逐位一致） | `VLLM_GLM5_ROUTE_V2=1`、`_GEMV=gate` | 约 +9% |
+| 0010 | MoE route v2（gate 模式与原路由逐位一致；tc 模式与对方 `_moe_route_kernel` 逐位一致） | `VLLM_GLM5_ROUTE_V2=1`；补丁默认 `_GEMV=gate`，**compose 用 `tc`**（见下） | 约 +9%；tc 再 +0.6%（c1 29.05→29.21 步/秒） |
 | 0011 | indexer gather 工作区收紧 | `VLLM_GLM5_INDEXER_GATHER_CLAMP` | KV 池 +25%（配合 util 0.95、logits 128 MiB） |
 | 0012 | PP sparse MLA prefill（Gluon 64 头） | `VLLM_GLM5_PP_SPARSE_MLA_PREFILL` | 有效 |
 | 0013 | PP Marlin MoE prefill 拆块 | `VLLM_GLM5_PP_MARLIN_PREFILL` | MoE prefill 1.23–1.31×，99.9% 逐位一致 |
@@ -186,6 +186,14 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0026 | routed moe_sum 与 shared expert 加法融合 | `VLLM_GLM5_MOE_SUM_ADD` | GPU 逐位 512/512 |
 | 0027 | shared experts 在 routed experts 之后入队 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 逐位一致；与 0026 一起 c8 counting 752.9 |
 | 0028 | T ≥ 384 的 prenorm GEMM 改用对方的 bf16x3 张量核 Triton kernel（Apache-2.0，原样复制） | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS`（默认 384，0 = 等同 0025）；**只在 0025 打开时生效** | T=2312 prenorm 923 → 154 μs；T ≥ 384 与对方逐位一致，T < 384 与 0025 逐位一致；冷 prefill 见下 |
+| 0029 | indexer wk+weights 合成一次双输出 thin GEMM（k 列 bf16 逐位不变；head weights 以 fp32 累加值输出，替代 cast + fp32 sgemm） | `VLLM_GLM5_IDX_DUAL_GEMM`（默认 0；需 `VLLM_GLM5_THIN_GEMM=1`；**compose 打开**） | 每 MLA 层省 15.7 μs；c1 counting 28.87→29.05 步/秒，c8 727.8→742.7；接受率不变；weights 误差为 sgemm 的 1.07×/1.24×（outlier/cancel 输入的 mean），max 更低 |
+
+**route v2 用 tc 模式（compose 中 `VLLM_GLM5_ROUTE_V2_GEMV: tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
+**不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：
+一是与对方数值对齐，prose 接受率 1.232/轮，与对方相同（gate 为 1.218）；二是减少 SM 争用。gate 模式的 GEMV 一次铺开
+288 个 8-warp CTA，shared experts（侧流）只能等它排空，结果与 routed Marlin 重叠更多；tc 是一次 80-CTA launch。
+单卡 MoE 层 bench（M=8）：gate 385.5、tc 375.9、无路由 363.8 μs/层；整机 c1 counting 29.05→29.21 步/秒
+（`/tmp/dcp/dflash-port/STEP-GAP-2.md` §7–8）。
 
 0028 的代码位于 0025 的 `VLLM_GLM5_TARGET_PRENORM_FP32_0026=1` 分支内部，0025 关闭时完全不可达，所以系列默认行为不变
 （静态检查断言了这一点）。0028 的 kernel 会重写 sqrsum，因此 compose 显式设 `VLLM_MHC_POST_FUSE_SQRSUM=0`
@@ -248,7 +256,7 @@ podman compose -f compose.w4a16-dflash2.yml up -d
 `--max-num-batched-tokens=2312`；`--long-prefill-token-threshold=0`；
 `--gpu-memory-utilization=0.95`；`FULL_AND_PIECEWISE`；prefix caching；
 `--mamba-cache-mode=align`；DFlash2 `num_speculative_tokens=3`，自适应深度 `7,5`，`ACCEPT=0`（只按负载选深度：1 个请求验证 7、2 个 5、更多 3）；
-0005–0028 全部开启（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST=0`）；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
+0005–0029 全部开启（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST=0`；0010 用 `_GEMV=tc`）；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
 
 分层的另一选择是 `GLM_PP_LAYER_PARTITION=12,12,12,9`：c8 约 +10%，但 KV 池从 1.68M
 降到 1.24M token（这两个数是 0022 之前测得的）。
@@ -287,19 +295,23 @@ podman compose -f compose.w4a16-dflash2.yml up -d
 > 下面第一张表在 node2 的**源码挂载开发部署**上测得（开发树按上表顺序应用，开关与本 compose 相同）；
 > 紧接着的“新镜像复测”是 0001–0028 镜像、本 compose 原样启动、**不挂载源码**的结果。
 
-新镜像复测（`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`，GPU5–8，同方法）：
+新镜像复测（`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`，0001–0029，本 compose 原样启动、不挂载源码，GPU5–8，同方法）：
 
 | 负载 | c1 | c8 合计 | 对方 c1 | 对方 c8 |
 |---|---|---|---|---|
-| counting | 221.6 tok/s（每秒步数 28.87） | 727.8 [714.0–733.2] | 230.1（29.97） | 765.7 |
-| code | 156.3 | 594.4 | 157.5 | 608.5 |
-| prose | 65.3（每秒步数 29.47，每步输出 2.21） | 332.2 | 68.2（30.61） | 341.1 |
+| counting | 225.1 tok/s（每秒步数 29.32） | 739.5 [726.0–746.9] | 230.1（29.97） | 765.7 |
+| code | 149.2 [143.1–160.8] | 589.9 | 157.5 | 608.5 |
+| prose | 66.6（每秒步数 29.88，每步输出 2.22） | 324.0 [314.7–345.5] | 68.2（30.61，2.22） | 341.1 |
 
-- 冷 prefill：7k 3,696、28k 5,104、114k 5,651 tok/s（对方 3,839 / 5,316 / 5,862）。
-- KV 池 2,054,477 token（0021 审计修复后尾段 workspace 在 KV 定容前计入预算，比开发部署少约 2%；对方 1,917,988）。
-- prose 接受数（metrics）1.218/轮（对方 1.232）。
-- 正确性：同一引擎 T=0 greedy 3 类×4 次×128 token，所有偏离 top-1 的位置 logprob 差距 0–0.5（近似平局）。
-- c8 counting 在开发部署的多次运行中为 724–753，本次 727.8；运行间波动约 ±2%，因此 c8 与对方的差距在 1.7–5% 之间。
+- 冷 prefill：7k 3,709、28k 5,180、114k 5,725 tok/s（对方 3,839 / 5,316 / 5,862）。
+- KV 池 2,054,477 token（0021 审计修复后尾段 workspace 在 KV 定容前计入预算；对方 1,917,988，我们多 7%）。
+- prose 接受数（metrics）1.232/轮，与对方相同。
+- 与对方差距：c1 每秒步数 −2.2%（counting）/−2.4%（prose），c8 counting −3.4%，c8 code −3.1%，114k prefill −2.3%。
+  c1 code 单 prompt 吞吐受接受率轨迹影响大（运行间 143–161），不宜单独比较。
+- 剩余差距的定位：同一 kernel 单独运行时两边耗时相同；差距来自 shared expert（侧流 thin GEMM）与 routed Marlin
+  并发时的 SM 争用（我们 Marlin 与侧流重叠 28.7%，对方 18.9%）。`tc` 路由已缓解一部分。
+- 正确性：同一引擎 T=0 greedy 3 类×4 次×128 token，所有偏离 top-1 的位置 logprob 差距 0–0.75（近似平局）。
+  GPU 单测（镜像内）：0021 尾段与 FlashInfer 隔离、0018–0020、Marlin decode、kpool 回滚矩阵 293 项、0024、0026、0029 全部通过。
 
 开发部署结果：
 
@@ -336,12 +348,14 @@ GPU5–8，PP4，2 轮预热、5 轮正式取中位数，每次 500 token。我�
 | PP metadata cache（开发 0025，`VLLM_PP_METADATA_CACHE_0025`） | 整机无收益 |
 | PP 传输张量打包（开发 0029，`VLLM_PP_PACK_TENSORS_0029`） | 整机无收益 |
 | `VLLM_GLM5_ROUTE_V2_FIRST=1`（0023 的入队顺序部分） | 整机变慢；补丁保留但默认 0，compose 设 0 |
+| thin GEMM 配置选择与对方相同（评估时编号 0030，`VLLM_GLM5_THIN_GEMM_MM_SELECT`） | 整机 c8 729.2，无收益；已从系列删除 |
+| shared experts 侧流设 stream 优先级（评估时编号 0031，`VLLM_GLM5_SHARED_STREAM_PRIORITY`） | 单卡 MoE 层 bench：tc+high 381.3 vs tc+default 375.9 μs/层，更慢；已从系列删除 |
 
 ### 正确性证据
 
 - 开/关投机解码对比：T=0 greedy，3 类 prompt，每类 4 次，每次 128 token。短提示词与计数在两种模式下
   各自完全稳定；所有偏离 top-1 的位置，logprob 差距都不超过 0.75，属于 BF16 近似平局。
-- 0002：GPU 回滚矩阵 293 项通过。0006：11 项 GPU 测试通过。0010 gate 模式与原路由逐位一致。
+- 0002：GPU 回滚矩阵 293 项通过。0006：11 项 GPU 测试通过。0010 gate 模式与原路由逐位一致；tc 模式的 router logits 与对方 `_moe_route_kernel` 逐位一致（`bench_route`：mm_logits_bitwise True）。
   0013：99.9% 逐位一致。0014：误差比 FLA 更小。
 - 0018–0020、0023（kernel 部分）、0024、0026、0027 在 GPU 上与关闭时逐位一致；0021 用
   `VLLM_PP_DRAFT_TAIL_VERIFY=1` 对比 33,059 行草稿零差异。0017+0025 使相同历史首块与对方逐位一致。

@@ -32,6 +32,9 @@
 | 0026 | 0027 | `test_moe_sum_add_gpu.py`（第 3 项需 `vllm._ampere_marlin_C` 与 `marlin_decode_common.py`） | sm_80 | GPU 逐位 512/512（开发阶段） |
 | 0028 | 0026b | `bench_prenorm_bf16x3_gpu.py`（`--mm-file` 指向对方 `ampere_prefill/mhc_prenorm.py`） | sm_80 | T=2312 923 → 154 μs；T ≥ 384 与对方逐位、T < 384 与 0025 逐位（开发阶段） |
 | 0027 | 0028 | `bench_shared_reorder_gpu.py`（+ `marlin_decode_common.py`） | sm_80 + `vllm._ampere_marlin_C` | 逐位（开发阶段） |
+| 0029 | — | `test_idx_dual_gemm_gpu.py`（k 列逐位、weights 误差 ≤ 1.5× sgemm、op 回退逐位、graph、双流、微基准）；纯 CPU 部分在 `test_thin_gemm_pure.py` | sm_80 | node2 通过：每 MLA 层省 15.7 μs；weights mean 1.07×/1.24×（outlier/cancel），max 更低 |
+| —（诊断） | — | `trace_overlap_split.py`：把 profiler trace 中 `_thin_gemm_kernel` / `moe_dec_gemm` / `_post_update_num_computed_tokens_kernel` 每次调用按“单独运行 / 与 NCCL 重叠 / 与其他流重叠”分组统计 | 仅 python3（CPU） | 合成 trace 自测 |
+| —（诊断） | — | `bench_shared_contention_gpu.py`（+ `marlin_decode_common.py`）：一个 rank 的 MoE 层 graph，路由前奏 none/gate/tc × 侧流优先级 default/high + serial，输出逐位相同，us/层与重叠比例 | sm_80 + `vllm._ampere_marlin_C` | node2 M=8：none 363.8、gate 385.5、tc 375.9、tc+high 381.3 μs/层（据此 compose 改用 tc；0031 未纳入） |
 
 0007（融合 grouped conv）没有单独测试；它由整机 A/B 覆盖。0022（profile 占位收紧）与 0025（fp32 prenorm）
 没有单元测试：0022 由 KV 池大小与 243k/8×114k 压力测试覆盖，0025 由相同历史首块与对方逐位比较覆盖
@@ -98,6 +101,28 @@ podman run --rm -it --device nvidia.com/gpu=5 --security-opt label=disable \
     #     --mm-tl-file /mm/vllm/model_executor/kernels/mhc/tilelang_kernels.py
   '
 ```
+
+### 0029（新镜像内）
+
+```bash
+cd /root/app/vllm-cmp170hx
+podman run --rm -it --device nvidia.com/gpu=5 --security-opt label=disable \
+  -v "$PWD/models/glm-5.3-flash/tests/dflash2":/tests:ro \
+  -w /tests --entrypoint bash localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2 -c '
+    export PYTHONDONTWRITEBYTECODE=1
+    set -e
+    python3 test_idx_dual_gemm_gpu.py --json /tmp/0029.jsonl                    # 0029
+  '
+```
+
+- 对已有 profile（两边 `.pt.trace.json[.gz]`）：
+  `python3 trace_overlap_split.py ours/rank0.json.gz mm/rank0.json.gz`，看 `alone` 一行两边是否相同。
+- shared experts 与 Marlin 争用诊断（同一镜像内，不需要任何开关）：
+  `VLLM_GLM5_THIN_GEMM=1 python3 bench_shared_contention_gpu.py --tokens 8 --trace-dir /tmp/sc`，
+  然后 `python3 trace_overlap_split.py /tmp/sc/M8_gate_default.json /tmp/sc/M8_tc_default.json`。
+- 0029 已在 compose 中打开（`VLLM_GLM5_IDX_DUAL_GEMM: "1"`）。
+- 已评估未纳入：0030（`VLLM_GLM5_THIN_GEMM_MM_SELECT`，整机 c8 729.2，无收益）、
+  0031（`VLLM_GLM5_SHARED_STREAM_PRIORITY`，bench 中 tc+high 381.3 vs tc+default 375.9 μs/层，更慢）。
 
 - 所有脚本默认从镜像 site-packages 读取被测文件；要测另一份源码树，设 `GLM_DFLASH2_TREE=<树根>`
   并把它放进 `PYTHONPATH`。

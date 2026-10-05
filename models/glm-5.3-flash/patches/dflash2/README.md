@@ -18,7 +18,7 @@ exception: `VLLM_GLM5_ROUTE_V2_FIRST` (0023) defaulted to 1 under route v2 in
 development and defaults to 0 here (whole-machine runs were slower with 1).
 Only `VLLM_GLM5_INDEXER_JIT_WARMUP` (0015) defaults to on, and it is
 compile-only.
-`compose.w4a16-dflash2.yml` turns the rest on. With no GLM env set the image
+`compose.w4a16-dflash2.yml` turns the rest on (0010 in `tc` mode, see below). With no GLM env set the image
 behaves as the DeepSeek image for every other model.
 
 | # | patch | switch (default) | development no. |
@@ -51,6 +51,7 @@ behaves as the DeepSeek image for every other model.
 | 0026 | routed moe_sum fused with the shared-expert add | `VLLM_GLM5_MOE_SUM_ADD` (0) | 0027 (`patches-step/`) |
 | 0027 | shared experts enqueued after the routed experts | `VLLM_GLM5_SHARED_EXPERT_REORDER` (0) | 0028 (`patches-step/`) |
 | 0028 | bf16x3 tensor-core prenorm GEMM for T >= 384 (vendored Morrowmake kernel, Apache-2.0) | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS` (384; only inside 0025's `=1` branch) | 0026b (`patches/`) |
+| 0029 | indexer wk+weights as one dual-store thin GEMM (k bf16 bitwise, head weights fp32; replaces cast + fp32 sgemm) | `VLLM_GLM5_IDX_DUAL_GEMM` (0; needs `VLLM_GLM5_THIN_GEMM=1`; **on in compose**) | - (STEP-GAP-2) |
 
 Left out of the development series:
 
@@ -92,6 +93,22 @@ slightly different trees, so they were re-applied in the order above on top of
 mode), a provenance comment added to the vendored file and the code comment
 renumbered. Apart from these comment/default edits the final tree equals the development
 tree (`work-step/cand` + the 0021 audit delta) file by file.
+
+0029 (third round, `/tmp/dcp/dflash-port/STEP-GAP-2.md`) was written directly
+against the tree after 0028; it has no development predecessor. GPU: 15.7 us
+saved per MLA layer, c1 counting 28.87 -> 29.05 steps/s, c8 727.8 -> 742.7,
+acceptance unchanged; `compose.w4a16-dflash2.yml` turns it on. The compose
+also switches 0010 to `VLLM_GLM5_ROUTE_V2_GEMV=tc`: its router logits are not
+bitwise our old gate path but are bitwise Morrowmake's `_moe_route_kernel`
+(prose acceptance 1.232/round, same as MM; gate 1.218), and its single 80-CTA
+launch leaves SMs to the shared experts (c1 29.05 -> 29.21 steps/s).
+
+Evaluated in the same round and dropped (no patch file):
+
+| eval no. | patch | why |
+|---|---|---|
+| 0030 | thin GEMM schedule selected exactly as Morrowmake's (`VLLM_GLM5_THIN_GEMM_MM_SELECT`) | no end-to-end gain (c8 729.2) |
+| 0031 | shared-experts side stream with a CUDA stream priority (`VLLM_GLM5_SHARED_STREAM_PRIORITY`) | slower in the MoE-layer bench (tc+high 381.3 vs tc+default 375.9 us/layer) |
 
 Static checks: `scripts/test-glm53-dflash2-patches.py` (run by the apply
 script). CPU check of the whole stack:

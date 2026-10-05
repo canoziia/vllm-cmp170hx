@@ -1,0 +1,549 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: indexer wk+weights as one dual-store thin GEMM
+
+VLLM_GLM5_IDX_DUAL_GEMM (default 0; read once; needs VLLM_GLM5_THIN_GEMM=1
+on sm_80). Port of the "weights" part of Morrowmake's
+VLLM_GLM5_DECODE_IDX_GLUE (_thin_gemm_dual_kernel, verbatim). Per MLA layer
+and decode step the merged wk+weights thin GEMM, hidden.float() and the fp32
+sgemm that recomputes the head weights become one launch of the same grid:
+k columns stored bf16 (bitwise the merged GEMM's), weight columns stored as
+fp32 accumulators (fresh mma accumulator per 64-wide k slice, Kahan split-K
+reduce; not bitwise the sgemm, error bound checked by
+tests/dflash2/test_idx_dual_gemm_gpu.py). Registered custom op; any call the
+kernel cannot take, or an (M, N, K) first seen inside a capture, runs the
+original two ops. Workspace keyed per thin_gemm.private_workspace scope with
+its own tag. Warmed in kernel_warmup before capture. Off: original lines.
+
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index 63c8c5b..ff6ee3c 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -201,6 +201,17 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+ 
+         warmup_thin_gemm(worker, cudagraph_capture_sizes)
+ 
++        # Indexer wk+weights dual thin GEMM (0029): no-op unless
++        # VLLM_GLM5_IDX_DUAL_GEMM=1.
++        import os
++
++        if os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() == "1":
++            from vllm.models.glm5next.nvidia.ops.idx_dual_gemm import (
++                warmup_idx_dual,
++            )
++
++            warmup_idx_dual(worker, cudagraph_capture_sizes)
++
+     # 64-head Gluon sparse-MLA prefill (patch 0017): compile before the first
+     # prefill and before any capture. No-op unless
+     # VLLM_GLM5_PP_SPARSE_MLA_PREFILL=1 and this rank runs 64 heads on sm_80.
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 590fedb..743f389 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -42,6 +42,18 @@ from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
+ logger = init_logger(__name__)
+ 
+ 
++@functools.cache
++def _idx_dual_gemm_enabled() -> bool:
++    """VLLM_GLM5_IDX_DUAL_GEMM=1 (0029; default off) on top of the thin GEMM."""
++    import os
++
++    if os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1":
++        return False
++    from vllm.models.glm5next.nvidia.ops.idx_dual_gemm import enabled
++
++    return enabled()
++
++
+ @functools.cache
+ def _thin_gemm_enabled() -> bool:
+     """VLLM_GLM5_THIN_GEMM on an sm_80 part (read once; off = F.linear)."""
+@@ -397,16 +409,39 @@ class Indexer(nn.Module):
+ 
+         # Compute the head gate in fp32; bf16 error can change near-tie pool
+         # rankings on long-context tasks. Cache it after weights are loaded.
+-        kw, _ = self.wk_weights_proj(hidden_states)
+-        k = kw[:, : self.head_dim]
+-        if self._wp_fp32 is None:
+-            self._wp_fp32 = (
+-                self.wk_weights_proj.weight.data[self.head_dim :, :]
+-                .t()
+-                .contiguous()
+-                .float()
++        if _idx_dual_gemm_enabled() and hidden_states.dim() == 2:
++            # VLLM_GLM5_IDX_DUAL_GEMM (0029): one thin-GEMM launch stores the
++            # k columns bf16 (bitwise the merged GEMM's) and the head-weight
++            # columns as fp32 accumulators, replacing the cast + fp32 sgemm
++            # below. Falls back to exactly these two ops inside the op.
++            if self._wp_fp32 is None:
++                self._wp_fp32 = (
++                    self.wk_weights_proj.weight.data[self.head_dim :, :]
++                    .t()
++                    .contiguous()
++                    .float()
++                )
++            from vllm.models.glm5next.nvidia.ops.idx_dual_gemm import (
++                idx_dual_linear,
++            )
++
++            k, weights = idx_dual_linear(
++                hidden_states,
++                self.wk_weights_proj.weight,
++                self._wp_fp32,
++                self.head_dim,
+             )
+-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
++        else:
++            kw, _ = self.wk_weights_proj(hidden_states)
++            k = kw[:, : self.head_dim]
++            if self._wp_fp32 is None:
++                self._wp_fp32 = (
++                    self.wk_weights_proj.weight.data[self.head_dim :, :]
++                    .t()
++                    .contiguous()
++                    .float()
++                )
++            weights = torch.mm(hidden_states.float(), self._wp_fp32)
+ 
+         k = _fused_indexer_k_norm(
+             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
+diff --git a/vllm/models/glm5next/nvidia/ops/idx_dual_gemm.py b/vllm/models/glm5next/nvidia/ops/idx_dual_gemm.py
+new file mode 100644
+index 0000000..3e4d874
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/idx_dual_gemm.py
+@@ -0,0 +1,433 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Indexer wk+weights projection as one thin GEMM with a split store
++(VLLM_GLM5_IDX_DUAL_GEMM, default off; needs VLLM_GLM5_THIN_GEMM=1).
++
++Ported from Morrowmake/vllm-cmp170hx ``ampere-glm53`` @ 3a2bf16dae
++(``vllm/ampere_decode/idx_glue.py``: ``_thin_gemm_dual_kernel``,
++``thin_gemm_dual``, the "weights" part of ``VLLM_GLM5_DECODE_IDX_GLUE``).
++The kernel body is copied verbatim; the integration (custom op, workspace,
++capture fallback, warmup) follows our ``thin_gemm.py``.
++
++What it replaces, per MLA layer and decode step (``nvidia/attention.py``,
++``Glm5NextIndexer.forward``)::
++
++    kw = thin_gemm(x, W)                    # [M, 128 + n_head] bf16; only
++    k = kw[:, :128]                         #   the k columns are used
++    weights = torch.mm(x.float(), W_hi^T)   # cast + fp32 sgemm (+ splitK
++                                            #   reduce): the head weights again
++
++with one launch of the same thin GEMM grid that stores the k columns in bf16
++(bitwise what ``thin_gemm`` stores: same loop, same fixed-order split-K
++reduction) and the weight columns as their fp32 accumulators. The weight
++columns are NOT bitwise the cuBLAS sgemm (bf16 x bf16 products are exact in
++fp32, so only the summation order differs): each 64-wide k slice gets a fresh
++mma accumulator, slices are added with plain fp32 adds and the split-K
++partials with a Kahan-compensated reduce. MM measured 0.62x the sgemm's mean
++and 0.51x its max error against an exact product on decode inputs;
++``tests/dflash2/test_idx_dual_gemm_gpu.py`` re-checks that bound here.
++
++Default off: nothing here is imported and ``attention.py`` runs its original
++lines. With the switch on, any call the kernel cannot take (rows outside the
++thin-GEMM bound, ``n_lo`` not a multiple of the N tile, a non-unit K stride, or
++an (M, N, K) first seen inside a CUDA-graph capture) runs exactly the original
++two-op sequence inside the op.
++
++Multi-stream: workspace (split-K partials, arrival counters) comes from the
++thin-GEMM workspace dict under the active ``thin_gemm.private_workspace``
++scope plus a ``"dual"`` tag, so it is never shared with a plain thin GEMM or
++with another scope (0021's draft tail on its side stream).
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++from . import thin_gemm as _tg
++
++logger = init_logger(__name__)
++
++
++@functools.cache
++def enabled() -> bool:
++    """VLLM_GLM5_IDX_DUAL_GEMM=1 and the thin GEMM is on (sm_80). Read once."""
++    if os.getenv("VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1":
++        return False
++    return _tg.use_thin_gemm()
++
++
++# ---------------------------------------------------------------------------
++# Kernel (verbatim from MM idx_glue.py)
++# ---------------------------------------------------------------------------
++@triton.jit
++def _add_rn(a, b):
++    # Plain fp32 add the compiler cannot fold into an mma accumulator or
++    # reassociate (a tensor-core mma adding into a non-zero accumulator
++    # truncates on sm_80).
++    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b],
++                                     dtype=tl.float32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _sub_rn(a, b):
++    return tl.inline_asm_elementwise("sub.rn.f32 $0, $1, $2;", "=r,r,r", [a, b],
++                                     dtype=tl.float32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _kahan_add(s, c, v):
++    """(s, c) += v with Kahan compensation; returns the new (s, c)."""
++    y = _sub_rn(v, c)
++    t = _add_rn(s, y)
++    c = _sub_rn(_sub_rn(t, s), y)
++    return t, c
++
++
++@triton.jit
++def _thin_gemm_dual_kernel(
++    X, W, Y, Y2, P, LOCK,
++    M, N, K, N_LO,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    stride_y2m, stride_y2n,
++    stride_pk, stride_pm, stride_pn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    TILED_M: tl.constexpr,
++    HI_SUB_K: tl.constexpr = 0,
++    HI_KAHAN_LOOP: tl.constexpr = False,
++    HI_KAHAN_REDUCE: tl.constexpr = False,
++):
++    """``thin_gemm._thin_gemm_kernel`` with a split store.
++
++    Columns ``< N_LO`` run the incumbent's main loop and fixed-order split-K
++    reduction line for line and are stored bf16 into ``Y`` (bitwise the
++    incumbent's store). Columns ``>= N_LO`` replace a fp32 sgemm, so they are
++    accumulated for fp32 accuracy and stored unrounded into ``Y2``: a fresh
++    mma accumulator per ``HI_SUB_K``-wide k slice, summed in fp32 registers
++    (an sm_80 mma that adds products into a non-zero accumulator truncates
++    them to the running sum's exponent), and a Kahan-compensated split-K
++    reduce. ``HI_SUB_K == 0`` keeps the incumbent loop for them too.
++    ``N_LO % BLOCK_N == 0`` (checked by the wrapper), so every N tile is
++    entirely one or the other.
++    """
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    if TILED_M:
++        pid_m = tl.program_id(2)
++        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    else:
++        pid_m = 0
++        offs_m = tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    x_m = tl.where(m_mask, offs_m, 0)
++    w_n = tl.where(n_mask, offs_n, 0)
++
++    x_ptrs = X + x_m[:, None] * stride_xm + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_xk
++    w_ptrs = W + w_n[:, None] * stride_wn + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_wk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    step = BLOCK_K * SPLIT_K
++    n_iter = tl.cdiv(K, step)
++    is_lo = pid_n * BLOCK_N < N_LO
++    if is_lo or HI_SUB_K == 0:
++        # bf16 columns: the incumbent's loop, line for line (bitwise the
++        # merged GEMM's k columns).
++        for i in range(n_iter):
++            if EVEN_K:
++                x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++                w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
++            else:
++                k_now = i * step + pid_k * BLOCK_K + offs_k
++                k_mask = k_now < K
++                x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++                w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
++            acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
++            x_ptrs += step * stride_xk
++            w_ptrs += step * stride_wk
++    else:
++        # fp32 columns: a fresh mma accumulator per HI_SUB_K-wide slice,
++        # summed in fp32 registers (optionally Kahan-compensated), so no
++        # product is truncated to the running sum's exponent inside the mma.
++        comp = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++        offs_s = tl.arange(0, HI_SUB_K)
++        for i in range(n_iter):
++            for j in tl.static_range(BLOCK_K // HI_SUB_K):
++                kk = i * step + pid_k * BLOCK_K + j * HI_SUB_K + offs_s
++                xs = X + x_m[:, None] * stride_xm + kk[None, :] * stride_xk
++                ws = W + w_n[:, None] * stride_wn + kk[None, :] * stride_wk
++                if EVEN_K:
++                    x = tl.load(xs, mask=m_mask[:, None], other=0.0)
++                    w = tl.load(ws, mask=n_mask[:, None], other=0.0)
++                else:
++                    k_mask = kk < K
++                    x = tl.load(xs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++                    w = tl.load(ws, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
++                blk = tl.dot(x, tl.trans(w), out_dtype=tl.float32)
++                if HI_KAHAN_LOOP:
++                    acc, comp = _kahan_add(acc, comp, blk)
++                else:
++                    acc = _add_rn(acc, blk)
++    y_ptrs = Y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
++    y2_ptrs = Y2 + offs_m[:, None] * stride_y2m + \
++        (offs_n - N_LO)[None, :] * stride_y2n
++    if SPLIT_K == 1:
++        if is_lo:
++            tl.store(y_ptrs, acc.to(Y.dtype.element_ty), mask=m_mask[:, None])
++        else:
++            tl.store(y2_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
++    else:
++        p_mask = m_mask[:, None] & n_mask[None, :]
++        p_off = offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
++        tl.store(P + pid_k * stride_pk + p_off, acc, mask=p_mask,
++                 cache_modifier=".cg")
++        if TILED_M:
++            lock = LOCK + pid_m * tl.num_programs(0) + pid_n
++        else:
++            lock = LOCK + pid_n
++        arrived = tl.atomic_add(lock, 1, sem="acq_rel", scope="gpu")
++        if arrived == SPLIT_K - 1:
++            tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            if HI_KAHAN_REDUCE and not is_lo:
++                tc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++                for k in tl.static_range(SPLIT_K):
++                    v = tl.load(P + k * stride_pk + p_off, mask=p_mask,
++                                other=0.0, cache_modifier=".cv")
++                    tot, tc = _kahan_add(tot, tc, v)
++            else:
++                for k in tl.static_range(SPLIT_K):
++                    tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
++                                   other=0.0, cache_modifier=".cv")
++            if is_lo:
++                tl.store(y_ptrs, tot.to(Y.dtype.element_ty), mask=p_mask)
++            else:
++                tl.store(y2_ptrs, tot, mask=p_mask)
++            tl.atomic_xchg(lock, 0, sem="release", scope="gpu")
++
++
++# fp32 (high) block accumulation: (k width of each fresh mma accumulator, Kahan
++# in the k loop, Kahan in the split-K reduce). MM's choice: on real decode
++# inputs (M 4-32, K 4096) the running accumulator was 5.6x the fp32 sgemm's
++# mean error against an exact product; (64, False, True) is 0.62x mean, 0.51x
++# max, for <= 0.7 us per call.
++_HI_ACC = (64, False, True)
++
++
++# ---------------------------------------------------------------------------
++# Workspace (thin_gemm's dict, own "dual" keys, scope-aware)
++# ---------------------------------------------------------------------------
++def _partials(split_k, M, N, K, device):
++    key = (device.index, _tg._SCOPE.get(), "dual-p", split_k, M, N, K)
++    buf = _tg._WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.empty((split_k, M, N), dtype=torch.float32, device=device)
++        _tg._WORKSPACE[key] = buf
++    return buf
++
++
++def _locks(tiles, M, N, K, device):
++    key = (device.index, _tg._SCOPE.get(), "dual-lock", M, N, K, tiles)
++    buf = _tg._WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.zeros(tiles, dtype=torch.int32, device=device)
++        _tg._WORKSPACE[key] = buf
++    return buf
++
++
++# ---------------------------------------------------------------------------
++# Entry points
++# ---------------------------------------------------------------------------
++def kernel_supported(M: int, N: int, K: int, n_lo: int) -> bool:
++    """Host-only shape gate (no allocation, no device query beyond the cached
++    SM count used by the config heuristic)."""
++    if not (0 < n_lo < N) or not _tg.rows_supported(M, N, K):
++        return False
++    BLOCK_N = _tg._select_config(M, N, K)[1]
++    return n_lo % BLOCK_N == 0
++
++
++def thin_gemm_dual(
++    x: torch.Tensor, w: torch.Tensor, n_lo: int, _hi_acc=None
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``F.linear(x, w)`` split at column ``n_lo``.
++
++    Returns ``(lo_full, hi)``: ``lo_full`` is an ``[M, N]`` bf16 buffer whose
++    columns ``[:n_lo]`` are bitwise ``thin_gemm(x, w)[:, :n_lo]`` (columns
++    ``n_lo:`` are left unwritten, never read); ``hi`` is ``[M, N - n_lo]``
++    fp32. Callers slice ``lo_full[:, :n_lo]`` so the k view has the strides it
++    had as a slice of the merged GEMM output.
++    """
++    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
++    assert x.ndim == 2 and w.ndim == 2 and x.shape[1] == w.shape[1]
++    M, K = x.shape
++    N = w.shape[0]
++    BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = _tg._select_config(
++        M, N, K
++    )
++    assert n_lo % BLOCK_N == 0, (n_lo, BLOCK_N)
++    hi_acc = _HI_ACC if _hi_acc is None else _hi_acc
++    lo_full = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
++    hi = torch.empty((M, N - n_lo), dtype=torch.float32, device=x.device)
++    if M == 0:
++        return lo_full, hi
++    even_k = (K % (BLOCK_K * SPLIT_K)) == 0
++    tiles_n = triton.cdiv(N, BLOCK_N)
++    tiles_m = triton.cdiv(M, BLOCK_M)
++    if SPLIT_K == 1:
++        p, lock = _tg._dummy(x.device)
++        sp = (0, 0, 0)
++    else:
++        p = _partials(SPLIT_K, M, N, K, x.device)
++        sp = (p.stride(0), p.stride(1), p.stride(2))
++        lock = _locks(tiles_n * tiles_m, M, N, K, x.device)
++    _thin_gemm_dual_kernel[(tiles_n, SPLIT_K, tiles_m)](
++        x, w, lo_full, hi, p, lock,
++        M, N, K, n_lo,
++        x.stride(0), x.stride(1),
++        w.stride(0), w.stride(1),
++        lo_full.stride(0), lo_full.stride(1),
++        hi.stride(0), hi.stride(1),
++        sp[0], sp[1], sp[2],
++        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=SPLIT_K,
++        EVEN_K=even_k, TILED_M=(tiles_m > 1),
++        HI_SUB_K=min(hi_acc[0], BLOCK_K), HI_KAHAN_LOOP=hi_acc[1],
++        HI_KAHAN_REDUCE=hi_acc[2],
++        num_warps=num_warps, num_stages=num_stages,
++    )  # fmt: skip
++    return lo_full, hi
++
++
++# (device index, M, N, K) whose dual binary and workspace exist (run eagerly).
++_READY: set = set()
++_capture_fallback_logged: set = set()
++
++
++def _reference(
++    x: torch.Tensor, w: torch.Tensor, w_hi_t: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """The original sequence: merged GEMM through the thin-GEMM gate (exactly
++    what ``wk_weights_proj(x)`` dispatches to) + fp32 sgemm for the weights."""
++    if _tg.static_supported(x, w, None):
++        kw = _tg._glm5_thin_linear_impl(x, w)
++    else:
++        kw = torch.nn.functional.linear(x, w)
++    return kw, torch.mm(x.float(), w_hi_t)
++
++
++def _glm5_idx_dual_linear_impl(
++    x: torch.Tensor, w: torch.Tensor, w_hi_t: torch.Tensor, n_lo: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    M, K = x.shape
++    N = w.shape[0]
++    if (
++        not _tg.static_supported(x, w, None)
++        or x.stride(1) != 1
++        or not kernel_supported(M, N, K, n_lo)
++    ):
++        return _reference(x, w, w_hi_t)
++    key = (x.device.index, M, N, K)
++    if key not in _READY:
++        if torch.cuda.is_current_stream_capturing():
++            if key not in _capture_fallback_logged:
++                _capture_fallback_logged.add(key)
++                logger.warning(
++                    "VLLM_GLM5_IDX_DUAL_GEMM: (M=%d, N=%d, K=%d) was not warmed "
++                    "up before CUDA-graph capture; this graph keeps the merged "
++                    "GEMM + fp32 sgemm.", M, N, K)
++            return _reference(x, w, w_hi_t)
++        out = thin_gemm_dual(x, w, n_lo)
++        _READY.add(key)
++        return out
++    return thin_gemm_dual(x, w, n_lo)
++
++
++def _glm5_idx_dual_linear_fake(
++    x: torch.Tensor, w: torch.Tensor, w_hi_t: torch.Tensor, n_lo: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    M = x.shape[0]
++    N = w.shape[0]
++    return (
++        x.new_empty((M, N)),
++        x.new_empty((M, N - n_lo), dtype=torch.float32),
++    )
++
++
++direct_register_custom_op(
++    op_name="glm5_idx_dual_linear",
++    op_func=_glm5_idx_dual_linear_impl,
++    fake_impl=_glm5_idx_dual_linear_fake,
++)
++
++
++def idx_dual_linear(
++    x: torch.Tensor, w: torch.Tensor, w_hi_t: torch.Tensor, n_lo: int
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``(F.linear(x, w)[:, :n_lo] as bf16, x.float() @ w_hi_t)`` for the
++    indexer; see the module docstring. Only call when :func:`enabled`."""
++    lo_full, hi = torch.ops.vllm.glm5_idx_dual_linear(x, w, w_hi_t, n_lo)
++    return lo_full[:, :n_lo], hi
++
++
++# ---------------------------------------------------------------------------
++# Warmup (must run before CUDA-graph capture)
++# ---------------------------------------------------------------------------
++def _indexers(models):
++    for model in models:
++        for _name, module in model.named_modules():
++            proj = getattr(module, "wk_weights_proj", None)
++            head_dim = getattr(module, "head_dim", None)
++            w = getattr(proj, "weight", None)
++            if (
++                isinstance(w, torch.Tensor)
++                and w.is_cuda
++                and w.dtype is torch.bfloat16
++                and w.ndim == 2
++                and isinstance(head_dim, int)
++                and 0 < head_dim < w.shape[0]
++            ):
++                yield w, head_dim
++
++
++def warmup_idx_dual(worker, capture_sizes) -> None:
++    """Compile the dual kernel and allocate its workspace for every M a decode
++    graph can replay (outputs discarded, inputs zero)."""
++    if not enabled():
++        return
++    bound = _tg.dispatch_threshold()
++    ms = {int(s) for s in capture_sizes if 1 <= int(s) <= bound}
++    ms.update(m for m in _tg._EXTRA_MS if m <= bound)
++    seen: set = set()
++    n = 0
++    for w, n_lo in _indexers(_tg._candidate_models(worker)):
++        shape = (int(w.shape[0]), int(w.shape[1]), n_lo)
++        if shape in seen:
++            continue
++        seen.add(shape)
++        N, K, _ = shape
++        w_hi_t = w[n_lo:, :].t().contiguous().float()
++        for M in sorted(ms):
++            x = torch.zeros((M, K), dtype=torch.bfloat16, device=w.device)
++            _glm5_idx_dual_linear_impl(x, w, w_hi_t, n_lo)
++            n += int((w.device.index, M, N, K) in _READY)
++        del w_hi_t
++    torch.cuda.synchronize()
++    logger.info(
++        "VLLM_GLM5_IDX_DUAL_GEMM: indexer wk+weights dual thin GEMM warmed for "
++        "%d (M, N, K) over %d weight shapes, M in %s.", n, len(seen), sorted(ms))

@@ -1,4 +1,4 @@
-af64310f00f2f770e1a90daa1e9df55f243ac1e3326dc7ed6380eb80c68bf69f  models/glm-5.3-flash/patches/dflash2/series
+e11ba90fd48cf1e9461cbfae05e59993c1999beb43283b57522ba5f077c11731  models/glm-5.3-flash/patches/dflash2/series
 bdcc76eaf40505fdac9b7c682941f6a44724d170ad5f842225fe3c35a7d3378c  models/glm-5.3-flash/patches/dflash2/0001-glm5next-aux-hidden-states-pp.patch
 c60b635099acf40f5e3ce3996ed104ba194898f1636e7dac38be528dc281011e  models/glm-5.3-flash/patches/dflash2/0002-glm5next-kpool-tail-ring-spec-decode.patch
 1c78460fca518ee4456fed7e4964ac05d16dde7b84e9604c7057ef0f233b37f9  models/glm-5.3-flash/patches/dflash2/0003-glm5next-kv-layout-dflash-drafter-groups.patch
@@ -27,6 +27,7 @@ e51ea7530e3644e0e4169e892012e17e1f56adc14385789837bc09f761e1386a  models/glm-5.3
 5077343012290f769f0b9d5c24d4053bddf1fbd222d7d17e691e00dd9793e7a7  models/glm-5.3-flash/patches/dflash2/0026-glm5-moe-sum-add-fuse.patch
 06168d0aabe2c0c8816ce2a61cfabef80df0d3dc350355f42c75b1a22b6695a3  models/glm-5.3-flash/patches/dflash2/0027-glm5-shared-expert-reorder.patch
 7ac40fc50fa641b2e62d51660430e1328df762814ff1847578c32ce22ada9aaa  models/glm-5.3-flash/patches/dflash2/0028-mhc-prenorm-bf16x3-prefill.patch
+bcdffc25acbd475c90490bbd386b3715cb14da9c473cff54ab3027f95b29bff5  models/glm-5.3-flash/patches/dflash2/0029-glm5-idx-dual-thin-gemm.patch
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  models/glm-5.3-flash/native/ampere_marlin/LICENSE
 52a38ff8e31ed87788e11994da981f6db404be2948d80ee398ebff2fa592190d  models/glm-5.3-flash/native/ampere_marlin/README.md
 2be2d50ac7c11c91e572d334c397529351770e4725fbd53708314949fd856701  models/glm-5.3-flash/native/ampere_marlin/build.py
@@ -38,5 +39,5 @@ a1c676bd305156bedac32bf719a3fc66b4eb3e294770026e091cddf85891699e  models/glm-5.3
 81add119856a3d5d14d830a7e1945d7cdfc63a96fc3eb01c99c2522677d53fcf  models/glm-5.3-flash/manifests/source.env
 23b9789ae61609dff92a4efb43a1e39c5b8dae391452f6acac37dc789931d33c  scripts/apply-glm53-dflash2-patches.sh
 aa26fc56ea27268a9f87a671c9d41dce52efb1c0ccf1333efe4d531368255df5  scripts/build-glm53-dflash2-image.sh
-06298c45e786fe825ed251c807198eed80052f10c2f670e5ee8bef8ebd26b3ec  scripts/test-glm53-dflash2-patches.py
+162fcbce25b28cc131b25b79e71504b191d965c1470d86e7fe9c7da41ad42a0e  scripts/test-glm53-dflash2-patches.py
 01d5bec9354f982791554d5e7c47b28f852044171b296d199ec3877d399aae02  models/glm-5.3-flash/tests/check-dflash2-series.sh
