@@ -1,0 +1,237 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] v2 runner: one HtoD for the prepare_inputs index arrays
+
+VLLM_GLM5_PROLOGUE_PACKED_H2D (default 0). idx_mapping, cu_num_logits and
+query_start_loc are written into one pinned byte buffer, uploaded with one
+copy into a fresh device buffer and handed out as views; query_start_loc's
+segment is copied DtoD into the persistent (graph-addressed) buffer. 3 HtoD
++ 3 pin_memory() become 1 HtoD + 1 DtoD + 1 pinned allocation per step and
+rank. Same bytes, so all model inputs are bit-identical. Adaptive
+verification keeps the old path.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d1d2d35..ee7658f 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -49,6 +49,7 @@ if TYPE_CHECKING:
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
+     VLLM_PP_DECODE_COHORT_BALANCE: bool = True
++    VLLM_GLM5_PROLOGUE_PACKED_H2D: bool = False
+     VLLM_GLM5_DFLASH_ADAPTIVE_K: bool = False
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: str = "7,5"
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_LOG: int = 0
+@@ -984,6 +985,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # of the same name (MM default on; here default off). Frees ~0.6 GiB of
+     # profiled workspace per card at max_model_len 262144, max_num_seqs 8,
+     # kpool 4, which goes to the KV pool. Chunk formation is unchanged.
++    # One host-to-device copy for idx_mapping, cu_num_logits and
++    # query_start_loc in the V2 runner's prepare_inputs (patch 0019,
++    # vllm/v1/worker/gpu/prologue_h2d.py). Same bytes; default off.
++    "VLLM_GLM5_PROLOGUE_PACKED_H2D": lambda: os.getenv(
++        "VLLM_GLM5_PROLOGUE_PACKED_H2D", "0"
++    ).strip().lower() in ("1", "true", "yes", "on"),
+     "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
+         int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "0"))
+     ),
+@@ -2861,6 +2868,8 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_LOGGING_STREAM",
+         "VLLM_LOGGING_CONFIG_PATH",
+         "VLLM_LOGGING_COLOR",
++        # Host-side input preparation only (patch 0019).
++        "VLLM_GLM5_PROLOGUE_PACKED_H2D",
+         "VLLM_LOG_STATS_INTERVAL",
+         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
+         "VLLM_TUNED_CONFIG_FOLDER",
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index d4ab4f9..2f42d69 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -84,6 +84,7 @@ from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
++from vllm.v1.worker.gpu import prologue_h2d
+ from vllm.v1.worker.gpu.async_utils import (
+     AsyncOutput,
+     AsyncPoolingOutput,
+@@ -1307,7 +1308,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         req_ids = batch_req_state.req_ids
+         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
+         idx_mapping_np = batch_req_state.idx_mapping_np
+-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
++        # VLLM_GLM5_PROLOGUE_PACKED_H2D=1 (patch 0019): idx_mapping,
++        # cu_num_logits and query_start_loc go up in one copy below, once all
++        # three host arrays exist. Adaptive verification rewrites them in
++        # between, so it keeps the original three copies.
++        use_packed_h2d = (
++            self.adaptive_verification is None and prologue_h2d.enabled()
++        )
++        if not use_packed_h2d:
++            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+         num_reqs = len(req_ids)
+ 
+         # Get the number of draft tokens for each request.
+@@ -1321,7 +1330,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits = torch.arange(
+                 num_reqs + 1, device=self.device, dtype=torch.int32
+             )
+-            expanded_idx_mapping = idx_mapping
++            if not use_packed_h2d:
++                expanded_idx_mapping = idx_mapping
+             expanded_local_pos = torch.zeros(
+                 num_reqs, dtype=torch.int32, device=self.device
+             )
+@@ -1342,7 +1352,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
++            if not use_packed_h2d:
++                cu_num_logits = async_copy_to_gpu(
++                    cu_num_logits_np, device=self.device
++                )
+ 
+         adaptive_verification = (
+             self.adaptive_verification if num_draft_tokens_per_req is not None else None
+@@ -1370,7 +1383,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+         query_start_loc_np[num_reqs + 1 :] = num_tokens
+         query_start_loc = self.input_buffers.query_start_loc
+-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
++        if use_packed_h2d:
++            idx_mapping, packed_cu_num_logits = prologue_h2d.stage_prologue_inputs(
++                idx_mapping_np,
++                cu_num_logits_np if draft_tokens else None,
++                query_start_loc_np,
++                query_start_loc,
++                self.device,
++            )
++            if draft_tokens:
++                cu_num_logits = packed_cu_num_logits
++            else:
++                expanded_idx_mapping = idx_mapping
++        else:
++            async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+         if adaptive_verification is not None:
+             cu_num_logits, query_start_loc, total_num_draft_tokens = (
+                 adaptive_verification.reallocate_drafts(
+diff --git a/vllm/v1/worker/gpu/prologue_h2d.py b/vllm/v1/worker/gpu/prologue_h2d.py
+new file mode 100644
+index 0000000..d847a96
+--- /dev/null
++++ b/vllm/v1/worker/gpu/prologue_h2d.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""One host-to-device copy for the V2 runner's per-step index arrays.
++
++Opt-in with ``VLLM_GLM5_PROLOGUE_PACKED_H2D=1`` (patch 0019). Default **off**:
++``GPUModelRunner.prepare_inputs`` keeps its three ``async_copy_to_gpu`` calls.
++
++``prepare_inputs`` uploads three small arrays every step, each through its own
++``x.pin_memory()`` (a pinned-host allocation plus a host memcpy) and its own
++``cudaMemcpyAsync``:
++
++==========================  ======  ==========================================
++array                       dtype   destination
++==========================  ======  ==========================================
++``idx_mapping_np``          intp    fresh device tensor (``input_batch.idx_mapping``)
++``cu_num_logits_np``        int32   fresh device tensor (only with drafts)
++``query_start_loc_np``      int32   the persistent ``input_buffers.query_start_loc``
++==========================  ======  ==========================================
++
++Here the arrays are written into one pinned byte buffer (each segment 16-byte
++aligned), uploaded with one ``cudaMemcpyAsync`` into one fresh device byte
++buffer, and handed out as dtype views. ``query_start_loc`` must live in the
++persistent buffer (FULL CUDA graphs read it by address), so its segment is
++copied there device-to-device. Net per step: 3 HtoD + 3 pinned allocations
++become 1 HtoD + 1 DtoD + 1 pinned allocation.
++
++Safety
++------
++* The bytes are the same, so every derived input (positions, seq lens, slot
++  mappings, block tables, logits indices) is bit-identical.
++* The device views are fresh allocations, exactly like the tensors
++  ``async_copy_to_gpu`` returns, so deferred readers (the PP handler keeps a
++  step's ``idx_mapping`` for ``pp_size`` steps; the broadcast stream records
++  it) see the same lifetime as before. ``record_stream`` on a view records the
++  whole storage.
++* The pinned buffer comes from PyTorch's caching host allocator, which does
++  not hand a block out again until the event recorded by the non-blocking
++  copy has completed -- the same guarantee ``x.pin_memory()`` relies on today.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++
++import numpy as np
++import torch
++
++_ALIGN = 16
++_TRUE = ("1", "true", "yes", "on")
++
++
++@functools.cache
++def enabled() -> bool:
++    return os.getenv("VLLM_GLM5_PROLOGUE_PACKED_H2D", "0").strip().lower() in _TRUE
++
++
++def _layout(arrays: list[np.ndarray]) -> tuple[list[int], int]:
++    offsets = []
++    off = 0
++    for a in arrays:
++        offsets.append(off)
++        off += (a.nbytes + _ALIGN - 1) // _ALIGN * _ALIGN
++    return offsets, max(off, _ALIGN)
++
++
++def packed_h2d(
++    arrays: list[np.ndarray],
++    device: torch.device | str,
++    pin: bool | None = None,
++) -> list[torch.Tensor]:
++    """Upload ``arrays`` with one copy; return one 1-D device view per array,
++    with the dtype ``torch.from_numpy`` would give it."""
++    arrays = [np.ascontiguousarray(a).reshape(-1) for a in arrays]
++    offsets, total = _layout(arrays)
++    if pin is None:
++        pin = torch.device(device).type == "cuda"
++    host = torch.empty(total, dtype=torch.uint8, pin_memory=pin)
++    host_np = host.numpy()
++    for a, off in zip(arrays, offsets):
++        host_np[off : off + a.nbytes] = a.view(np.uint8)
++    dev = torch.empty(total, dtype=torch.uint8, device=device)
++    dev.copy_(host, non_blocking=True)
++    out = []
++    for a, off in zip(arrays, offsets):
++        dtype = torch.from_numpy(a[:0]).dtype
++        out.append(dev[off : off + a.nbytes].view(dtype))
++    return out
++
++
++def stage_prologue_inputs(
++    idx_mapping_np: np.ndarray,
++    cu_num_logits_np: np.ndarray | None,
++    query_start_loc_np: np.ndarray,
++    query_start_loc_out: torch.Tensor,
++    device: torch.device | str,
++    pin: bool | None = None,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Packed replacement for the three uploads in ``prepare_inputs``.
++
++    Writes ``query_start_loc_np`` into ``query_start_loc_out`` (persistent) and
++    returns ``(idx_mapping, cu_num_logits)``; ``cu_num_logits`` is None when
++    ``cu_num_logits_np`` is None (the caller keeps its device ``arange``).
++    """
++    assert query_start_loc_out.dtype == torch.from_numpy(query_start_loc_np[:0]).dtype
++    assert query_start_loc_out.shape[0] == query_start_loc_np.shape[0]
++    arrays = [idx_mapping_np, query_start_loc_np]
++    if cu_num_logits_np is not None:
++        arrays.append(cu_num_logits_np)
++    views = packed_h2d(arrays, device, pin=pin)
++    query_start_loc_out.copy_(views[1], non_blocking=True)
++    cu = views[2] if cu_num_logits_np is not None else None
++    return views[0], cu

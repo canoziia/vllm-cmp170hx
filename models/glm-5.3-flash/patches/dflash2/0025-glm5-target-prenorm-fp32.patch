@@ -1,0 +1,63 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mhc: fp32 TileLang prenorm GEMM at every T
+
+VLLM_GLM5_TARGET_PRENORM_FP32_0026 (default 0; the _0026 suffix is the
+development number, kept so existing deployments keep working). Our mHC
+prenorm GEMM takes a bf16 cuBLAS route for some token counts (e.g. the
+T=32 verify batch), Morrowmake never does: its prenorm is an fp32-FMA
+TileLang kernel at every T. With the switch the same dispatch is used
+(T<128: n_thr 1024 / tile_n 4; T<1024: 512 / 12; else block_m 2), so mixes
+are fp32 from fp32 fn. Covers prefill, decode M>16 and the PP receiver's
+standalone hc_pre. Together with VLLM_GLM5_DECODE_MHC_V2 (0017) the first
+block of an identical history matches the reference bit for bit, and the
+prose acceptance gap closes.
+
+diff --git a/vllm/model_executor/kernels/mhc/tilelang.py b/vllm/model_executor/kernels/mhc/tilelang.py
+index 102d216..5127763 100644
+--- a/vllm/model_executor/kernels/mhc/tilelang.py
++++ b/vllm/model_executor/kernels/mhc/tilelang.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -93,6 +95,36 @@ def _tilelang_hc_prenorm_gemm(
+         _torch_hc_prenorm_gemm(x, fn, out, sqrsum)
+         return
+     use_default_config = tile_n == 12 and n_thr == 512
++    if (
++        n_splits == 1
++        and use_default_config
++        and os.environ.get("VLLM_GLM5_TARGET_PRENORM_FP32_0026", "0") == "1"
++    ):
++        # Target prenorm in fp32 (VLLM_GLM5_TARGET_PRENORM_FP32_0026, default
++        # off; enable together with VLLM_GLM5_DECODE_MHC_V2). The reference
++        # (Morrowmake) has no bf16 cuBLAS route: its prenorm GEMM is
++        # an fp32-FMA TileLang kernel at every T (HcPrenormGemmTileLangKernel
++        # .dispatch: T<128 -> (n_thr 1024, tile_n 4); T<1024 -> (512, 12);
++        # else block_m=2, tile_n=12). Mirror that exact dispatch so `mixes`
++        # are fp32 from fp32 `fn`, never bf16(fn) with a bf16-rounded output.
++        # Covers prefill, decode M>16, and the PP receiver's standalone hc_pre.
++        hc_hidden = x.shape[1]
++        if x.shape[0] >= 1024:
++            hc_prenorm_gemm_block_m_tilelang(
++                x, fn, out, sqrsum, hidden_size, hc_mult, fn.shape[0],
++                512, 12, 2,
++            )
++        elif x.shape[0] < 128 and hc_hidden % 1024 == 0:
++            hc_prenorm_gemm_tilelang(
++                x, fn, out, sqrsum, hidden_size, hc_mult, fn.shape[0],
++                1024, 4, 1,
++            )
++        else:
++            hc_prenorm_gemm_tilelang(
++                x, fn, out, sqrsum, hidden_size, hc_mult, fn.shape[0],
++                512, 12, 1,
++            )
++        return
+     if (
+         n_splits == 1
+         and use_default_config

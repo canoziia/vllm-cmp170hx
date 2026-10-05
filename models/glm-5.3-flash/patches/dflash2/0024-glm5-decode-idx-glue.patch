@@ -1,0 +1,334 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: fold the indexer weight scale into the decode FWHT quant
+
+VLLM_GLM5_DECODE_IDX_GLUE_0024 (default 0; sm_80 only). Port of the "fwht"
+and "expand" items of Morrowmake's ampere_decode/idx_glue.py
+(ops/idx_glue_0024.py): for bf16 contiguous Q with <= 4096 rows and a
+power-of-two weight scale, one Triton launch does the FWHT, the FP8 quant
+and the indexer weight scaling (replacing fwht128_quant_fp8 +
+_fused_indexer_weight_scale), and the kpool indexer expands pool ids in one
+launch. FP8 encoding uses the baseline encoder (v1/attention/ops/fp8_sm80),
+not the MM-only triton_e4m3 module. GPU-verified bit-identical.
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index 4701b62..4e25072 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -448,7 +448,19 @@ def sparse_attn_indexer_kpool(
+                     scale_fmt,
+                 )
+ 
+-    topk_indices_buffer[: hidden_states.shape[0]] = -1
++    from vllm.models.glm5next.nvidia.ops import idx_glue_0024
++
++    glue_direct = (
++        idx_glue_0024.enabled() and has_decode and not has_prefill
++        and index_kpool > 1 and positions is not None
++        and attn_metadata_narrowed.decode is not None
++        and not attn_metadata_narrowed.decode.requires_padding
++        and attn_metadata_narrowed.max_seq_len > topk_tokens
++        and topk_indices_buffer.dtype == torch.int32
++        and topk_indices_buffer.stride(1) == 1
++    )
++    if not glue_direct:
++        topk_indices_buffer[: hidden_states.shape[0]] = -1
+     if has_prefill:
+         prefill_metadata = attn_metadata_narrowed.prefill
+         assert prefill_metadata is not None
+@@ -933,6 +945,14 @@ def sparse_attn_indexer_kpool(
+                     select_k,
+                 )
+ 
++        # Same pool writes/top-k, only the final data movement is folded.
++        # Width is physical (typically 2176), never logical topk_tokens=2048.
++        if glue_direct:
++            idx_glue_0024.expand_pools_into_buffer(
++                pool_topk, positions, topk_indices_buffer,
++                hidden_states.shape[0], index_kpool)
++            return topk_indices_buffer
++
+         # Resolve to token-level indices in the output buffer.
+         if index_kpool > 1:
+             pool_ids = pool_topk.to(torch.int64)
+diff --git a/vllm/models/glm5next/nvidia/attention.py b/vllm/models/glm5next/nvidia/attention.py
+index 0780843..590fedb 100644
+--- a/vllm/models/glm5next/nvidia/attention.py
++++ b/vllm/models/glm5next/nvidia/attention.py
+@@ -442,13 +442,20 @@ class Indexer(nn.Module):
+         assert self.head_dim == 128 and self.quant_block_size == 128
+         assert self.scale_fmt == "ue8m0"
+         q = q.view(-1, self.head_dim)
+-        q_fp8, q_scale = fwht128_quant_fp8(q)
++        from vllm.models.glm5next.nvidia.ops import idx_glue_0024
++
++        wscale = self.softmax_scale * self.n_head**-0.5
++        if (idx_glue_0024.enabled() and q.shape[0] <= 4096
++                and q.dtype == torch.bfloat16 and q.is_contiguous()
++                and weights.dtype == torch.float32
++                and idx_glue_0024.is_pow2_float(wscale)):
++            q_fp8, weights = idx_glue_0024.fwht128_quant_fp8_wscale(
++                q, weights, wscale)
++        else:
++            q_fp8, q_scale = fwht128_quant_fp8(q)
++            q_scale = q_scale.view(-1, self.n_head, 1)
++            weights = _fused_indexer_weight_scale(weights, q_scale, wscale)
+         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+-        q_scale = q_scale.view(-1, self.n_head, 1)
+-
+-        weights = _fused_indexer_weight_scale(
+-            weights, q_scale, self.softmax_scale * self.n_head**-0.5
+-        )
+ 
+         # kpool: per-token gate score driving the softmax-weighted pool. Computed
+         # from the same hidden_states that produced `k`, so it stays token-aligned.
+diff --git a/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py b/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py
+new file mode 100644
+index 0000000..a0d986f
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py
+@@ -0,0 +1,245 @@
++# SPDX-License-Identifier: Apache-2.0
++# Fixed upstream excerpt: see patches-idx/upstream.json.
++import os
++import torch
++from vllm.models.glm5next.nvidia.ops.kpool_compress import _fwht_stage
++from vllm.triton_utils import tl, triton
++# Use the incumbent FWHT encoder, not the MM-only triton_e4m3 module.
++from vllm.v1.attention.ops.fp8_sm80 import (
++    _encode_e4m3fn_u8,
++    native_fp8_cast_supported,
++)
++
++def enabled():
++    return os.getenv("VLLM_GLM5_DECODE_IDX_GLUE_0024", "0") == "1" and torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 0)
++
++@triton.jit
++def _fwht_quant_wscale_kernel(
++    q_ptr,
++    qout_ptr,
++    w_ptr,
++    wout_ptr,
++    n_rows,
++    w_s0,
++    w_s1,
++    wscale,
++    NH: tl.constexpr,
++    BLOCK_R: tl.constexpr,
++    FP8_NATIVE: tl.constexpr,
++):
++    """``kpool_compress._fwht_quant_kernel`` + the indexer weight scaling.
++
++    Rows are ``token * NH + head``. The rotation/quant body is the incumbent's
++    (same butterflies via the shared ``_fwht_stage``, same per-row max, same
++    ue8m0 scale); every op is per row, so the row block size does not change
++    any value. The per-row scale is not stored: its only consumer was
++    ``weights * q_scale * scale``, computed here as ``(w * s) * wscale`` in
++    fp32, the incumbent inductor kernel's order.
++    """
++    pid = tl.program_id(0)
++    rows = pid * BLOCK_R + tl.arange(0, BLOCK_R)
++    rmask = rows < n_rows
++    offs = tl.arange(0, 128)
++    x = tl.load(
++        q_ptr + rows[:, None] * 128 + offs[None, :], mask=rmask[:, None], other=0.0
++    ).to(tl.float32)
++
++    N: tl.constexpr = BLOCK_R * 128
++    x = tl.reshape(x, (N,))
++    x = _fwht_stage(x, N, BLOCK_R * 64, 1)
++    x = _fwht_stage(x, N, BLOCK_R * 32, 2)
++    x = _fwht_stage(x, N, BLOCK_R * 16, 4)
++    x = _fwht_stage(x, N, BLOCK_R * 8, 8)
++    x = _fwht_stage(x, N, BLOCK_R * 4, 16)
++    x = _fwht_stage(x, N, BLOCK_R * 2, 32)
++    x = _fwht_stage(x, N, BLOCK_R, 64)
++    x = x * 0.08838834764831845  # 1/sqrt(128), exact in fp32
++
++    x = x.to(tl.bfloat16).to(tl.float32)
++    x = tl.reshape(x, (BLOCK_R, 128))
++
++    absmax = tl.maximum(tl.max(tl.abs(x), axis=1), 1e-4)
++    scale = tl.exp2(tl.ceil(tl.log2(absmax * (1.0 / 448.0))))
++    y = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
++
++    out_ptr = qout_ptr + rows[:, None] * 128 + offs[None, :]
++    if FP8_NATIVE:
++        tl.store(out_ptr, y, mask=rmask[:, None])
++    else:
++        tl.store(out_ptr, _encode_e4m3fn_u8(y), mask=rmask[:, None])
++
++    tok = rows // NH
++    head = rows % NH
++    w = tl.load(w_ptr + tok * w_s0 + head * w_s1, mask=rmask, other=0.0)
++    tl.store(wout_ptr + rows, (w * scale) * wscale, mask=rmask)
++
++
++def _fwht_block_rows(n_rows: int) -> tuple[int, int]:
++    """(BLOCK_R, num_warps). The incumbent runs 32 rows per CTA, i.e. M CTAs
++    at 32 heads; small row blocks give M*8 CTAs at decode sizes."""
++    if n_rows <= 4096:
++        return 4, 1
++    return 32, 2
++
++
++def fwht128_quant_fp8_wscale(
++    q: torch.Tensor, weights: torch.Tensor, wscale: float
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Fused ``fwht128_quant_fp8(q)`` + ``weights * q_scale * wscale``.
++
++    Args:
++        q: ``[tokens * NH, 128]`` bf16, contiguous (head-major within a token).
++        weights: ``[tokens, NH]`` fp32, any strides.
++        wscale: python float whose fp32 rounding is a power of two
++            (:func:`is_pow2_float`); the kernel multiplies by that fp32 value.
++
++    Returns:
++        (q_fp8 ``[tokens * NH, 128]`` float8_e4m3fn,
++         scaled weights ``[tokens, NH]`` fp32 contiguous).
++    """
++    assert q.ndim == 2 and q.shape[1] == 128 and q.dtype == torch.bfloat16
++    assert q.is_contiguous()
++    assert weights.ndim == 2 and weights.dtype == torch.float32
++    tokens, nh = weights.shape
++    n_rows = q.shape[0]
++    assert n_rows == tokens * nh, (n_rows, tokens, nh)
++    q_fp8 = torch.empty((n_rows, 128), dtype=torch.float8_e4m3fn, device=q.device)
++    w_out = torch.empty((tokens, nh), dtype=torch.float32, device=q.device)
++    if n_rows == 0:
++        return q_fp8, w_out
++    block_r, num_warps = _fwht_block_rows(n_rows)
++    native = native_fp8_cast_supported()
++    _fwht_quant_wscale_kernel[(triton.cdiv(n_rows, block_r),)](
++        q,
++        q_fp8 if native else q_fp8.view(torch.uint8),
++        weights,
++        w_out,
++        n_rows,
++        weights.stride(0),
++        weights.stride(1),
++        fp32_value(float(wscale)),
++        NH=nh,
++        BLOCK_R=block_r,
++        FP8_NATIVE=native,
++        num_warps=num_warps,
++    )
++    return q_fp8, w_out
++
++
++def fp32_value(x: float) -> float:
++    """``x`` rounded to fp32, as a Python float."""
++    import struct
++
++    return struct.unpack("f", struct.pack("f", x))[0]
++
++
++def is_pow2_float(x: float) -> bool:
++    """Is ``x``, rounded to fp32, a power of two?
++
++    The production constant ``head_dim**-0.5 * n_head**-0.5`` is
++    0.015625000000000003 in fp64 and exactly 2**-6 in fp32. With a power-of-two
++    fp32 constant, ``(w * q_scale) * c`` is exact (q_scale is ue8m0), and it is
++    the same fp32 value whether the unfused leaf multiplies by the fp32 or the
++    fp64 constant: the fp64 product is ``v * (1 + 2**-52 k)`` for an fp32
++    value ``v`` and rounds back to ``v``.
++    """
++    import math
++
++    if not math.isfinite(x) or x <= 0.0:
++        return False
++    x32 = fp32_value(x)
++    if not (x32 > 0.0) or not math.isfinite(x32):
++        return False
++    m, _ = math.frexp(x32)
++    return m == 0.5
++
++
++# ---------------------------------------------------------------------------
++# glue: expand pools + tail straight into the top-k buffer rows
++# ---------------------------------------------------------------------------
++@triton.jit
++def _expand_into_buffer_kernel(
++    pool_ids_ptr,  # [n_rows, n_groups] int32 (pool top-k, -1 = none)
++    pos_ptr,  # [n_rows] any int (token positions)
++    out_ptr,  # topk_indices_buffer, int32
++    n_rows,  # rows that get indices; rows [n_rows, grid0) get -1
++    topk,  # n_groups * POOL_SIZE
++    out_cols,  # topk + POOL_SIZE - 1
++    width,  # buffer row width
++    pid_s0,
++    out_s0,
++    POOL_SIZE: tl.constexpr,
++    BLOCK_COLS: tl.constexpr,
++):
++    """``buf[:T] = -1``; ``buf[:n, :out_cols] = expand(pool_ids, pos + 1)``.
++
++    The expansion is ``kpool_compress._expand_pools_and_append_tail_kernel``
++    with the int64 pool-id cast and the int32 ``pos + 1`` folded into the loads
++    (pool ids < 2**29, positions < 2**31, so no value changes).
++    """
++    row = tl.program_id(0)
++    tile = tl.program_id(1)
++    cols = tile * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
++    wmask = cols < width
++    result = tl.full((BLOCK_COLS,), -1, tl.int32)
++    if row < n_rows:
++        seq_len = tl.load(pos_ptr + row).to(tl.int32) + 1
++        pool_len = seq_len // POOL_SIZE
++        tail_start = pool_len * POOL_SIZE
++        tail_count = seq_len - tail_start
++
++        mask = cols < out_cols
++        is_history = cols < topk
++        g = cols // POOL_SIZE
++        o = cols % POOL_SIZE
++        pid = tl.load(pool_ids_ptr + row * pid_s0 + g, mask=mask & is_history,
++                      other=-1)
++        hist_val = (pid * POOL_SIZE + o).to(tl.int32)
++        hist_out = tl.where(pid >= 0, hist_val, -1)
++
++        tail_off = cols - topk
++        is_tail = (tail_off >= 0) & (tail_off < tail_count)
++        tail_val = (tail_start + tail_off).to(tl.int32)
++        tail_out = tl.where(is_tail, tail_val, -1)
++
++        result = tl.where(is_history, hist_out, tail_out)
++        result = tl.where(mask, result, -1)
++    tl.store(out_ptr + row * out_s0 + cols, result, mask=wmask)
++
++
++def expand_pools_into_buffer(
++    pool_topk: torch.Tensor,
++    positions: torch.Tensor,
++    buf: torch.Tensor,
++    n_fill_rows: int,
++    pool_size: int,
++) -> None:
++    """In place: rows ``[0, n)`` of ``buf`` get the expanded indices (``n`` =
++    ``pool_topk.shape[0]``), every other column and rows ``[n, n_fill_rows)``
++    get -1. Equivalent to the fill + cast + expand + copy sequence it replaces.
++    """
++    assert pool_topk.ndim == 2 and pool_topk.dtype == torch.int32
++    assert buf.dtype == torch.int32 and buf.stride(1) == 1
++    n, n_groups = pool_topk.shape
++    assert positions.shape[0] >= n and positions.is_contiguous()
++    assert n <= n_fill_rows <= buf.shape[0]
++    topk = n_groups * pool_size
++    out_cols = topk + pool_size - 1
++    width = buf.shape[1]
++    assert out_cols <= width
++    if n_fill_rows == 0:
++        return
++    BLOCK_COLS = 128
++    _expand_into_buffer_kernel[(n_fill_rows, triton.cdiv(width, BLOCK_COLS))](
++        pool_topk,
++        positions,
++        buf,
++        n,
++        topk,
++        out_cols,
++        width,
++        pool_topk.stride(0),
++        buf.stride(0),
++        POOL_SIZE=pool_size,
++        BLOCK_COLS=BLOCK_COLS,
++    )

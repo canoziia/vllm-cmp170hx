@@ -1,0 +1,477 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] v2 runner: fused GDN/KDA spec-decode metadata build
+
+VLLM_GLM5_PROLOGUE_FUSE (default 0 = upstream body, byte for byte;
+_GDN sub-switch defaults to 1 and only bisects). Port of the GDN part of
+Morrowmake's vllm/v1/worker/gpu/prologue_fuse.py. In steady DFlash decode
+(every row a spec row, padded rows empty at the back, full cudagraphs) each
+GDNAttentionMetadataBuilder.build call drops one pinned HtoD, two CPU-bool
+mask indexings of CUDA tensors, an unused sub, an arange, six copy_ and five
+fill_ in favour of one Triton launch that writes the same persistent
+buffers. Integer index tensors only: bit-identical. Any other batch shape
+falls back to the upstream body.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index d123f3d..d1d2d35 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -65,6 +65,8 @@ if TYPE_CHECKING:
+     VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS: int = 2312
+     VLLM_GLM5_THIN_GEMM: bool = False
+     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
++    VLLM_GLM5_PROLOGUE_FUSE: bool = False
++    VLLM_GLM5_PROLOGUE_FUSE_GDN: bool = True
+     VLLM_GLM5_THIN_GEMM_MAX_TOKENS: int = 32
+     VLLM_GLM5_DECODE_MHC_V2: bool = False
+     VLLM_GLM5_DECODE_MHC_V2_MAX_TOKENS: int = 32
+@@ -1037,6 +1039,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_PP_FOLD_DRAFT_FC": lambda: bool(
+         int(os.getenv("VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"))
+     ),
++    # Fused GDN/KDA spec-decode metadata build (patch 0018,
++    # vllm/v1/worker/gpu/prologue_fuse.py; port of Morrowmake's switch of the
++    # same name, GDN part). Host-side input preparation only; writes integer
++    # index tensors, bit-identical. Default off. _GDN (default 1) bisects.
++    "VLLM_GLM5_PROLOGUE_FUSE": lambda: os.getenv(
++        "VLLM_GLM5_PROLOGUE_FUSE", "0"
++    ).strip().lower() in ("1", "true", "yes", "on"),
++    "VLLM_GLM5_PROLOGUE_FUSE_GDN": lambda: os.getenv(
++        "VLLM_GLM5_PROLOGUE_FUSE_GDN", "1"
++    ).strip().lower() in ("1", "true", "yes", "on"),
+     "VLLM_GLM5_THIN_GEMM_MAX_TOKENS": lambda: int(
+         os.getenv("VLLM_GLM5_THIN_GEMM_MAX_TOKENS", "32")
+     ),
+@@ -2889,6 +2901,9 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_ENABLE_CUDA_COMPATIBILITY",
+         "VLLM_CUDA_COMPATIBILITY_PATH",
+         "VLLM_SKIP_MODEL_NAME_VALIDATION",
++        # Host-side input preparation only (patch 0018).
++        "VLLM_GLM5_PROLOGUE_FUSE",
++        "VLLM_GLM5_PROLOGUE_FUSE_GDN",
+         "LOCAL_RANK",
+         "CUDA_VISIBLE_DEVICES",
+         "NO_COLOR",
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 23daff5..6a3c70f 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -226,6 +226,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )
+ 
++        # VLLM_GLM5_PROLOGUE_FUSE=1 (patch 0018): steady spec decode (every row
++        # a spec row, padded rows empty at the back) writes all persistent
++        # buffers with one kernel and no HtoD. Returns None -- and the body
++        # below runs unchanged -- for every other batch shape or when unset.
++        from vllm.v1.worker.gpu import prologue_fuse
++
++        if prologue_fuse.enabled():
++            fused = prologue_fuse.try_build_gdn_spec_decode(
++                self,
++                m,
++                block_table_tensor,
++                num_accepted_tokens,
++                num_decode_draft_tokens_cpu,
++            )
++            if fused is not None:
++                return fused
++
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+             spec_sequence_masks = None
+diff --git a/vllm/v1/worker/gpu/prologue_fuse.py b/vllm/v1/worker/gpu/prologue_fuse.py
+new file mode 100644
+index 0000000..0f8e116
+--- /dev/null
++++ b/vllm/v1/worker/gpu/prologue_fuse.py
+@@ -0,0 +1,390 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fused GDN/KDA spec-decode metadata build (GLM-5.3-Flash + DFlash decode).
++
++Opt-in with ``VLLM_GLM5_PROLOGUE_FUSE=1`` (sub-switch
++``VLLM_GLM5_PROLOGUE_FUSE_GDN``, default 1, for bisecting). Default **off**:
++the only call site (``GDNAttentionMetadataBuilder.build``) asks
++:func:`try_build_gdn_spec_decode` first, which returns ``None`` immediately
++when the switch is unset, so the upstream body runs unchanged.
++
++Ported from Morrowmake/vllm-cmp170hx ``vllm/v1/worker/gpu/prologue_fuse.py``
++(GDN part only: our tree already gathers the Mamba "align" block table with
++one Triton kernel, ``mamba_get_block_table_tensor_triton``).
++
++Why
++---
++In steady DFlash decode every KDA builder call (one per KDA KV-cache group
++present on the rank) runs, outside the CUDA graph:
++
++* ``async_tensor_h2d(spec_sequence_masks_cpu)``            1 pinned HtoD
++* ``block_table_tensor[spec_sequence_masks_cpu, :k]``      CPU bool mask on a
++  CUDA tensor: nonzero on the host, then a blocking index HtoD, then an
++  ``index`` kernel
++* ``num_accepted_tokens[spec_sequence_masks_cpu]``         same again
++* ``query_start_loc[1:] - query_start_loc[:-1]`` (unused in this branch),
++  ``torch.arange``, six ``copy_`` and five ``fill_`` into the persistent
++  FULL-graph buffers.
++
++In that shape every row is a spec-decode row and the padded rows are empty at
++the back, so the masked selects are leading slices and all writes collapse
++into one Triton launch. Any other batch (any prefill, a plain decode row, a
++mask that is not a leading run, a batch above the capture size, no full
++cudagraphs) returns ``None`` and the upstream body runs.
++
++Exactness
++---------
++Only integer index tensors are written, so "exact" means bit-identical.
++:func:`gdn_spec_decode_meta_ref` is a transcription of the upstream writes;
++the Triton kernel is a transcription of the reference. On non-CUDA tensors
++the reference runs, which lets CPU tests drive the full dispatch.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++import torch
++
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.v1.attention.backends.gdn_attn import (
++        GDNAttentionMetadata,
++        GDNAttentionMetadataBuilder,
++    )
++
++logger = init_logger(__name__)
++
++_TRUE = ("1", "true", "yes", "on")
++_FALSE = ("0", "false", "no", "off", "")
++
++
++def _env_flag(env: dict[str, str], name: str, default: bool) -> bool:
++    raw = env.get(name)
++    if raw is None:
++        return default
++    v = raw.strip().lower()
++    if v in _TRUE:
++        return True
++    if v in _FALSE:
++        return False
++    raise ValueError(f"{name}={raw!r} is not a boolean")
++
++
++@dataclass(frozen=True)
++class PrologueFuseSettings:
++    enabled: bool = False
++    gdn: bool = True
++
++
++def read_settings(env: dict[str, str] | None = None) -> PrologueFuseSettings:
++    """Parse the environment. Pure; safe on CPU."""
++    env = dict(os.environ) if env is None else env
++    return PrologueFuseSettings(
++        enabled=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE", False),
++        gdn=_env_flag(env, "VLLM_GLM5_PROLOGUE_FUSE_GDN", True),
++    )
++
++
++@functools.cache
++def settings() -> PrologueFuseSettings:
++    s = read_settings()
++    if s.enabled:
++        logger.info("VLLM_GLM5_PROLOGUE_FUSE=1: fused GDN decode metadata (gdn=%s)", s.gdn)
++    return s
++
++
++def enabled() -> bool:
++    return settings().enabled
++
++
++try:  # pragma: no cover - GPU only
++    from vllm.triton_utils import tl, triton
++
++    _HAS_TRITON = triton is not None and tl is not None and hasattr(triton, "jit")
++except Exception:  # pragma: no cover
++    _HAS_TRITON = False
++
++
++def _use_triton(t: torch.Tensor) -> bool:
++    return _HAS_TRITON and t.is_cuda
++
++
++def _flat(*tensors: torch.Tensor) -> bool:
++    return all(t.is_contiguous() for t in tensors)
++
++
++if _HAS_TRITON:  # pragma: no cover - GPU only
++
++    @triton.jit
++    def _gdn_spec_decode_meta_kernel(
++        block_table_ptr,
++        bt_row_stride,
++        bt_col_stride,
++        src_qsl_ptr,
++        src_acc_ptr,
++        state_idx_ptr,
++        state_idx_stride,
++        masks_ptr,  # int8 view of the bool buffer
++        token_indx_ptr,
++        qsl_out_ptr,
++        acc_out_ptr,
++        num_spec_decodes,
++        batch_size,
++        spec_token_size,
++        NUM_COLS: tl.constexpr,
++        NULL_BLOCK_ID: tl.constexpr,
++        BLOCK: tl.constexpr,
++    ):
++        which = tl.program_id(0)
++        off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++        if which == 0:
++            # spec_state_indices_tensor[:batch_size, :NUM_COLS]
++            keep = off < batch_size * NUM_COLS
++            row = off // NUM_COLS
++            col = off % NUM_COLS
++            is_spec = row < num_spec_decodes
++            v = tl.load(
++                block_table_ptr + row * bt_row_stride + col * bt_col_stride,
++                mask=keep & is_spec,
++                other=0,
++            )
++            v = tl.where(is_spec, v, NULL_BLOCK_ID)
++            tl.store(state_idx_ptr + row * state_idx_stride + col, v, mask=keep)
++        elif which == 1:
++            # spec_sequence_masks[:batch_size]
++            keep = off < batch_size
++            v = tl.where(off < num_spec_decodes, 1, 0).to(tl.int8)
++            tl.store(masks_ptr + off, v, mask=keep)
++        elif which == 2:
++            # spec_token_indx[:spec_token_size] = arange(spec_token_size)
++            keep = off < spec_token_size
++            tl.store(token_indx_ptr + off, off.to(tl.int32), mask=keep)
++        elif which == 3:
++            # spec_query_start_loc[:batch_size + 1], tail held at qsl[S]
++            keep = off < batch_size + 1
++            idx = tl.minimum(off, num_spec_decodes)
++            v = tl.load(src_qsl_ptr + idx, mask=keep, other=0)
++            tl.store(qsl_out_ptr + off, v, mask=keep)
++        else:
++            # num_accepted_tokens[:batch_size], padded rows = 1
++            keep = off < batch_size
++            is_spec = off < num_spec_decodes
++            v = tl.load(src_acc_ptr + off, mask=keep & is_spec, other=0)
++            v = tl.where(is_spec, v, 1)
++            tl.store(acc_out_ptr + off, v, mask=keep)
++
++
++def gdn_spec_decode_meta_ref(
++    block_table: torch.Tensor,
++    src_qsl: torch.Tensor,
++    src_acc: torch.Tensor,
++    state_idx: torch.Tensor,
++    masks: torch.Tensor,
++    token_indx: torch.Tensor,
++    qsl_out: torch.Tensor,
++    acc_out: torch.Tensor,
++    num_spec_decodes: int,
++    batch_size: int,
++    spec_token_size: int,
++    num_cols: int,
++    null_block_id: int,
++) -> None:
++    """Pure-torch transcription of the upstream buffer writes."""
++    s = num_spec_decodes
++    state_idx[:s, :num_cols].copy_(block_table[:s, :num_cols])
++    state_idx[s:batch_size, :num_cols].fill_(null_block_id)
++    masks[:s].fill_(True)
++    masks[s:batch_size].fill_(False)
++    token_indx[:spec_token_size].copy_(
++        torch.arange(spec_token_size, dtype=token_indx.dtype, device=token_indx.device)
++    )
++    qsl_out[: s + 1].copy_(src_qsl[: s + 1])
++    qsl_out[s + 1 : batch_size + 1].copy_(src_qsl[s])
++    acc_out[:s].copy_(src_acc[:s])
++    acc_out[s:batch_size].fill_(1)
++
++
++def _gdn_spec_decode_meta(
++    block_table: torch.Tensor,
++    src_qsl: torch.Tensor,
++    src_acc: torch.Tensor,
++    state_idx: torch.Tensor,
++    masks: torch.Tensor,
++    token_indx: torch.Tensor,
++    qsl_out: torch.Tensor,
++    acc_out: torch.Tensor,
++    num_spec_decodes: int,
++    batch_size: int,
++    spec_token_size: int,
++    num_cols: int,
++    null_block_id: int,
++) -> None:
++    args = (
++        block_table,
++        src_qsl,
++        src_acc,
++        state_idx,
++        masks,
++        token_indx,
++        qsl_out,
++        acc_out,
++        num_spec_decodes,
++        batch_size,
++        spec_token_size,
++        num_cols,
++        null_block_id,
++    )
++    if not _use_triton(block_table) or not _flat(
++        src_qsl, src_acc, masks, token_indx, qsl_out, acc_out
++    ):
++        gdn_spec_decode_meta_ref(*args)
++        return
++    block = 128
++    longest = max(batch_size * num_cols, batch_size + 1, spec_token_size, 1)
++    grid = (5, (longest + block - 1) // block)
++    _gdn_spec_decode_meta_kernel[grid](
++        block_table,
++        block_table.stride(0),
++        block_table.stride(1),
++        src_qsl,
++        src_acc,
++        state_idx,
++        state_idx.stride(0),
++        masks.view(torch.int8),
++        token_indx,
++        qsl_out,
++        acc_out,
++        num_spec_decodes,
++        batch_size,
++        spec_token_size,
++        NUM_COLS=num_cols,
++        NULL_BLOCK_ID=null_block_id,
++        BLOCK=block,
++    )
++
++
++def gdn_spec_decode_plan(
++    builder: Any,
++    num_reqs: int,
++    query_start_loc_cpu: torch.Tensor,
++    num_decode_draft_tokens_cpu: torch.Tensor | None,
++) -> dict[str, int] | None:
++    """CPU-only eligibility test. Returns the derived scalars when the batch
++    has the steady spec-decode shape the fused writer handles, else ``None``.
++    Touches only small CPU tensors and launches nothing."""
++    if not builder.use_spec_decode or num_decode_draft_tokens_cpu is None:
++        return None
++    if not builder.use_full_cuda_graph:
++        return None
++    if num_reqs == 0 or num_decode_draft_tokens_cpu.shape[0] != num_reqs:
++        return None
++    mask = num_decode_draft_tokens_cpu >= 0
++    s = int(mask.sum().item())
++    if s == 0 or s > num_reqs:
++        return None
++    # Upstream selects spec rows with a boolean mask, the fused writer with a
++    # slice; they agree only when the spec rows are exactly the leading run.
++    if not bool(mask[:s].all().item()) or bool(mask[s:num_reqs].any().item()):
++        return None
++    if int(num_decode_draft_tokens_cpu[:s].sum().item()) == 0:
++        return None
++    query_lens_cpu = query_start_loc_cpu[1 : num_reqs + 1] - query_start_loc_cpu[:num_reqs]
++    # num_prefills == 0 and num_decodes == 0 <=> every non-spec row is empty.
++    if int(query_lens_cpu[s:num_reqs].abs().sum().item()) != 0:
++        return None
++    total_tokens = int(query_lens_cpu.sum().item())
++    if s > builder.decode_cudagraph_max_bs or total_tokens > builder.decode_cudagraph_max_bs:
++        return None
++    if num_reqs > builder.decode_cudagraph_max_bs:
++        return None
++    spec_token_size = min(
++        s * (builder.num_spec + 1), int(query_start_loc_cpu[num_reqs].item())
++    )
++    if spec_token_size > builder.spec_token_indx.numel():
++        return None
++    return {
++        "num_spec_decodes": s,
++        "num_spec_decode_tokens": total_tokens,
++        "spec_token_size": spec_token_size,
++    }
++
++
++def try_build_gdn_spec_decode(
++    builder: "GDNAttentionMetadataBuilder",
++    m: Any,
++    block_table_tensor: torch.Tensor,
++    num_accepted_tokens: torch.Tensor | None,
++    num_decode_draft_tokens_cpu: torch.Tensor | None,
++) -> "GDNAttentionMetadata | None":
++    """Fused GDN metadata build, or ``None`` to fall back to upstream."""
++    s = settings()
++    if not (s.enabled and s.gdn):
++        return None
++    if num_accepted_tokens is None:
++        return None
++    batch_size = m.num_reqs
++    plan = gdn_spec_decode_plan(
++        builder, batch_size, m.query_start_loc_cpu, num_decode_draft_tokens_cpu
++    )
++    if plan is None:
++        return None
++    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++    nsd = plan["num_spec_decodes"]
++    num_cols = builder.num_spec + 1
++    if (
++        block_table_tensor.dim() != 2
++        or block_table_tensor.shape[1] < num_cols
++        or block_table_tensor.shape[0] < nsd
++        or num_accepted_tokens.shape[0] < nsd
++        or builder.spec_state_indices_tensor.shape[1] != num_cols
++        or m.query_start_loc.shape[0] < nsd + 1
++    ):
++        return None
++    _gdn_spec_decode_meta(
++        block_table_tensor,
++        m.query_start_loc,
++        num_accepted_tokens,
++        builder.spec_state_indices_tensor,
++        builder.spec_sequence_masks,
++        builder.spec_token_indx,
++        builder.spec_query_start_loc,
++        builder.num_accepted_tokens,
++        nsd,
++        batch_size,
++        plan["spec_token_size"],
++        num_cols,
++        NULL_BLOCK_ID,
++    )
++    return GDNAttentionMetadata(
++        num_prefills=0,
++        num_prefill_tokens=0,
++        num_decodes=0,
++        num_decode_tokens=0,
++        num_spec_decodes=nsd,
++        num_spec_decode_tokens=plan["num_spec_decode_tokens"],
++        num_actual_tokens=m.num_actual_tokens,
++        has_initial_state=None,
++        chunk_indices=None,
++        chunk_offsets=None,
++        prefill_query_start_loc=None,
++        prefill_state_indices=None,
++        prefill_has_initial_state=None,
++        spec_query_start_loc=builder.spec_query_start_loc[: batch_size + 1],
++        non_spec_query_start_loc=None,
++        spec_state_indices_tensor=builder.spec_state_indices_tensor[:batch_size],
++        non_spec_state_indices_tensor=None,
++        spec_sequence_masks=builder.spec_sequence_masks[:batch_size],
++        spec_token_indx=builder.spec_token_indx[: plan["spec_token_size"]],
++        non_spec_token_indx=builder.non_spec_token_indx[:0],
++        num_accepted_tokens=builder.num_accepted_tokens[:batch_size],
++        nums_dict=None,
++        batch_ptr=None,
++        token_chunk_offset_ptr=None,
++    )

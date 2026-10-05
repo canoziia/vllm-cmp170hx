@@ -1,0 +1,1926 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] PP: run the DFlash2 draft tail on an earlier stage
+
+VLLM_PP_DRAFT_TAIL_STAGE (default -1 = off; the compose uses 2). Port of
+Morrowmake's switch (v1/worker/gpu/pp_draft_tail.py): the drafter's tail
+(candidate lm_head pass, top-k, candidate selector, selector walk) runs on
+the given pipeline stage instead of the last one; that stage keeps a copy of
+lm_head and the selector and roots the draft-token broadcast. Unsupported
+configurations fail at start-up. Includes the audit hardening: the tail's
+persistent GEMM and FlashInfer top-k buffers are prepared inside the model
+memory profiler (before KV sizing); FlashInfer top-k scratch is isolated
+from the main stream only after a start-up probe of the deployed package
+(unknown cache contracts fail closed); mHC rejects non-power-of-two hidden
+sizes; ContextVar scopes are reset. Validation aid:
+VLLM_PP_DRAFT_TAIL_VERIFY (default 0) re-runs the tail on the last stage and
+counts rows whose received drafts differ.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f66893e..6758970 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -58,6 +58,8 @@ if TYPE_CHECKING:
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_COSTS_MULTI: str = ""
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_HYST: float = 0.03
+     VLLM_GLM5_DFLASH_ADAPTIVE_K_PRIOR: float = 0.75
++    VLLM_PP_DRAFT_TAIL_STAGE: int = -1
++    VLLM_PP_DRAFT_TAIL_VERIFY: bool = False
+     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = False
+     VLLM_GLM5_INDEXER_JIT_WARMUP: bool = True
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
+@@ -943,6 +945,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
+         int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1"))
+     ),
++    # DFlash2 under PP: run the drafter's tail (candidate lm_head pass, top-k,
++    # candidate selector, selector walk) on this earlier pipeline stage
++    # instead of the last one; that stage keeps a copy of lm_head and the
++    # selector and roots the draft-token broadcast (port of Morrowmake's
++    # switch, v1/worker/gpu/pp_draft_tail.py). Unset or -1 = off. Unsupported
++    # configurations fail at start-up.
++    "VLLM_PP_DRAFT_TAIL_STAGE": lambda: int(
++        os.getenv("VLLM_PP_DRAFT_TAIL_STAGE", "-1")
++    ),
++    # Validation aid for VLLM_PP_DRAFT_TAIL_STAGE: the last stage also runs the
++    # tail itself and counts rows whose received drafts differ (logged every
++    # 500 steps). Costs the tail's time on the last stage. Default off.
++    "VLLM_PP_DRAFT_TAIL_VERIFY": lambda: bool(
++        int(os.getenv("VLLM_PP_DRAFT_TAIL_VERIFY", "0"))
++    ),
+     # Adaptive DFlash verification depth (port of Morrowmake's switch of the
+     # same name). With 1: the drafter drafts the deepest depth listed in
+     # _DEPTHS (it becomes num_speculative_tokens) and each step verifies the
+@@ -2905,6 +2922,10 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_MAX_AUDIO_PREPROCESS_WORKERS",
+         "VLLM_MAX_EMBED_DECODE_BYTES",
+         "VLLM_MAX_IMAGE_PIXELS",
++        # Where the DFlash2 draft tail runs; the compiled drafter/selector
++        # code is the same either way.
++        "VLLM_PP_DRAFT_TAIL_STAGE",
++        "VLLM_PP_DRAFT_TAIL_VERIFY",
+         "VLLM_VIDEO_LOADER_BACKEND",
+         "VLLM_MEDIA_CONNECTOR",
+         "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
+diff --git a/vllm/models/glm5next/nvidia/ops/mhc_decode_v2_gate.py b/vllm/models/glm5next/nvidia/ops/mhc_decode_v2_gate.py
+index e9808b3..cf8dcd0 100644
+--- a/vllm/models/glm5next/nvidia/ops/mhc_decode_v2_gate.py
++++ b/vllm/models/glm5next/nvidia/ops/mhc_decode_v2_gate.py
+@@ -95,7 +95,7 @@ def shape_ok(num_tokens: int, hc_mult: int, hidden_size: int,
+         return False
+     if not has_norm:
+         return False
+-    if hc_mult != HC or hidden_size <= 0 or hidden_size % 1024:
++    if hc_mult != HC or hidden_size <= 0 or hidden_size % 1024 or hidden_size & (hidden_size - 1):
+         return False
+     # The finish kernel unrolls SINK-2 approximate iterations + one corrected
+     # pair; MM only measured 20. Anything < 2 is a different algorithm.
+diff --git a/vllm/models/glm5next/nvidia/ops/thin_gemm.py b/vllm/models/glm5next/nvidia/ops/thin_gemm.py
+index 06d9e49..4dab0da 100644
+--- a/vllm/models/glm5next/nvidia/ops/thin_gemm.py
++++ b/vllm/models/glm5next/nvidia/ops/thin_gemm.py
+@@ -40,6 +40,8 @@ Differences from MM [deliberate]:
+     capture. The warmup below normally makes this unreachable.
+ """
+ 
++import contextlib
++from contextvars import ContextVar
+ import functools
+ 
+ import torch
+@@ -495,10 +497,26 @@ _WORKSPACE: dict = {}
+ # (device index, M, N, K) that have run at least once outside a capture, i.e.
+ # whose Triton binary and workspace exist.
+ _READY: set = set()
++# Workspace namespace (VLLM_PP_DRAFT_TAIL_STAGE): work that runs on a side
++# stream beside the stage's own forward takes private split-K partials and
++# arrival counters, so a same-shape GEMM on the main stream (or in a graph it
++# replays) can never share them. None = the shared namespace. Host-side only:
++# the buffer is chosen at launch time.
++_SCOPE: ContextVar[str | None] = ContextVar("thin_gemm_scope", default=None)
++
++
++@contextlib.contextmanager
++def private_workspace(name: str):
++    """Launches inside the block use workspace buffers private to ``name``."""
++    token = _SCOPE.set(name)
++    try:
++        yield
++    finally:
++        _SCOPE.reset(token)
+ 
+ 
+ def _partials(split_k, M, N, K, device):
+-    key = (device.index, "p", split_k, M, N, K)
++    key = (device.index, _SCOPE.get(), "p", split_k, M, N, K)
+     buf = _WORKSPACE.get(key)
+     if buf is None:
+         buf = torch.empty((split_k, M, N), dtype=torch.float32, device=device)
+@@ -507,7 +525,7 @@ def _partials(split_k, M, N, K, device):
+ 
+ 
+ def _locks(tiles, M, N, K, device):
+-    key = (device.index, "lock", M, N, K, tiles)
++    key = (device.index, _SCOPE.get(), "lock", M, N, K, tiles)
+     buf = _WORKSPACE.get(key)
+     if buf is None:
+         buf = torch.zeros(tiles, dtype=torch.int32, device=device)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2f42d69..fd77371 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -139,6 +139,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
+ from vllm.v1.worker.gpu.model_states import init_model_state
+ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
++from vllm.v1.worker.gpu.pp_draft_tail import DraftTailController
+ from vllm.v1.worker.gpu.pp_utils import PPHandler
+ from vllm.v1.worker.gpu.sample.batch_shard import (
+     BatchSharder,
+@@ -288,6 +289,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+ 
++        # VLLM_PP_DRAFT_TAIL_STAGE: the DFlash2 draft tail on an earlier PP
++        # stage. None (and nothing else changes) unless the switch is set;
++        # raises at start-up for an unsupported configuration.
++        self.draft_tail: DraftTailController | None = (
++            DraftTailController.create(
++                vllm_config,
++                device,
++                get_pp_group().rank_in_group,
++                get_pp_group().world_size,
++            )
++            if self.use_pp or envs.VLLM_PP_DRAFT_TAIL_STAGE >= 0
++            else None
++        )
++        if self.draft_tail is not None:
++            self.draft_tail.attach_speculator(self.speculator)
++
+         # Draft tokens propagation - for spec-dec + struct outputs.
+         self.draft_tokens_handler = DraftTokensHandler(self.device)
+ 
+@@ -330,7 +347,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 max_num_reqs=self.max_num_reqs,
+                 num_speculative_steps=self.num_speculative_steps,
+                 device=self.device,
++                draft_tail_stage=(
++                    self.draft_tail.stage if self.draft_tail is not None else -1
++                ),
++                max_concurrent_batches=vllm_config.max_concurrent_batches,
+             )
++            if self.draft_tail is not None:
++                self.draft_tail.attach_handler(self.pp_handler)
+ 
+         # Samplers and decode_query_len created in load_model() after
+         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
+@@ -445,6 +468,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.speculator,
+                         None if load_dummy_weights else self.model,
+                     )
++            if self.draft_tail is not None:
++                # Tail stage: its lm_head + selector copy, counted in the
++                # model's memory (weights arrive after graph capture).
++                self.draft_tail.load(self.model, self.dtype)
++                self.draft_tail.prepare_workspaces()
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+@@ -1124,6 +1152,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             for mm_hash in scheduler_output.free_encoder_mm_hashes:
+                 self.encoder_cache.free_encoder_cache(mm_hash)
+ 
++    def finalize_pp_draft_tail(self) -> None:
++        """VLLM_PP_DRAFT_TAIL_STAGE: every stage, once, after graph capture."""
++        if self.draft_tail is not None:
++            self.draft_tail.finalize()
++
++    def _apply_remote_drafts(self, scheduler_output: SchedulerOutput) -> None:
++        """Last stage with a moved draft tail: land the drafts this batch reads
++        (combine_sampled_and_draft_tokens reads req_states.draft_tokens)."""
++        index = self.req_states.req_id_to_index
++        batch_idx_np = np.fromiter(
++            (index[r] for r in scheduler_output.num_scheduled_tokens if r in index),
++            dtype=np.int64,
++        )
++        assert self.pp_handler is not None
++        self.pp_handler.apply_remote_drafts(batch_idx_np, self.req_states.draft_tokens)
++
+     def update_pp_decode_requests(self):
+         # For non-last PP ranks, update decode requests with sampler output from
+         # the prior step in which they were scheduled (pp_size steps ago).
+@@ -1693,6 +1737,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.add_requests(scheduler_output)
+             self.update_requests(scheduler_output)
+             self.block_tables.apply_staged_writes()
++            if (
++                self.pp_handler is not None
++                and self.pp_handler.remote_drafts is not None
++            ):
++                self._apply_remote_drafts(scheduler_output)
+             if scheduler_output.total_num_scheduled_tokens == 0:
+                 # No need to run the model.
+                 empty_output = self.kv_connector.no_forward(scheduler_output)
+@@ -2099,7 +2148,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # IntermediateTensors instead of final hidden states. Receive the
+             # sampled tokens broadcast from the last rank and update local state.
+             assert self.pp_handler is not None
+-            all_decode_next = self.pp_handler.receive(input_batch)
++            all_decode_next = self.pp_handler.receive(
++                input_batch,
++                (
++                    self.draft_tail.step(input_batch)
++                    if self.draft_tail is not None
++                    else None
++                ),
++            )
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+             self.postprocess_num_computed_tokens(input_batch)
+@@ -2194,6 +2250,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch.query_start_loc,
+         )
+ 
++        remote_tail = False
++        tail_payload = tail_check = None
+         if self.speculator is not None:
+             assert self.sampler is not None
+             # Let the target override the hidden state fed to the drafter
+@@ -2204,6 +2262,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            propose_kwargs: dict[str, Any] = {}
++            if self.draft_tail is not None and self.draft_tail.remote_step(
++                input_batch
++            ):
++                remote_tail = propose_kwargs["remote_tail"] = True
+             with use_workspace_lane(self._draft_workspace_lane):
+                 draft_tokens = self.speculator.propose(
+                     input_batch,
+@@ -2219,8 +2282,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.sampler.sampling_states.seeds.gpu,
+                     dp_sync=dp_sync,
+                     mm_inputs=mm_inputs,
++                    **propose_kwargs,
+                 )
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if remote_tail:
++                # The tail stage roots this step's drafts; they reach the
++                # request state through _apply_remote_drafts.
++                assert self.draft_tail is not None
++                tail_payload = self.draft_tail.payload(input_batch.num_reqs)
++                tail_check = self.draft_tail.check_drafts(input_batch.num_reqs)
++            else:
++                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None and not self.use_pp:
+                 self.adaptive_verification.record_confidences(
+                     self.speculator.draft_token_confidence_probs, input_batch
+@@ -2233,7 +2304,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 self.req_states.draft_tokens[input_batch.idx_mapping],
+             )
+-            if self.pp_handler is not None:
++            if self.pp_handler is not None and remote_tail:
++                assert tail_payload is not None
++                self.pp_handler.send_draft_tail(tail_payload, input_batch, tail_check)
++            elif self.pp_handler is not None:
+                 self.pp_handler.broadcast_drafts(
+                     self.req_states.draft_tokens, input_batch,
+                     self.speculator.draft_token_confidence_probs[:input_batch.num_reqs]
+@@ -2263,6 +2337,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if not live_ids:
+             return DraftTokenIds([], [])
+         slots = [self.req_states.req_id_to_index[req_id] for req_id in live_ids]
++        if self.pp_handler is not None and self.pp_handler.remote_drafts is not None:
++            # Drafts of these requests may still be queued from the tail stage.
++            self.pp_handler.apply_remote_drafts(
++                np.asarray(slots, dtype=np.int64),
++                self.req_states.draft_tokens,
++                advance=False,
++            )
+         return DraftTokenIds(live_ids, self.req_states.draft_tokens[slots].tolist())
+ 
+     @torch.inference_mode()
+diff --git a/vllm/v1/worker/gpu/pp_draft_tail.py b/vllm/v1/worker/gpu/pp_draft_tail.py
+new file mode 100644
+index 0000000..408b48f
+--- /dev/null
++++ b/vllm/v1/worker/gpu/pp_draft_tail.py
+@@ -0,0 +1,1166 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Run the DFlash2 draft tail on an earlier pipeline stage
++(``VLLM_PP_DRAFT_TAIL_STAGE=<stage>``; unset or -1 = off).
++
++Port of Morrowmake's ``vllm/v1/worker/gpu/pp_draft_tail.py`` to our tree
++(single drafted width: our load/acceptance-adaptive depth always drafts
++``num_speculative_tokens`` and only narrows the verified prefix).
++
++Under pipeline parallelism the last stage runs the target's last layers, the
++verify lm_head, the rejection sampler, the drafter's layers *and* the
++drafter's tail: a second full-vocabulary lm_head pass over the sampled rows
++(top-k candidates), the candidate selector and the selector walk. The tail
++needs no KV cache, only ``lm_head`` and the selector weights.
++
++With the switch on:
++
++* the last stage runs the drafter's layers as before; its captured drafter
++  graph ends by gathering the sampled rows' hidden states plus the walk's
++  per-row inputs (anchor token, sample position, row state, temperature,
++  seed) into one byte buffer (the *payload*), which is sent to the tail stage
++  on a dedicated NCCL communicator (``pp_draft_tail``);
++* the tail stage runs the same candidate pass, selector and walk on the same
++  rows (the drafter's CUDA-graph padded row count) with the same weights
++  (copied from the last stage once, after graph capture) on its PP broadcast
++  stream, beside its own forward, and roots that step's draft broadcast;
++* the last stage receives the drafts like every other stage and scatters them
++  into its request state before a later step reads them.
++
++A step keeps the tail on the last stage when structured output needs the
++drafts on the host at once, or when no row samples (nothing is broadcast).
++Every stage takes that decision from the same scheduler output, so the
++collective order always agrees.
++
++Differences from Morrowmake [deliberate]: any configuration the moved tail
++does not support is a start-up error instead of a warning and silent
++fallback; a failed start-up agreement (weights, layouts, signatures) is an
++error as well.
++"""
++
++from __future__ import annotations
++
++import contextlib
++from collections import deque
++from collections.abc import Callable, Iterator
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++logger = init_logger(__name__)
++
++TAIL_STAGE_OFF = -1
++
++# Elements per fp64 partial sum in weight_checksum: a 128 MiB fp64 transient.
++CHECKSUM_CHUNK = 1 << 24
++
++# thin_gemm workspace namespace for the tail (see thin_gemm.private_workspace).
++THIN_GEMM_SCOPE = "pp_draft_tail"
++
++
++# --------------------------------------------------------------------------
++# Gate
++# --------------------------------------------------------------------------
++
++
++def draft_tail_stage(vllm_config: VllmConfig, requested: int) -> int:
++    """The pipeline rank (within the PP group) that runs the tail, or -1.
++
++    Decided from the config alone, so every rank agrees. Raises ValueError for
++    any configuration the moved tail does not support: the operator asked for
++    it, so it must not silently stay off.
++    """
++    if requested is None or requested < 0:
++        return TAIL_STAGE_OFF
++
++    def refuse(reason: str) -> ValueError:
++        return ValueError(f"VLLM_PP_DRAFT_TAIL_STAGE={requested}: {reason}")
++
++    pc = vllm_config.parallel_config
++    pp = pc.pipeline_parallel_size
++    if pp < 2:
++        raise refuse("needs pipeline parallelism (pipeline_parallel_size >= 2)")
++    if requested > pp - 2:
++        raise refuse(f"the stage must be earlier than the last (0..{pp - 2})")
++    if pc.tensor_parallel_size != 1:
++        raise refuse("needs one card per stage (tensor_parallel_size 1)")
++    if pc.data_parallel_size != 1:
++        raise refuse("not supported with data parallelism")
++    if getattr(pc, "prefill_context_parallel_size", 1) != 1:
++        raise refuse("not supported with prefill context parallelism")
++    if getattr(pc, "decode_context_parallel_size", 1) != 1:
++        raise refuse("not supported with decode context parallelism")
++    if not vllm_config.use_v2_model_runner:
++        raise refuse("needs the V2 model runner (VLLM_USE_V2_MODEL_RUNNER=1)")
++    spec = vllm_config.speculative_config
++    if spec is None or spec.method != "dflash":
++        raise refuse("needs a DFlash2 drafter (speculative method 'dflash')")
++    archs = getattr(spec.draft_model_config, "architectures", None) or []
++    if "DFlash2DraftModel" not in archs:
++        raise refuse(
++            f"needs a DFlash2 drafter (candidate selector); architectures={archs}"
++        )
++    if (spec.num_speculative_tokens or 0) < 1:
++        raise refuse("needs num_speculative_tokens >= 1")
++    if spec.draft_sample_method != "greedy":
++        raise refuse("needs greedy draft sampling (draft_sample_method='greedy')")
++    if spec.enable_adaptive_verification:
++        raise refuse("not supported with adaptive verification")
++    if spec.uses_dynamic_speculative_decoding():
++        raise refuse("not supported with num_speculative_tokens_per_batch_size")
++    if getattr(spec, "use_heterogeneous_vocab", False):
++        raise refuse("not supported with a heterogeneous draft vocabulary")
++    # Adaptive depth (VLLM_GLM5_DFLASH_ADAPTIVE_K, patch 0004) is carried: the
++    # drafter always drafts num_speculative_tokens, only the verified prefix
++    # varies, so the tail's rows and width are fixed.
++    return requested
++
++
++# --------------------------------------------------------------------------
++# Per-step decision and roles
++# --------------------------------------------------------------------------
++
++
++def step_uses_remote_tail(
++    live: bool,
++    need_sampled_mask: np.ndarray | None,
++    has_structured_output_reqs: bool,
++) -> bool:
++    """Whether this step's tail runs on the tail stage. Every input is known on
++    every stage from the scheduler output, so every stage agrees (it decides
++    the draft broadcast's root)."""
++    return live and need_sampled_mask is not None and not has_structured_output_reqs
++
++
++ROLE_LOCAL_ROOT = "local_root"  # last stage, tail local: root the drafts
++ROLE_SEND_THEN_RECV = "send_then_recv"  # last stage, tail remote
++ROLE_TAIL_ROOT = "tail_root"  # tail stage, tail remote: recv payload, root
++ROLE_RECV = "recv"  # every other stage: receive drafts
++
++
++def draft_role(pp_rank: int, pp_size: int, tail_stage: int, remote: bool) -> str:
++    last = pp_size - 1
++    if not remote:
++        return ROLE_LOCAL_ROOT if pp_rank == last else ROLE_RECV
++    if pp_rank == last:
++        return ROLE_SEND_THEN_RECV
++    if pp_rank == tail_stage:
++        return ROLE_TAIL_ROOT
++    return ROLE_RECV
++
++
++def draft_broadcast_src(pp_size: int, tail_stage: int, remote: bool) -> int:
++    """Pipeline rank (within the PP group) that roots this step's drafts."""
++    return tail_stage if remote else pp_size - 1
++
++
++def tail_rows(num_reqs: int, rows_table: dict[int, int] | None) -> int:
++    """Rows the tail runs over: the drafter's (CUDA-graph padded) row count
++    for a batch of ``num_reqs`` requests, from the table the last stage sends
++    once after capture."""
++    if rows_table:
++        return rows_table.get(num_reqs, num_reqs)
++    return num_reqs
++
++
++# --------------------------------------------------------------------------
++# Payload
++# --------------------------------------------------------------------------
++
++_ALIGN = 16
++
++
++def _align(n: int) -> int:
++    return (n + _ALIGN - 1) // _ALIGN * _ALIGN
++
++
++def _esize(dtype: torch.dtype) -> int:
++    return torch.tensor([], dtype=dtype).element_size()
++
++
++@dataclass
++class TailPayloadViews:
++    hidden: torch.Tensor  # [rows * k, H] model dtype
++    sample_pos: torch.Tensor  # [rows * k] int64
++    seeds: torch.Tensor  # [rows] int64
++    anchor: torch.Tensor  # [rows] input-id dtype
++    row_state: torch.Tensor  # [rows * k] int32; row index, -1 = padding
++    temperature: torch.Tensor  # [rows] float32
++
++
++class TailPayloadLayout:
++    """One contiguous byte buffer per step, laid out from the row count, so
++    both ends compute the same offsets without exchanging them. ``hidden``
++    comes first (offset 0) so its alignment is the allocation's."""
++
++    def __init__(
++        self,
++        max_rows: int,
++        num_steps: int,
++        hidden_size: int,
++        hidden_dtype: torch.dtype,
++        anchor_dtype: torch.dtype,
++    ) -> None:
++        self.max_rows = max_rows
++        self.num_steps = num_steps
++        self.hidden_size = hidden_size
++        self.hidden_dtype = hidden_dtype
++        self.anchor_dtype = anchor_dtype
++
++    def key(self) -> tuple:
++        return (
++            self.max_rows,
++            self.num_steps,
++            self.hidden_size,
++            str(self.hidden_dtype),
++            str(self.anchor_dtype),
++        )
++
++    def _regions(self, rows: int) -> list[tuple[str, torch.dtype, tuple[int, ...]]]:
++        n = rows * self.num_steps
++        return [
++            ("hidden", self.hidden_dtype, (n, self.hidden_size)),
++            ("sample_pos", torch.int64, (n,)),
++            ("seeds", torch.int64, (rows,)),
++            ("anchor", self.anchor_dtype, (rows,)),
++            ("row_state", torch.int32, (n,)),
++            ("temperature", torch.float32, (rows,)),
++        ]
++
++    def _offsets(self, rows: int) -> tuple[list[tuple], int]:
++        out = []
++        off = 0
++        for name, dtype, shape in self._regions(rows):
++            nbytes = int(np.prod(shape)) * _esize(dtype)
++            out.append((name, dtype, shape, off))
++            off = _align(off + nbytes)
++        return out, off
++
++    def nbytes(self, rows: int) -> int:
++        return self._offsets(rows)[1]
++
++    def views(self, buf: torch.Tensor, rows: int) -> TailPayloadViews:
++        assert buf.dtype == torch.uint8 and buf.dim() == 1
++        regions, total = self._offsets(rows)
++        assert buf.numel() >= total, (buf.numel(), total)
++        parts: dict[str, torch.Tensor] = {}
++        for name, dtype, shape, off in regions:
++            n = int(np.prod(shape))
++            parts[name] = buf[off : off + n * _esize(dtype)].view(dtype).view(shape)
++        return TailPayloadViews(**parts)
++
++
++def pack_tail_payload(
++    views: TailPayloadViews,
++    rows: int,
++    num_steps: int,
++    last_hidden_states: torch.Tensor,
++    sample_indices: torch.Tensor,
++    input_ids: torch.Tensor,
++    anchor_indices: torch.Tensor,
++    sample_pos: torch.Tensor,
++    sample_idx_mapping: torch.Tensor,
++    temperature: torch.Tensor,
++    seeds: torch.Tensor,
++    row_ids: torch.Tensor,
++) -> None:
++    """Gather what the tail reads, row for row as the fused path reads it.
++
++    Static shapes for a given ``rows`` and no host syncs, so it sits inside
++    the drafter's captured graph. ``temperature``/``seeds`` are indexed by
++    request slot on the last stage; the payload carries them per row and
++    ``row_state`` maps each sample row to its row (or -1 for padding), which
++    is what the walk indexes them by on the tail stage.
++    """
++    n = rows * num_steps
++    torch.index_select(last_hidden_states, 0, sample_indices[:n], out=views.hidden)
++    torch.index_select(input_ids, 0, anchor_indices[:rows], out=views.anchor)
++    views.sample_pos.copy_(sample_pos[:n])
++    idx = sample_idx_mapping[:n]
++    views.row_state.copy_(
++        torch.where(idx >= 0, row_ids[:n], torch.full_like(row_ids[:n], -1))
++    )
++    slots = sample_idx_mapping[0:n:num_steps].clamp(min=0).to(torch.int64)
++    torch.index_select(temperature, 0, slots, out=views.temperature)
++    torch.index_select(seeds, 0, slots, out=views.seeds)
++
++
++def copy_payload_rows(
++    src: TailPayloadViews, dst: TailPayloadViews, rows: int, num_steps: int
++) -> None:
++    """Copy the first ``rows`` rows between payloads of different row counts
++    (only if the last stage's row count ever differs from the table)."""
++    n = rows * num_steps
++    dst.hidden[:n].copy_(src.hidden[:n])
++    dst.sample_pos[:n].copy_(src.sample_pos[:n])
++    dst.row_state[:n].copy_(src.row_state[:n])
++    dst.anchor[:rows].copy_(src.anchor[:rows])
++    dst.temperature[:rows].copy_(src.temperature[:rows])
++    dst.seeds[:rows].copy_(src.seeds[:rows])
++
++
++# --------------------------------------------------------------------------
++# The tail computation
++# --------------------------------------------------------------------------
++
++
++def run_draft_tail(
++    compute_candidates: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
++    select: Callable[..., torch.Tensor],
++    walk: Callable[..., None],
++    views: TailPayloadViews,
++    rows: int,
++    num_steps: int,
++    top_k: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Candidate pass, selector and walk over ``rows`` payload rows.
++
++    Mirrors ``DFlash2Speculator._generate_draft`` after the drafter forward:
++    same inputs, shapes and order. ``walk`` writes the draft tokens.
++    """
++    hidden = views.hidden.view(rows, num_steps, -1)
++    candidate_ids, unary_logits = compute_candidates(hidden.flatten(0, 1))
++    candidate_ids = candidate_ids.view(rows, num_steps, top_k)
++    unary_logits = unary_logits.view_as(candidate_ids)
++    scores = select(candidate_ids, unary_logits, hidden, views.anchor)
++    walk(candidate_ids, scores, views, rows)
++    return candidate_ids, scores
++
++
++def launch_walk(
++    candidate_ids: torch.Tensor,
++    scores: torch.Tensor,
++    views: TailPayloadViews,
++    rows: int,
++    out_tokens: torch.Tensor,
++    realized_scores: torch.Tensor,
++    num_steps: int,
++    top_k: int,
++    sample_probabilistic: bool,
++    use_fp64: bool,
++) -> None:
++    """The selector walk over payload rows (``row_state`` indexes the per-row
++    temperature/seed). Same kernel and constexprs as the fused path."""
++    from vllm.triton_utils import triton
++    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
++        _selector_walk_kernel,
++    )
++
++    _selector_walk_kernel[(rows,)](
++        scores.contiguous(),
++        candidate_ids.contiguous(),
++        views.sample_pos,
++        views.row_state,
++        views.temperature,
++        views.seeds,
++        out_tokens,
++        realized_scores,
++        num_steps=num_steps,
++        top_k=top_k,
++        BLOCK_K=triton.next_power_of_2(top_k),
++        SAMPLE_PROBABILISTIC=sample_probabilistic,
++        USE_FP64=use_fp64,
++        num_warps=1,
++    )
++
++
++# --------------------------------------------------------------------------
++# Last stage: drafts that arrive from the tail stage
++# --------------------------------------------------------------------------
++
++
++@dataclass
++class RemoteDrafts:
++    step: int
++    event: Any
++    draft_tokens: torch.Tensor  # [num_reqs, k], batch order
++    idx_mapping_np: np.ndarray  # [num_reqs]
++    keep_np: np.ndarray  # [num_reqs] rows that produce a sample
++    gen_np: np.ndarray  # [num_reqs] slot generation at send time
++    # VLLM_PP_DRAFT_TAIL_VERIFY: the drafts the last stage computed itself.
++    check: torch.Tensor | None = None
++
++
++class RemoteDraftQueue:
++    """Drafts broadcast by the tail stage, not yet in the last stage's state.
++
++    Before a step reads draft tokens it applies every entry that holds a live
++    row of the batch (and every entry before it, in order, so a row always
++    ends with its newest drafts), plus any entry older than ``max_age`` steps.
++    Entries for other rows stay queued, so the stage never waits on a tail it
++    does not need yet. Rows whose request slot was freed since the send
++    (finished, aborted, preempted) are skipped.
++    """
++
++    REPORT_EVERY = 500
++
++    def __init__(self, max_age: int) -> None:
++        self.max_age = max_age
++        self.entries: deque[RemoteDrafts] = deque()
++        self.step = 0
++        self.checked_rows: torch.Tensor | None = None
++        self.differing_rows: torch.Tensor | None = None
++
++    def __len__(self) -> int:
++        return len(self.entries)
++
++    def push(self, entry: RemoteDrafts) -> None:
++        self.entries.append(entry)
++
++    def next_step(self) -> int:
++        self.step += 1
++        return self.step
++
++    def _verify(self, e: RemoteDrafts, keep: np.ndarray) -> None:
++        assert e.check is not None
++        keep_t = torch.as_tensor(keep, device=e.draft_tokens.device)
++        diff = (e.draft_tokens != e.check).any(dim=1) & keep_t
++        if self.checked_rows is None:
++            self.checked_rows = torch.zeros(
++                (), dtype=torch.int64, device=e.draft_tokens.device
++            )
++            self.differing_rows = torch.zeros_like(self.checked_rows)
++        self.checked_rows += keep_t.sum()
++        self.differing_rows += diff.sum()
++
++    def verify_report(self) -> tuple[int, int] | None:
++        """(rows checked, rows whose drafts differed); a host sync."""
++        if self.checked_rows is None:
++            return None
++        assert self.differing_rows is not None
++        return int(self.checked_rows), int(self.differing_rows)
++
++    def _live_rows(self, e: RemoteDrafts, gen_now: np.ndarray) -> np.ndarray:
++        return e.keep_np & (gen_now[e.idx_mapping_np] == e.gen_np)
++
++    def due(self, batch_idx_np: np.ndarray, gen_now: np.ndarray) -> list[RemoteDrafts]:
++        last_due = -1
++        batch = {int(i) for i in batch_idx_np}
++        for i, e in enumerate(self.entries):
++            if e.step <= self.step - self.max_age:
++                last_due = i
++                continue
++            rows = e.idx_mapping_np[self._live_rows(e, gen_now)]
++            if any(int(r) in batch for r in rows):
++                last_due = i
++        return [self.entries.popleft() for _ in range(last_due + 1)]
++
++    def apply(
++        self,
++        batch_idx_np: np.ndarray,
++        gen_now: np.ndarray,
++        draft_tokens_to_update: torch.Tensor,
++        wait_event: Callable[[Any], None],
++        to_device: Callable[[np.ndarray], torch.Tensor],
++    ) -> int:
++        """Apply the due entries in order; returns how many were applied."""
++        applied = 0
++        for e in self.due(batch_idx_np, gen_now):
++            keep = self._live_rows(e, gen_now)
++            if not keep.any():
++                continue
++            wait_event(e.event)
++            if e.check is not None:
++                self._verify(e, keep)
++            draft_tokens = e.draft_tokens
++            if keep.all():
++                idx_np = e.idx_mapping_np
++            else:
++                keep_t = torch.as_tensor(keep, device=draft_tokens.device)
++                draft_tokens = draft_tokens[keep_t]
++                idx_np = e.idx_mapping_np[keep]
++            draft_tokens_to_update[to_device(idx_np)] = draft_tokens
++            applied += 1
++        return applied
++
++
++# --------------------------------------------------------------------------
++# Private workspaces for a tail that runs beside the stage's own forward
++# --------------------------------------------------------------------------
++
++
++def _flashinfer_cache():
++    try:
++        import flashinfer.utils as fi_utils
++    except Exception:
++        return None
++    cache = getattr(fi_utils, "_cache_buf", None)
++    return cache if isinstance(cache, dict) else None
++
++
++@contextlib.contextmanager
++def private_flashinfer_topk_workspace(
++    device: torch.device, holder: dict
++) -> Iterator[None]:
++    """Give FlashInfer's radix top-k a private row-state buffer.
++
++    The radix top-k keeps one cached, zero-initialised row-state buffer per
++    device and relies on stream order to reuse it. The tail runs its top-k on
++    a side stream while the stage's own forward may use the same cache on the
++    main stream, so the tail swaps in its own buffer for the call. Host-side
++    only: the kernel uses whichever pointer the cache holds at launch time.
++    """
++    cache = _flashinfer_cache()
++    from vllm.model_executor.layers.logits_processor import _flashinfer_topk
++
++    if _flashinfer_topk() is None:
++        yield
++        return
++    if cache is None or "key" not in holder:
++        raise RuntimeError("FlashInfer top-k cache contract was not validated")
++    key = holder["key"]
++    missing = object()
++    prev = cache.get(key, missing)
++    mine = holder.get("buf")
++    if mine is None:
++        raise RuntimeError("private top-k workspace was not preallocated")
++    cache[key] = mine
++    try:
++        yield
++    finally:
++        # FlashInfer may have grown the buffer: keep whatever it now holds.
++        holder["buf"] = cache.get(key, mine)
++        if prev is missing:
++            cache.pop(key, None)
++        else:
++            cache[key] = prev
++
++
++def validate_flashinfer_topk_contract(device: torch.device, holder: dict) -> None:
++    """Execute the deployed top_k and observe its actual utils cache lookup.
++
++    Fail closed on aliases, alternate caches, multiple keys or an incompatible
++    buffer. This probe is startup-only, before any concurrent model execution.
++    """
++    from vllm.model_executor.layers.logits_processor import _flashinfer_topk
++    impl = _flashinfer_topk()
++    if impl is None:
++        return
++    import flashinfer.utils as utils
++    cache = _flashinfer_cache()
++    if cache is None:
++        raise RuntimeError("unsupported FlashInfer cache")
++
++    class Probe(dict):
++        def get(self, key, default=None):
++            seen.add(key)
++            return super().get(key, default)
++
++    seen: set = set()
++    probe = Probe(cache)
++    utils._cache_buf = probe
++    try:
++        x = torch.randn((4, 4096), device=device)
++        values, indices = impl(x, 16, sorted=True, deterministic=True)
++        torch.cuda.synchronize(device)
++        expected = torch.topk(x, 16, dim=-1)
++        if not torch.equal(indices, expected.indices) or not torch.equal(values, expected.values):
++            raise RuntimeError("deployed top_k failed reference check")
++        if len(seen) != 1:
++            raise RuntimeError(f"unsupported top_k cache lookups: {seen}")
++        key = next(iter(seen))
++        buf = probe.get(key)
++        if (not isinstance(key, tuple) or len(key) != 2
++                or key != (f"radix_topk_row_states_{device}", device)
++                or not isinstance(buf, torch.Tensor) or buf.dtype != torch.uint8
++                or buf.device != device or buf.numel() != 1024 * 1024):
++            raise RuntimeError("unsupported deployed radix top-k cache contract")
++        holder["key"] = key
++        holder["buf"] = torch.zeros_like(buf)
++    finally:
++        utils._cache_buf = cache
++
++
++def flashinfer_topk_isolatable() -> bool:
++    """True when the candidate top-k either does not use FlashInfer or uses a
++    FlashInfer whose row-state cache the tail can swap (see above)."""
++    from vllm.model_executor.layers.logits_processor import _flashinfer_topk
++
++    if _flashinfer_topk() is None:
++        return True
++    # A dict alone proves nothing about the kernel's actual cache key.
++    # Only the startup execution probe can establish the deployed contract.
++    return False
++
++
++@contextlib.contextmanager
++def tail_side_stream_workspaces(device: torch.device, holder: dict) -> Iterator[None]:
++    """Everything the tail needs to run concurrently with the stage's
++    forward: a private thin-GEMM workspace namespace (patch 0005) and a
++    private FlashInfer top-k buffer. cuBLAS keeps its workspace per stream."""
++    from vllm import envs
++
++    with contextlib.ExitStack() as stack:
++        if envs.VLLM_GLM5_THIN_GEMM:
++            from vllm.models.glm5next.nvidia.ops.thin_gemm import private_workspace
++
++            stack.enter_context(private_workspace(THIN_GEMM_SCOPE))
++        stack.enter_context(private_flashinfer_topk_workspace(device, holder))
++        yield
++
++
++# --------------------------------------------------------------------------
++# Tail stage: its own copy of lm_head and the selector
++# --------------------------------------------------------------------------
++
++
++def _find_lm_head_prefix(model: torch.nn.Module) -> str:
++    for name, _ in model.named_modules():
++        if name == "lm_head" or name.endswith(".lm_head"):
++            return name
++    return "lm_head"
++
++
++def _is_unquantized(module: torch.nn.Module) -> bool:
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        UnquantizedEmbeddingMethod,
++    )
++
++    return isinstance(
++        getattr(module, "quant_method", None),
++        (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
++    )
++
++
++class DraftTailModule(torch.nn.Module):
++    """lm_head, the candidate logits processor and the candidate selector,
++    built the way the last stage builds them (same classes, arguments, config
++    context and compile tag); weights are copied from the last stage after
++    capture."""
++
++    def __init__(self, vllm_config: VllmConfig, target_model: torch.nn.Module) -> None:
++        super().__init__()
++        from vllm.compilation.backends import set_model_tag
++        from vllm.config import set_current_vllm_config
++        from vllm.model_executor.layers.logits_processor import LogitsProcessor
++        from vllm.model_executor.layers.vocab_parallel_embedding import (
++            ParallelLMHead,
++        )
++        from vllm.model_executor.models.qwen3_dflash2 import CandidateSelector
++        from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
++            dflash_draft_vllm_config,
++        )
++
++        spec = vllm_config.speculative_config
++        assert spec is not None
++        draft_hf = spec.draft_model_config.hf_config
++        draft_cfg = draft_hf.dflash_config
++        target_hf = vllm_config.model_config.hf_text_config
++        draft_vllm_config = dflash_draft_vllm_config(vllm_config)
++        self.lm_head_prefix = _find_lm_head_prefix(target_model)
++        # The target builds its lm_head under its own config with the target
++        # quant config (models/glm5next/nvidia/model.py, Glm5NextForCausalLM).
++        with set_current_vllm_config(vllm_config):
++            self.lm_head = ParallelLMHead(
++                target_hf.vocab_size,
++                target_hf.hidden_size,
++                quant_config=vllm_config.quant_config,
++                prefix=self.lm_head_prefix,
++            )
++        if not _is_unquantized(self.lm_head):
++            raise ValueError(
++                "VLLM_PP_DRAFT_TAIL_STAGE needs an unquantized lm_head; got "
++                f"{type(self.lm_head.quant_method).__name__}"
++            )
++        # The drafter builds these under the draft config
++        # (model_executor/models/qwen3_dflash2.py).
++        with set_current_vllm_config(draft_vllm_config):
++            softcap = float(draft_cfg.get("final_logit_softcapping") or 0.0)
++            self.candidate_logits_processor = LogitsProcessor(
++                vllm_config.model_config.get_vocab_size(),
++                scale=float(draft_cfg.get("output_multiplier", 1.0)),
++                soft_cap=softcap if softcap > 0 else None,
++            )
++            with set_model_tag("dflash2_candidate_selector"):
++                self.candidate_selector = CandidateSelector(
++                    hidden_size=draft_hf.hidden_size,
++                    vocab_size=draft_hf.vocab_size,
++                    rank=int(draft_cfg["selector_rank"]),
++                    top_k=int(draft_cfg["selector_top_k"]),
++                    params_dtype=vllm_config.model_config.dtype,
++                    prefix="model.candidate_selector",
++                )
++        for module in (self.lm_head, self.candidate_selector.hidden_projection):
++            quant_method = getattr(module, "quant_method", None)
++            if quant_method is not None and hasattr(
++                quant_method, "process_weights_after_loading"
++            ):
++                quant_method.process_weights_after_loading(module)
++
++    @property
++    def top_k(self) -> int:
++        return self.candidate_selector.top_k
++
++    def compute_candidates(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        return self.candidate_logits_processor.get_top_k_tokens(
++            self.lm_head, hidden_states, self.candidate_selector.top_k
++        )
++
++    def select(self, candidate_ids, unary_logits, hidden_states, anchor_token_ids):
++        return self.candidate_selector(
++            candidate_ids, unary_logits, hidden_states, anchor_token_ids
++        )
++
++
++def tail_tensors(lm_head: torch.nn.Module, selector: torch.nn.Module) -> dict:
++    """Name -> tensor for everything the tail reads, in a fixed order."""
++    out: dict[str, torch.Tensor] = {}
++    for prefix, module in (("lm_head", lm_head), ("candidate_selector", selector)):
++        for name, t in sorted(module.named_parameters()):
++            out[f"{prefix}.{name}"] = t
++        for name, t in sorted(module.named_buffers()):
++            out[f"{prefix}.{name}"] = t
++    return out
++
++
++def weight_checksum(t: torch.Tensor, chunk: int | None = None) -> float:
++    """fp64 sum of ``t`` over fixed dim-0 slices, so the fp64 transient is at
++    most ``chunk`` elements whatever the tensor's size (the copy is checked
++    after the KV pool is sized). Both stages sum in the same order, so equal
++    bytes give an equal result."""
++    chunk = chunk or CHECKSUM_CHUNK
++    t = t.detach()
++    if t.dim() == 0:
++        return float(t.double())
++    if t.numel() == 0:
++        return 0.0
++    row = max(1, t[0].numel())
++    total = 0.0
++    for part in t.split(max(1, chunk // row), dim=0):
++        if part.numel() <= chunk:
++            total += float(part.double().sum())
++        else:
++            for r in part:
++                total += weight_checksum(r, chunk)
++    return total
++
++
++def tensor_signature(tensors: dict) -> list[tuple]:
++    return [
++        (name, tuple(t.shape), str(t.dtype), tuple(t.stride()))
++        for name, t in tensors.items()
++    ]
++
++
++def module_signature(lm_head: torch.nn.Module, logits_processor, selector) -> dict:
++    """What must match between the two copies besides the weights."""
++    si = lm_head.shard_indices
++    return {
++        "lm_head_quant": type(lm_head.quant_method).__name__,
++        "lm_head_shard": (
++            si.org_vocab_start_index,
++            si.org_vocab_end_index,
++            si.num_org_vocab_padding,
++        ),
++        "lm_head_tp": lm_head.tp_size,
++        "logits_scale": float(logits_processor.scale),
++        "logits_soft_cap": logits_processor.soft_cap,
++        "logits_head_dtype": str(getattr(logits_processor, "head_dtype", None)),
++        "selector_cls": type(selector).__name__,
++        "top_k": int(selector.top_k),
++        "selector_proj_quant": type(
++            getattr(selector.hidden_projection, "quant_method", None)
++        ).__name__,
++    }
++
++
++def agree(last: dict, tail: dict) -> tuple[bool, str]:
++    """Whether the last stage's and the tail stage's start-up info match."""
++    if not last.get("ok"):
++        return False, last.get("reason") or "last stage not ready"
++    if not tail.get("ok"):
++        return False, tail.get("reason") or "tail stage not ready"
++    if last.get("probabilistic"):
++        return False, "the drafter samples its drafts probabilistically"
++    for key in ("sig", "mod", "layout", "fp64", "thin_gemm"):
++        if last.get(key) != tail.get(key):
++            return False, (
++                f"the two stages differ ({key}: {last.get(key)} vs {tail.get(key)})"
++            )
++    return True, ""
++
++
++# --------------------------------------------------------------------------
++# Controller: what the model runner calls
++# --------------------------------------------------------------------------
++
++
++@dataclass
++class DraftTailStep:
++    """This step's moved draft tail, for a non-last stage's ``receive``.
++
++    On the tail stage ``compute`` turns the received payload into the step's
++    draft tokens (written into its second argument); on the other stages it is
++    None and the stage only needs to know the drafts are rooted at the tail
++    stage."""
++
++    payload_nbytes: int
++    compute: Callable[[torch.Tensor, torch.Tensor], None] | None = None
++
++
++class DraftTailController:
++    """Owns the moved draft tail for one pipeline stage.
++
++    Lifecycle: ``create`` in the runner's __init__ (config gate, identical on
++    every stage; raises if unsupported) -> ``attach_speculator`` (last stage:
++    the drafter's graphs stop after packing the payload) -> ``attach_handler``
++    -> ``load`` (tail stage: allocate the lm_head + selector copy inside the
++    model's memory profile) -> ``finalize`` after CUDA-graph capture (every
++    stage: agree, copy the weights, warm the tail up, go live). Until
++    ``finalize`` every step keeps the tail on the last stage.
++    """
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        device: torch.device,
++        stage: int,
++        pp_rank: int,
++        pp_size: int,
++    ) -> None:
++        self.vllm_config = vllm_config
++        self.device = device
++        self.stage = stage
++        self.pp_rank = pp_rank
++        self.pp_size = pp_size
++        self.is_last = pp_rank == pp_size - 1
++        self.is_tail = pp_rank == stage
++        self.live = False
++        spec = vllm_config.speculative_config
++        assert spec is not None
++        self.num_steps = int(spec.num_speculative_tokens)
++        self.max_rows = vllm_config.scheduler_config.max_num_seqs
++        self.rows_table: dict[int, int] | None = None
++        self.layout: TailPayloadLayout | None = None
++        self.module: DraftTailModule | None = None
++        self.speculator = None
++        self.handler = None  # the stage's PPHandler (communicator, stream)
++        self._workspaces: dict = {}
++        self._out_tokens: torch.Tensor | None = None
++        self._scores: torch.Tensor | None = None
++        self._warned_rows = False
++        self._prepared = False
++
++    @classmethod
++    def create(
++        cls,
++        vllm_config: VllmConfig,
++        device: torch.device,
++        pp_rank: int,
++        pp_size: int,
++    ) -> DraftTailController | None:
++        from vllm import envs
++
++        stage = draft_tail_stage(vllm_config, envs.VLLM_PP_DRAFT_TAIL_STAGE)
++        if stage < 0:
++            return None
++        return cls(vllm_config, device, stage, pp_rank, pp_size)
++
++    # ---- set-up -----------------------------------------------------------
++
++    def attach_handler(self, handler) -> None:
++        self.handler = handler
++
++    def attach_speculator(self, speculator) -> None:
++        """Last stage: capture the drafter without its tail from now on."""
++        if not self.is_last:
++            return
++        from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
++            DFlash2Speculator,
++        )
++
++        if not isinstance(speculator, DFlash2Speculator):
++            raise ValueError(
++                "VLLM_PP_DRAFT_TAIL_STAGE needs the DFlash2 speculator on the "
++                f"last stage; got {type(speculator).__name__}"
++            )
++        speculator.enable_split_tail()
++        self.speculator = speculator
++        self.layout = speculator.tail_layout
++
++    def load(self, target_model: torch.nn.Module, dtype: torch.dtype) -> None:
++        """Tail stage: allocate its copy of lm_head and the selector (inside
++        the runner's DeviceMemoryProfiler, so the KV pool accounts for it)."""
++        if not self.is_tail:
++            return
++        from vllm.utils.torch_utils import set_default_torch_dtype
++
++        with set_default_torch_dtype(dtype), torch.device(self.device):
++            self.module = DraftTailModule(self.vllm_config, target_model)
++        spec = self.vllm_config.speculative_config
++        assert spec is not None
++        self.layout = TailPayloadLayout(
++            max_rows=self.max_rows,
++            num_steps=self.num_steps,
++            hidden_size=spec.draft_model_config.get_hidden_size(),
++            hidden_dtype=dtype,
++            anchor_dtype=torch.int32,
++        )
++        self._out_tokens = torch.zeros(
++            self.max_rows * self.num_steps, dtype=torch.int64, device=self.device
++        )
++        self._scores = torch.zeros(
++            self.max_rows * self.num_steps * self.module.top_k,
++            dtype=torch.float32,
++            device=self.device,
++        )
++
++    def prepare_workspaces(self) -> None:
++        """Run before KV sizing, never in capture; retain all persistent buffers."""
++        if not self.is_tail or self._prepared:
++            return
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("tail preparation inside CUDA capture")
++        assert self.module is not None
++        validate_flashinfer_topk_contract(self.device, self._workspaces)
++        self._warm_up()
++        self._prepared = True
++
++    # ---- per step ---------------------------------------------------------
++
++    def remote_step(self, input_batch) -> bool:
++        from vllm.v1.worker.gpu.pp_utils import compute_need_sampled_mask
++
++        return step_uses_remote_tail(
++            self.live,
++            compute_need_sampled_mask(input_batch),
++            input_batch.has_structured_output_reqs,
++        )
++
++    def step(self, input_batch) -> DraftTailStep | None:
++        """Non-last stages: this step's DraftTailStep, or None (tail local)."""
++        if not self.remote_step(input_batch):
++            return None
++        if not self.is_tail:
++            return DraftTailStep(payload_nbytes=0)
++        assert self.layout is not None
++        num_reqs = input_batch.num_reqs
++        rows = tail_rows(num_reqs, self.rows_table)
++
++        def compute(payload: torch.Tensor, draft_tokens: torch.Tensor) -> None:
++            self._run(payload, rows, num_reqs, draft_tokens)
++
++        return DraftTailStep(self.layout.nbytes(rows), compute)
++
++    def check_drafts(self, num_reqs: int) -> torch.Tensor | None:
++        """VLLM_PP_DRAFT_TAIL_VERIFY (last stage): run the tail here too, from
++        the same payload, for comparison with the drafts that come back."""
++        from vllm import envs
++
++        if not envs.VLLM_PP_DRAFT_TAIL_VERIFY or self.speculator is None:
++            return None
++        self.speculator.run_tail_local(self.speculator.tail_rows)
++        return self.speculator.draft_tokens[:num_reqs].clone()
++
++    def payload(self, num_reqs: int) -> torch.Tensor:
++        """Last stage, after a split drafter forward: the bytes to send (a copy
++        on the main stream, so the next drafter forward may rewrite the
++        staging buffer while the send is in flight)."""
++        spec = self.speculator
++        assert spec is not None and self.layout is not None
++        rows = spec.tail_rows
++        expected = tail_rows(num_reqs, self.rows_table)
++        if rows == expected:
++            return spec.tail_payload(rows).clone()
++        if not self._warned_rows:
++            self._warned_rows = True
++            logger.warning(
++                "PP draft tail: the drafter ran %d rows for %d requests where the "
++                "tail stage expects %d; sending %d rows (drafts stay valid but "
++                "may differ in the last bits from a last-stage tail).",
++                rows, num_reqs, expected, expected,
++            )  # fmt: skip
++        out = torch.zeros(
++            self.layout.nbytes(expected), dtype=torch.uint8, device=self.device
++        )
++        dst = self.layout.views(out, expected)
++        dst.row_state.fill_(-1)
++        copy_payload_rows(
++            spec.tail_staging_views(rows),
++            dst,
++            min(rows, expected),
++            self.layout.num_steps,
++        )
++        return out
++
++    def _run(
++        self,
++        payload: torch.Tensor,
++        rows: int,
++        num_reqs: int,
++        draft_tokens: torch.Tensor | None,
++    ) -> None:
++        """Tail stage, on the broadcast stream (beside its own forward)."""
++        assert self.module is not None and self.layout is not None
++        assert self._out_tokens is not None and self._scores is not None
++        k = self.num_steps
++        module = self.module
++        views = self.layout.views(payload, rows)
++        use_fp64 = bool(self.vllm_config.model_config.use_fp64_gumbel)
++        out_tokens = self._out_tokens
++        scores_out = self._scores
++
++        def walk(candidate_ids, scores, views, rows):
++            launch_walk(
++                candidate_ids, scores, views, rows, out_tokens, scores_out,
++                k, module.top_k, False, use_fp64,
++            )  # fmt: skip
++
++        with tail_side_stream_workspaces(self.device, self._workspaces):
++            run_draft_tail(
++                module.compute_candidates, module.select, walk, views, rows, k,
++                module.top_k,
++            )  # fmt: skip
++        if draft_tokens is not None:
++            draft_tokens.copy_(out_tokens.view(-1, k)[:num_reqs])
++
++    # ---- after capture ----------------------------------------------------
++
++    def _local_info(self) -> dict:
++        from vllm import envs
++
++        info: dict = {"ok": False, "reason": ""}
++        thin = bool(envs.VLLM_GLM5_THIN_GEMM)
++        if self.is_last:
++            spec = self.speculator
++            if spec is None or not spec.split_tail:
++                info["reason"] = "the last stage's drafter is not split"
++                return info
++            lm_head = spec.model.lm_head
++            selector = spec.model.model.candidate_selector
++            if not _is_unquantized(lm_head):
++                info["reason"] = (
++                    "the last stage's lm_head is quantized "
++                    f"({type(lm_head.quant_method).__name__})"
++                )
++                return info
++            assert self.layout is not None
++            info.update(
++                ok=True,
++                sig=tensor_signature(tail_tensors(lm_head, selector)),
++                mod=module_signature(
++                    lm_head, spec.model.candidate_logits_processor, selector
++                ),
++                rows_table=spec.graph_rows_table(),
++                layout=self.layout.key(),
++                probabilistic=spec.draft_logits is not None,
++                fp64=bool(spec.use_fp64_gumbel),
++                thin_gemm=thin,
++            )
++        elif self.is_tail:
++            m = self.module
++            if m is None:
++                info["reason"] = "the tail stage has no lm_head copy"
++                return info
++            if not self._prepared:
++                info["reason"] = "cannot give the candidate top-k a private buffer"
++                return info
++            assert self.layout is not None
++            info.update(
++                ok=True,
++                sig=tensor_signature(tail_tensors(m.lm_head, m.candidate_selector)),
++                mod=module_signature(
++                    m.lm_head, m.candidate_logits_processor, m.candidate_selector
++                ),
++                layout=self.layout.key(),
++                fp64=bool(self.vllm_config.model_config.use_fp64_gumbel),
++                thin_gemm=thin,
++            )
++        return info
++
++    def finalize(self) -> None:
++        """Every stage, once, after CUDA-graph capture. Raises on any
++        disagreement (all stages raise together: the verdict is broadcast)."""
++        from vllm.distributed.parallel_state import get_pp_group
++
++        pp = get_pp_group()
++        last_idx = self.pp_size - 1
++        tail_idx = self.stage
++        mine = self._local_info()
++        info_last = pp.broadcast_object(mine if self.is_last else None, src=last_idx)
++        info_tail = pp.broadcast_object(mine if self.is_tail else None, src=tail_idx)
++        ok, reason = agree(info_last, info_tail)
++        if ok and (self.is_last or self.is_tail):
++            ok, reason = self._copy_weights(pp, tail_idx)
++        # Workspaces were warmed and measured before KV sizing. Finalize must
++        # not allocate persistent workspaces or compile shapes after capture.
++        if ok and self.is_tail and not self._prepared:
++            ok, reason = False, "tail workspaces were not prepared before profiling"
++        verdict = pp.broadcast_object(
++            (ok, reason) if self.is_tail else None, src=tail_idx
++        )
++        ok, reason = verdict
++        if not ok:
++            raise RuntimeError(
++                f"VLLM_PP_DRAFT_TAIL_STAGE={tail_idx}: start-up check failed: "
++                f"{reason}. Unset VLLM_PP_DRAFT_TAIL_STAGE to keep the draft "
++                "tail on the last stage."
++            )
++        self.rows_table = info_last["rows_table"]
++        self.live = True
++        logger.info(
++            "PP draft tail on (stage %d of %d, this is stage %d): stage %d runs "
++            "the DFlash2 candidate lm_head pass, top-k, selector and walk and "
++            "roots the draft broadcast; rows per batch size %s.",
++            tail_idx, self.pp_size, self.pp_rank, tail_idx, self.rows_table,
++        )  # fmt: skip
++
++    def _copy_weights(self, pp, tail_idx: int) -> tuple[bool, str]:
++        group = getattr(self.handler, "tail_group", None)
++        if group is None:
++            return False, "no draft-tail communicator"
++        if self.is_last:
++            spec = self.speculator
++            assert spec is not None
++            tensors = tail_tensors(
++                spec.model.lm_head, spec.model.model.candidate_selector
++            )
++            for t in tensors.values():
++                torch.distributed.send(
++                    t.detach().contiguous(), dst=pp.ranks[tail_idx], group=group
++                )
++            sums = [weight_checksum(t) for t in tensors.values()]
++            torch.cuda.synchronize(self.device)
++            pp.send_object(sums, dst=tail_idx)
++            return True, ""
++        m = self.module
++        assert m is not None
++        tensors = tail_tensors(m.lm_head, m.candidate_selector)
++        for t in tensors.values():
++            assert t.is_contiguous()
++            torch.distributed.recv(t.data, src=pp.ranks[-1], group=group)
++        torch.cuda.synchronize(self.device)
++        sums = [weight_checksum(t) for t in tensors.values()]
++        expect = pp.recv_object(src=self.pp_size - 1)
++        if sums != expect:
++            return False, "the lm_head/selector copy does not match the last stage"
++        return True, ""
++
++    def _warm_up(self) -> None:
++        """Compile the selector, the thin-GEMM shapes and allocate the private
++        workspaces for every row count, on the stream the tail runs on."""
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("tail warm-up inside CUDA capture")
++        assert self.layout is not None and self.handler is not None
++        stream = self.handler.broadcast_stream
++        rows_seen = sorted(
++            set((self.rows_table or {}).values()) | set(range(1, self.max_rows + 1))
++        )
++        with torch.cuda.stream(stream):
++            for rows in rows_seen:
++                buf = torch.zeros(
++                    self.layout.nbytes(rows), dtype=torch.uint8, device=self.device
++                )
++                self.layout.views(buf, rows).row_state.fill_(-1)
++                self._run(buf, rows, 0, None)
++        torch.cuda.synchronize(self.device)
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 87ee207..24eea61 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -10,10 +10,18 @@ import numpy as np
+ import torch
+ 
+ from vllm.distributed.parallel_state import get_pp_group
++from vllm.logger import init_logger
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+ from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.pp_draft_tail import (
++    DraftTailStep,
++    RemoteDraftQueue,
++    RemoteDrafts,
++)
++
++logger = init_logger(__name__)
+ 
+ 
+ @dataclass
+@@ -62,6 +70,8 @@ class PPHandler:
+     def __init__(
+         self, max_num_reqs: int, num_speculative_steps: int, device: torch.device,
+         *, relay_draft_confidences: bool = False,
++        draft_tail_stage: int = -1,
++        max_concurrent_batches: int = 1,
+     ):
+         self.is_last_rank = get_pp_group().is_last_rank
+         self.last_rank = get_pp_group().last_rank
+@@ -91,6 +101,27 @@ class PPHandler:
+         )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+ 
++        # VLLM_PP_DRAFT_TAIL_STAGE: the stage (rank within the PP group) that
++        # runs the drafter's tail, with its own communicator for the payload
++        # hop from the last stage (and the one-off weight copy). Created on
++        # every rank (a collective) when the switch is on; nothing otherwise.
++        self.draft_tail_stage = draft_tail_stage
++        self.draft_tail_src = -1
++        self.tail_group = None
++        self.remote_drafts: RemoteDraftQueue | None = None
++        if draft_tail_stage >= 0 and num_speculative_steps > 0:
++            pp_group = get_pp_group()
++            self.draft_tail_src = pp_group.ranks[draft_tail_stage]
++            self.tail_group = pp_group.make_sibling_device_group(
++                group_desc="pp_draft_tail"
++            )
++            if self.is_last_rank:
++                # An entry older than every step that can be in flight has
++                # long landed; waiting on it costs nothing.
++                self.remote_drafts = RemoteDraftQueue(
++                    max_age=max(2, max_concurrent_batches + 1)
++                )
++
+     def on_req_idx_freed(self, req_idx: int) -> None:
+         self.req_idx_gen_np[req_idx] += 1
+ 
+@@ -202,9 +233,98 @@ class PPHandler:
+             )
+             send.record_stream(self.broadcast_stream)
+ 
+-    def receive(self, input_batch: InputBatch) -> bool:
++    def send_draft_tail(
++        self,
++        payload: torch.Tensor,
++        input_batch: InputBatch,
++        check: torch.Tensor | None = None,
++    ) -> None:
++        """Last stage, a step whose tail runs on the tail stage: send the
++        payload there, then receive the drafts it roots like any other stage.
++        The drafts reach the request state through ``apply_remote_drafts``."""
++        assert self.is_last_rank and self.remote_drafts is not None
++        assert not self.relay_draft_confidences
++        need_sampled_mask = compute_need_sampled_mask(input_batch)
++        assert need_sampled_mask is not None
++        num_reqs = input_batch.num_reqs
++        gen_np = self.req_idx_gen_np[input_batch.idx_mapping_np].copy()
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            # Allocated on the main stream (a copy of the staging buffer).
++            payload.record_stream(self.broadcast_stream)
++            torch.distributed.send(payload, dst=self.draft_tail_src, group=self.tail_group)
++            draft_tokens = torch.empty(
++                num_reqs,
++                self.num_speculative_steps,
++                dtype=torch.int64,
++                device=self.device,
++            )
++            torch.distributed.broadcast(
++                draft_tokens, src=self.draft_tail_src, group=self.broadcast_group
++            )
++            event = self.broadcast_stream.record_event()
++            draft_tokens.record_stream(self.main_stream)
++            if check is not None:
++                check.record_stream(self.main_stream)
++        self.remote_drafts.push(
++            RemoteDrafts(
++                step=self.remote_drafts.step,
++                event=event,
++                draft_tokens=draft_tokens,
++                idx_mapping_np=input_batch.idx_mapping_np.copy(),
++                keep_np=need_sampled_mask.copy(),
++                gen_np=gen_np,
++                check=check,
++            )
++        )
++
++    def apply_remote_drafts(
++        self,
++        batch_idx_np: np.ndarray,
++        draft_tokens_to_update: torch.Tensor,
++        advance: bool = True,
++    ) -> None:
++        """Last stage, before a step reads draft tokens: scatter the drafts of
++        every earlier step that holds one of this batch's requests (waiting on
++        the main stream only for those). ``advance``: count a step (False for
++        an out-of-step read such as take_draft_token_ids)."""
++        queue = self.remote_drafts
++        if queue is None:
++            return
++        if advance:
++            queue.next_step()
++        if not len(queue):
++            return
++        queue.apply(
++            batch_idx_np,
++            self.req_idx_gen_np,
++            draft_tokens_to_update,
++            self.main_stream.wait_event,
++            lambda idx_np: async_copy_to_gpu(idx_np, device=self.device),
++        )
++        if (
++            advance
++            and queue.checked_rows is not None
++            and queue.step % queue.REPORT_EVERY == 0
++        ):
++            report = queue.verify_report()
++            assert report is not None
++            logger.info(
++                "PP draft tail check: %d of %d rows differ from the last stage's "
++                "own tail (VLLM_PP_DRAFT_TAIL_VERIFY).",
++                report[1],
++                report[0],
++            )
++
++    def receive(
++        self, input_batch: InputBatch, draft_tail: DraftTailStep | None = None
++    ) -> bool:
+         """Returns True iff sampled tokens need to be gathered from *all*
+-        requests in the batch."""
++        requests in the batch.
++
++        ``draft_tail`` is set when this step's drafts are rooted at the tail
++        stage (VLLM_PP_DRAFT_TAIL_STAGE); on the tail stage it also carries
++        the computation that produces them."""
+         assert not self.is_last_rank
+         need_sampled_mask = compute_need_sampled_mask(input_batch)
+         if need_sampled_mask is None:
+@@ -238,9 +358,30 @@ class PPHandler:
+                     dtype=torch.int64,
+                     device=self.device,
+                 )
+-                torch.distributed.broadcast(
+-                    draft_payload, src=self.last_rank, group=self.broadcast_group
+-                )
++                if draft_tail is None:
++                    torch.distributed.broadcast(
++                        draft_payload, src=self.last_rank, group=self.broadcast_group
++                    )
++                else:
++                    assert not self.relay_draft_confidences
++                    if draft_tail.compute is not None:
++                        # Tail stage: take the payload from the last stage, run
++                        # the tail here (on this side stream, beside the next
++                        # forward) and root the draft broadcast.
++                        tail_payload = torch.empty(
++                            draft_tail.payload_nbytes,
++                            dtype=torch.uint8,
++                            device=self.device,
++                        )
++                        torch.distributed.recv(
++                            tail_payload, src=self.last_rank, group=self.tail_group
++                        )
++                        draft_tail.compute(tail_payload, draft_payload)
++                    torch.distributed.broadcast(
++                        draft_payload,
++                        src=self.draft_tail_src,
++                        group=self.broadcast_group,
++                    )
+                 draft_tokens = draft_payload[:, :self.num_speculative_steps]
+                 if self.relay_draft_confidences:
+                     draft_confidences = draft_payload[:, self.num_speculative_steps:].to(torch.int32).view(torch.float32)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index a3e8df7..cd782e0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -486,6 +486,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+ 
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             assert self.query_cudagraph_manager is not None
++            # Rows the replayed graph runs over (DFlashCudaGraphManager.capture
++            # passes the same count to _generate_draft); read by the PP draft
++            # tail (VLLM_PP_DRAFT_TAIL_STAGE).
++            self.last_graph_rows = batch_desc.num_reqs or min(
++                batch_desc.num_tokens, self.max_num_reqs
++            )
+             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+         else:
+             self._generate_draft(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index 6226dea..cb2a44b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -11,8 +11,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+ )
+ 
+ 
+-def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+-    from vllm.compilation.backends import set_model_tag
++def dflash_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
++    """The VllmConfig the DFlash drafter is built under (also used by the PP
++    draft tail, VLLM_PP_DRAFT_TAIL_STAGE, to build its selector copy the same
++    way)."""
+     from vllm.model_executor.models.qwen3_dflash import (
+         dflash_has_any_non_causal,
+     )
+@@ -22,7 +24,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+     draft_model_config = speculative_config.draft_model_config
+     # Select an attention backend that supports the drafter's attention: mixing
+     # a non-causal layer onto a causal-only backend would fail.
+-    draft_vllm_config = replace(
++    return replace(
+         vllm_config,
+         attention_config=replace(
+             vllm_config.attention_config,
+@@ -38,6 +40,15 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             else vllm_config.cache_config
+         ),
+     )
++
++
++def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
++    from vllm.compilation.backends import set_model_tag
++
++    speculative_config = vllm_config.speculative_config
++    assert speculative_config is not None
++    draft_model_config = speculative_config.draft_model_config
++    draft_vllm_config = dflash_draft_vllm_config(vllm_config)
+     with set_model_tag("dflash_head"):
+         dflash_model = get_model(
+             vllm_config=draft_vllm_config, model_config=draft_model_config
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+index 1cd19ac..e546f93 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py
+@@ -8,6 +8,7 @@ import torch
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ 
+@@ -129,6 +130,127 @@ class DFlash2Speculator(DFlashSpeculator):
+         self._cached_candidate_ids = torch.zeros(
+             self._selector_scores.shape, dtype=torch.int64, device=device
+         )
++        # VLLM_PP_DRAFT_TAIL_STAGE (last pipeline stage only): the drafter
++        # forward (and its CUDA graphs) stops after gathering the tail's
++        # inputs into ``_tail_staging``; the tail then runs here eagerly from
++        # those inputs, or on the tail stage. Off unless enable_split_tail()
++        # is called before any forward or capture.
++        self.split_tail = False
++        self._tail_layout = None
++        self._tail_staging: torch.Tensor | None = None
++        self._tail_row_ids: torch.Tensor | None = None
++        self._tail_packed_rows: int | None = None
++        self.tail_rows: int | None = None
++        self.last_graph_rows: int | None = None
++
++    # ---- VLLM_PP_DRAFT_TAIL_STAGE (split tail) ------------------------------
++
++    def enable_split_tail(self) -> None:
++        """Split the tail (candidate lm_head pass, selector, walk) off the
++        drafter forward. Draft tokens are unchanged: the tail runs the same
++        kernels on the same rows, from a gathered copy of its inputs."""
++        from vllm.v1.worker.gpu.pp_draft_tail import TailPayloadLayout
++
++        k = self.num_speculative_steps
++        self._tail_layout = TailPayloadLayout(
++            max_rows=self.max_num_reqs,
++            num_steps=k,
++            hidden_size=self.hidden_size,
++            hidden_dtype=self.dtype,
++            anchor_dtype=self.input_buffers.input_ids.dtype,
++        )
++        self._tail_row_ids = (
++            torch.arange(self.max_num_reqs * k, dtype=torch.int32, device=self.device)
++            // k
++        )
++        self._tail_staging = torch.zeros(
++            self._tail_layout.nbytes(self.max_num_reqs),
++            dtype=torch.uint8,
++            device=self.device,
++        )
++        self.split_tail = True
++
++    @property
++    def tail_layout(self):
++        assert self._tail_layout is not None
++        return self._tail_layout
++
++    def tail_staging_views(self, rows: int):
++        assert self._tail_staging is not None
++        return self.tail_layout.views(self._tail_staging, rows)
++
++    def tail_payload(self, rows: int) -> torch.Tensor:
++        """The staged tail inputs for ``rows`` rows, as bytes."""
++        assert self._tail_staging is not None
++        return self._tail_staging[: self.tail_layout.nbytes(rows)]
++
++    def run_tail_local(self, rows: int) -> None:
++        """The tail on this stage, from the staged inputs (split mode)."""
++        from vllm.v1.worker.gpu.pp_draft_tail import launch_walk, run_draft_tail
++
++        assert self.split_tail
++        k = self.num_speculative_steps
++
++        def walk(candidate_ids, scores, views, rows):
++            launch_walk(
++                candidate_ids, scores, views, rows, self.draft_tokens,
++                self._selector_scores, k, self.selector_top_k,
++                self.draft_logits is not None, self.use_fp64_gumbel,
++            )  # fmt: skip
++
++        candidate_ids, _ = run_draft_tail(
++            self.model.compute_candidates,
++            self.model.model.candidate_selector,
++            walk,
++            self.tail_staging_views(rows),
++            rows,
++            k,
++            self.selector_top_k,
++        )
++        if self.draft_logits is not None:
++            self._cache_draft_logits(candidate_ids, rows * k)
++
++    def graph_rows_table(self) -> dict[int, int]:
++        """Request count -> rows the drafter forward runs over, for every batch
++        size (sent to the tail stage once, after capture). Same dispatch as
++        propose(); a pure function of the batch size without DP."""
++        table: dict[int, int] = {}
++        for num_reqs in range(1, self.max_num_reqs + 1):
++            batch_desc, _ = dispatch_cg_and_sync_dp(
++                self.query_cudagraph_manager,
++                num_reqs,
++                num_reqs * self.num_query_per_req,
++                uniform_token_count=self.num_query_per_req,
++                dp_size=self.dp_size,
++                dp_rank=self.dp_rank,
++            )
++            if batch_desc.cg_mode == CUDAGraphMode.FULL:
++                table[num_reqs] = batch_desc.num_reqs or min(
++                    batch_desc.num_tokens, self.max_num_reqs
++                )
++            else:
++                table[num_reqs] = num_reqs
++        return table
++
++    def propose(self, input_batch, *args, remote_tail: bool = False, **kwargs):
++        if not self.split_tail:
++            assert not remote_tail
++            return super().propose(input_batch, *args, **kwargs)
++        self._tail_packed_rows = None
++        self.last_graph_rows = None
++        super().propose(input_batch, *args, **kwargs)
++        # An eager forward records its row count in _generate_draft; a
++        # replayed graph records it in DFlashSpeculator.propose.
++        rows = self._tail_packed_rows
++        if rows is None:
++            rows = self.last_graph_rows
++        assert rows is not None, "split drafter forward recorded no row count"
++        self.tail_rows = rows
++        if remote_tail:
++            # The tail stage computes this step's drafts from the payload.
++            return None
++        self.run_tail_local(rows)
++        return self.draft_tokens[: input_batch.num_reqs]
+ 
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # fp32 so the walk and the rejection that checks it read the same
+@@ -194,6 +316,27 @@ class DFlash2Speculator(DFlashSpeculator):
+             num_tokens_across_dp,
+             cudagraph_runtime_mode,
+         )
++        if self.split_tail:
++            # Stop after the drafter's layers: gather the tail's inputs. Runs
++            # inside the captured graph (static shapes for a given num_reqs).
++            from vllm.v1.worker.gpu.pp_draft_tail import pack_tail_payload
++
++            pack_tail_payload(
++                self.tail_staging_views(num_reqs),
++                num_reqs,
++                self.num_speculative_steps,
++                last_hidden_states,
++                self.sample_indices,
++                self.input_buffers.input_ids,
++                self._anchor_indices,
++                self.sample_pos,
++                self.sample_idx_mapping,
++                self.temperature,
++                self.seeds,
++                self._tail_row_ids,
++            )
++            self._tail_packed_rows = num_reqs
++            return
+         num_sample = num_reqs * self.num_speculative_steps
+         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
+             num_reqs, self.num_speculative_steps, -1
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 697d50c..dab5ca9 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -220,6 +220,11 @@ class Worker(WorkerBase):
+         self.profiler_config = vllm_config.profiler_config
+ 
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        if envs.VLLM_PP_DRAFT_TAIL_STAGE >= 0 and not self.use_v2_model_runner:
++            raise ValueError(
++                "VLLM_PP_DRAFT_TAIL_STAGE needs the V2 model runner "
++                "(VLLM_USE_V2_MODEL_RUNNER=1)."
++            )
+ 
+         # Device handles of the previous step's PP intermediate-tensor send.
+         self._pp_send_work: list[Handle] = []
+@@ -884,6 +889,12 @@ class Worker(WorkerBase):
+         cuda_graph_memory_bytes = 0
+         if not self.model_config.enforce_eager:
+             cuda_graph_memory_bytes = self.model_runner.capture_model()
++        if self.use_v2_model_runner and hasattr(
++            self.model_runner, "finalize_pp_draft_tail"
++        ):
++            # VLLM_PP_DRAFT_TAIL_STAGE: agree, copy the tail weights and go
++            # live once every graph is captured (a no-op when unset).
++            self.model_runner.finalize_pp_draft_tail()
+ 
+         # Compare actual vs estimated CUDA graph memory (if we did profiling)
+         if (
