@@ -41,7 +41,7 @@ def env_default(text: str, name: str, default: str) -> bool:
 
 series = [line.strip() for line in (PATCH_DIR / "series").read_text().splitlines()
           if line.strip() and not line.startswith("#")]
-check("series has 28 patches", len(series) == 28, str(len(series)))
+check("series has 29 patches", len(series) == 29, str(len(series)))
 
 touched: set[str] = set()
 for name in series:
@@ -116,6 +116,9 @@ markers = [
     ("0028 hook", "vllm/model_executor/kernels/mhc/tilelang.py", "mm_prenorm_bf16x3 import"),
     ("0027 shared reorder", "vllm/model_executor/layers/fused_moe/runner/shared_experts.py",
      "VLLM_GLM5_SHARED_EXPERT_REORDER"),
+    ("0029 idx dual thin GEMM", ops + "idx_dual_gemm.py", "def _thin_gemm_dual_kernel("),
+    ("0029 attention hook", "vllm/models/glm5next/nvidia/attention.py", "idx_dual_linear("),
+    ("0029 warmup before capture", "vllm/model_executor/warmup/kernel_warmup.py", "warmup_idx_dual"),
 ]
 for label, rel, needle in markers:
     text = src(rel)
@@ -163,6 +166,9 @@ defaults = [
     (src("vllm/model_executor/layers/fused_moe/runner/moe_runner.py"), "VLLM_GLM5_SHARED_EXPERT_REORDER", "0"),
     (src("vllm/model_executor/kernels/mhc/tilelang.py"), "VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS", "384"),
     (envs, "VLLM_MHC_POST_FUSE_SQRSUM", "0"),
+    (src(ops + "idx_dual_gemm.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
+    (src("vllm/models/glm5next/nvidia/attention.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
+    (src("vllm/model_executor/warmup/kernel_warmup.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
 ]
 for text, name, default in defaults:
     check(f"{name} defaults to {default!r}", env_default(text, name, default))
@@ -193,6 +199,8 @@ check("0028 bf16x3 route only inside the 0025 (FP32_0026=1) branch",
 route_v2 = src(ops + "route_v2_decode.py")
 check("VLLM_GLM5_ROUTE_V2_FIRST is opt-in (only '1' enables it)",
       '"VLLM_GLM5_ROUTE_V2_FIRST", "0").strip() == "1"' in route_v2)
+check("VLLM_GLM5_IDX_DUAL_GEMM is opt-in (only '1' enables it)",
+      '"VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1"' in src(ops + "idx_dual_gemm.py"))
 check("VLLM_GLM5_MARLIN_DECODE_VARIANT defaults to 'orig'",
       re.search(r'"VLLM_GLM5_MARLIN_DECODE_VARIANT",\s*"orig"', envs) is not None)
 
@@ -209,6 +217,8 @@ absent = {
     "same-history overlay module": "same_history",
     "KDA dual projection (old 0011)": "VLLM_GLM5_KDA_GATE_PROJECTION",
     "context KV graph (old 0007)": "VLLM_DFLASH_CONTEXT_KV_GRAPH",
+    "MM thin GEMM selection (evaluated 0030)": "VLLM_GLM5_THIN_GEMM_MM_SELECT",
+    "shared-stream priority (evaluated 0031)": "VLLM_GLM5_SHARED_STREAM_PRIORITY",
 }
 # Excluded dev 0025/0029 would also touch parallel_state.py.
 scanned = sorted(touched | {"vllm/distributed/parallel_state.py"})
