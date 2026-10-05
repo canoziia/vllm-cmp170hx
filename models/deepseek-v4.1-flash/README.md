@@ -250,3 +250,55 @@ KV cache memory is fixed at 6 GiB per rank. `max_num_seqs=32` is an admission
 limit, not capacity for 32 one-million-token requests. Record the reported token
 capacity and PP2 free HBM for every new image because Graph coverage and model
 allocations can change the runtime headroom.
+
+## Decode optimisation: single-kernel deterministic MoE align (patch 0003)
+
+Profiling one DSpark request (PP6, CUDA graphs, node1) showed every MoE layer
+spending ~100 us on `VLLM_DETERMINISTIC_MOE_ALIGN`'s torch implementation
+(stable argsort, scatter_add, two cumsums, searchsorted, ~25 small kernels),
+about 12% of each stage's per-step GPU time. Patch 0003 computes the same
+`sorted_ids` / `expert_ids` / `num_tokens_post_pad` in one Triton program
+(`vllm/model_executor/layers/fused_moe/fast_det_align.py`).
+
+- Switch `VLLM_DSV4_FAST_DET_MOE_ALIGN` (patch default 0; `compose.yml` sets 1).
+- Only without an expert map and for at most 512 routed entries (decode); larger
+  batches keep the torch path, which is faster there.
+- Correctness: `tests/test_fast_det_align_gpu.py` compares all three outputs with
+  the torch path bit for bit (3,368 cases: 384/128/257/8 experts, block 8-64,
+  invalid ids, int32/int64, plus 200 CUDA-graph replays with changing ids). The
+  MoE GEMM therefore sees the same layout and produces the same numbers.
+- Micro-benchmark (graph replay, 384 experts, top-6, block 16): 6 tokens
+  103 -> 21 us, 48 tokens 119 -> 66 us.
+
+```bash
+podman run --rm --device nvidia.com/gpu=0 --security-opt label=disable \
+  -v "$PWD/models/deepseek-v4.1-flash/tests:/t:ro" -w /t --entrypoint python3 \
+  localhost/vllm-backport:deepseek-v4.1-flash test_fast_det_align_gpu.py
+```
+
+Measured on node1 (PP6, 2 warm-up + 5 timed rounds, medians, 500 tokens).
+"before" is the deployed debug image without this patch; "after" is the
+rebuilt default image with `compose.yml` as committed, nothing mounted:
+
+| load | before tok/s (steps/s) | after tok/s (steps/s) | accepted/step |
+|---|---:|---:|---:|
+| c1 counting | 150.2 (25.28) | 164.5 (27.69) | 5.88 / 5.88 |
+| c1 code | 127.3 (23.32) | 138.3 (25.35) | 5.41 / 5.41 |
+| c1 prose | 58.4 (25.38) | 63.6 (27.65) | 2.29 / 2.29 |
+| c8 counting | 719.4 | 819.2 | 5.88 / 5.88 |
+| c8 code | 587.7 | 665.7 | 5.37 / 5.38 |
+| c8 prose | 190.7 | 267.8 | 2.25 / 2.25 |
+
+- Only the c1 step rate (+8.7-9.5%) is a firm result: c8 runs have wide ranges
+  on this deployment (e.g. counting 525-890).
+- Cold prefill is unchanged by the patch: on the same rebuilt image, switch
+  off vs on (warm, 7k / 27k / 107k tokens) 2033-2053 / 3841-3868 / 4212-4409
+  vs 2044-2054 / 3381-3848 / 4072-4304 tok/s. The first requests after a
+  restart of a new image are slower (JIT); the long-running debug image
+  measured 2150 / 4235 / 4956 in a single run.
+- KV pool unchanged: 4,142,306 tokens.
+- The engine is not deterministic at T=0 even without this patch (two
+  identical greedy requests diverge after a few tokens), so correctness rests
+  on the bitwise layout test, not on text comparison.
+- `podman-compose` 1.3 does not apply `${VAR:-default}` for variables missing
+  from `.env` inside `environment:`, so the switch is written as a literal.

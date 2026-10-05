@@ -57,6 +57,9 @@ services:
       NCCL_ALGO: "Ring"
       NCCL_PROTO: "Simple"
       NCCL_IB_DISABLE: "1"
+      # patch 0003: single-kernel deterministic MoE align (bitwise identical
+      # layout to the torch path; decode only). 0 = torch path.
+      VLLM_DSV4_FAST_DET_MOE_ALIGN: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
