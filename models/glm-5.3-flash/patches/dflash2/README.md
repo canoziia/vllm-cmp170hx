@@ -52,6 +52,8 @@ behaves as the DeepSeek image for every other model.
 | 0027 | shared experts enqueued after the routed experts | `VLLM_GLM5_SHARED_EXPERT_REORDER` (0) | 0028 (`patches-step/`) |
 | 0028 | bf16x3 tensor-core prenorm GEMM for T >= 384 (vendored Morrowmake kernel, Apache-2.0) | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS` (384; only inside 0025's `=1` branch) | 0026b (`patches/`) |
 | 0029 | indexer wk+weights as one dual-store thin GEMM (k bf16 bitwise, head weights fp32; replaces cast + fp32 sgemm) | `VLLM_GLM5_IDX_DUAL_GEMM` (0; needs `VLLM_GLM5_THIN_GEMM=1`; **on in compose**) | - (STEP-GAP-2) |
+| 0030 | PP hop metadata cache (32-byte header; payload only when the pickled bytes change) | `VLLM_PP_METADATA_CACHE_0025` (0; **on in compose**; same on every PP rank) | 0025 (`patches-pp/`) |
+| 0031 | PP hop tensors packed into one NCCL P2P | `VLLM_PP_PACK_TENSORS_0029` (0; **on in compose**; checked equal on every PP rank) | 0029 (`patches-pp/`) |
 
 Left out of the development series:
 
@@ -64,8 +66,6 @@ Left out of the development series:
 | 0015 | draft trace | diagnostic only |
 | 0018 | mHC v1 numerics | never validated on a GPU (and needs 0009) |
 | 0021 | PP pipeline trace (`patches/0021-pp-pipeline-trace-diagnostic`) | diagnostic only |
-| 0025 | PP metadata cache (`patches-pp/`) | no end-to-end gain |
-| 0029 | PP pack hop tensors (`patches-pp/`) | no end-to-end gain |
 | - | accept-same-history overlay | diagnostic only |
 
 Dropping them needed one regeneration: `0011` (dev 0016) had an `envs.py`
@@ -103,12 +103,28 @@ bitwise our old gate path but are bitwise Morrowmake's `_moe_route_kernel`
 (prose acceptance 1.232/round, same as MM; gate 1.218), and its single 80-CTA
 launch leaves SMs to the shared experts (c1 29.05 -> 29.21 steps/s).
 
-Evaluated in the same round and dropped (no patch file):
+0030 and 0031 are the development PP patches 0025
+(`patches-pp/0025-pp-metadata-cache-experimental.patch`, `PP-HOP-FULL.md`) and
+0029 (`patches-pp/0029-pp-pack-hop-tensors.patch`, `PP-PACK.md`). Both applied
+on node2 with `patch -p1` (offsets only) on the image tree (0001-0028) + 0029;
+here they were regenerated as clean git diffs against the tree that
+`check-dflash2-series.sh` builds (0030 on 0001-0029, 0031 on 0001-0030). The
+env names keep their development suffixes (`VLLM_PP_METADATA_CACHE_0025`,
+`VLLM_PP_PACK_TENSORS_0029`); both default to 0 and change the PP wire
+protocol, so every PP rank must use the same value (0031 checks this at
+start-up). They were earlier listed as "no end-to-end gain"; that was on an
+older baseline. On the full 0001-0029 stack + tc routing, both on: c1 counting
+29.32 -> 29.44 steps/s, c8 counting/code/prose 739.5/589.9/324.0 ->
+752.4/609.2/335.4 (Morrowmake 765.7/608.5/341.1); prose acceptance 1.232
+unchanged. `compose.w4a16-dflash2.yml` turns both on.
+
+Evaluated in the same round and dropped (no patch file; their evaluation
+numbers 0030/0031 predate and are unrelated to the patches above):
 
 | eval no. | patch | why |
 |---|---|---|
-| 0030 | thin GEMM schedule selected exactly as Morrowmake's (`VLLM_GLM5_THIN_GEMM_MM_SELECT`) | no end-to-end gain (c8 729.2) |
-| 0031 | shared-experts side stream with a CUDA stream priority (`VLLM_GLM5_SHARED_STREAM_PRIORITY`) | slower in the MoE-layer bench (tc+high 381.3 vs tc+default 375.9 us/layer) |
+| (0030) | thin GEMM schedule selected exactly as Morrowmake's (`VLLM_GLM5_THIN_GEMM_MM_SELECT`) | no end-to-end gain (c8 729.2) |
+| (0031) | shared-experts side stream with a CUDA stream priority (`VLLM_GLM5_SHARED_STREAM_PRIORITY`) | slower in the MoE-layer bench (tc+high 381.3 vs tc+default 375.9 us/layer) |
 
 Static checks: `scripts/test-glm53-dflash2-patches.py` (run by the apply
 script). CPU check of the whole stack:

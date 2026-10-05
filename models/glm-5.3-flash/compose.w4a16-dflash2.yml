@@ -110,6 +110,11 @@ services:
       VLLM_GLM5_SHARED_EXPERT_REORDER: "1"
       # dflash2/0029: indexer wk+weights as one dual thin GEMM (needs THIN_GEMM)
       VLLM_GLM5_IDX_DUAL_GEMM: "1"
+      # dflash2/0030 PP metadata cache, 0031 one packed NCCL P2P per PP hop.
+      # Both change the PP wire protocol: all PP ranks must use the same setting
+      # (single engine here, so this environment covers every rank).
+      VLLM_PP_METADATA_CACHE_0025: "1"
+      VLLM_PP_PACK_TENSORS_0029: "1"
     command:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0

@@ -1,0 +1,137 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] PP: cache the per-hop tensor-dict metadata
+
+VLLM_PP_METADATA_CACHE_0025 (default 0; read once when the "pp"
+GroupCoordinator is built; every PP rank must set the same value -- a mixed
+setting is not negotiated and ends in an error or a timeout). Only the PP
+group's isend_tensor_dict/irecv_tensor_dict change. Each direction keeps the
+exact pickled metadata bytes of the previous message; every hop first sends a
+32-byte int64 CPU header (magic, version, sequence, payload length) and the
+full metadata payload only when the bytes differ (always on the first hop).
+The receiver decides from the header alone and unpickles on every step, so
+there is no independent decision on the two sides. Device tensors, their
+order, padded shapes and all-gather postprocessing are unchanged; metadata
+handle[0] semantics are kept. Header/payload buffers are retained until the
+work completes; metadata-only messages are explicitly waited on in the reap
+path. Bad magic/version, skipped sequence or negative length raise.
+Restarting one rank requires restarting the whole PP group.
+
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 92deff1..0337a6c 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -459,6 +459,13 @@ class GroupCoordinator:
+     ):
+         group_name = group_name or "anonymous"
+         self.unique_name = _get_unique_name(group_name)
++        # Wire protocol is PP-only, startup-fixed and opt-in on every peer.
++        import os
++        self._pp_metadata_cache = None
++        if (group_name == "pp"
++                and os.environ.get("VLLM_PP_METADATA_CACHE_0025", "0") == "1"):
++            from vllm.distributed.pp_metadata_cache import PPMetadataCache
++            self._pp_metadata_cache = PPMetadataCache(self, _RetainedHandle)
+         _register_group(self)
+ 
+         self.rank = torch.distributed.get_rank()
+@@ -1137,6 +1144,10 @@ class GroupCoordinator:
+             handles, _ = pending[0]
+             tensor_handles = handles[1:]
+             if not tensor_handles:
++                if getattr(self, "_pp_metadata_cache", None) is not None:
++                    # No device completion gate: retain CPU header/payload
++                    # until genuinely drained (empty/metadata-only messages).
++                    handles[0].wait()
+                 pending.popleft()
+                 continue
+             if not all(h.is_completed() for h in tensor_handles):
+@@ -1195,7 +1206,10 @@ class GroupCoordinator:
+         # Reap completed sends before posting new ones, bounding the
+         # self-retention FIFO.
+         self._reap_completed_isends()
+-        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
++        cache = getattr(self, "_pp_metadata_cache", None)
++        metadata_handle = (self.isend_object(metadata_list, dst=dst)
++                           if cache is None else cache.send(metadata_list, dst))
++        handles: list[Handle] = [metadata_handle]
+ 
+         sent_tensors: list[torch.Tensor] = []
+         for key, tensor in zip(tensor_keys, tensor_list):
+@@ -1302,7 +1316,9 @@ class GroupCoordinator:
+         group = self.device_group
+         metadata_group = self.cpu_group
+ 
+-        recv_metadata_list = self.recv_object(src=src)
++        cache = getattr(self, "_pp_metadata_cache", None)
++        recv_metadata_list = (self.recv_object(src=src)
++                              if cache is None else cache.recv(src))
+         tensor_dict: dict[str, Any] = {}
+         handles: list[Handle] = []
+         postprocess: list[Callable[[], None]] = []
+diff --git a/vllm/distributed/pp_metadata_cache.py b/vllm/distributed/pp_metadata_cache.py
+new file mode 100644
+index 0000000..2ea86b5
+--- /dev/null
++++ b/vllm/distributed/pp_metadata_cache.py
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Ordered PP metadata protocol; CPU header only, device operations unchanged.
++
++All PP peers must enable the protocol at process startup. Cache one serialized
++metadata value per directed peer. Compare exact bytes, never hashes or sizes.
++Deserialize each receive anew: callers may mutate returned metadata objects.
++"""
++import pickle
++
++import torch
++
++_MAGIC = 0x50503235
++_VERSION = 1
++
++
++class PPMetadataCache:
++    def __init__(self, group, retained_handle, dist=None):
++        self.group = group
++        self.retained_handle = retained_handle
++        self.dist = torch.distributed if dist is None else dist
++        self.sent = {}  # peer -> (sequence, serialized metadata)
++        self.received = {}
++
++    def send(self, metadata, dst):
++        data = pickle.dumps(metadata)
++        seq, previous = self.sent.get(dst, (0, None))
++        reuse = data == previous
++        # Sequence detects missing/reordered protocol headers, not step identity.
++        header = torch.tensor([_MAGIC, _VERSION, seq, 0 if reuse else len(data)],
++                              dtype=torch.int64, device='cpu')
++        retained = [header]
++        if not reuse:
++            # Own writable storage, independent of the source objects.
++            retained.append(torch.frombuffer(bytearray(data), dtype=torch.uint8))
++        works = []
++        for tensor in retained:
++            work = self.dist.isend(tensor, dst=self.group.ranks[dst],
++                                   group=self.group.cpu_group)
++            if work is not None:
++                works.append(work)
++        self.sent[dst] = (seq + 1, data)
++        return self.retained_handle(works, tuple(retained))
++
++    def recv(self, src):
++        header = torch.empty(4, dtype=torch.int64, device='cpu')
++        self.dist.recv(header, src=self.group.ranks[src], group=self.group.cpu_group)
++        magic, version, seq, size = header.tolist()
++        expected, previous = self.received.get(src, (0, None))
++        if magic != _MAGIC or version != _VERSION or seq != expected or size < 0:
++            raise RuntimeError('PP metadata cache: invalid header or sequence')
++        if size == 0:
++            if previous is None:
++                raise RuntimeError('PP metadata cache: reuse without initial metadata')
++            data = previous
++        else:
++            payload = torch.empty(size, dtype=torch.uint8, device='cpu')
++            self.dist.recv(payload, src=self.group.ranks[src], group=self.group.cpu_group)
++            data = payload.numpy().tobytes()
++        value = pickle.loads(data)
++        self.received[src] = (seq + 1, data)
++        return value

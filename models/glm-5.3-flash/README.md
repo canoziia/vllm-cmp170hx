@@ -187,6 +187,8 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0027 | shared experts 在 routed experts 之后入队 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 逐位一致；与 0026 一起 c8 counting 752.9 |
 | 0028 | T ≥ 384 的 prenorm GEMM 改用对方的 bf16x3 张量核 Triton kernel（Apache-2.0，原样复制） | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS`（默认 384，0 = 等同 0025）；**只在 0025 打开时生效** | T=2312 prenorm 923 → 154 μs；T ≥ 384 与对方逐位一致，T < 384 与 0025 逐位一致；冷 prefill 见下 |
 | 0029 | indexer wk+weights 合成一次双输出 thin GEMM（k 列 bf16 逐位不变；head weights 以 fp32 累加值输出，替代 cast + fp32 sgemm） | `VLLM_GLM5_IDX_DUAL_GEMM`（默认 0；需 `VLLM_GLM5_THIN_GEMM=1`；**compose 打开**） | 每 MLA 层省 15.7 μs；c1 counting 28.87→29.05 步/秒，c8 727.8→742.7；接受率不变；weights 误差为 sgemm 的 1.07×/1.24×（outlier/cancel 输入的 mean），max 更低 |
+| 0030 | PP 段间跳的元数据缓存：每跳先发 32 字节 CPU header，元数据 pickle 字节与上一跳相同时不再发送 payload；张量与顺序不变 | `VLLM_PP_METADATA_CACHE_0025`（默认 0；**compose 打开**；所有 PP rank 必须一致） | 与 0031 一起见“本轮实测”；CPU 逻辑 5 项 + 真实 Gloo 160 步通过 |
+| 0031 | PP 段间跳的多个张量打包为一次 NCCL P2P（mHC hidden_states + fc 折叠部分和，每跳 2 次 → 1 次；字节与 padded 行数不变） | `VLLM_PP_PACK_TENSORS_0029`（默认 0；**compose 打开**；启动时校验所有 PP rank 一致，不一致即报错） | 两卡 NCCL 120 步 packed=False/True 逐位一致；与 0030 一起 c1 counting 29.32→29.44 步/秒，c8 739.5→752.4 |
 
 **route v2 用 tc 模式（compose 中 `VLLM_GLM5_ROUTE_V2_GEMV: tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
 **不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：
@@ -204,8 +206,9 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 整机实测 `=1` 变慢，因此正式补丁把默认值改为 0（只有设为 `1` 才启用），compose 仍显式设 `0`；
 这样即使有人漏掉这项 env，也不会进入较慢的顺序。
 
-未纳入的开发补丁：context-KV graph、旧版 mHC v2（开发 0009，已由 0017 完整移植取代）、KDA 双投影（三者均无整机收益）；
-PP metadata cache（开发 0025）与 PP 传输张量打包（开发 0029），两者整机无收益；mHC v1 数值
+0030/0031 的开关名同样沿用开发编号（`_0025`、`_0029` 后缀，开发编号与生产编号无关）。
+
+未纳入的开发补丁：context-KV graph、旧版 mHC v2（开发 0009，已由 0017 完整移植取代）、KDA 双投影（三者均无整机收益）；mHC v1 数值
 （未在 GPU 上验证）；force-file、draft trace、PP trace、相同历史（accept-same-history）overlay（仅用于诊断）。去掉这些补丁后，其余补丁只有
 gather clamp 的 `envs.py` 上下文需要重新生成。最终源码与开发树逐文件比对，差异只有被排除的补丁。
 
@@ -256,12 +259,12 @@ podman compose -f compose.w4a16-dflash2.yml up -d
 `--max-num-batched-tokens=2312`；`--long-prefill-token-threshold=0`；
 `--gpu-memory-utilization=0.95`；`FULL_AND_PIECEWISE`；prefix caching；
 `--mamba-cache-mode=align`；DFlash2 `num_speculative_tokens=3`，自适应深度 `7,5`，`ACCEPT=0`（只按负载选深度：1 个请求验证 7、2 个 5、更多 3）；
-0005–0029 全部开启（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST=0`；0010 用 `_GEMV=tc`）；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
+0005–0031 全部开启（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST=0`；0010 用 `_GEMV=tc`）；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
 
 分层的另一选择是 `GLM_PP_LAYER_PARTITION=12,12,12,9`：c8 约 +10%，但 KV 池从 1.68M
 降到 1.24M token（这两个数是 0022 之前测得的）。
 
-“实测性能”一节第一张表是 0001–0016 镜像的数据（不挂载源码）；0017–0028 见“本轮实测”，
+“实测性能”一节第一张表是 0001–0016 镜像的数据（不挂载源码）；0017–0031 见“本轮实测”，
 其中包含新镜像（不挂载源码）的复测。
 
 ### 实测性能（node2，GPU5–8，PP4）
@@ -290,10 +293,43 @@ podman compose -f compose.w4a16-dflash2.yml up -d
   但 KV 池降到约 1.24M；`12,11,11,11` 更差（c8 625，KV 1.11M），因为最后一段还承担 drafter。
   c8 时开发版 PP 流水 trace 诊断显示 rank0 的 GPU 约 98% 忙、rank3 约 65%，瓶颈在 rank0。
 
-### 本轮实测（0017–0027，源码挂载开发部署）
+### 本轮实测（0017–0031）
+
+0030 + 0031（PP 元数据缓存 + 张量打包）实测：node2 GPU5–8，2 轮预热、5 轮正式取中位数；基础为 0001–0029 全开 +
+tc 路由（即下方“新镜像复测”的配置），两项同时打开：
+
+| 负载 | c1 | c8 合计 | 对方 c1 | 对方 c8 |
+|---|---|---|---|---|
+| counting | 226.0 tok/s（每秒步数 29.44） | 752.4 | 230.1（29.97） | 765.7 |
+| code | 155.7 | 609.2 | 157.5 | 608.5 |
+| prose | 66.9（每秒步数 30.03，每步输出 2.22） | 335.4 | 68.2（30.61，2.22） | 341.1 |
+
+- 不开这两项时同一镜像：c1 counting 225.1（29.32 步/秒），c8 739.5 / 589.9 / 324.0（counting / code / prose）。
+- 与对方差距：c1 每秒步数 −1.8%（counting）/−1.9%（prose），c8 counting −1.7%、code +0.1%、prose −1.7%，所有负载 ≤ 约 2%。
+- prose 接受率 1.232/轮（与对方相同）；greedy 3 类×4 次×128 token，所有偏离 top-1 的位置 logprob 差 ≤ 0.75。
+- GPU 单测：`test_pp_pack_hop_gpu.py --no-bench` 两卡 NCCL 120 步 packed=False/True 逐位一致。
+- 上述数字是在 0001–0029 镜像树上以开发补丁加入这两项后测得。
+
+**新镜像复测（0001–0031，本 compose 原样启动、不挂载源码，GPU5–8，同方法）**：
+
+| 负载 | c1 | c8 合计 | 对方 c1 | 对方 c8 |
+|---|---|---|---|---|
+| counting | 225.6 tok/s（每秒步数 29.38，−2.0%） | 753.3 [748.6–758.8]（−1.6%） | 230.1（29.97） | 765.7 |
+| code | 168.1 | 603.8（−0.8%） | 157.5 | 608.5 |
+| prose | 66.8（每秒步数 29.99，−2.0%；每步输出 2.22） | 328.7（每秒步数 23.08 vs 23.54，−2.0%） | 68.2（30.61） | 341.1 |
+
+- 冷 prefill（7k / 28k / 114k）：3,705 / 5,215 / 5,713 tok/s（对方 3,839 / 5,316 / 5,862，−3.5% / −1.9% / −2.5%）。
+- KV 池 2,054,477 token（对方 1,917,988，+7%）；prose 接受率 1.232/轮，与对方相同。
+- c8 prose 吞吐差 3.6%，其中步速差 2.0%，其余来自各自生成轨迹的每步接受数（1.75 vs 1.79；8 并发时两边自身均有批次相关的输出分叉）。
+- c8 时各 PP 段每步 GPU 计算与对方持平（rank0 8.54/8.53 ms、rank1 7.99/7.83、rank2 9.27/9.14）。
+- 正确性：同一引擎 greedy 3 类×4 次×128 token，共 3 组（36 条）。偏离 top-1 的位置中 35 条序列的最大 logprob 差 ≤0.5；
+  1 条在第 6 个 token 分叉后，第 45 个 token 差 1.5（用 prefill 的 prompt_logprobs 评分，分叉后上下文不同；未复现，记录备查）。
+  GPU 单测（镜像内）：0030/0031 的 CPU/gloo/两卡 NCCL 测试全部通过（gloo 测试需 `--security-opt apparmor=unconfined`）。
+
+以下为 0030/0031 之前的结果。
 
 > 下面第一张表在 node2 的**源码挂载开发部署**上测得（开发树按上表顺序应用，开关与本 compose 相同）；
-> 紧接着的“新镜像复测”是 0001–0028 镜像、本 compose 原样启动、**不挂载源码**的结果。
+> 紧接着的“新镜像复测”是 0001–0029 镜像、本 compose 原样启动、**不挂载源码**的结果。
 
 新镜像复测（`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`，0001–0029，本 compose 原样启动、不挂载源码，GPU5–8，同方法）：
 
@@ -343,13 +379,16 @@ GPU5–8，PP4，2 轮预热、5 轮正式取中位数，每次 500 token。我�
 
 无收益、未纳入的项：
 
+PP metadata cache（`VLLM_PP_METADATA_CACHE_0025`）与 PP 传输张量打包（`VLLM_PP_PACK_TENSORS_0029`）之前列在此表中，
+记为“整机无收益”；那是在较早的基线上测的（当时其他 decode 瓶颈占主导，PP 通信不在关键路径上）。
+在 0001–0029 完整栈 + tc 路由上两项一起打开测得有效（c1 counting 29.32→29.44 步/秒，c8 counting 739.5→752.4、
+code 589.9→609.2、prose 324.0→335.4），已作为 0030、0031 纳入，从此表移除。
+
 | 项 | 结果 |
 |---|---|
-| PP metadata cache（开发 0025，`VLLM_PP_METADATA_CACHE_0025`） | 整机无收益 |
-| PP 传输张量打包（开发 0029，`VLLM_PP_PACK_TENSORS_0029`） | 整机无收益 |
 | `VLLM_GLM5_ROUTE_V2_FIRST=1`（0023 的入队顺序部分） | 整机变慢；补丁保留但默认 0，compose 设 0 |
-| thin GEMM 配置选择与对方相同（评估时编号 0030，`VLLM_GLM5_THIN_GEMM_MM_SELECT`） | 整机 c8 729.2，无收益；已从系列删除 |
-| shared experts 侧流设 stream 优先级（评估时编号 0031，`VLLM_GLM5_SHARED_STREAM_PRIORITY`） | 单卡 MoE 层 bench：tc+high 381.3 vs tc+default 375.9 μs/层，更慢；已从系列删除 |
+| thin GEMM 配置选择与对方相同（评估时曾用编号 0030，与现在的 0030 无关；`VLLM_GLM5_THIN_GEMM_MM_SELECT`） | 整机 c8 729.2，无收益；已从系列删除 |
+| shared experts 侧流设 stream 优先级（评估时曾用编号 0031，与现在的 0031 无关；`VLLM_GLM5_SHARED_STREAM_PRIORITY`） | 单卡 MoE 层 bench：tc+high 381.3 vs tc+default 375.9 μs/层，更慢；已从系列删除 |
 
 ### 正确性证据
 
@@ -379,7 +418,7 @@ GPU5–8，PP4，2 轮预热、5 轮正式取中位数，每次 500 token。我�
 
 - KDA v2 decode 融合（mHC v2 已由 0017 移植）；
 - idx glue 的 weights、glue、cache 三项（0024 只移植了 fwht 与 expand；moesum 由 0026 移植）；
-- PP 传输包（`VLLM_PP_PACKED_HOP`、`VLLM_PP_HOP_NO_METADATA`、`VLLM_PP_SPLIT_DRAFT_EVENT`、
+- 对方的 PP 传输包原实现（0030/0031 以自己的方式实现了元数据缓存与张量打包，保留 padded 行和每步 pickle；以下原开关未移植：`VLLM_PP_PACKED_HOP`、`VLLM_PP_HOP_NO_METADATA`、`VLLM_PP_SPLIT_DRAFT_EVENT`、
   `VLLM_PP_SPREAD_DECODES`）；
 - fair prefill（`--prefill-chunk-with-decodes`、`--max-num-partial-prefills`）、drafter 显存相关开关
   （`ROPE_FIT`、`SELECTOR_SHARD`）、编译版 Marlin prefill（`VLLM_GLM5_MARLIN_PREFILL_CUDA`）；

@@ -1,0 +1,322 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] PP: pack the per-hop tensors into one NCCL P2P
+
+VLLM_PP_PACK_TENSORS_0029 (default 0; read once; the "pp" group exchanges
+the value over its gloo group at start-up and every rank raises if the PP
+ranks disagree). With the GLM mHC boundary plus the folded drafter fc
+partial each hop carries two tensors ([rows,4,4096] bf16 hidden_states and
+[rows,4096] fp32 aux_fc_partial), i.e. two NCCL SendRecv per hop per step.
+When enabled, both sides derive the same byte layout from the (unchanged)
+metadata: non-empty tensors sent whole (no TP all-gather slicing, or a
+group of size 1) on the device type of the first such tensor, in dict order,
+16-byte aligned, are copied into one uint8 buffer sent as the first device
+P2P of the hop; the remaining tensors follow on the original path. The
+receiver gets one buffer and returns dtype/shape views in the original key
+order. Padded rows, dtypes and bytes on the wire are unchanged (at most 15
+bytes of padding per segment); results are bit-identical. The pack copy runs
+on the current stream before the isend is enqueued, so the source (the full
+CUDA graph's persistent outputs) is no longer read by the send afterwards;
+the buffer inherits the existing record_stream / pending-isend retention.
+Composes with VLLM_PP_METADATA_CACHE_0025.
+
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index 0337a6c..dc7b6b4 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -589,6 +589,14 @@ class GroupCoordinator:
+         # without calling ``super().__init__``.
+         self._pending_isends: deque[tuple[list[Handle], list[torch.Tensor]]] = deque()
+ 
++        # VLLM_PP_PACK_TENSORS_0029 (patch 0029): one P2P op per PP hop.
++        # Startup collective on the PP CPU group; raises if ranks disagree.
++        self._pp_pack_0029 = False
++        if group_name == "pp" and self.world_size > 1:
++            from vllm.distributed.pp_pack_0029 import configure
++
++            self._pp_pack_0029 = configure(self)
++
+     def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
+         """Create a new device-side ProcessGroup with the same per-rank membership
+         as this coordinator's `device_group`, but backed by a distinct communicator.
+@@ -1202,6 +1210,18 @@ class GroupCoordinator:
+ 
+         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
+         assert len(tensor_keys) == len(tensor_list)
++        if getattr(self, "_pp_pack_0029", False):
++            # Patch 0029: metadata unchanged; packable tensors become one
++            # leading uint8 buffer sent (and retained) by the loop below.
++            from vllm.distributed.pp_pack_0029 import pack_for_send
++
++            tensor_keys, tensor_list, all_gather_tensors = pack_for_send(
++                tensor_keys,
++                tensor_list,
++                all_gather_group,
++                all_gather_tensors,
++                self._should_use_all_gather,
++            )
+ 
+         # Reap completed sends before posting new ones, bounding the
+         # self-retention FIFO.
+@@ -1322,6 +1342,18 @@ class GroupCoordinator:
+         tensor_dict: dict[str, Any] = {}
+         handles: list[Handle] = []
+         postprocess: list[Callable[[], None]] = []
++        pack_plan = None
++        if getattr(self, "_pp_pack_0029", False):
++            # Patch 0029: same layout as the sender, derived from metadata.
++            from vllm.distributed.pp_pack_0029 import plan_recv
++
++            recv_metadata_list, pack_plan, all_gather_tensors = plan_recv(
++                recv_metadata_list,
++                TensorMetadata,
++                all_gather_group,
++                all_gather_tensors,
++                self._should_use_all_gather,
++            )
+ 
+         for key, value in recv_metadata_list:
+             if isinstance(value, TensorMetadata):
+@@ -1368,6 +1400,11 @@ class GroupCoordinator:
+             else:
+                 tensor_dict[key] = value
+ 
++        if pack_plan is not None:
++            # Original key order; buffer views for the packed keys. The
++            # all-gather postprocess closures write into the rebound dict.
++            tensor_dict = pack_plan.unpack(tensor_dict)
++
+         return tensor_dict, handles, postprocess
+ 
+     def barrier(self):
+diff --git a/vllm/distributed/pp_pack_0029.py b/vllm/distributed/pp_pack_0029.py
+new file mode 100644
+index 0000000..0b0e71e
+--- /dev/null
++++ b/vllm/distributed/pp_pack_0029.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Patch 0029: pack one PP hop's tensors into one byte buffer (one P2P op).
++
++``VLLM_PP_PACK_TENSORS_0029=1`` (default off). Only the device payload of
++``GroupCoordinator.isend_tensor_dict`` / ``irecv_tensor_dict`` changes:
++
++* the pickled metadata list is sent exactly as before (same keys, order,
++  shapes, dtypes, non-tensor fields such as ``__verification_budget``);
++* both sides derive the same byte layout from that metadata alone: every
++  non-empty tensor that would be sent whole (no TP all-gather slicing, or an
++  all-gather group of size 1, where the slice *is* the whole tensor) and that
++  shares the device type of the first such tensor gets a 16-byte aligned
++  segment, in dict order;
++* with >= 2 such tensors they travel as one ``uint8`` buffer, sent *before*
++  the remaining (unpacked) tensors, which keep their relative order;
++* the receiver hands out ``view``s of the buffer, re-inserted into the dict
++  at their original positions, so values are bit-identical and the dict
++  order is unchanged.
++
++Rows are never trimmed: shapes are the padded shapes from the metadata.
++
++The buffer is an ordinary tensor in ``isend_tensor_dict``'s send loop, so it
++inherits the existing lifetime handling: ``record_stream`` plus the
++``_pending_isends`` retention until the NCCL work completes (and the
++worker's top-of-step wait on ``_pp_send_work``). The pack copies run on the
++current stream before the ``isend`` is enqueued, so the source tensors (e.g.
++FULL-graph persistent outputs) are no longer read by the send itself.
++
++Every rank of the PP group must agree: ``configure`` all-gathers the flag
++over the PP CPU group at group construction and raises on a mismatch.
++"""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Callable
++from typing import Any
++
++import torch
++
++ENV = "VLLM_PP_PACK_TENSORS_0029"
++PACK_KEY = "__pp_pack_0029"
++ALIGN = 16
++
++
++def env_enabled() -> bool:
++    value = os.environ.get(ENV, "0")
++    if value not in ("0", "1"):
++        raise ValueError(f"{ENV} must be 0 or 1, got {value!r}")
++    return value == "1"
++
++
++def configure(coordinator: Any) -> bool:
++    """Collective over ``coordinator.cpu_group``: every member must call it.
++    Returns the (agreed) flag; raises if the PP ranks disagree."""
++    mine = env_enabled()
++    flags: list[Any] = [None] * coordinator.world_size
++    torch.distributed.all_gather_object(flags, mine, group=coordinator.cpu_group)
++    if any(flag != mine for flag in flags):
++        raise RuntimeError(
++            f"{ENV} must be set identically on every PP rank; got "
++            f"{dict(zip(coordinator.ranks, flags))} (global rank -> enabled)"
++        )
++    return mine
++
++
++def _align(n: int) -> int:
++    return (n + ALIGN - 1) // ALIGN * ALIGN
++
++
++def _numel(size: Any) -> int:
++    n = 1
++    for d in size:
++        n *= int(d)
++    return n
++
++
++def plan(
++    entries: list[tuple[str, str, torch.dtype, Any]],
++    whole: Callable[[str, int], bool],
++) -> tuple[list[tuple[int, int, int]], int] | None:
++    """``entries``: (key, device_type, dtype, size) per tensor, in dict order.
++    ``whole(key, numel)``: True iff the tensor would be sent whole.
++    Returns ([(entry index, byte offset, nbytes)], total bytes) or None."""
++    segments: list[tuple[int, int, int]] = []
++    device_type: str | None = None
++    offset = 0
++    for i, (key, dev, dtype, size) in enumerate(entries):
++        numel = _numel(size)
++        if numel == 0 or not whole(key, numel):
++            continue
++        if device_type is None:
++            device_type = dev
++        elif dev != device_type:
++            continue
++        nbytes = numel * torch.empty((), dtype=dtype).element_size()
++        segments.append((i, offset, nbytes))
++        offset = _align(offset + nbytes)
++    if len(segments) < 2:
++        return None
++    return segments, offset
++
++
++def _whole_fn(
++    should_use_all_gather: Callable[..., bool],
++    all_gather_group: Any,
++    all_gather_tensors: dict[str, bool] | None,
++) -> Callable[[str, int], bool]:
++    ag_size = 1 if all_gather_group is None else all_gather_group.world_size
++
++    def whole(key: str, numel: int) -> bool:
++        if ag_size == 1:
++            # all_gather over one rank is the identity; the "slice" is the
++            # whole (flattened) tensor.
++            return True
++        return not should_use_all_gather(
++            key, numel, all_gather_group, all_gather_tensors
++        )
++
++    return whole
++
++
++def _no_all_gather_for_pack(
++    all_gather_tensors: dict[str, bool] | None,
++) -> dict[str, bool]:
++    out = dict(all_gather_tensors or {})
++    out[PACK_KEY] = False
++    return out
++
++
++def element_view(buf: torch.Tensor, offset: int, nbytes: int,
++                 dtype: torch.dtype, size: Any) -> torch.Tensor:
++    return buf[offset:offset + nbytes].view(dtype).view(size)
++
++
++def pack_for_send(
++    tensor_keys: list[str],
++    tensor_list: list[torch.Tensor],
++    all_gather_group: Any,
++    all_gather_tensors: dict[str, bool] | None,
++    should_use_all_gather: Callable[..., bool],
++) -> tuple[list[str], list[torch.Tensor], dict[str, bool] | None]:
++    """Sender: replace the packable tensors by one leading byte buffer."""
++    if PACK_KEY in tensor_keys:
++        raise RuntimeError(f"reserved key {PACK_KEY} in a PP tensor dict")
++    entries = [
++        (k, t.device.type, t.dtype, tuple(t.shape))
++        for k, t in zip(tensor_keys, tensor_list)
++    ]
++    layout = plan(
++        entries,
++        _whole_fn(should_use_all_gather, all_gather_group, all_gather_tensors),
++    )
++    if layout is None:
++        return tensor_keys, tensor_list, all_gather_tensors
++    segments, total = layout
++    device = tensor_list[segments[0][0]].device
++    buf = torch.empty(total, dtype=torch.uint8, device=device)
++    packed = set()
++    for i, offset, nbytes in segments:
++        t = tensor_list[i]
++        element_view(buf, offset, nbytes, t.dtype, t.shape).copy_(t)
++        packed.add(i)
++    keys = [PACK_KEY] + [k for i, k in enumerate(tensor_keys) if i not in packed]
++    tensors = [buf] + [t for i, t in enumerate(tensor_list) if i not in packed]
++    return keys, tensors, _no_all_gather_for_pack(all_gather_tensors)
++
++
++class RecvPlan:
++    def __init__(self, metadata_list: list[tuple[str, Any]],
++                 views: dict[str, tuple[int, int, torch.dtype, Any]]) -> None:
++        self.metadata_list = metadata_list
++        self.views = views
++
++    def unpack(self, tensor_dict: dict[str, Any]) -> dict[str, Any]:
++        """Rebuild the dict in the original key order with buffer views."""
++        buf = tensor_dict.pop(PACK_KEY)
++        out: dict[str, Any] = {}
++        for key, _ in self.metadata_list:
++            view = self.views.get(key)
++            if view is None:
++                out[key] = tensor_dict[key]
++            else:
++                out[key] = element_view(buf, *view)
++        return out
++
++
++def plan_recv(
++    metadata_list: list[tuple[str, Any]],
++    tensor_metadata_cls: type,
++    all_gather_group: Any,
++    all_gather_tensors: dict[str, bool] | None,
++    should_use_all_gather: Callable[..., bool],
++) -> tuple[list[tuple[str, Any]], RecvPlan | None, dict[str, bool] | None]:
++    """Receiver: the metadata list to post receives for (pack buffer first,
++    then every other entry in order) and the plan to undo it."""
++    positions = [
++        i for i, (_, v) in enumerate(metadata_list)
++        if isinstance(v, tensor_metadata_cls)
++    ]
++    entries = [
++        (metadata_list[i][0], metadata_list[i][1].device,
++         metadata_list[i][1].dtype, tuple(metadata_list[i][1].size))
++        for i in positions
++    ]
++    layout = plan(
++        entries,
++        _whole_fn(should_use_all_gather, all_gather_group, all_gather_tensors),
++    )
++    if layout is None:
++        return metadata_list, None, all_gather_tensors
++    segments, total = layout
++    device_type = entries[segments[0][0]][1]
++    views: dict[str, tuple[int, int, torch.dtype, Any]] = {}
++    packed_positions = set()
++    for j, offset, nbytes in segments:
++        key, _, dtype, size = entries[j]
++        views[key] = (offset, nbytes, dtype, size)
++        packed_positions.add(positions[j])
++    if PACK_KEY in {k for k, _ in metadata_list}:
++        raise RuntimeError(f"reserved key {PACK_KEY} in a PP tensor dict")
++    posted = [(PACK_KEY, tensor_metadata_cls(device_type, torch.uint8,
++                                             torch.Size([total])))]
++    posted += [e for i, e in enumerate(metadata_list) if i not in packed_positions]
++    return (posted, RecvPlan(metadata_list, views),
++            _no_all_gather_for_pack(all_gather_tensors))

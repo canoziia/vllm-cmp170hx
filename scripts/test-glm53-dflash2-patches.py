@@ -41,7 +41,7 @@ def env_default(text: str, name: str, default: str) -> bool:
 
 series = [line.strip() for line in (PATCH_DIR / "series").read_text().splitlines()
           if line.strip() and not line.startswith("#")]
-check("series has 29 patches", len(series) == 29, str(len(series)))
+check("series has 31 patches", len(series) == 31, str(len(series)))
 
 touched: set[str] = set()
 for name in series:
@@ -119,6 +119,10 @@ markers = [
     ("0029 idx dual thin GEMM", ops + "idx_dual_gemm.py", "def _thin_gemm_dual_kernel("),
     ("0029 attention hook", "vllm/models/glm5next/nvidia/attention.py", "idx_dual_linear("),
     ("0029 warmup before capture", "vllm/model_executor/warmup/kernel_warmup.py", "warmup_idx_dual"),
+    ("0030 PP metadata cache", "vllm/distributed/pp_metadata_cache.py", "class PPMetadataCache"),
+    ("0030 hook", "vllm/distributed/parallel_state.py", "_pp_metadata_cache"),
+    ("0031 PP pack module", "vllm/distributed/pp_pack_0029.py", 'ENV = "VLLM_PP_PACK_TENSORS_0029"'),
+    ("0031 hook", "vllm/distributed/parallel_state.py", "_pp_pack_0029"),
 ]
 for label, rel, needle in markers:
     text = src(rel)
@@ -169,6 +173,7 @@ defaults = [
     (src(ops + "idx_dual_gemm.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
     (src("vllm/models/glm5next/nvidia/attention.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
     (src("vllm/model_executor/warmup/kernel_warmup.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
+    (src("vllm/distributed/parallel_state.py"), "VLLM_PP_METADATA_CACHE_0025", "0"),
 ]
 for text, name, default in defaults:
     check(f"{name} defaults to {default!r}", env_default(text, name, default))
@@ -201,6 +206,11 @@ check("VLLM_GLM5_ROUTE_V2_FIRST is opt-in (only '1' enables it)",
       '"VLLM_GLM5_ROUTE_V2_FIRST", "0").strip() == "1"' in route_v2)
 check("VLLM_GLM5_IDX_DUAL_GEMM is opt-in (only '1' enables it)",
       '"VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1"' in src(ops + "idx_dual_gemm.py"))
+check("VLLM_PP_METADATA_CACHE_0025 is opt-in (only '1' enables it)",
+      'os.environ.get("VLLM_PP_METADATA_CACHE_0025", "0") == "1"' in src("vllm/distributed/parallel_state.py"))
+_pack = src("vllm/distributed/pp_pack_0029.py")
+check("VLLM_PP_PACK_TENSORS_0029 defaults to '0' (only '1' enables it)",
+      'os.environ.get(ENV, "0")' in _pack and 'return value == "1"' in _pack)
 check("VLLM_GLM5_MARLIN_DECODE_VARIANT defaults to 'orig'",
       re.search(r'"VLLM_GLM5_MARLIN_DECODE_VARIANT",\s*"orig"', envs) is not None)
 
@@ -211,23 +221,19 @@ absent = {
     "PP pipeline trace (old 0021)": "VLLM_PP_PIPELINE_TRACE",
     "mHC v1 numerics (old 0018)": "VLLM_GLM5_TARGET_MHC_V1",
     "mHC v2 (old 0009)": "VLLM_GLM5_TARGET_MHC_V2",
-    "PP metadata cache (dev 0025)": "VLLM_PP_METADATA_CACHE_0025",
-    "PP pack hop tensors (dev 0029)": "VLLM_PP_PACK_TENSORS_0029",
     "same-history overlay": "VLLM_SAME_HISTORY_",
     "same-history overlay module": "same_history",
     "KDA dual projection (old 0011)": "VLLM_GLM5_KDA_GATE_PROJECTION",
     "context KV graph (old 0007)": "VLLM_DFLASH_CONTEXT_KV_GRAPH",
-    "MM thin GEMM selection (evaluated 0030)": "VLLM_GLM5_THIN_GEMM_MM_SELECT",
-    "shared-stream priority (evaluated 0031)": "VLLM_GLM5_SHARED_STREAM_PRIORITY",
+    "MM thin GEMM selection (evaluated, not in series)": "VLLM_GLM5_THIN_GEMM_MM_SELECT",
+    "shared-stream priority (evaluated, not in series)": "VLLM_GLM5_SHARED_STREAM_PRIORITY",
 }
-# Excluded dev 0025/0029 would also touch parallel_state.py.
-scanned = sorted(touched | {"vllm/distributed/parallel_state.py"})
+scanned = sorted(touched)
 haystack = "\n".join((root / p).read_text() for p in scanned if (root / p).is_file())
 for label, needle in absent.items():
     check(label, needle not in haystack)
 for rel in ("vllm/v1/worker/gpu/pp_trace.py", "vllm/v1/worker/gpu/spec_decode/dflash/trace.py",
             ops + "mhc_decode_v1.py", ops + "kda_gate_projection.py",
-            "vllm/distributed/pp_pack_0029.py",
             "vllm/v1/worker/gpu/spec_decode/dflash/same_history.py"):
     check(f"{rel} absent", not (root / rel).exists())
 
