@@ -83,6 +83,29 @@ services:
       # dflash2/0015 indexer JIT warmup is on by default
       # dflash2/0016 drafter fc fold
       VLLM_GLM5_PP_FOLD_DRAFT_FC: "1"
+      # dflash2/0017 Gluon mHC decode v2; 0025 fp32 prenorm GEMM. Turn on together:
+      # only both give the reference target numerics (prose acceptance).
+      VLLM_GLM5_DECODE_MHC_V2: "1"
+      VLLM_GLM5_TARGET_PRENORM_FP32_0026: "1"
+      # dflash2/0028: T >= 384 prenorm on the bf16x3 tensor-core kernel (default 384).
+      # That kernel rewrites sqrsum, so do not also fuse sqrsum into mhc_post.
+      VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS: "384"
+      VLLM_MHC_POST_FUSE_SQRSUM: "0"
+      # dflash2/0018-0020 host-side input preparation (bit-identical)
+      VLLM_GLM5_PROLOGUE_FUSE: "1"
+      VLLM_GLM5_PROLOGUE_PACKED_H2D: "1"
+      VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS: "1"
+      # dflash2/0021 drafter tail (lm_head pass, top-k, selector) on PP stage 2
+      VLLM_PP_DRAFT_TAIL_STAGE: "2"
+      # dflash2/0022 sparse-MLA profile placeholder clamp (KV pool 1.68M -> 2.10M)
+      VLLM_GLM5_MLA_PROFILE_WS_CLAMP: "1"
+      # dflash2/0023: route-before-shared measured slower end to end; keep 0
+      VLLM_GLM5_ROUTE_V2_FIRST: "0"
+      # dflash2/0024 indexer weight scale folded into the decode FWHT quant
+      VLLM_GLM5_DECODE_IDX_GLUE_0024: "1"
+      # dflash2/0026 fused moe_sum + shared add, 0027 shared experts after routed
+      VLLM_GLM5_MOE_SUM_ADD: "1"
+      VLLM_GLM5_SHARED_EXPERT_REORDER: "1"
     command:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0

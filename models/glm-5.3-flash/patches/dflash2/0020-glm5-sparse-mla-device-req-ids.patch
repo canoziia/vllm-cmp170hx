@@ -1,0 +1,223 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] sparse MLA: device-side req_id_per_token
+
+VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS (default 0). XPUMLASparseMetadataBuilder
+(base of the sm_80 Triton sparse MLA builder) fills its req_id_per_token
+buffer with fill_(0) plus a pinned HtoD every step. One Triton launch now
+derives the same int32 values from the device query_start_loc over the
+whole buffer. Kept on the host path under adaptive verification (device
+query_start_loc differs there).
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index ee7658f..f66893e 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -89,6 +89,7 @@ if TYPE_CHECKING:
+     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
+     VLLM_XLA_CHECK_RECOMPILATION: bool = False
+     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
++    VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS: bool = False
+     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
+     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+@@ -1027,6 +1028,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     # Largest prefill chunk (tokens) for the path above. 2312 is what
+     # Morrowmake validated; larger values (<= 32768) are unvalidated.
++    # Sparse-MLA (Triton/XPU builder) req_id_per_token built on device from
++    # query_start_loc in one launch instead of fill_ + pinned HtoD (patch
++    # 0020, vllm/v1/attention/backends/mla/req_id_per_token.py). Same values;
++    # default off; ignored under adaptive verification.
++    "VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS": lambda: os.getenv(
++        "VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS", "0"
++    ).strip().lower() in ("1", "true", "yes", "on"),
+     "VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS": lambda: int(
+         os.getenv("VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS", "2312")
+     ),
+@@ -2881,6 +2889,8 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+         "VLLM_IMAGE_FETCH_TIMEOUT",
++        # Metadata build only (patch 0020).
++        "VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS",
+         "VLLM_VIDEO_FETCH_TIMEOUT",
+         "VLLM_AUDIO_FETCH_TIMEOUT",
+         "VLLM_MEDIA_CACHE",
+diff --git a/vllm/v1/attention/backends/mla/req_id_per_token.py b/vllm/v1/attention/backends/mla/req_id_per_token.py
+new file mode 100644
+index 0000000..9e94d01
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/req_id_per_token.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Device-side ``req_id_per_token`` for the Triton/XPU sparse-MLA builder.
++
++Opt-in with ``VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS=1`` (patch 0020). Default
++**off**: ``XPUMLASparseMetadataBuilder.build`` keeps its host path, i.e.
++
++    req_id_per_token = np.repeat(arange(num_reqs), diff(query_start_loc_cpu))
++    buffer.fill_(0)                                   # 1 fill kernel
++    buffer[:n].copy_(pinned(req_id_per_token))        # 1 pinned HtoD
++
++every step, for every sparse-MLA KV-cache group on the rank. Here one Triton
++launch derives the same int32 values from the device ``query_start_loc``
++(token ``t`` belongs to the request ``j`` with ``qsl[j] <= t < qsl[j+1]``,
++i.e. ``j = #{r in 1..R : qsl[r] <= t}``) and writes zeros past
++``qsl[R]``, over the whole buffer -- exactly what the fill + copy leave.
++
++Equality needs the device ``query_start_loc`` to hold the same bytes as the
++host copy. That holds in the V1/V2 runners except under adaptive
++verification, which rewrites the device copy (``reallocate_drafts``); the
++builder therefore keeps the host path when that is enabled.
++"""
++
++from __future__ import annotations
++
++import functools
++import os
++
++import numpy as np
++import torch
++
++try:  # pragma: no cover - GPU only
++    from vllm.triton_utils import tl, triton
++
++    _HAS_TRITON = triton is not None and tl is not None and hasattr(triton, "jit")
++except Exception:  # pragma: no cover
++    _HAS_TRITON = False
++
++_TRUE = ("1", "true", "yes", "on")
++
++
++@functools.cache
++def enabled() -> bool:
++    return (
++        os.getenv("VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS", "0").strip().lower() in _TRUE
++    )
++
++
++def req_id_per_token_ref(
++    query_start_loc_cpu: torch.Tensor, buffer_len: int
++) -> torch.Tensor:
++    """The upstream host computation, materialised over the whole buffer."""
++    starts = np.asarray(query_start_loc_cpu, dtype=np.int32)
++    seg = np.diff(starts)
++    ids = np.repeat(np.arange(seg.shape[0], dtype=np.int32), seg)
++    out = torch.zeros(buffer_len, dtype=torch.int32)
++    out[: ids.shape[0]] = torch.from_numpy(ids)
++    return out
++
++
++if _HAS_TRITON:  # pragma: no cover - GPU only
++
++    @triton.jit
++    def _req_id_per_token_kernel(
++        qsl_ptr,
++        out_ptr,
++        num_reqs,
++        buffer_len,
++        BLOCK: tl.constexpr,
++    ):
++        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++        keep = offs < buffer_len
++        cnt = tl.zeros([BLOCK], dtype=tl.int32)
++        for r in range(0, num_reqs):
++            start = tl.load(qsl_ptr + r + 1)
++            cnt += (start <= offs).to(tl.int32)
++        total = tl.load(qsl_ptr + num_reqs)
++        val = tl.where(offs < total, cnt, 0)
++        tl.store(out_ptr + offs, val, mask=keep)
++
++
++def fill_req_id_per_token(
++    query_start_loc: torch.Tensor, num_reqs: int, buffer: torch.Tensor
++) -> bool:
++    """Write the per-token request ids for ``query_start_loc[: num_reqs + 1]``
++    into the whole ``buffer``. Returns False (nothing written) when the
++    device path does not apply, so the caller runs its host path."""
++    if not (
++        _HAS_TRITON
++        and query_start_loc.is_cuda
++        and buffer.is_cuda
++        and buffer.dtype == torch.int32
++        and buffer.is_contiguous()
++        and query_start_loc.is_contiguous()
++        and query_start_loc.dtype == torch.int32
++        and query_start_loc.shape[0] >= num_reqs + 1
++        and num_reqs >= 0
++    ):
++        return False
++    n = buffer.shape[0]
++    block = 1024
++    _req_id_per_token_kernel[(triton.cdiv(n, block),)](
++        query_start_loc, buffer, num_reqs, n, BLOCK=block
++    )
++    return True
+diff --git a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+index c8a8222..cc15750 100644
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -142,6 +142,21 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
+             dtype=torch.int32,
+             device=device,
+         )
++        # VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS=1 (patch 0020): build
++        # req_id_per_token from the device query_start_loc in one launch
++        # instead of fill_ + a pinned HtoD. Adaptive verification rewrites the
++        # device query_start_loc, so it keeps the host path.
++        from vllm.v1.attention.backends.mla import req_id_per_token as _rid
++
++        spec = vllm_config.speculative_config
++        self._device_req_ids = (
++            _rid.enabled()
++            and torch.device(device).type == "cuda"
++            and not (
++                spec is not None
++                and getattr(spec, "enable_adaptive_verification", False)
++            )
++        )
+ 
+     def build(
+         self,
+@@ -150,16 +165,30 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
+         fast_build: bool = False,
+     ) -> XPUMLASparseMetadata:
+         num_tokens = common_attn_metadata.num_actual_tokens
+-        starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+-        seg_lengths = np.diff(starts)
+-        req_id_per_token = np.repeat(
+-            np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
+-        )
+-        # Zero-fill for cudagraphs
+-        self.req_id_per_token_buffer.fill_(0)
+-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+-            np_to_pinned_tensor(req_id_per_token), non_blocking=True
+-        )
++        device_done = False
++        if getattr(self, "_device_req_ids", False):
++            from vllm.v1.attention.backends.mla.req_id_per_token import (
++                fill_req_id_per_token,
++            )
++
++            device_done = fill_req_id_per_token(
++                common_attn_metadata.query_start_loc,
++                common_attn_metadata.query_start_loc_cpu.shape[0] - 1,
++                self.req_id_per_token_buffer,
++            )
++        if not device_done:
++            starts = np.asarray(
++                common_attn_metadata.query_start_loc_cpu, dtype=np.int32
++            )
++            seg_lengths = np.diff(starts)
++            req_id_per_token = np.repeat(
++                np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
++            )
++            # Zero-fill for cudagraphs
++            self.req_id_per_token_buffer.fill_(0)
++            self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
++                np_to_pinned_tensor(req_id_per_token), non_blocking=True
++            )
+ 
+         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+ 

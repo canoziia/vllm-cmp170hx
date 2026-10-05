@@ -1,0 +1,107 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: clamp the sparse-MLA profile-run placeholder (KV pool)
+
+VLLM_GLM5_MLA_PROFILE_WS_CLAMP (default 0 = unchanged). In the profile run
+(attn_metadata is None) MLAAttention.forward_impl allocates a placeholder of
+[chunked_prefill_workspace_size, H, nope + v] for the dense-MHA context
+up-projection, sized with the dense 64K-row heuristic aligned to the 4608
+block size: 69120 x 64 x 512 x 2 B = 4.22 GiB on every PP stage that holds
+an MLA layer. With the flag, sparse MLA caps it at the sparse builders'
+chunk bound max(min(.., max_num_seqs * index_topk), block_size) = 16384 rows
+(1.0 GiB), same as Morrowmake. Never larger than before; the freed memory
+goes to the KV pool.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 6758970..fe324ed 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -61,6 +61,7 @@ if TYPE_CHECKING:
+     VLLM_PP_DRAFT_TAIL_STAGE: int = -1
+     VLLM_PP_DRAFT_TAIL_VERIFY: bool = False
+     VLLM_GLM5_INDEXER_GATHER_CLAMP: bool = False
++    VLLM_GLM5_MLA_PROFILE_WS_CLAMP: bool = False
+     VLLM_GLM5_INDEXER_JIT_WARMUP: bool = True
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL_MIN_TOKENS: int = 384
+@@ -1012,6 +1013,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_GLM5_INDEXER_GATHER_CLAMP": lambda: bool(
+         int(os.getenv("VLLM_GLM5_INDEXER_GATHER_CLAMP", "0"))
+     ),
++    # Patch 0022 (KV-PEAK.md). The MLA profile-run placeholder that stands in
++    # for the dense-MHA context up-projection [rows, H, nope + v] is sized
++    # with the dense 64K-row heuristic (aligned to block_size: 69120 rows,
++    # 4.2 GiB at 64 heads x 512 bf16 on GLM-5.3-Flash). For sparse MLA, cap
++    # the rows at max(min(that, max_num_seqs * index_topk), block_size) -- the
++    # chunk bound the sparse metadata builders use, same as Morrowmake's
++    # sparse_mla_attention.py. Never larger than before. Default off.
++    "VLLM_GLM5_MLA_PROFILE_WS_CLAMP": lambda: bool(
++        int(os.getenv("VLLM_GLM5_MLA_PROFILE_WS_CLAMP", "0"))
++    ),
+     # Pre-compile, at model construction, every Triton specialization the
+     # GLM5Next kpool indexer prefill reaches (MQA-logits KV_GROUP x N % 16, and
+     # the prefill-chunk metadata kernel's query-slice classes) instead of
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 34df61f..5b95d27 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -717,13 +717,56 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+     @property
+     def chunked_prefill_workspace_size(self) -> int:
+         if self._chunked_prefill_workspace_size is None:
+-            self._chunked_prefill_workspace_size = (
+-                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+-                    self._vllm_config
+-                )
++            size = MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
++                self._vllm_config
+             )
++            if envs.VLLM_GLM5_MLA_PROFILE_WS_CLAMP:
++                size = self._clamped_sparse_profile_rows(size)
++            self._chunked_prefill_workspace_size = size
+         return self._chunked_prefill_workspace_size
+ 
++    def _clamped_sparse_profile_rows(self, legacy: int) -> int:
++        """VLLM_GLM5_MLA_PROFILE_WS_CLAMP (patch 0022): rows of the profile-run
++        placeholder in forward_impl for sparse MLA.
++
++        The placeholder models ``kv_b_proj`` over one chunk of prefill
++        context. Sparse builders (SparseMLACommonMetadataBuilder) cap that
++        chunk at max_num_seqs * index_topk rows (dense MHA only fires when a
++        prefill's seq_len <= index_topk); TRITON_MLA_SPARSE on sm80 routes
++        every token through MQA and never up-projects context at all. The
++        result is never above ``legacy``; anything unexpected keeps ``legacy``.
++        """
++        if not getattr(self.impl, "is_sparse", False):
++            return legacy
++        if self._vllm_config.parallel_config.decode_context_parallel_size > 1:
++            return legacy
++        model_config = self._vllm_config.model_config
++        topk = getattr(model_config.hf_text_config, "index_topk", None)
++        if not isinstance(topk, int) or topk <= 0:
++            return legacy
++        sched = self._vllm_config.scheduler_config
++        block_size = self._vllm_config.cache_config.block_size
++        rows = min(
++            max(
++                8 * model_config.max_model_len,
++                4 * sched.max_num_seqs * block_size,
++            ),
++            64 * 1024,
++            sched.max_num_seqs * topk,
++        )
++        rows = min(max(rows, block_size), legacy)
++        logger.info_once(
++            "VLLM_GLM5_MLA_PROFILE_WS_CLAMP: MLA profile placeholder rows "
++            "%d -> %d (%.2f -> %.2f GiB).",
++            legacy,
++            rows,
++            legacy * self.num_heads * (self.qk_nope_head_dim + self.v_head_dim)
++            * 2 / (1 << 30),
++            rows * self.num_heads * (self.qk_nope_head_dim + self.v_head_dim)
++            * 2 / (1 << 30),
++        )
++        return rows
++
+     def forward(
+         self,
+         q: torch.Tensor,

@@ -1,0 +1,133 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: route v2 tile load order; optional route-before-shared
+
+Two changes, both under VLLM_GLM5_ROUTE_V2=1 (0010):
+- the route v2 kernel loads both tiles of a row before computing (same order
+  as Morrowmake); bit-identical results;
+- VLLM_GLM5_ROUTE_V2_FIRST (default 0 here; it was 1 in development): with 1
+  the MoE runner enqueues route v2 before forking the shared experts onto
+  the aux stream. Enqueue order only. Defaults to 0 because whole-machine
+  GLM-5.3-Flash DFlash2 runs were slower with 1; the compose also sets 0.
+
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 45227f7..d320c02 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -903,6 +903,29 @@ class MoERunner(MoERunnerInterface):
+         # TODO(bnell): this can be removed after MK migration is complete.
+         self.routed_experts._ensure_moe_quant_config_init()
+ 
++        # VLLM_GLM5_ROUTE_V2 + _FIRST=1 (default 0): enqueue the fused
++        # router BEFORE forking the shared experts onto the aux stream.  The
++        # aux stream's input-ready event is then recorded after the router,
++        # so this layer's shared-expert kernels no longer co-run with the
++        # router's spin-waiting split-K launch (they overlap the routed Marlin
++        # instead, as MM's VLLM_GLM5_SHARED_EXPERT_REORDER=1 arranges).  Same
++        # kernels, same inputs: enqueue order only.  None = original order.
++        early_logits = None
++        tried_first = False
++        if (
++            self.gate is not None
++            and not self._fse_fuse_gate
++            and _glm5_route_v2_enabled()
++        ):
++            from vllm.models.glm5next.nvidia.ops.route_v2_decode import (
++                maybe_route,
++                route_first,
++            )
++
++            if route_first():
++                tried_first = True
++                early_logits = maybe_route(self.gate, self.router, hidden_states)
++
+         # If using multi-stream overlap for shared experts, we must launch it
+         # before routed expert dispatch.
+         shared_experts_overlapping = False
+@@ -914,13 +937,15 @@ class MoERunner(MoERunnerInterface):
+         # If the Runner holds the gate, apply it after the stream sync,
+         # so it can run overlapped with the
+         # NOTE: in future PR, MoE runner will always hold the gate.
+-        if self.gate is not None:
++        if early_logits is not None:
++            router_logits = early_logits
++        elif self.gate is not None:
+             if self._fse_fuse_gate:
+                 self._maybe_fuse_gate_weights()
+                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
+             else:
+                 router_logits = None
+-                if _glm5_route_v2_enabled():
++                if _glm5_route_v2_enabled() and not tried_first:
+                     # sm_80 decode: top-8 + Marlin block alignment fused into
+                     # one launch (VLLM_GLM5_ROUTE_V2); None = original path.
+                     from vllm.models.glm5next.nvidia.ops.route_v2_decode import (
+diff --git a/vllm/models/glm5next/nvidia/ops/route_v2_decode.py b/vllm/models/glm5next/nvidia/ops/route_v2_decode.py
+index 78a30a9..aa1a397 100644
+--- a/vllm/models/glm5next/nvidia/ops/route_v2_decode.py
++++ b/vllm/models/glm5next/nvidia/ops/route_v2_decode.py
+@@ -119,8 +119,19 @@ def _sigmoid(x):
+ 
+ 
+ @triton.jit
+-def _keys(logits_ptr, bias_ptr, row, stride_lm, e0,
+-          E: tl.constexpr, EW: tl.constexpr):
++def _load_tile(logits_ptr, bias_ptr, row, stride_lm, e0,
++               E: tl.constexpr, EW: tl.constexpr):
++    """Logits and bias of experts [e0, e0+EW) (loads only)."""
++    offs_e = e0 + tl.arange(0, EW)
++    valid_e = offs_e < E
++    b = tl.load(bias_ptr + offs_e, mask=valid_e, other=0.0).to(tl.float32)
++    x = tl.load(logits_ptr + row * stride_lm + offs_e, mask=valid_e,
++                other=0.0).to(tl.float32)
++    return x, b
++
++
++@triton.jit
++def _pack(x, b, e0, E: tl.constexpr, EW: tl.constexpr):
+     """[1, EW] packed (monotone(key) << 32 | E-1-e) for experts [e0, e0+EW).
+ 
+     key = sigmoid(x) + bias, the incumbent's preprocess_score: non-finite
+@@ -129,9 +140,6 @@ def _keys(logits_ptr, bias_ptr, row, stride_lm, e0,
+     """
+     offs_e = e0 + tl.arange(0, EW)
+     valid_e = offs_e < E
+-    b = tl.load(bias_ptr + offs_e, mask=valid_e, other=0.0).to(tl.float32)
+-    x = tl.load(logits_ptr + row * stride_lm + offs_e, mask=valid_e,
+-                other=0.0).to(tl.float32)
+     key = _sigmoid(x) + b
+     key = tl.where(key == 0.0, 0.0, key)
+     key = tl.where(_finite(x) & _finite(b), key, float("-inf"))
+@@ -149,9 +157,15 @@ def _route_row(logits_ptr, bias_ptr, topk_w_ptr, topk_ids_ptr, row,
+                RENORM: tl.constexpr):
+     """Top-8 of one row; stores ids (descending key, lower index on ties)
+     and weights with the incumbent's arithmetic.  Returns ids [1, 8]."""
+-    pa = _keys(logits_ptr, bias_ptr, row, stride_lm, 0, E, EA)
++    # 0023: both tiles are LOADED before either is computed (MM
++    # `_route_tile`): otherwise tile B's loads issue behind tile A's branchy
++    # libdevice tanh, one serialized L2 round trip per row.  Same arithmetic.
++    xa, ba = _load_tile(logits_ptr, bias_ptr, row, stride_lm, 0, E, EA)
+     if EB > 0:
+-        pb = _keys(logits_ptr, bias_ptr, row, stride_lm, EA, E, EB)
++        xb, bb = _load_tile(logits_ptr, bias_ptr, row, stride_lm, EA, E, EB)
++    pa = _pack(xa, ba, 0, E, EA)
++    if EB > 0:
++        pb = _pack(xb, bb, EA, E, EB)
+     ta = tl.topk(pa, 8)
+     if EB > 0:
+         tb = tl.topk(pb, 8)
+@@ -317,6 +331,15 @@ def mode() -> str:
+     return m
+ 
+ 
++def route_first() -> bool:
++    """VLLM_GLM5_ROUTE_V2_FIRST (default 0): with 1 the runner enqueues
++    route v2 before forking the shared experts onto the aux stream (0023).
++    0 keeps the route v2 order (shared experts forked first, co-running with
++    the router). Enqueue order only; numerics are unaffected either way.
++    Off by default: end-to-end GLM-5.3-Flash DFlash2 runs were slower with 1."""
++    return os.getenv("VLLM_GLM5_ROUTE_V2_FIRST", "0").strip() == "1"
++
++
+ def route_v2(bias: torch.Tensor, *, logits: torch.Tensor | None = None,
+              x: torch.Tensor | None = None, weight: torch.Tensor | None = None,
+              renormalize: bool = True, routed_scaling_factor: float = 1.0):

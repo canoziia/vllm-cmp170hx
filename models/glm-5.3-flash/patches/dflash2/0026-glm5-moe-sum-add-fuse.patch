@@ -1,0 +1,317 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: fuse routed moe_sum with the shared-expert add
+
+VLLM_GLM5_MOE_SUM_ADD (default 0; read once per process). MoERunner.forward
+arms a host-side hand-off around its experts call (decode: M <= 32, bf16,
+shared experts present, no routed scale/transform/padding/reduction/dispatch
+between experts and the add). The compiled Marlin decode then leaves its
+c3 [M,8,K] unsummed and the runner computes
+    bf16(f32(shared) + f32(bf16(sum_k f32(c3[:,k]))))
+in one Triton launch (port of Morrowmake idx_glue._moe_sum_add_kernel)
+instead of moe_sum + an elementwise bf16 add. Same slot order and rounding
+points: bit-identical. Any other MoE path is unchanged; an offer that cannot
+be fused is flushed with ops.moe_sum exactly as before.
+
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index d320c02..7a3e63c 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -53,6 +53,7 @@ from vllm.utils.torch_utils import (
+ )
+ 
+ logger = init_logger(__name__)
++_GLM5_MOE_SUM_ADD: bool | None = None  # VLLM_GLM5_MOE_SUM_ADD (0027), read once
+ 
+ 
+ def _glm5_route_v2_enabled() -> bool:
+@@ -745,16 +746,26 @@ class MoERunner(MoERunnerInterface):
+             )
+         )
+ 
+-        result = self._forward_entry(
+-            hidden_states,
+-            router_logits,
+-            shared_experts_input,
+-            input_ids,
+-            self._encode_layer_name(),
+-            self.moe_config.hidden_dim_unpadded
+-            if self._quant_method.has_unpadded_output
+-            else 0,
+-        )
++        # VLLM_GLM5_MOE_SUM_ADD (0027, default off): let the compiled Marlin
++        # decode leave its slot sum to the shared+routed add below.
++        msa = None
++        if self._glm5_moe_sum_add_gate(hidden_states, og_hidden_dim_pre_xform):
++            from vllm.models.glm5next.nvidia.ops import moe_sum_add as msa
++
++            msa.DEFERRAL.arm()
++        try:
++            result = self._forward_entry(
++                hidden_states,
++                router_logits,
++                shared_experts_input,
++                input_ids,
++                self._encode_layer_name(),
++                self.moe_config.hidden_dim_unpadded
++                if self._quant_method.has_unpadded_output
++                else 0,
++            )
++        finally:
++            pending_moe_sum = msa.DEFERRAL.take() if msa is not None else None
+ 
+         #
+         # Note: there are two all-reduce points below. They are mutually
+@@ -768,6 +779,16 @@ class MoERunner(MoERunnerInterface):
+         # Extract outputs from result
+         shared_output, fused_output = _unpack(result)
+         fused_output = cast(torch.Tensor, fused_output)
++        if pending_moe_sum is not None and not msa.can_fuse(
++            pending_moe_sum[0], shared_output
++        ):
++            # Not fusable after all: do the deferred sum where it would have
++            # gone (and into fused_output, should finalize have copied the
++            # unsummed buffer), then continue exactly as without the flag.
++            msa.flush(pending_moe_sum[0], pending_moe_sum[1])
++            if fused_output.data_ptr() != pending_moe_sum[1].data_ptr():
++                msa.flush(pending_moe_sum[0], fused_output)
++            pending_moe_sum = None
+ 
+         if og_hidden_dim_pre_xform is not None:
+             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
+@@ -796,7 +817,12 @@ class MoERunner(MoERunnerInterface):
+         # Apply output transform (e.g. latent -> full dim)
+         fused_output = self.apply_routed_output_transform(fused_output)
+ 
+-        if shared_output is not None:
++        if pending_moe_sum is not None:
++            # bf16(shared + bf16(slot-order fp32 sum)): same two roundings as
++            # moe_sum_vec_kernel followed by the add below, one launch.
++            assert shared_output is not None
++            result = msa.moe_sum_add(pending_moe_sum[0], shared_output)
++        elif shared_output is not None:
+             result = shared_output + fused_output
+         else:
+             result = fused_output
+@@ -807,6 +833,42 @@ class MoERunner(MoERunnerInterface):
+ 
+         return self._maybe_add_zero_expert_output(result)
+ 
++    def _glm5_moe_sum_add_gate(
++        self, hidden_states: torch.Tensor, og_hidden_dim_pre_xform
++    ) -> bool:
++        """May the routed slot sum be deferred into the shared add (0027)?
++
++        Everything between the experts' sum and ``shared + routed`` must be the
++        identity: no routed scale, no output transform, no reduction of the
++        routed output before the add, no padding, no dispatch/combine. Decode
++        sizes only.
++        """
++        global _GLM5_MOE_SUM_ADD
++        if _GLM5_MOE_SUM_ADD is None:
++            import os
++
++            _GLM5_MOE_SUM_ADD = os.getenv("VLLM_GLM5_MOE_SUM_ADD", "0").strip() == "1"
++        if not _GLM5_MOE_SUM_ADD:
++            return False
++        from vllm.models.glm5next.nvidia.ops import moe_sum_add as msa
++
++        mc = self.moe_config
++        return not (
++            self._shared_experts is None
++            or self.routed_scaling_factor != 1.0
++            or self.routed_output_transform is not None
++            or og_hidden_dim_pre_xform is not None
++            or self._fused_output_is_reduced
++            or self.do_naive_dispatch_combine
++            or mc.pcp_size > 1
++            or mc.is_sequence_parallel
++            or hidden_states.dim() != 2
++            or hidden_states.shape[0] > msa.MAX_TOKENS
++            or hidden_states.dtype != torch.bfloat16
++            or isinstance(self.router, ZeroExpertRouter)
++            or torch.compiler.is_compiling()
++        )
++
+     @property
+     def do_naive_dispatch_combine(self) -> bool:
+         return (
+diff --git a/vllm/models/glm5next/nvidia/ops/marlin_decode.py b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+index 0cb7385..6ee8fd5 100644
+--- a/vllm/models/glm5next/nvidia/ops/marlin_decode.py
++++ b/vllm/models/glm5next/nvidia/ops/marlin_decode.py
+@@ -360,6 +360,11 @@ def run(layer, output, hidden_states, w1, w2, topk_weights, topk_ids,
+         _clamp_limit(layer.activation_config), h)
+     gemm(h, w2, layer.w2_scale, sorted_ids, expert_ids, ntpp, tw, topk, slots,
+          N, K, False, N // 16, c2, ctr, c3)
++    from . import moe_sum_add as _msa
++    if _msa.enabled() and _msa.DEFERRAL.offer(c3.view(M, topk, K), output):
++        # VLLM_GLM5_MOE_SUM_ADD (0027): the MoE runner armed the hand-off and
++        # fuses this slot sum with the shared-expert add (bitwise the same).
++        return output
+     layer.moe_sum(c3.view(M, topk, K), output, topk_ids, None)
+     return output
+ 
+@@ -464,6 +469,8 @@ def warmup_from_worker(worker) -> None:
+             "layer was found on this rank; unset the flag for this model.")
+     with torch.cuda.device(device), torch.inference_mode():
+         _counters(device)
++        from . import moe_sum_add as _msa
++        _msa.warmup(device)
+         # Every layer is gated (cheap); the numerical check runs on the first.
+         _, experts, w13, w2, act = layers[0]
+         errors = self_check(experts, w13, w2, act, tokens)
+diff --git a/vllm/models/glm5next/nvidia/ops/moe_sum_add.py b/vllm/models/glm5next/nvidia/ops/moe_sum_add.py
+new file mode 100644
+index 0000000..6f6dc6c
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/ops/moe_sum_add.py
+@@ -0,0 +1,149 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Routed ``moe_sum`` fused with the shared-expert add (VLLM_GLM5_MOE_SUM_ADD).
++
++Port of Morrowmake's ``idx_glue`` "moesum" item (mm-vllm
++``vllm/ampere_decode/idx_glue.py:728-796`` and the runner hand-off in
++``fused_moe/runner/moe_runner.py:868-948``), restricted to the compiled sm_80
++Marlin decode (``marlin_decode.run``).
++
++Incumbent per MoE layer (decode, shared experts present, no reduction or
++transform between the experts and the add):
++
++    moe_sum_vec_kernel   c3[M, topk, H] -> routed[M, H]   (fp32 slot-order sum,
++                                                           one bf16 rounding)
++    elementwise add      shared + routed                  (fp32 opmath,
++                                                           one bf16 rounding)
++
++Fused: one Triton launch computing exactly the same two roundings:
++
++    out = bf16( f32(shared) + f32( bf16( sum_{k=0..topk-1} f32(c3[t, k]) ) ) )
++
++The slot order (k = 0, 1, ..., topk-1, accumulator starting at +0.0) and both
++rounding points are the incumbent's, so the result is bitwise identical (no
++summation order change).  ``tests/step/gpu_moe_sum_add.py`` checks this.
++Note: Triton 3.x folds the final ``bf16(f32(a) + f32(b))`` into
++``fma.rn.bf16 a*1.0+b`` (a single rounding).  For addition, rounding the
++fp32 sum and then to bf16 equals rounding the exact sum once (fp32 has
++24 >= 2*8+2 significand bits, Figueroa's double-rounding bound), so this is
++still the incumbent's result bit for bit.
++
++Hand-off: ``MoERunner.forward`` arms ``DEFERRAL`` around its experts call when
++the gate below holds; ``marlin_decode.run`` offers its ``c3`` instead of
++summing (only the first offer after an arm is taken); the runner takes it
++back and either fuses with the shared output or, if the shapes do not fit,
++performs the deferred sum exactly as before.  Single-threaded host state, read
++only while enqueuing; inside a CUDA graph capture the decision is baked in per
++captured size exactly like every other Python branch of the forward.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++_ENABLED: bool | None = None
++MAX_TOKENS = 32
++
++
++def enabled() -> bool:
++    """VLLM_GLM5_MOE_SUM_ADD=1 (default off; read once)."""
++    global _ENABLED
++    if _ENABLED is None:
++        _ENABLED = os.getenv("VLLM_GLM5_MOE_SUM_ADD", "0").strip() == "1"
++    return _ENABLED
++
++
++@triton.jit
++def _moe_sum_add_kernel(out_ptr, in_ptr, sh_ptr, H, s_tok, s_topk, s_h,
++                        sh_s0, sh_s1, out_s0,
++                        TOPK: tl.constexpr, BLOCK_H: tl.constexpr):
++    t = tl.program_id(0)
++    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
++    mask = h < H
++    base = in_ptr + t.to(tl.int64) * s_tok + h * s_h
++    acc = tl.zeros([BLOCK_H], tl.float32)
++    for k in tl.static_range(TOPK):
++        acc += tl.load(base + k * s_topk, mask=mask, other=0.0).to(tl.float32)
++    # bf16 rounding of the routed sum, as moe_sum_vec_kernel stores it
++    routed = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
++    sh = tl.load(sh_ptr + t.to(tl.int64) * sh_s0 + h * sh_s1, mask=mask,
++                 other=0.0).to(tl.float32)
++    tl.store(out_ptr + t.to(tl.int64) * out_s0 + h,
++             (sh + routed).to(out_ptr.dtype.element_ty), mask=mask)
++
++
++def moe_sum_add(inp: torch.Tensor, shared: torch.Tensor,
++                out: torch.Tensor | None = None) -> torch.Tensor:
++    """``shared + moe_sum(inp)`` in one launch; ``inp`` [M, topk, H]."""
++    M, topk, H = inp.shape
++    assert shared.shape == (M, H) and shared.dtype == inp.dtype
++    if out is None:
++        out = torch.empty((M, H), dtype=inp.dtype, device=inp.device)
++    assert out.shape == (M, H) and out.stride(1) == 1
++    if M == 0:
++        return out
++    block_h = 256 if H >= 256 else max(16, triton.next_power_of_2(H))
++    _moe_sum_add_kernel[(M, triton.cdiv(H, block_h))](
++        out, inp, shared, H, inp.stride(0), inp.stride(1), inp.stride(2),
++        shared.stride(0), shared.stride(1), out.stride(0),
++        TOPK=topk, BLOCK_H=block_h, num_warps=4, num_stages=1,
++    )
++    return out
++
++
++def flush(inp: torch.Tensor, out: torch.Tensor) -> None:
++    """The deferred sum done exactly as the incumbent (``ops.moe_sum``)."""
++    from vllm import _custom_ops as ops
++
++    ops.moe_sum(inp, out)
++
++
++class _MoeSumDeferral:
++    def __init__(self) -> None:
++        self.armed = False
++        self.pending: tuple[torch.Tensor, torch.Tensor] | None = None
++
++    def arm(self) -> None:
++        self.armed = True
++        self.pending = None
++
++    def offer(self, inp: torch.Tensor, out: torch.Tensor) -> bool:
++        if not self.armed:
++            return False
++        self.armed = False
++        self.pending = (inp, out)
++        return True
++
++    def take(self) -> tuple[torch.Tensor, torch.Tensor] | None:
++        self.armed = False
++        p, self.pending = self.pending, None
++        return p
++
++
++DEFERRAL = _MoeSumDeferral()
++
++
++def can_fuse(inp: torch.Tensor, shared: torch.Tensor | None) -> bool:
++    return (
++        shared is not None
++        and shared.dim() == 2
++        and inp.dim() == 3
++        and shared.dtype == inp.dtype
++        and shared.shape[0] == inp.shape[0]
++        and shared.shape[1] == inp.shape[2]
++        and shared.stride(1) == 1
++    )
++
++
++def warmup(device, hidden: int = 4096, topk: int = 8) -> None:
++    """Compile the Triton binary outside any CUDA graph capture."""
++    if not enabled() or torch.cuda.is_current_stream_capturing():
++        return
++    for m in (1, 8):
++        x = torch.zeros((m, topk, hidden), dtype=torch.bfloat16, device=device)
++        s = torch.zeros((m, hidden), dtype=torch.bfloat16, device=device)
++        moe_sum_add(x, s)

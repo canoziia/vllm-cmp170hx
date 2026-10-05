@@ -23,7 +23,19 @@
 | 0015 | 0022 | `test_indexer_jit_warmup_gpu.py` | sm_80 | 整机：冷启动首个 110k 请求 28.9 s → 18.0 s |
 | 0016 | 0023 | `test_pp_fold_draft_fc_container.py`、`test_pp_fold_draft_fc_gpu.py` | CPU 容器 / sm_80（`--draft` 指向 drafter） | 未确认 |
 
-0007（融合 grouped conv）没有单独测试；它由整机 A/B 覆盖。
+| 0017 | 0017 | `test_mhc_v2_full_gpu.py` | sm_80；`OURS_V2` 默认取 `$GLM_DFLASH2_TREE/.../mhc_decode_v2.py`；`GATE=1` 测真实入口 | GPU 数值与 graph 通过（开发阶段） |
+| 0018–0020 | 0018–0020 | `test_host_overhead_gpu.py` | CUDA + 打过补丁的 vllm | GPU 逐位通过（开发阶段） |
+| 0021 | 0021 | `test_pp_draft_tail_gpu.py` | CUDA（thin GEMM 层需 sm_80）；`--draft` 可选 | 开发阶段（审计前版本）编写 |
+| 0021 | 0021 | `test_pp_tail_topk_audit_gpu.py` | CUDA + FlashInfer（镜像内版本） | FlashInfer 双流隔离 GPU 通过（开发阶段） |
+| 0023 | 0023 | `bench_route_first_gpu.py`、`fixtures/route_v2_decode_pre0023.py` | sm_80；不 import vllm，按文件路径加载 | kernel 逐位不变（开发阶段） |
+| 0024 | 0024 | `bench_idx_glue_gpu.py` | sm_80；需要 `--run-gpu` | GPU 逐位通过（开发阶段） |
+| 0026 | 0027 | `test_moe_sum_add_gpu.py`（第 3 项需 `vllm._ampere_marlin_C` 与 `marlin_decode_common.py`） | sm_80 | GPU 逐位 512/512（开发阶段） |
+| 0028 | 0026b | `bench_prenorm_bf16x3_gpu.py`（`--mm-file` 指向对方 `ampere_prefill/mhc_prenorm.py`） | sm_80 | T=2312 923 → 154 μs；T ≥ 384 与对方逐位、T < 384 与 0025 逐位（开发阶段） |
+| 0027 | 0028 | `bench_shared_reorder_gpu.py`（+ `marlin_decode_common.py`） | sm_80 + `vllm._ampere_marlin_C` | 逐位（开发阶段） |
+
+0007（融合 grouped conv）没有单独测试；它由整机 A/B 覆盖。0022（profile 占位收紧）与 0025（fp32 prenorm）
+没有单元测试：0022 由 KV 池大小与 243k/8×114k 压力测试覆盖，0025 由相同历史首块与对方逐位比较覆盖
+（该诊断 overlay 不在仓库内）。
 
 “未确认”表示本仓库整理时没有对应的 GPU 运行记录，不代表失败。
 
@@ -59,3 +71,38 @@ podman run --rm -it --device nvidia.com/gpu=5 --security-opt label=disable \
 - `test_pp_fold_draft_fc_gpu.py --draft /root/app/models/GLM-5.3-Flash-DFlash2` 读取真实 drafter 的 `fc.weight`。
 - `test_adaptive_k_container.py` 需要 vLLM 源码树的 `tests/` 目录（镜像中没有），请在应用过补丁的源码树中运行：`cd <source> && python -m pytest -q <repo>/models/glm-5.3-flash/tests/dflash2/test_adaptive_k_container.py`。
 - 容器是 `--rm` 的一次性环境，`pip install pytest` 不影响镜像。
+
+### 0017–0028（新镜像内）
+
+```bash
+cd /root/app/vllm-cmp170hx
+podman run --rm -it --device nvidia.com/gpu=5 --security-opt label=disable \
+  -v "$PWD/models/glm-5.3-flash/tests/dflash2":/tests:ro \
+  -v /root/app/models:/root/app/models:ro \
+  -w /tests --entrypoint bash localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2 -c '
+    python3 -m pip install -q pytest 2>/dev/null || true
+    export PYTHONDONTWRITEBYTECODE=1
+    set -e
+    GATE=1 BENCH=0 python3 test_mhc_v2_full_gpu.py                       # 0017
+    python3 -m pytest -q -s -p no:cacheprovider test_host_overhead_gpu.py # 0018-0020
+    VLLM_GLM5_THIN_GEMM=1 python3 test_pp_draft_tail_gpu.py \
+        --draft /root/app/models/GLM-5.3-Flash-DFlash2                    # 0021
+    VLLM_GLM5_THIN_GEMM=0 python3 test_pp_draft_tail_gpu.py
+    python3 -m pytest -q -s -p no:cacheprovider test_pp_tail_topk_audit_gpu.py
+    python3 bench_route_first_gpu.py --ms 1,4,8                           # 0023
+    python3 bench_idx_glue_gpu.py --run-gpu                               # 0024
+    python3 test_moe_sum_add_gpu.py                                       # 0026
+    python3 bench_shared_reorder_gpu.py --tokens 4,8                      # 0027
+    # 0028：需要对方源码，另挂载 -v <MM>:/mm:ro
+    # python3 bench_prenorm_bf16x3_gpu.py --mm-file /mm/vllm/ampere_prefill/mhc_prenorm.py \
+    #     --mm-tl-file /mm/vllm/model_executor/kernels/mhc/tilelang_kernels.py
+  '
+```
+
+- 所有脚本默认从镜像 site-packages 读取被测文件；要测另一份源码树，设 `GLM_DFLASH2_TREE=<树根>`
+  并把它放进 `PYTHONPATH`。
+- `test_mhc_v2_full_gpu.py`：`MM_V2=<Morrowmake>/vllm/ampere_decode/mhc_decode_v2.py` 可加入对方实现对比；
+  `REAL_CKPT=/root/app/models/GLM-5.3-Flash-W4A16-MTP` 使用真实权重。
+- `bench_route_first_gpu.py`：`--orig` 默认是 0023 之前的 route v2（`fixtures/`），`--new` 默认是镜像内文件，
+  `--mm` 可选。
+- `test_pp_draft_tail_gpu.py --no-private` 是负对照（thin GEMM 开启时允许失败）。

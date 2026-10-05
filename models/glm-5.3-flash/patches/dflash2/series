@@ -14,3 +14,15 @@
 0014-glm5-pp-kda-prefill.patch
 0015-glm5-indexer-jit-warmup.patch
 0016-glm5-pp-fold-draft-fc.patch
+0017-glm5-mhc-decode-v2-full.patch
+0018-glm5-gdn-prologue-fuse.patch
+0019-glm5-prologue-packed-h2d.patch
+0020-glm5-sparse-mla-device-req-ids.patch
+0021-pp-draft-tail-stage2.patch
+0022-glm5-mla-profile-workspace-clamp.patch
+0023-glm5-route-v2-first-before-shared.patch
+0024-glm5-decode-idx-glue.patch
+0025-glm5-target-prenorm-fp32.patch
+0026-glm5-moe-sum-add-fuse.patch
+0027-glm5-shared-expert-reorder.patch
+0028-mhc-prenorm-bf16x3-prefill.patch
