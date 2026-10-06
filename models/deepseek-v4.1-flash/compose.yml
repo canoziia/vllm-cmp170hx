@@ -80,6 +80,12 @@ services:
       VLLM_DSV4_CUDA_DET_ALIGN: "1"
       # patch 0009: fp8 copy of lm_head for draft logits (target stays bf16).
       VLLM_DSPARK_DRAFT_HEAD_FP8: "1"
+      # patch 0010: thin-M wo_a GEMM (decode).
+      VLLM_DSV41_THIN_WOA: "1"
+      # patch 0011: MXFP4 MoE prefill split-list.
+      VLLM_DSV41_MOE_PREFILL_SPLIT: "1"
+      # patch 0012: fast sm80 prefill indexer (logits bitwise, same top-512 set).
+      VLLM_DSV41_INDEXER_PREFILL_FAST: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 

@@ -62,6 +62,7 @@ PAYLOAD_CID=
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
 cp -a "$MODEL_DIR/native/dsv4_moe" "$WORKDIR/context/dsv4_moe"
+cp -a "$MODEL_DIR/native/dsv41_indexer" "$WORKDIR/context/dsv41_indexer"
 INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 
 # One build, as for Qwen: the pinned vLLM tree and shared LMCache payload are
@@ -73,11 +74,15 @@ COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY lmcache-payload/ /opt/lmcache-patched/
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 COPY dsv4_moe/ /tmp/dsv4_moe/
+COPY dsv41_indexer/ /tmp/dsv41_indexer/
 # patch 0004: compile the MXFP4 decode kernels into the vllm package (no GPU
 # needed; sm_80 only). The library is loaded only with VLLM_DSV4_MXFP4_DECODE=1.
 RUN bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build /tmp/dsv4_moe /root/.cache/torch_extensions \\
-    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv4_moe_C.abi3.so
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv4_moe_C.abi3.so \\
+    && bash /tmp/dsv41_indexer/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
+    && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build /tmp/dsv41_indexer /root/.cache/torch_extensions \\
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_indexer_C.abi3.so
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/vllm /opt/lmcache-patched/lmcache \
     && python3 -c 'import lmcache,sys,torch,lmcache.cuda_ops,lmcache.lmcache_native,lmcache.lmcache_fs; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert sys.version_info[:2] == (3,12); assert torch.version.cuda == "13.0"; print(lmcache.__version__, lmcache.__file__, torch.__version__, torch.version.cuda)' \
