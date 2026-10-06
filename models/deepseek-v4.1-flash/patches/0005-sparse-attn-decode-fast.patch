@@ -1,0 +1,132 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek: faster sm80 sparse-attention decode, bitwise identical
+
+VLLM_DSV4_SPARSE_DECODE_FAST (default 0 = unchanged), sm80 split-K decode
+path only. The fp8 K cache is decoded with integer placement (e4m3 byte as
+bf16 v * 2^-120, times 2^120, times the e8m0 scale; NaN codes -> 0, scale
+byte 0 -> 2^-127) instead of a 256-entry LUT gather plus exp2 per element,
+the kernel runs with 8 warps, and batches of more than 16 queries use
+32-head blocks so each K tile is decoded half as often. The split count is
+still derived from 16-head blocks, so every head sees the same K slices and
+merge order: the output is bitwise identical to the deployed kernel.
+
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index 72803e4..f091712 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -6,6 +6,8 @@ import math
+ from collections.abc import Callable
+ from importlib.util import find_spec
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ 
+@@ -2305,6 +2307,7 @@ def _sparse_attn_decode_partial_kernel(
+     BLOCK_K: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
+     NUM_STAGES: tl.constexpr,
++    FAST_FP8: tl.constexpr = False,
+ ):
+     query_idx = tl.program_id(0)
+     split_id = tl.program_id(1)
+@@ -2366,14 +2369,25 @@ def _sparse_attn_decode_partial_kernel(
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+-        k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
+         encoded_scales = tl.load(
+             token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+             mask=valid[:, None] & nope_mask[None, :],
+             other=127,
+         )
+-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
++        if FAST_FP8 and not IS_FNUZ_MAIN:
++            # exact: e4m3 byte placed as bf16 (v * 2^-120), * 2^120, * 2^(s-127)
++            u16 = x_uint8.to(tl.uint16)
++            placed = ((u16 & 0x80) << 8) | ((u16 & 0x7F) << 4)
++            kv = placed.to(tl.bfloat16, bitcast=True) * 1.329227995784916e36
++            s16 = encoded_scales.to(tl.uint16)
++            sbits = tl.where(s16 == 0, 0x0040, s16 << 7).to(tl.uint16)
++            k_nope = kv.to(tl.bfloat16) * sbits.to(tl.bfloat16, bitcast=True)
++            nan_code = (x_uint8 & 0x7F) == 0x7F
++            k_nope = tl.where(nan_code, zero_nope, k_nope)
++        else:
++            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
++            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
++            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+         k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -2434,14 +2448,25 @@ def _sparse_attn_decode_partial_kernel(
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+-            k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
+             encoded_scales = tl.load(
+                 token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=127,
+             )
+-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
++            if FAST_FP8 and not IS_FNUZ_EXTRA:
++                # exact: e4m3 byte placed as bf16 (v * 2^-120), * 2^120, * 2^(s-127)
++                u16 = x_uint8.to(tl.uint16)
++                placed = ((u16 & 0x80) << 8) | ((u16 & 0x7F) << 4)
++                kv = placed.to(tl.bfloat16, bitcast=True) * 1.329227995784916e36
++                s16 = encoded_scales.to(tl.uint16)
++                sbits = tl.where(s16 == 0, 0x0040, s16 << 7).to(tl.uint16)
++                k_nope = kv.to(tl.bfloat16) * sbits.to(tl.bfloat16, bitcast=True)
++                nan_code = (x_uint8 & 0x7F) == 0x7F
++                k_nope = tl.where(nan_code, zero_nope, k_nope)
++            else:
++                k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
++                scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
++                k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+             k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+ 
+@@ -3799,6 +3824,17 @@ def _rocm_sparse_attn_decode_ragged_triton(
+         extra_indptr = torch.zeros(num_queries + 1, device=q.device, dtype=torch.int32)
+ 
+     block_h = 16
++    # VLLM_DSV4_SPARSE_DECODE_FAST (sm80 split-K path only): integer fp8
++    # decode, 8 warps, and 32-head blocks for > 16 queries. The split count
++    # below is still derived from 16-head blocks, so every head sees the same
++    # K slices and merge order: the output is bitwise identical.
++    sparse_fast = (
++        os.environ.get("VLLM_DSV4_SPARSE_DECODE_FAST", "0") == "1"
++        and _use_split_k_decode()
++        and not _ON_GFX950
++    )
++    if sparse_fast and num_queries > 16:
++        block_h = 32
+     if out is None:
+         out = torch.empty_like(q, dtype=torch.bfloat16)
+     else:
+@@ -3873,8 +3909,11 @@ def _rocm_sparse_attn_decode_ragged_triton(
+         inv_q = 1.0 / max(1, num_queries)
+         avg_main_len = main_indices.numel() * inv_q
+         avg_extra_len = (extra_indices.numel() * inv_q) if has_extra else 0.0
++        # Split count from the 16-head blocking regardless of
++        # VLLM_DSV4_SPARSE_BLOCK_H, so every head sees the same K slices and
++        # merge order (bitwise-identical output).
+         num_splits = _decode_num_splits(
+-            num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
++            num_queries, triton.cdiv(num_heads, 16), avg_main_len, avg_extra_len, block_k
+         )
+ 
+     base_workgroups = num_queries * heads_blocks
+@@ -3978,7 +4017,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
+             BLOCK_K=block_k,
+             NUM_SPLITS=num_splits,
+             NUM_STAGES=1,
+-            num_warps=4,
++            FAST_FP8=sparse_fast,
++            num_warps=8 if sparse_fast else 4,
+         )
+ 
+     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](

@@ -63,6 +63,8 @@ services:
       # patch 0004: weight-streaming MXFP4 MoE decode kernels (<= 64 tokens;
       # prefill and anything else keeps Marlin). 0 = Marlin everywhere.
       VLLM_DSV4_MXFP4_DECODE: "1"
+      # patch 0005: faster sm80 sparse-attention decode (bitwise identical).
+      VLLM_DSV4_SPARSE_DECODE_FAST: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
