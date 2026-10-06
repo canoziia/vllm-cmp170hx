@@ -3,3 +3,6 @@
 0003-deterministic-moe-align-single-kernel.patch
 0004-mxfp4-moe-decode-kernels.patch
 0005-sparse-attn-decode-fast.patch
+0006-dsv41-fused-small-decode-kernels.patch
+0007-dsv4-mhc-decode-v2.patch
+0008-mxfp4-decode-v2-fused.patch

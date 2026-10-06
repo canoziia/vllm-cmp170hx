@@ -1,0 +1,479 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4.1: fuse small decode kernels around sparse attention
+
+Default off, each behind its own switch; switch off runs the original code.
+VLLM_DSV41_TOPK_RAGGED_FUSED: the 5-launch top-k ragged metadata build (lens,
+zeros, two cumsums, pack) as one Triton kernel (M <= 256, integer, bitwise).
+VLLM_DSV41_TOPK_RAGGED_REUSE: build it once per index source per step
+(epoch-invalidated cache). VLLM_DSV4_ATTN_DIRECT_OUT: sparse attention writes
+straight into the output buffer (no per-layer DtoD copy, no fake SWA-only
+indptr). VLLM_DSV41_SWA_RAGGED_INPLACE: SWA ragged build in place.
+VLLM_DSV41_INDEXER_Q_LUT_FUSED: indexer q LUT decode in one kernel. All
+bitwise identical (tests/test_dsv41_small_kernels_gpu.py).
+
+diff --git a/vllm/models/deepseek_v4_1/amd/rocm.py b/vllm/models/deepseek_v4_1/amd/rocm.py
+index 038053d..bd2e76c 100644
+--- a/vllm/models/deepseek_v4_1/amd/rocm.py
++++ b/vllm/models/deepseek_v4_1/amd/rocm.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import functools
++import os
+ from dataclasses import dataclass
+ from typing import cast
+ 
+@@ -13,7 +14,7 @@ from vllm.distributed import (
+ )
+ from vllm.forward_context import get_forward_context
+ from vllm.logger import init_logger
+-from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
++from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention, topk_epoch
+ from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
+ from vllm.models.deepseek_v4_1.sparse_mla import (
+     DeepseekV4FlashMLAMetadata,
+@@ -363,6 +364,247 @@ def compute_global_topk_ragged_indices_and_indptr(
+     return global_topk_ragged, topk_indptr, topk_lens
+ 
+ 
++# ---------------------------------------------------------------------------
++# VLLM_DSV41_TOPK_RAGGED_FUSED / VLLM_DSV41_TOPK_RAGGED_REUSE
++# ---------------------------------------------------------------------------
++
++
++@functools.cache
++def _topk_ragged_fused_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_TOPK_RAGGED_FUSED", "0") == "1"
++
++
++@functools.cache
++def _topk_ragged_reuse_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_TOPK_RAGGED_REUSE", "0") == "1"
++
++
++# Above this many decode rows the per-program recount (O(rows^2 * topk) L2
++# reads) stops paying; fall back to the 3-kernel chain.
++_FUSED_TOPK_RAGGED_MAX_ROWS = 256
++
++
++@triton.jit
++def _fused_topk_ragged_kernel(
++    global_topk_ragged_ptr,
++    topk_indptr_ptr,
++    topk_lens_ptr,
++    topk_indices_ptr,
++    topk_indices_stride,
++    token_to_req_indices_ptr,
++    block_table_ptr,
++    block_table_stride,
++    is_valid_token_ptr,
++    block_size,
++    topk,
++    num_tokens,
++    BLOCK_TOPK: tl.constexpr,
++    ROWS: tl.constexpr,
++):
++    """compute_topk_lens + exclusive scan + pack_global_topk_ragged, 1 launch.
++
++    Program ``t`` recounts the valid entries of rows ``0..t`` (ROWS rows per
++    2-D load) to get its own exclusive prefix, then packs its row exactly as
++    ``_pack_global_topk_ragged_kernel`` does. Integer-only, so indptr / lens
++    / packed slot ids are bit-identical to the unfused chain.
++    """
++    t = tl.program_id(0)
++    cols = tl.arange(0, BLOCK_TOPK)
++    col_mask = cols < topk
++    row_off = tl.arange(0, ROWS)
++
++    prefix = tl.zeros((), dtype=tl.int32)
++    own = tl.zeros((), dtype=tl.int32)
++    for r0 in range(0, t + 1, ROWS):
++        rows = r0 + row_off
++        rmask = rows <= t
++        vals = tl.load(
++            topk_indices_ptr + rows[:, None] * topk_indices_stride + cols[None, :],
++            mask=rmask[:, None] & col_mask[None, :],
++            other=-1,
++        )
++        cnt = tl.sum((vals >= 0).to(tl.int32), axis=1)
++        valid = tl.load(is_valid_token_ptr + rows, mask=rmask, other=0) != 0
++        cnt = tl.where(valid & rmask, cnt, 0)
++        prefix += tl.sum(tl.where(rows < t, cnt, 0), axis=0)
++        own += tl.sum(tl.where(rows == t, cnt, 0), axis=0)
++
++    tl.store(topk_lens_ptr + t, own)
++    tl.store(topk_indptr_ptr + t + 1, prefix + own)
++    if t == 0:
++        tl.store(topk_indptr_ptr, 0)
++
++    # Pack: identical arithmetic to _pack_global_topk_ragged_kernel.
++    if own > 0:
++        req_idx = tl.load(token_to_req_indices_ptr + t)
++        mask = (cols < own) & col_mask
++        local_idx = tl.load(
++            topk_indices_ptr + t * topk_indices_stride + cols,
++            mask=mask,
++            other=-1,
++        )
++        valid_e = mask & (local_idx >= 0)
++        block_indices = local_idx // block_size
++        block_numbers = tl.load(
++            block_table_ptr + req_idx * block_table_stride + block_indices,
++            mask=valid_e,
++            other=0,
++        )
++        block_offsets = local_idx % block_size
++        slot_ids = tl.where(valid_e, block_numbers * block_size + block_offsets, -1)
++        tl.store(global_topk_ragged_ptr + prefix + cols, slot_ids, mask=mask)
++
++
++def fused_global_topk_ragged_indices_and_indptr(
++    topk_indices: torch.Tensor,
++    token_to_req_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    block_size: int,
++    is_valid_token: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Single-launch drop-in for compute_global_topk_ragged_indices_and_indptr.
++
++    Same outputs (dtype, shape, values in every position a reader may touch:
++    ``indptr``, ``lens`` and ``ragged[:indptr[-1]]``).
++    """
++    topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
++    num_tokens = topk_indices.shape[0]
++    topk = topk_indices.shape[1]
++    if (
++        num_tokens == 0
++        or topk == 0
++        or num_tokens > _FUSED_TOPK_RAGGED_MAX_ROWS
++        or topk > 2048
++        or block_table.stride(-1) != 1
++    ):
++        return compute_global_topk_ragged_indices_and_indptr(
++            topk_indices, token_to_req_indices, block_table, block_size,
++            is_valid_token,
++        )
++    device = topk_indices.device
++    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
++    topk_indptr = torch.empty(num_tokens + 1, dtype=torch.int32, device=device)
++    global_topk_ragged = torch.empty(
++        num_tokens * topk, dtype=torch.int32, device=device
++    )
++    block_topk = triton.next_power_of_2(topk)
++    # Keep the 2-D recount tile at <= 8K int32 (32 per thread at 8 warps).
++    rows = max(1, min(16, 8192 // block_topk))
++    _fused_topk_ragged_kernel[(num_tokens,)](
++        global_topk_ragged,
++        topk_indptr,
++        topk_lens,
++        topk_indices,
++        topk_indices.stride(0),
++        token_to_req_indices,
++        block_table,
++        block_table.stride(0),
++        is_valid_token,
++        block_size,
++        topk,
++        num_tokens,
++        BLOCK_TOPK=block_topk,
++        ROWS=rows,
++        num_warps=8,
++    )
++    return global_topk_ragged, topk_indptr, topk_lens
++
++
++# Cross-layer reuse of the decode topk ragged metadata. Every compressed layer
++# up to the next index source reads the same topk_indices_buffer, the same
++# token->request map / validity mask and (per compressed cache) the same block
++# table, so the packed slot ids are identical; only the first consumer has to
++# build them. ``topk_epoch()`` advances every time an indexer is about to
++# (re)write the topk buffer (Indexer.forward, the eager indexer_op break and
++# shadow-source replays),
++# so an entry can never outlive the buffer contents it was derived from.
++_TOPK_RAGGED_CACHE: dict[tuple, tuple[int, tuple]] = {}
++
++
++def _topk_ragged_cache_key(
++    topk_indices: torch.Tensor,
++    token_to_req_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    block_size: int,
++    is_valid_token: torch.Tensor,
++) -> tuple:
++    def sig(x: torch.Tensor) -> tuple:
++        return (x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype)
++
++    return (
++        sig(topk_indices),
++        sig(token_to_req_indices),
++        sig(block_table),
++        sig(is_valid_token),
++        int(block_size),
++        topk_indices.device,
++    )
++
++
++def decode_global_topk_ragged(
++    topk_indices: torch.Tensor,
++    token_to_req_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    block_size: int,
++    is_valid_token: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Dispatch for the decode topk ragged build (both flags default off)."""
++    build = (
++        fused_global_topk_ragged_indices_and_indptr
++        if _topk_ragged_fused_enabled()
++        else compute_global_topk_ragged_indices_and_indptr
++    )
++    if not _topk_ragged_reuse_enabled():
++        return build(
++            topk_indices, token_to_req_indices, block_table, block_size,
++            is_valid_token,
++        )
++    key = _topk_ragged_cache_key(
++        topk_indices, token_to_req_indices, block_table, block_size,
++        is_valid_token,
++    )
++    hit = _TOPK_RAGGED_CACHE.get(key)
++    epoch = topk_epoch()
++    if hit is not None and hit[0] == epoch:
++        return hit[1]
++    result = build(
++        topk_indices, token_to_req_indices, block_table, block_size,
++        is_valid_token,
++    )
++    if len(_TOPK_RAGGED_CACHE) > 64:
++        _TOPK_RAGGED_CACHE.clear()
++    _TOPK_RAGGED_CACHE[key] = (epoch, result)
++    return result
++
++
++@functools.cache
++def _swa_ragged_inplace_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_SWA_RAGGED_INPLACE", "0") == "1"
++
++
++def _build_ragged_into_graph_buffers(
++    dense_indices: torch.Tensor,
++    lengths: torch.Tensor,
++    ragged_indices_buffer: torch.Tensor,
++    ragged_indptr_buffer: torch.Tensor,
++    num_rows: int,
++    max_entries_per_row: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """VLLM_DSV41_SWA_RAGGED_INPLACE: build straight into the persistent
++    buffers (V4 already does this) instead of build + two DtoD copies.
++    Returns the same views ``_copy_ragged_to_graph_buffers`` returns off
++    gfx950; every value a reader can reach (indptr and the first NNZ
++    indices) is bit-identical."""
++    max_entries = max(num_rows * max_entries_per_row, 1)
++    build_ragged_indices_from_dense(
++        dense_indices,
++        lengths,
++        indices_out=ragged_indices_buffer[:max_entries],
++        indptr_out=ragged_indptr_buffer[: num_rows + 1],
++    )
++    return ragged_indices_buffer[:max_entries], ragged_indptr_buffer[: num_rows + 1]
++
++
+ def _copy_ragged_to_graph_buffers(
+     ragged_indices: torch.Tensor,
+     ragged_indptr: torch.Tensor,
+@@ -439,6 +681,22 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
+             and base.decode_swa_indices is not None
+             and base.decode_swa_lens is not None
+         ):
++            if _swa_ragged_inplace_enabled() and not _ON_GFX950:
++                ragged_indices, ragged_indptr = _build_ragged_into_graph_buffers(
++                    base.decode_swa_indices.reshape(
++                        base.num_decode_tokens, base.decode_swa_width
++                    ),
++                    base.decode_swa_lens,
++                    self.decode_swa_ragged_indices_buffer,
++                    self.decode_swa_ragged_indptr_buffer,
++                    base.num_decode_tokens,
++                    base.decode_swa_width,
++                )
++                return DeepseekV4ROCMAiterSparseSWAMetadata(
++                    **vars(base),
++                    decode_swa_ragged_indices=ragged_indices,
++                    decode_swa_ragged_indptr=ragged_indptr,
++                )
+             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                 base.decode_swa_indices.reshape(
+                     base.num_decode_tokens, base.decode_swa_width
+@@ -757,7 +1015,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
+                 topk_ragged_indices,
+                 topk_ragged_indptr,
+                 topk_lens,
+-            ) = compute_global_topk_ragged_indices_and_indptr(
++            ) = decode_global_topk_ragged(
+                 self.topk_indices_buffer[:num_decode_tokens],
+                 swa_metadata.token_to_req_indices,
+                 attn_metadata.block_table[:num_decodes],
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 05d878d..86b3a36 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -72,6 +72,21 @@ from vllm.v1.kv_cache_interface import (
+ logger = init_logger(__name__)
+ 
+ 
++# Generation counter for ``topk_indices_buffer`` contents. Advanced (host-side
++# int, no GPU work) whenever an indexer may rewrite the buffer; consumers that
++# cache metadata derived from the buffer (VLLM_DSV41_TOPK_RAGGED_REUSE in
++# amd/rocm.py) treat a different epoch as a miss.
++_TOPK_EPOCH = [0]
++
++
++def bump_topk_epoch() -> None:
++    _TOPK_EPOCH[0] += 1
++
++
++def topk_epoch() -> int:
++    return _TOPK_EPOCH[0]
++
++
+ def _replace_layer_index(prefix: str, layer_id: int) -> str:
+     """Swap the layer index inside a ``...layers.<idx>...`` prefix."""
+     new_prefix, n = re.subn(r"\.layers\.\d+\.", f".layers.{layer_id}.", prefix)
+@@ -619,6 +634,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+             hidden_states
+         )
+         qr, qr_scale, _kv = self._split_qkv_and_norm(qr_kv)
++        if self.indexer is not None:
++            bump_topk_epoch()
+         latent: torch.Tensor | None = None
+         if self.compressor is not None:
+             latent = self.compressor(kv_score, positions)
+@@ -878,6 +895,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
+         positions: torch.Tensor,
+         out: torch.Tensor,
+     ) -> None:
++        if self.indexer is not None:
++            # Always-eager point preceding every topk-buffer write of this
++            # layer (the indexer prep may be inside a captured segment).
++            bump_topk_epoch()
+         if self.indexer is not None and index_q is not None:
+             assert index_weights is not None
+             q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
+@@ -1229,6 +1250,7 @@ class DeepseekV4Indexer(nn.Module):
+         rotary_emb: nn.Module,
+         qr_scale: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
++        bump_topk_epoch()
+         attn_metadata = get_forward_context().attn_metadata
+         if isinstance(attn_metadata, dict):
+             indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index 094d4ee..d7cbd9c 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -132,6 +132,37 @@ def _get_e4m3fn_bf16_lut(device: torch.device) -> torch.Tensor:
+     return get_e4m3fn_bf16_lut(device, nan_value=_INDEXER_LUT_NAN_VALUE)
+ 
+ 
++@functools.cache
++def _paged_q_lut_fused_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_INDEXER_Q_LUT_FUSED", "0") == "1"
++
++
++@triton.jit
++def _paged_q_lut_decode_kernel(src_ptr, lut_ptr, dst_ptr, n, BLOCK: tl.constexpr):
++    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < n
++    u = tl.load(src_ptr + offs, mask=mask, other=0)
++    v = tl.load(lut_ptr + u.to(tl.int32), mask=mask)
++    tl.store(dst_ptr + offs, v, mask=mask)
++
++
++def paged_q_lut_decode(q_byte: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
++    """``lut[q_byte]`` (uint8 -> lut.dtype) as a single gather launch.
++
++    Bit-identical to ``lut.index_select(0, q_byte.reshape(-1).to(int32))``.
++    """
++    assert q_byte.dtype == torch.uint8 and q_byte.is_contiguous()
++    assert lut.numel() == 256 and lut.is_contiguous()
++    out = torch.empty(q_byte.shape, dtype=lut.dtype, device=q_byte.device)
++    n = q_byte.numel()
++    if n:
++        block = 1024
++        _paged_q_lut_decode_kernel[(triton.cdiv(n, block),)](
++            q_byte, lut, out, n, BLOCK=block, num_warps=4
++        )
++    return out
++
++
+ @triton.jit
+ def _decode_e4m3fn_bf16_lut(u, lut_ptr):
+     return tl.load(lut_ptr + u.to(tl.uint32))
+@@ -314,7 +345,11 @@ def fp8_paged_mqa_logits_triton(
+     BLOCK_N = triton.next_power_of_2(block_size)
+ 
+     fp8_lut = _get_e4m3fn_bf16_lut(q.device)
+-    if q_is_bf16:
++    if q_is_bf16 and _paged_q_lut_fused_enabled() and q_byte.is_contiguous():
++        # VLLM_DSV41_INDEXER_Q_LUT_FUSED: one gather launch instead of the
++        # uint8->int32 cast + index_select pair; same table, same bits.
++        q_in = paged_q_lut_decode(q_byte, fp8_lut)
++    elif q_is_bf16:
+         # The same table the kernel would apply, applied once per call instead
+         # of once per (query, KV block). `lut[byte]` produces exactly what
+         # `_decode_e4m3fn_bf16_lut` produces -- NaN pin at +-480 included --
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index f091712..a9d3a3b 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1401,6 +1401,14 @@ _DSV4_SPARSE_NOPE_DIM = 448
+ _DSV4_SPARSE_ROPE_DIM = 64
+ 
+ 
++@functools.cache
++def _dsv4_attn_direct_out_enabled() -> bool:
++    """VLLM_DSV4_ATTN_DIRECT_OUT=1: sm8x decode writes straight into the
++    layer output and SWA-only layers skip the dummy extra-indptr fill.
++    Read once per process (the flag must not change at runtime)."""
++    return os.environ.get("VLLM_DSV4_ATTN_DIRECT_OUT", "0") == "1"
++
++
+ def _validate_sparse_dims(
+     head_dim: int,
+     nope_head_dim: int,
+@@ -3818,6 +3826,15 @@ def _rocm_sparse_attn_decode_ragged_triton(
+         assert extra_indptr.numel() == num_queries + 1, (
+             f"expected extra_indptr shape [{num_queries + 1}], got {extra_indptr.shape}"
+         )
++    elif _dsv4_attn_direct_out_enabled() and not _ON_GFX950:
++        # VLLM_DSV4_ATTN_DIRECT_OUT: HAS_EXTRA is a constexpr and every kernel
++        # reads extra_indices / extra_indptr only under it, so any valid int32
++        # pointer does. Reusing the main arrays drops the per-layer zero fill
++        # (one FillFunc launch per SWA-only layer per step); outputs are
++        # bitwise unchanged.
++        extra_cache = main_cache
++        extra_indices = main_indices
++        extra_indptr = main_indptr
+     else:
+         extra_cache = main_cache
+         extra_indices = torch.empty(0, device=q.device, dtype=torch.int32)
+@@ -4300,6 +4317,20 @@ def rocm_sparse_attn_decode(
+             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
+ 
+     direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
++    if (
++        direct_out is None
++        and _dsv4_attn_direct_out_enabled()
++        and output.dtype == torch.bfloat16
++        and output.shape == q.shape
++        and output.stride(-1) == 1
++        and output.data_ptr() != q.data_ptr()
++    ):
++        # VLLM_DSV4_ATTN_DIRECT_OUT: the split-K reduce (and the single-pass
++        # kernel) store through out.stride(0)/stride(1) with a unit last
++        # stride, so they can write the caller's buffer directly. This drops
++        # the per-layer bf16 scratch + DtoD ``output.copy_`` below; the
++        # stored values are the same bits.
++        direct_out = output
+     attn_out = _rocm_sparse_attn_decode_triton(
+         q=q,
+         main_cache=swa_k_cache,
