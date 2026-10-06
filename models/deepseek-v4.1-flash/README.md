@@ -405,3 +405,37 @@ image before this work (150.2/127.3/58.4, steps/s 25.28/23.32/25.38; c8
 Evaluated and not included: a tensor-core router gate GEMV (19.4 -> 9.3 us per
 call, error at the scalar GEMV's level) changed engine step rate by only
 +0.5 % while changing fp32 summation order in routing.
+
+## Decode optimisation round 2 (patches 0006-0008)
+
+Written in parallel by subagents from a shared profile/hardware brief and
+verified on node1 by the main session.
+
+| patch | switches (compose sets 1) | what | numerics |
+|---|---|---|---|
+| 0006 | `VLLM_DSV4_ATTN_DIRECT_OUT`, `VLLM_DSV41_TOPK_RAGGED_FUSED`, `VLLM_DSV41_SWA_RAGGED_INPLACE`, `VLLM_DSV41_INDEXER_Q_LUT_FUSED` (`VLLM_DSV41_TOPK_RAGGED_REUSE` included, not enabled) | small decode kernels around sparse attention / indexer fused, per-layer DtoD copies removed | bitwise (`tests/test_dsv41_small_kernels_gpu.py`) |
+| 0007 | `VLLM_DSV4_MHC_V2` | Gluon mHC decode v2 generalised to hidden 5120, M 1-64, warmed before capture | residual bitwise; mixes / layer input fp64 error within 4x of TileLang's 1e-7 level at M <= 16, ~100x lower at M = 48 (`tests/test_mhc_v2_gpu.py`); 24-47 % faster per call |
+| 0008 | `VLLM_DSV4_MXFP4_FUSED_ACT`, `VLLM_DSV4_MXFP4_FUSED_SUM` (+`_ORDER=1`), `VLLM_DSV4_CUDA_DET_ALIGN` | split-K sum + activation inside w13, top-k sum inside w2 (<= 16 tokens), single-CTA CUDA align (3-6 us vs 17-89 us) | bitwise (`tests/test_mxfp4_decode_v2_gpu.py`) |
+
+`VLLM_DSV4_MXFP4_DQ=2` (cheaper dequant, exact weights, different fp32 order)
+passes its tests but measured slower end to end (c1 counting steps/s 31.45 vs
+31.96 with DQ=0) with lower prose acceptance in that run, so it stays off.
+
+Development measurements (node1 PP6, 2 warm-up + 5 timed rounds, medians;
+0001-0005 image + 0006-0008 mounted):
+
+| load | 0001-0005 image tok/s (steps/s) | + 0006-0008 tok/s (steps/s) |
+|---|---:|---:|
+| c1 counting | 179.0 (30.13) | 189.9 (31.96) |
+| c1 code | 148.4 (27.65) | 161.0 (29.15) |
+| c1 prose | 69.9 (30.00) | 73.9 (31.70) |
+| c8 counting / code / prose | 897.4 / 710.1 / 348.5 | 937.0 / 708.6 / 329.8 |
+
+Rebuilt image with 0001-0008, `compose.yml` as committed, nothing mounted:
+c1 counting/code/prose 188.9/157.8/73.7 tok/s (steps/s 31.79/29.08/31.61),
+c8 878.7/743.3/324.5, KV pool 4,142,306 tokens (unchanged), all in-image GPU
+tests pass. Against the deployed debug image before this work (steps/s
+25.28/23.32/25.38): c1 steps/s +24-26 %.
+
+Acceptance unchanged (counting 5.88, prose 2.33). Greedy self-scoring under
+the engine: only near ties (gap <= 0.5). c8 ranges stay wide on this box.

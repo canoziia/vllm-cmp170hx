@@ -38,7 +38,7 @@ def main() -> None:
     cuda_flags = [*flags, "--expt-relaxed-constexpr", "-lineinfo",
                   "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
                   "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__"]
-    cpp_extension.load(name=a.name, sources=[str(HERE / "mxfp4_decode.cu")],
+    cpp_extension.load(name=a.name, sources=[str(HERE / "mxfp4_decode.cu"), str(HERE / "mxfp4_decode_v2.cu")],
                        extra_cuda_cflags=cuda_flags, extra_cflags=flags,
                        build_directory=str(build_dir), is_python_module=False,
                        verbose=a.verbose)

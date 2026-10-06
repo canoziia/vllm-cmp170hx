@@ -1,0 +1,334 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4: MXFP4 decode v2 (fused act/sum) and CUDA deterministic align
+
+Extends patch 0004. VLLM_DSV4_MXFP4_FUSED_ACT: the last warp of each w13
+tile pair sums the split-K partials and applies clamp-silu-mul (bitwise equal
+to sum + _C.silu_and_mul_with_clamp). VLLM_DSV4_MXFP4_FUSED_SUM (+ _ORDER=1):
+w2 writes the top-k sum directly for <= 16 tokens (bitwise equal to
+_moe_C.moe_sum). VLLM_DSV4_CUDA_DET_ALIGN: single-CTA CUDA deterministic
+align, bitwise equal to the torch and Triton versions (3-6 us vs 17-89 us).
+VLLM_DSV4_MXFP4_DQ=1|2 (cheaper dequant via pre-scaled activations; exact
+weights, different fp32 order) is included but measured slower end to end
+and is not enabled. All default off.
+
+diff --git a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+index fee5473..a7b980a 100644
+--- a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
++++ b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+@@ -18,6 +18,23 @@ VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS (default 64) tokens, the compiled shapes
+ (hidden 5120, intermediate 2304), and every e8m0 scale of the layer <= 128
+ (checked once per weight tensor outside CUDA-graph capture). Anything else
+ uses the unchanged Marlin path.
++
++v2 (``_dsv4_moe2`` ops in the same .so; every switch default off, each
++independent; all off == v1 behaviour bit for bit):
++  VLLM_DSV4_MXFP4_DQ=1|2          dequant without per-weight bf16 multiply
++                                  (scale applied per 32-k group in fp32;
++                                  scales up to 254 allowed). 0 = v1 dequant.
++  VLLM_DSV4_MXFP4_FUSED_ACT=1     split-K sum + clamp-silu-mul inside the
++                                  w13 kernel (bitwise == sum + _C op).
++  VLLM_DSV4_MXFP4_FUSED_SUM=1     moe_sum inside the w2 kernel, for at most
++                                  VLLM_DSV4_MXFP4_FUSED_SUM_MAX_TOKENS (16)
++                                  tokens; order VLLM_DSV4_MXFP4_FUSED_SUM_ORDER
++                                  (0 fp32 seq, 1 torch reduce [default],
++                                  2 bf16 seq; pick the one the GPU test
++                                  reports bitwise equal to _moe_C.moe_sum).
++  VLLM_DSV4_CUDA_DET_ALIGN=1      single-CTA CUDA deterministic moe align
++                                  (same outputs as fast_det_align), only
++                                  with VLLM_DETERMINISTIC_MOE_ALIGN.
+ """
+ 
+ from __future__ import annotations
+@@ -36,6 +53,10 @@ _LOAD_ERROR: str | None = None
+ _SCALE_OK: dict[int, bool] = {}
+ _CTR: dict[tuple, torch.Tensor] = {}
+ _LOGGED = False
++_OPS2 = None
++_SYNC: dict[tuple, torch.Tensor] = {}
++_SYNC_SIZE = 32768  # 128 w2 tile counters + w13 (block, tile pair) counters
++_LOGGED2 = False
+ 
+ 
+ def enabled() -> bool:
+@@ -46,6 +67,96 @@ def _max_tokens() -> int:
+     return int(os.environ.get("VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS", "64"))
+ 
+ 
++def _dq() -> int:
++    return int(os.environ.get("VLLM_DSV4_MXFP4_DQ", "0"))
++
++
++def _fused_act() -> bool:
++    return os.environ.get("VLLM_DSV4_MXFP4_FUSED_ACT", "0") == "1"
++
++
++def _fused_sum() -> bool:
++    return os.environ.get("VLLM_DSV4_MXFP4_FUSED_SUM", "0") == "1"
++
++
++def _sum_order() -> int:
++    return int(os.environ.get("VLLM_DSV4_MXFP4_FUSED_SUM_ORDER", "1"))
++
++
++def _sum_max_tokens() -> int:
++    return int(os.environ.get("VLLM_DSV4_MXFP4_FUSED_SUM_MAX_TOKENS", "16"))
++
++
++def cuda_align_enabled() -> bool:
++    return os.environ.get("VLLM_DSV4_CUDA_DET_ALIGN", "0") == "1"
++
++
++def _ops2():
++    global _OPS2
++    if _OPS2 is None:
++        _ops()
++        ops2 = torch.ops._dsv4_moe2
++        if int(ops2.abi()) != 1:
++            raise RuntimeError("unexpected _dsv4_moe2 ABI")
++        _OPS2 = ops2
++    return _OPS2
++
++
++def _sync(dev: torch.device) -> torch.Tensor | None:
++    """Zeroed int32 counters, self-resetting inside the kernels."""
++    key = (str(dev), torch.cuda.current_stream(dev).cuda_stream)
++    t = _SYNC.get(key)
++    if t is None:
++        if torch.cuda.is_current_stream_capturing():
++            return None
++        t = torch.zeros(_SYNC_SIZE, dtype=torch.int32, device=dev)
++        _SYNC[key] = t
++    return t
++
++
++def _plain_clamp_limit(activation, activation_func, activation_config) -> float | None:
++    """clamp limit if the activation is exactly _C.silu_and_mul_with_clamp."""
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    if activation != MoEActivation.SILU:
++        return None
++    if activation_func is None:
++        cfg = activation_config
++    else:
++        f = getattr(activation_func, "__func__", None)
++        if f is None or f.__qualname__ != "FusedMoEExpertsModular.activation":
++            return None
++        cfg = getattr(activation_func.__self__, "activation_config", None)
++    if cfg is None or cfg.clamp_limit is None:
++        return None
++    return float(cfg.clamp_limit)
++
++
++def _plain_moe_sum(moe_sum) -> bool:
++    if moe_sum is None:
++        return True
++    f = getattr(moe_sum, "__func__", None)
++    return f is not None and f.__qualname__ == "MarlinExperts.moe_sum"
++
++
++def try_det_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids,
++                  num_tokens_post_pad, expert_map) -> bool:
++    """CUDA deterministic align; False keeps the caller's path."""
++    if expert_map is not None or not topk_ids.is_cuda or not topk_ids.is_contiguous():
++        return False
++    if topk_ids.dtype not in (torch.int32, torch.int64):
++        return False
++    s = topk_ids.numel()
++    if s == 0 or s > 512 or not 0 < num_experts <= 1024:
++        return False
++    if not (sorted_ids.is_contiguous() and expert_ids.is_contiguous()
++            and sorted_ids.dtype == expert_ids.dtype == num_tokens_post_pad.dtype
++            == torch.int32):
++        return False
++    _ops2().align(topk_ids.view(-1), num_experts, block_size, sorted_ids, expert_ids,
++                  num_tokens_post_pad)
++    return True
++
++
+ def _ops():
+     global _OPS, _LOAD_ERROR
+     if _OPS is not None or _LOAD_ERROR is not None:
+@@ -67,17 +178,17 @@ def _ops():
+     return _OPS
+ 
+ 
+-def _scales_ok(s: torch.Tensor) -> bool | None:
+-    key = s.data_ptr()
++def _scales_ok(s: torch.Tensor, limit: int = 128) -> bool | None:
++    key = s.data_ptr() if limit == 128 else (s.data_ptr(), limit)
+     ok = _SCALE_OK.get(key)
+     if ok is None:
+         if torch.cuda.is_current_stream_capturing():
+             return None
+-        ok = int(s.view(torch.uint8).max().item()) <= 128
++        ok = int(s.view(torch.uint8).max().item()) <= limit
+         _SCALE_OK[key] = ok
+         if not ok:
+-            logger.warning("VLLM_DSV4_MXFP4_DECODE: a layer has e8m0 scales > 128; "
+-                           "it keeps the Marlin path")
++            logger.warning("VLLM_DSV4_MXFP4_DECODE: a layer has e8m0 scales > %d; "
++                           "it keeps the Marlin path", limit)
+     return ok
+ 
+ 
+@@ -98,8 +209,12 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+             expert_map, apply_router_weight_on_input, block_size_m, input_dtype,
+             activation, activation_func, activation_config,
+             sorted_token_ids, expert_ids, num_tokens_post_padded,
+-            intermediate_cache13, intermediate_cache2):
+-    """Return the [M*topk, K] w2 output, or None to keep the Marlin path."""
++            intermediate_cache13, intermediate_cache2, moe_sum=None, output=None):
++    """Return (tensor, summed) or None to keep the Marlin path.
++
++    summed=False: tensor is the [M*topk, K] w2 output (caller runs moe_sum);
++    summed=True: tensor is the final [M, K] output (fused moe_sum, v2 only).
++    """
+     from vllm.scalar_type import scalar_types
+ 
+     M, K = hidden_states.shape
+@@ -117,6 +232,19 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+             or torch.cuda.get_device_capability(hidden_states.device) != (8, 0)):
+         return None
+     ops = _ops()
++    dq = _dq()
++    limit = _plain_clamp_limit(activation, activation_func, activation_config) \
++        if _fused_act() else None
++    fsum = (_fused_sum() and M <= _sum_max_tokens() and _plain_moe_sum(moe_sum)
++            and topk <= 8 and (output is None or (
++                output.dtype == torch.bfloat16 and output.is_contiguous()
++                and tuple(output.shape) == (M, K))))
++    if dq != 0 or limit is not None or fsum:
++        return _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
++                           topk_weights, topk_ids, activation, activation_func,
++                           activation_config, sorted_token_ids, expert_ids,
++                           num_tokens_post_padded, intermediate_cache13,
++                           intermediate_cache2, output)
+     if not (_scales_ok(w1_scale) and _scales_ok(w2_scale)):
+         return None
+     slots = M * topk
+@@ -154,4 +282,72 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+     out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
+     ops.gemm(h, w2, w2_scale.view(torch.uint8), sorted_token_ids, expert_ids,
+              num_tokens_post_padded, tw, topk, slots, _NI, _K, False, cfg, ctr, out)
+-    return out
++    return out, False
++
++
++def _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
++                topk_weights, topk_ids, activation, activation_func, activation_config,
++                sorted_token_ids, expert_ids, num_tokens_post_padded,
++                intermediate_cache13, intermediate_cache2, output):
++    if dq not in (0, 1, 2):
++        return None
++    smax = 128 if dq == 0 else 254
++    if not (_scales_ok(w1_scale, smax) and _scales_ok(w2_scale, smax)):
++        return None
++    M = hidden_states.size(0)
++    topk = topk_ids.size(1)
++    slots = M * topk
++    dev = hidden_states.device
++    ctr = _counters(dev)
++    sync = _sync(dev)
++    if ctr is None or sync is None:
++        return None
++    if (intermediate_cache13.numel() < slots * max(2 * _NI, _K)
++            or intermediate_cache2.numel() < slots * _NI
++            or not intermediate_cache13.is_contiguous()
++            or not intermediate_cache2.is_contiguous()):
++        return None
++    if 128 + slots * 36 > _SYNC_SIZE:
++        return None
++    ops2 = _ops2()
++    global _LOGGED2
++    if not _LOGGED2:
++        _LOGGED2 = True
++        logger.info("VLLM_DSV4_MXFP4_DECODE v2: dq=%d fused_act=%s fused_sum=%s (order %d)",
++                    dq, limit is not None, fsum, _sum_order())
++    cfg = 2 if M <= 6 else 5
++    part = torch.empty(4 * slots * 2 * _NI, dtype=torch.float32, device=dev)
++    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    tw = topk_weights.view(-1)
++    w1s = w1_scale.view(torch.uint8)
++    w2s = w2_scale.view(torch.uint8)
++    if limit is not None:
++        ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids, num_tokens_post_padded,
++                  tw, topk, slots, _K, 2 * _NI, True, cfg, dq, True, limit, 0, ctr, sync,
++                  part, h)
++    else:
++        dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
++        ks = ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids,
++                       num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True, cfg, dq,
++                       False, 0.0, 0, ctr, sync, part, dummy)
++        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
++        ops.sum(part, ks, slots, 2 * _NI, act_in)
++        if activation_func is None:
++            from vllm.model_executor.layers.fused_moe.activation import (
++                ApplyMoEActivationConfig, apply_moe_activation)
++            apply_moe_activation(activation, h, act_in,
++                                 activation_config=activation_config
++                                 or ApplyMoEActivationConfig(),
++                                 topk_ids=topk_ids, expert_map=None)
++        else:
++            activation_func(activation, h, act_in, topk_ids=topk_ids, expert_map=None)
++    out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
++    if fsum:
++        y = output if output is not None else torch.empty_like(hidden_states)
++        ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw, topk,
++                  slots, _NI, _K, False, cfg, dq, True, 0.0, _sum_order(), ctr, sync, out, y)
++        return y, True
++    dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
++    ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw, topk,
++              slots, _NI, _K, False, cfg, dq, False, 0.0, 0, ctr, sync, out, dummy)
++    return out, False
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index f6f4c27..bd2e39e 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -353,8 +353,14 @@ def fused_marlin_moe(
+             sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
+             num_tokens_post_padded=num_tokens_post_padded,
+             intermediate_cache13=intermediate_cache13,
+-            intermediate_cache2=intermediate_cache2)
++            intermediate_cache2=intermediate_cache2,
++            moe_sum=moe_sum if expert_map is None else False,
++            output=output)
+         if moe_output is not None:
++            moe_output, summed = moe_output
++            if summed:
++                # v2 fused moe_sum already wrote the final [M, K] output.
++                return moe_output
+             moe_output = moe_output.view(-1, topk, K)
+     if moe_output is None:
+         moe_output = _fused_marlin_moe(
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index c4daaa1..2bd7543 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -5,6 +5,7 @@ import torch
+ 
+ import vllm.envs as envs
+ from vllm import _custom_ops as ops
++from vllm.model_executor.layers.fused_moe import dsv4_mxfp4_decode as _dsv4_mxfp4_decode
+ from vllm.model_executor.layers.fused_moe import fast_det_align as _fast_det_align
+ from vllm.triton_utils import triton
+ from vllm.utils.math_utils import round_up
+@@ -176,7 +177,19 @@ def moe_align_block_size(
+     )
+     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+ 
+-    if envs.VLLM_DETERMINISTIC_MOE_ALIGN and _fast_det_align.enabled() and (
++    if envs.VLLM_DETERMINISTIC_MOE_ALIGN and _dsv4_mxfp4_decode.cuda_align_enabled() and (
++        _dsv4_mxfp4_decode.try_det_align(
++            topk_ids,
++            num_experts,
++            block_size,
++            sorted_ids,
++            expert_ids,
++            num_tokens_post_pad,
++            expert_map if ignore_invalid_experts else None,
++        )
++    ):
++        pass
++    elif envs.VLLM_DETERMINISTIC_MOE_ALIGN and _fast_det_align.enabled() and (
+         _fast_det_align.try_align(
+             topk_ids,
+             num_experts,
