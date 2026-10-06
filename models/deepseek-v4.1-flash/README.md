@@ -302,3 +302,71 @@ rebuilt default image with `compose.yml` as committed, nothing mounted:
   on the bitwise layout test, not on text comparison.
 - `podman-compose` 1.3 does not apply `${VAR:-default}` for variables missing
   from `.env` inside `environment:`, so the switch is written as a literal.
+
+## Decode optimisation: weight-streaming MXFP4 MoE kernels (patch 0004)
+
+Hardware facts that shape every kernel on this box (CMP 170HX, measured):
+
+| | measured |
+|---|---|
+| HBM pure read | 1,612 GB/s (copy r+w 1,594, write 1,356) |
+| FP32 FFMA / FMUL / FADD, bf16 HMUL2 / HFMA2 | ~42 thread-instr / SM / clk (limited) |
+| integer shift/logic | ~70 / SM / clk |
+| bf16 tensor-core mma | not limited |
+
+Marlin's MXFP4 MoE GEMM reached only 740-880 GB/s at decode sizes. Patch 0004
+(`VLLM_DSV4_MXFP4_DECODE`, patch default 0, `compose.yml` sets 1) runs the two
+expert GEMMs of `fused_marlin_moe` for batches of at most 64 tokens with
+`native/dsv4_moe/mxfp4_decode.cu`, compiled into the image as
+`vllm/_dsv4_moe_C.abi3.so`:
+
+- adapted from the GLM W4A16 weight-streaming decode kernel: tokens are the
+  mma N dimension, each warp pulls (expert block, 64-column tile, K slice)
+  items from an integer work queue and streams the Marlin-packed weights
+  through a per-lane `cp.async` ring; w13 is split four ways over K into
+  fixed-order fp32 partials (deterministic, no atomics on data);
+- reads the deployed Marlin MXFP4 layout and e8m0 scales directly (no repack,
+  prefill keeps Marlin); dequantisation is exact (folded scale 2^(S-1), valid
+  for every e8m0 scale <= 128; the checkpoint's range is 115-128, and a layer
+  with a larger scale keeps Marlin);
+- the activation is the caller's own `activation_func` on the bf16 w13 result
+  and the slot sum stays `moe_sum`; only the fp32 accumulation order differs.
+
+Kernel results (`tests/test_mxfp4_decode_gpu.py --bench`, 384 experts, top-6):
+
+| tokens / distinct experts | Marlin | 0004 |
+|---|---:|---:|
+| 1 / 6 | 196 us | 183 us |
+| 6 / 12 | 303 us | 291 us |
+| 6 / 18 | 430 us | 384 us |
+| 6 / 36 | 797 us | 687 us |
+| 48 / 150 | 3,188 us | 2,822 us |
+
+Error against an fp64 reference equals Marlin's (mean 4.3-4.7e-3 relative in
+every case); CUDA-graph replay equals eager; repeated calls are bitwise
+identical.
+
+Engine (node1 PP6, rebuilt image + 0004 mounted for development, 2 warm-up +
+5 timed rounds, medians):
+
+| load | 0003 tok/s (steps/s) | 0003+0004 tok/s (steps/s) | accepted/step |
+|---|---:|---:|---:|
+| c1 counting | 164.5 (27.69) | 171.6 (28.89) | 5.88 / 5.88 |
+| c1 code | 138.3 (25.35) | 144.3 (26.56) | 5.41 / 5.41 |
+| c1 prose | 63.6 (27.65) | 65.9 (28.27) | 2.29 / 2.33 |
+| c8 counting | 819.2 | 859.7 | 5.88 / 5.88 |
+| c8 code | 665.7 | 632.1 | 5.38 / 5.41 |
+| c8 prose | 267.8 | 311.8 | 2.25 / 2.29 |
+
+Rebuilt image with 0004, `compose.yml` as committed, nothing mounted (same
+method): c1 counting/code/prose 169.0/143.2/66.0 tok/s (steps/s
+28.44/26.34/28.30), c8 863.4/636.9/270.8, acceptance unchanged.
+
+A weight-streaming FP8 kernel for the dense (MXFP8 Marlin) projections was
+also written and verified (error equal to Marlin's) but was 15-40 % slower
+than Marlin, which already reaches 930-1,140 GB/s on those shapes at M=6; it
+is not included.
+
+Greedy self-consistency (3 cases x 4 runs x 128 tokens, scored with
+`prompt_logprobs` under the same engine): every non-top-1 token is a near tie
+(logprob gap <= 0.5).
