@@ -1,3 +1,4 @@
 0001-prime-pp-communicators-before-model-load.patch
 0002-fixed-triton-logits-workspace.patch
 0003-deterministic-moe-align-single-kernel.patch
+0004-mxfp4-moe-decode-kernels.patch

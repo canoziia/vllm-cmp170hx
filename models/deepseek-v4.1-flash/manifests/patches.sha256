@@ -10,3 +10,4 @@ b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepsee
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v4.1-flash/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
 3f7f6cfbecfa7aeb79e61f78bf85c1e43d0cf006a3bc863a57e8d248d6bbb01b  models/deepseek-v4.1-flash/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
 058fe578034fb029cba150baf174040def81dca020fe5b59f5a4b1b3e7c157ae  models/deepseek-v4.1-flash/patches/0003-deterministic-moe-align-single-kernel.patch
+aa99954cc70f9bc137b273ab2320d2c1dc6968be81898f5fe37a00071c56fe53  models/deepseek-v4.1-flash/patches/0004-mxfp4-moe-decode-kernels.patch

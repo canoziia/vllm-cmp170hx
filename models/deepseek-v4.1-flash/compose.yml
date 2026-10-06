@@ -60,6 +60,9 @@ services:
       # patch 0003: single-kernel deterministic MoE align (bitwise identical
       # layout to the torch path; decode only). 0 = torch path.
       VLLM_DSV4_FAST_DET_MOE_ALIGN: "1"
+      # patch 0004: weight-streaming MXFP4 MoE decode kernels (<= 64 tokens;
+      # prefill and anything else keeps Marlin). 0 = Marlin everywhere.
+      VLLM_DSV4_MXFP4_DECODE: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
