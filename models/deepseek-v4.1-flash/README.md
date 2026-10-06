@@ -469,3 +469,26 @@ Rebuilt image with 0001-0009 (compose as committed, nothing mounted): c1
 counting/code/prose 191.6/157.3/75.0 tok/s (steps/s 32.26/29.62/32.14),
 c8 925.6/750.4/347.6; cold prefill (same warm instance, median of 2)
 8k/32k/64k/107k 1919/2874/4000/4206 tok/s.
+
+## Long-context prefill (patches 0011-0012) and thin wo_a (0010)
+
+| patch | switch (compose sets 1) | what |
+|---|---|---|
+| 0010 | `VLLM_DSV41_THIN_WOA` (`VLLM_DSV41_PACKED_PROLOGUE` included, off) | grouped wo_a GEMM for small M, short-chain tensor-core Triton (45-47 vs 50 us at M=6), fp64 error <= cuBLAS |
+| 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` (`VLLM_DSV41_SPARSE_PREFILL_64H` included, off) | MXFP4 MoE prefill split expert lists (27.4 -> 23.0 ms per 4096-token chunk) |
+| 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | prefill indexer logits + top-512 as two CUDA kernels (`native/dsv41_indexer`, built into the image): logits bitwise, same top-512 set (sorted by column); 80.2 -> 38.6 ms per 4096-row chunk at 114K KV |
+
+Cold prefill on node1 PP6 (180 W cap, warm instance, unique prompts, actual
+prompt length shown, tok/s):
+
+| prompt tokens | 0001-0009 image | + 0011/0012 (development tree) |
+|---:|---:|---:|
+| 106k | 4572 | 5326 (+16 %) |
+| 261k | 3978 | 5114 (+29 %) |
+| 523-541k | 3021 | 4432 (+47 %) |
+| 719k | 2549 | 4078 (+60 %) |
+| 989k | 2013 | 3555 (+77 %; 491 s -> 278 s) |
+
+The tail drop from 106k to 989k goes from -56 % to -33 %. Runs within a pair
+agree within ~1 %. Earlier jumpy long-prompt numbers came from the first
+requests on a fresh instance (one-time JIT/warm-up), not from steady state.

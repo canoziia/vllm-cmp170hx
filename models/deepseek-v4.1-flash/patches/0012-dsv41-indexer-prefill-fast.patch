@@ -1,0 +1,315 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4.1: fast sm80 prefill indexer (logits + top-512)
+
+VLLM_DSV41_INDEXER_PREFILL_FAST (default 0). Long-context prefill indexer as
+two CUDA kernels (native/dsv41_indexer, built into the image as
+vllm/_dsv41_indexer_C.abi3.so): 8 query rows per block share each K tile
+(4-stage cp.async, bf16 mma, same arithmetic order as the Triton kernel, so
+the logits are bitwise identical) and also emit exact per-32-column maxima;
+top-512 uses them to read only candidate groups (same index set, sorted by
+column). 4096-row chunk at 114K KV: 80.2 -> 38.6 ms.
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 733c6b6..7219f8f 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -46,6 +46,7 @@ from vllm.v1.attention.backends.mla.indexer import (
+     indexer_decode_shard_rows,
+ )
+ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
++from vllm.v1.attention.ops import dsv41_indexer_prefill as _dsv41_prefill
+ from vllm.v1.attention.ops.mqa_logits_triton import (
+     fp8_mqa_logits_triton,
+     fp8_paged_mqa_logits_triton,
+@@ -577,6 +578,17 @@ def sparse_attn_indexer(
+         workspace = workspace_manager.get_simultaneous(*workspace_specs)
+         k_quant_full, k_scale_full = workspace[:2]
+         logits_workspace = workspace[2] if fixed_logits else None
++        # VLLM_DSV41_INDEXER_PREFILL_FAST: tensor-core logits + pruned top-k
++        # (bit-identical logits, identical top-k set). Default off.
++        fast_prefill = (
++            fixed_logits
++            and logits_workspace is not None
++            and not use_fp4_cache
++            and dcp_world_size <= 1
++            and not current_platform.is_xpu()
++            and _dsv41_prefill.enabled()
++        )
++        fast_k_bf16 = None
+         for chunk in prefill_metadata.chunks:
+             cu_seqlen_ks = chunk.cu_seqlen_ks
+             cu_seqlen_ke = chunk.cu_seqlen_ke
+@@ -636,6 +648,42 @@ def sparse_attn_indexer(
+                         cu_seqlen_ke,
+                         clean_logits=False,
+                     )
++                elif (
++                    fast_prefill
++                    and _dsv41_prefill.supported(
++                        q_slice_cast, k_quant_cast, topk_tokens, dcp_world_size
++                    )
++                    and q_slice_cast.shape[0] * k_quant_cast.shape[0]
++                    <= logits_workspace.numel()
++                ):
++                    # Same K rows across a request's query sub-chunks: decode
++                    # once and reuse while the gather is skipped.
++                    if (
++                        fast_k_bf16 is None
++                        or not chunk.skip_kv_gather
++                        or fast_k_bf16.shape[0] != k_quant_cast.shape[0]
++                    ):
++                        fast_k_bf16 = _dsv41_prefill.decode_fp8(k_quant_cast)
++                    _dsv41_prefill.indexer_prefill_topk(
++                        q_slice_cast,
++                        k_quant_cast,
++                        k_scale_cast,
++                        weights[chunk.token_start : chunk.token_end],
++                        cu_seqlen_ks,
++                        cu_seqlen_ke,
++                        topk_indices,
++                        topk_tokens,
++                        logits_workspace,
++                        k_bf16=fast_k_bf16,
++                        candidate_blocks=(
++                            candidate_blocks[chunk.token_start : chunk.token_end]
++                            if candidate_blocks is not None
++                            else None
++                        ),
++                        candidate_block_size=candidate_block_size,
++                        candidate_write=candidate_write,
++                    )
++                    logits = q_slice_cast.new_empty((0, 0), dtype=torch.float32)
+                 elif envs.VLLM_DSV4_LOGITS_ROW_CHUNK > 0 and dcp_world_size <= 1:
+                     # SM80/SM121 Triton fallback, row-chunked (from
+                     # allover326's long-context fix in #50576): the monolithic
+@@ -1125,6 +1173,9 @@ class SparseAttnIndexer(CustomOp):
+             elif not use_fp4_cache:
+                 device = topk_indices_buffer.device
+                 warmup_fp8_mqa_logits_triton(num_heads, head_dim, device)
++                if _dsv41_prefill.enabled():
++                    # Load the extension and its decode table outside capture.
++                    _dsv41_prefill.warmup(device)
+                 # 64/256 are the V3.2 and V4 indexer kernel block sizes, 128
+                 # the V4.1 indexer cache block off SM90; the configured cache
+                 # block size covers user-chosen values, which the backends
+diff --git a/vllm/v1/attention/ops/dsv41_indexer_prefill.py b/vllm/v1/attention/ops/dsv41_indexer_prefill.py
+new file mode 100644
+index 0000000..0ee5db4
+--- /dev/null
++++ b/vllm/v1/attention/ops/dsv41_indexer_prefill.py
+@@ -0,0 +1,215 @@
++# SPDX-License-Identifier: Apache-2.0
++"""SM80 DeepSeek V4.1 sparse-indexer prefill: tensor-core logits + pruned top-k.
++
++Opt-in with ``VLLM_DSV41_INDEXER_PREFILL_FAST=1`` (default off: the original
++Triton logits + ``top_k_per_row_prefill`` path is untouched).
++
++* ``_dsv41_indexer_C.logits`` reproduces ``fp8_mqa_logits_triton`` inside each
++  row's ``[ks, ke)`` bit for bit (same bf16 operands, same MMA k-order, same
++  relu/weight/head-sum/k_scale tree as the Triton kernel's PTX) but tiles 8
++  query rows per CTA so a K tile is staged in shared memory once and reused,
++  instead of every query row re-reading K from L2/HBM.  The candidate mask
++  (``apply_candidate_mask``) is fused into the epilogue, and tiles without any
++  kept column are skipped.  It also emits, per 32-column chunk, the maximum
++  order-preserving key.
++* ``_dsv41_indexer_C.topk`` returns exactly the top-k set over ``[ks, ke)``
++  (lowest column wins exact ties, output sorted by column, relative to ks;
++  short rows give ``0..L-1`` then ``-1`` like ``top_k_per_row_prefill``).  It
++  only touches chunks whose max can reach the k-th largest value.
++
++Columns outside ``[ks, ke)`` are not written (the original fills them with
++-inf; nothing downstream reads them).  No host synchronisation, no persistent
++state beyond a 256-entry decode table created at first use (outside capture);
++deterministic.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++_OPS = None
++_LUT: dict[torch.device, torch.Tensor] = {}
++CHUNK = 32
++KEYS_PER_CTA = int(os.environ.get("VLLM_DSV41_INDEXER_KEYS_PER_CTA", "2048"))
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_INDEXER_PREFILL_FAST", "0") == "1"
++
++
++def ops():
++    global _OPS
++    if _OPS is None:
++        path = os.environ.get("VLLM_DSV41_INDEXER_LIB")
++        if not path:
++            path = os.path.join(
++                os.path.dirname(
++                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++                ),
++                "_dsv41_indexer_C.abi3.so",
++            )
++        torch.ops.load_library(path)
++        o = torch.ops._dsv41_indexer_C
++        if int(o.abi()) != 1:
++            raise RuntimeError("unexpected _dsv41_indexer_C ABI")
++        _OPS = o
++    return _OPS
++
++
++def _lut(device: torch.device) -> torch.Tensor:
++    t = _LUT.get(device)
++    if t is None:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("dsv41 indexer LUT must be created before capture")
++        t = (
++            torch.arange(256, dtype=torch.uint8, device=device)
++            .view(torch.float8_e4m3fn)
++            .to(torch.bfloat16)
++            .view(torch.int16)
++            .contiguous()
++        )
++        _LUT[device] = t
++    return t
++
++
++def warmup(device: torch.device) -> None:
++    ops()
++    _lut(device)
++
++
++def supported(q: torch.Tensor, k: torch.Tensor, topk: int, dcp_world_size: int = 1) -> bool:
++    return (
++        q.is_cuda
++        and torch.cuda.get_device_capability(q.device) == (8, 0)
++        and q.dtype == torch.float8_e4m3fn
++        and k.dtype == torch.float8_e4m3fn
++        and q.dim() == 3
++        and q.shape[1] == 32
++        and q.shape[2] == 128
++        and k.dim() == 2
++        and k.shape[1] == 128
++        and 0 < topk <= 1024
++        and dcp_world_size <= 1
++        and k.shape[0] < 2**31 // 32
++    )
++
++
++def decode_fp8(x: torch.Tensor) -> torch.Tensor:
++    """Exact e4m3fn -> bf16 (identical to ``x.to(torch.bfloat16)``)."""
++    x = x.contiguous()
++    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
++    if x.numel() % 16:
++        out.copy_(x)
++        return out
++    ops().decode_fp8(x.view(torch.uint8), _lut(x.device), out)
++    return out
++
++
++def candidate_flags(
++    row_ks: torch.Tensor,
++    candidate_blocks: torch.Tensor,
++    width: int,
++    block_size: int,
++) -> torch.Tensor:
++    """Same flags as candidate_blocks.apply_candidate_mask builds."""
++    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
++        _candidate_flags_kernel,
++    )
++    from vllm.triton_utils import triton
++
++    rows = row_ks.shape[0]
++    nblocks = triton.cdiv(width, block_size)
++    flags = torch.empty((rows, nblocks + 1), device=row_ks.device, dtype=torch.uint8)
++    _candidate_flags_kernel[(rows,)](
++        candidate_blocks,
++        row_ks,
++        flags,
++        *candidate_blocks.stride(),
++        row_ks.stride(0),
++        width,
++        nblocks,
++        block_size,
++        candidate_blocks.shape[1],
++        True,
++        1,
++    )
++    return flags
++
++
++def logits(
++    q_bf16: torch.Tensor,
++    k_bf16: torch.Tensor,
++    k_scale: torch.Tensor,
++    weights: torch.Tensor,
++    ks: torch.Tensor,
++    ke: torch.Tensor,
++    out: torch.Tensor,
++    flags: torch.Tensor | None = None,
++    block_size: int = 0,
++) -> torch.Tensor:
++    """Fill ``out[:, :N]`` (only inside [ks, ke) tiles) and return chunk-max keys."""
++    R, N = q_bf16.shape[0], k_bf16.shape[0]
++    mx = torch.empty((R, (N + CHUNK - 1) // CHUNK), dtype=torch.int32, device=q_bf16.device)
++    ops().logits(q_bf16, k_bf16, k_scale.reshape(-1), weights, ks, ke, out, mx, flags, block_size, KEYS_PER_CTA)
++    return mx
++
++
++def topk(
++    logits_: torch.Tensor,
++    mx: torch.Tensor,
++    ks: torch.Tensor,
++    ke: torch.Tensor,
++    out: torch.Tensor,
++    k: int,
++    stats: torch.Tensor | None = None,
++) -> None:
++    ops().topk(logits_, mx, ks, ke, out, k, stats)
++
++
++def chunkmax(logits_: torch.Tensor, ks: torch.Tensor, ke: torch.Tensor) -> torch.Tensor:
++    R, N = logits_.shape
++    mx = torch.empty((R, (N + CHUNK - 1) // CHUNK), dtype=torch.int32, device=logits_.device)
++    ops().chunkmax(logits_, ks, ke, mx)
++    return mx
++
++
++def indexer_prefill_topk(
++    q_fp8: torch.Tensor,
++    k_fp8: torch.Tensor,
++    k_scale: torch.Tensor,
++    weights: torch.Tensor,
++    ks: torch.Tensor,
++    ke: torch.Tensor,
++    topk_out: torch.Tensor,
++    topk_tokens: int,
++    logits_workspace: torch.Tensor,
++    k_bf16: torch.Tensor | None = None,
++    candidate_blocks: torch.Tensor | None = None,
++    candidate_block_size: int = 0,
++    candidate_write: bool = False,
++) -> torch.Tensor | None:
++    """One prefill metadata chunk. Writes ``topk_out[R, topk_tokens]``.
++
++    Returns the logits view (needed only by the candidate writer) or None.
++    """
++    R, N = q_fp8.shape[0], k_fp8.shape[0]
++    ks = ks.contiguous()
++    ke = ke.contiguous()
++    lg = logits_workspace.view(-1)[: R * N].view(R, N)
++    if k_bf16 is None:
++        k_bf16 = decode_fp8(k_fp8)
++    q_bf16 = decode_fp8(q_fp8)
++    flags = None
++    if candidate_blocks is not None and not candidate_write:
++        flags = candidate_flags(ks, candidate_blocks, N, candidate_block_size)
++    mx = logits(q_bf16, k_bf16, k_scale, weights, ks, ke, lg, flags, candidate_block_size)
++    if candidate_blocks is not None and candidate_write:
++        from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
++            select_candidate_blocks,
++        )
++
++        select_candidate_blocks(lg, ks, ke, candidate_blocks.shape[1], candidate_block_size, candidate_blocks)
++    topk(lg, mx, ks, ke, topk_out, topk_tokens)
++    return lg

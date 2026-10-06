@@ -7,3 +7,6 @@
 0007-dsv4-mhc-decode-v2.patch
 0008-mxfp4-decode-v2-fused.patch
 0009-dspark-draft-head-fp8.patch
+0010-dsv41-thin-woa-packed-prologue.patch
+0011-dsv41-moe-prefill-split.patch
+0012-dsv41-indexer-prefill-fast.patch
