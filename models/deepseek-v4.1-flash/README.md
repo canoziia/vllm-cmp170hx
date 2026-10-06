@@ -370,3 +370,38 @@ is not included.
 Greedy self-consistency (3 cases x 4 runs x 128 tokens, scored with
 `prompt_logprobs` under the same engine): every non-top-1 token is a near tie
 (logprob gap <= 0.5).
+
+## Decode optimisation: faster sm80 sparse-attention decode (patch 0005)
+
+The sm80 split-K sparse-attention decode (`_sparse_attn_decode_partial_kernel`,
+shared with ROCm) spent ~60 us per layer at c1. It decoded every fp8 K byte
+with a 256-entry LUT gather plus an `exp2` per element (FMA-class ALU is
+limited on this card), and with 16-head blocks each K tile was decoded four
+times (MQA: one K for all 64 heads). Patch 0005
+(`VLLM_DSV4_SPARSE_DECODE_FAST`, patch default 0, `compose.yml` sets 1):
+
+- integer fp8 placement (e4m3 byte as bf16 v * 2^-120, times 2^120, times the
+  e8m0 scale; NaN codes -> 0; scale byte 0 -> 2^-127): exactly the LUT values;
+- 8 warps; 32-head blocks for more than 16 queries;
+- the split count is still derived from 16-head blocks, so every head sees
+  the same K slices and merge order.
+
+`tests/test_sparse_decode_fast_gpu.py` checks bitwise equality with the switch
+off (1-48 queries, padded top-k, NaN K codes, scale byte 0). Kernel time
+(synthetic cache, SWA 128 + top-512): 6 queries 127 -> 88 us, 16 queries
+307 -> 213 us, 48 queries 854 -> 347 us.
+
+Engine (node1 PP6, 0003+0004 image + 0005 mounted for development, 2 warm-up
++ 5 timed rounds): c1 counting/code/prose 178.0/150.9/69.8 tok/s (steps/s
+29.96/28.12/29.93, from 28.44/26.34/28.30), prose acceptance unchanged
+(2.33). Greedy self-scoring: only near ties (gap <= 0.5).
+
+Rebuilt image with 0003-0005, `compose.yml` as committed, nothing mounted:
+c1 counting/code/prose 179.0/148.4/69.9 tok/s (steps/s 30.13/27.65/30.00),
+c8 897.4/710.1/348.5 tok/s, acceptance unchanged. Against the deployed debug
+image before this work (150.2/127.3/58.4, steps/s 25.28/23.32/25.38; c8
+719.4/587.7/190.7): c1 steps/s +18-19 %.
+
+Evaluated and not included: a tensor-core router gate GEMV (19.4 -> 9.3 us per
+call, error at the scalar GEMV's level) changed engine step rate by only
++0.5 % while changing fp32 summation order in routing.
