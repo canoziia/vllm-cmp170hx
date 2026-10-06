@@ -78,6 +78,8 @@ services:
       VLLM_DSV4_MXFP4_FUSED_SUM: "1"
       VLLM_DSV4_MXFP4_FUSED_SUM_ORDER: "1"
       VLLM_DSV4_CUDA_DET_ALIGN: "1"
+      # patch 0009: fp8 copy of lm_head for draft logits (target stays bf16).
+      VLLM_DSPARK_DRAFT_HEAD_FP8: "1"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
