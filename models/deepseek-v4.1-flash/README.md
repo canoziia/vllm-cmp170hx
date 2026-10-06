@@ -439,3 +439,18 @@ tests pass. Against the deployed debug image before this work (steps/s
 
 Acceptance unchanged (counting 5.88, prose 2.33). Greedy self-scoring under
 the engine: only near ties (gap <= 0.5). c8 ranges stay wide on this box.
+
+## fp8 draft head (patch 0009)
+
+`VLLM_DSPARK_DRAFT_HEAD_FP8` (patch default 0, `compose.yml` sets 1): the
+DSpark drafter computes its base logits from a per-row fp8 copy of lm_head
+(FP8 Marlin, 0.5 ms instead of 1.0 ms at 6 rows); target verification keeps
+the bf16 head, so the output distribution is unchanged. Last-stage GPU time
+per step 7.74 -> 7.03 ms; acceptance unchanged on the benchmark prompts
+(counting 5.88, prose 2.33). Development run: c1 steps/s 31.90/29.16/31.72,
+c8 937.1/745.9/379.1 tok/s (c8 ranges wide). `tests/test_draft_head_fp8_gpu.py`.
+
+Rebuilt image with 0001-0009 (compose as committed, nothing mounted): c1
+counting/code/prose 191.6/157.3/75.0 tok/s (steps/s 32.26/29.62/32.14),
+c8 925.6/750.4/347.6; cold prefill (same warm instance, median of 2)
+8k/32k/64k/107k 1919/2874/4000/4206 tok/s.

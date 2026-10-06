@@ -6,3 +6,4 @@
 0006-dsv41-fused-small-decode-kernels.patch
 0007-dsv4-mhc-decode-v2.patch
 0008-mxfp4-decode-v2-fused.patch
+0009-dspark-draft-head-fp8.patch

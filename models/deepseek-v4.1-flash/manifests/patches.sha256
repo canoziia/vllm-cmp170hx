@@ -15,3 +15,4 @@ aabc7c81ff1fea8089069b6b272dfae6f59e99bfa0f2564082bba7411e386004  models/deepsee
 0149176d8085a65841c74c21fe4bd4c42ab97999646663e59a50a2e5dcbd0fee  models/deepseek-v4.1-flash/patches/0006-dsv41-fused-small-decode-kernels.patch
 bdbd36d110fe5ad6cb13e9ea7e96156cabdd09de496a3435d5ff9cd7f9d818fb  models/deepseek-v4.1-flash/patches/0007-dsv4-mhc-decode-v2.patch
 25038de8fe1e3b36bd3ded524fbe671dce0b68b700c388228131b4cdbb0ed158  models/deepseek-v4.1-flash/patches/0008-mxfp4-decode-v2-fused.patch
+c07c727af9b9f7c27c4e0bb48af770d0ec3f92234239694f7e6203ac7b28895f  models/deepseek-v4.1-flash/patches/0009-dspark-draft-head-fp8.patch
