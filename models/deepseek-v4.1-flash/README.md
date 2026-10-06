@@ -310,9 +310,24 @@ Hardware facts that shape every kernel on this box (CMP 170HX, measured):
 | | measured |
 |---|---|
 | HBM pure read | 1,612 GB/s (copy r+w 1,594, write 1,356) |
-| FP32 FFMA / FMUL / FADD, bf16 HMUL2 / HFMA2 | ~42 thread-instr / SM / clk (limited) |
-| integer shift/logic | ~70 / SM / clk |
-| bf16 tensor-core mma | not limited |
+| FP32 FFMA / FMUL / FADD / FMNMX, bf16 HFMA2, integer LOP3/SHF/PRMT/IMAD | ~64 thread-instr / SM / clk (A100 rate, not throttled) |
+| f16 HMUL2 | ~122 / SM / clk |
+| bf16 tensor-core mma | A100 rate |
+| L2 | 32 MiB (CUDA device attribute) |
+| board power limit | 180 W on every card (default 250 W, max 300 W) |
+
+Correction (later measurements): an earlier version of this table listed
+FP32/bf16 FMA-class instructions at ~42 / SM / clk and called them
+throttled, and the L2 as 40 MB. Clean microbenchmarks on node1/node2 (O2,
+P4 lab runs) measure ~64 / SM / clk for FP32, bf16 HFMA2 and integer ops
+alike, i.e. no ALU throttling, and the device reports 32 MiB of L2. The real
+limit on sustained decode is the 180 W power cap: under load every card sits
+at 179-181 W with the SW power-cap throttle active and SM clocks of
+~800-1150 MHz, so energy per byte (bytes read + instructions issued per
+byte), not instruction rate, decides kernel speed. With the clock allowed
+to recover (~1400 MHz) the deployed MXFP4 MoE kernel already reaches
+1.17-1.46 TB/s. The earlier ~42 figure was taken under that clock
+throttling.
 
 Marlin's MXFP4 MoE GEMM reached only 740-880 GB/s at decode sizes. Patch 0004
 (`VLLM_DSV4_MXFP4_DECODE`, patch default 0, `compose.yml` sets 1) runs the two
