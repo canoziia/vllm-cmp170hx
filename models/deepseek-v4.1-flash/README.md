@@ -513,3 +513,40 @@ Engine (node1 PP6, development tree): c1 steps/s +2.6 % on all three loads
 and greedy self-scoring unchanged. c8 shows no measurable change: PP6
 schedules the c8 requests in micro-batches of 1-2 requests per stage step
 (M 6-12), so the larger-M kernels matter only at higher concurrency.
+
+## Optimisation switches (patch 0014 profile)
+
+`compose.yml` enables all optimisation patches with one variable,
+`VLLM_DSV41_OPT_PROFILE: "default"` (patch 0014). The profile sets each switch
+below to the listed value **only if that variable is not already set**, so a
+single optimisation can be turned off by adding it to `environment:` (for
+example `VLLM_DSV41_INDEXER_PREFILL_FAST: "0"`). Without the profile every
+switch defaults to off (original code path). The profile is applied from
+`vllm.env_override`, before any other vLLM import, in every process.
+
+| patch | switch | profile value | what |
+|---|---|---|---|
+| 0003 | `VLLM_DSV4_FAST_DET_MOE_ALIGN` | 1 | single-kernel deterministic MoE align (bitwise) |
+| 0004 | `VLLM_DSV4_MXFP4_DECODE` | 1 | weight-streaming MXFP4 MoE decode (<= 64 tokens) |
+| 0005 | `VLLM_DSV4_SPARSE_DECODE_FAST` | 1 | faster sm80 sparse-attention decode (bitwise) |
+| 0006 | `VLLM_DSV4_ATTN_DIRECT_OUT` | 1 | attention writes straight into the output buffer |
+| 0006 | `VLLM_DSV41_TOPK_RAGGED_FUSED` | 1 | top-k ragged metadata in one kernel |
+| 0006 | `VLLM_DSV41_SWA_RAGGED_INPLACE` | 1 | SWA ragged metadata built in place |
+| 0006 | `VLLM_DSV41_INDEXER_Q_LUT_FUSED` | 1 | indexer q LUT decode in one kernel |
+| 0006 | `VLLM_DSV41_TOPK_RAGGED_REUSE` | (off) | reuse top-k metadata across layers; not enabled |
+| 0007 | `VLLM_DSV4_MHC_V2` | 1 | Gluon mHC decode v2 for hidden 5120 |
+| 0008 | `VLLM_DSV4_MXFP4_FUSED_ACT` | 1 | split-K sum + activation inside w13 |
+| 0008 | `VLLM_DSV4_MXFP4_FUSED_SUM` | 1 | top-k sum inside w2 (<= 16 tokens) |
+| 0008 | `VLLM_DSV4_MXFP4_FUSED_SUM_ORDER` | 1 | sum order bitwise equal to `_moe_C.moe_sum` |
+| 0008 | `VLLM_DSV4_CUDA_DET_ALIGN` | 1 | single-CTA CUDA deterministic align |
+| 0008 | `VLLM_DSV4_MXFP4_DQ` | (0) | cheaper-dequant variants; slower end to end, not enabled |
+| 0009 | `VLLM_DSPARK_DRAFT_HEAD_FP8` | 1 | fp8 copy of lm_head for draft logits (target stays bf16) |
+| 0010 | `VLLM_DSV41_THIN_WOA` | 1 | thin-M grouped wo_a GEMM (decode) |
+| 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` | 1 | MXFP4 MoE prefill split-list |
+| 0011 | `VLLM_DSV41_SPARSE_PREFILL_64H` | (off) | 64-head sparse prefill tile; no stable gain, not enabled |
+| 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | 1 | fast prefill indexer (logits bitwise, same top-512 set) |
+| 0013 | `VLLM_DSV4_O2_DENSE` | 1 | dense MXFP8 decode GEMM for M 1-192 (Marlin elsewhere) |
+| 0013 | `VLLM_DSV4_O2_LIB` | `vllm/_o2.so` | path of the 0013 kernel library (built into the image) |
+
+Requirements: patch 0003/0008 align switches act only with
+`VLLM_DETERMINISTIC_MOE_ALIGN` (on by default in this tree).

@@ -1,0 +1,88 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4.1: one profile switch for the optimisation patches
+
+VLLM_DSV41_OPT_PROFILE=default sets every per-patch switch of 0003-0013 to
+its deployed value unless that variable is already set (so each switch can
+still be overridden). Unset/0/off changes nothing. Applied from
+vllm.env_override, before any other vLLM import, in every process.
+
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+new file mode 100644
+index 0000000..5609526
+--- /dev/null
++++ b/vllm/dsv41_opt_profile.py
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One switch for the DeepSeek V4.1 Flash CMP 170HX optimisation patches.
++
++VLLM_DSV41_OPT_PROFILE=default sets every per-patch switch of patches 0003-0013
++to its deployed value *unless that variable is already set*, so a single
++switch can still be overridden (e.g. VLLM_DSV41_INDEXER_PREFILL_FAST=0).
++Unset / "0" / "off": nothing is changed (every patch stays at its own default,
++which is off). Applied from vllm.env_override, i.e. before any other vLLM
++module is imported, in the API server and in every spawned worker.
++The switch list is documented in models/deepseek-v4.1-flash/README.md.
++"""
++import os
++
++PROFILES: dict[str, dict[str, str]] = {
++    "default": {
++        # 0003 single-kernel deterministic MoE align
++        "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
++        # 0004 weight-streaming MXFP4 MoE decode
++        "VLLM_DSV4_MXFP4_DECODE": "1",
++        # 0005 faster sm80 sparse-attention decode
++        "VLLM_DSV4_SPARSE_DECODE_FAST": "1",
++        # 0006 fused small decode kernels
++        "VLLM_DSV4_ATTN_DIRECT_OUT": "1",
++        "VLLM_DSV41_TOPK_RAGGED_FUSED": "1",
++        "VLLM_DSV41_SWA_RAGGED_INPLACE": "1",
++        "VLLM_DSV41_INDEXER_Q_LUT_FUSED": "1",
++        # 0007 Gluon mHC decode v2
++        "VLLM_DSV4_MHC_V2": "1",
++        # 0008 fused MoE activation / top-k sum, CUDA deterministic align
++        "VLLM_DSV4_MXFP4_FUSED_ACT": "1",
++        "VLLM_DSV4_MXFP4_FUSED_SUM": "1",
++        "VLLM_DSV4_MXFP4_FUSED_SUM_ORDER": "1",
++        "VLLM_DSV4_CUDA_DET_ALIGN": "1",
++        # 0009 fp8 draft head
++        "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
++        # 0010 thin-M wo_a GEMM
++        "VLLM_DSV41_THIN_WOA": "1",
++        # 0011 MXFP4 MoE prefill split-list
++        "VLLM_DSV41_MOE_PREFILL_SPLIT": "1",
++        # 0012 fast prefill indexer
++        "VLLM_DSV41_INDEXER_PREFILL_FAST": "1",
++        # 0013 dense MXFP8 decode GEMM
++        "VLLM_DSV4_O2_DENSE": "1",
++        "VLLM_DSV4_O2_LIB": os.path.join(os.path.dirname(os.path.abspath(__file__)), "_o2.so"),
++    },
++}
++
++
++def apply() -> None:
++    name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
++    if name in ("", "0", "off", "none"):
++        return
++    if name not in PROFILES:
++        raise ValueError(
++            f"VLLM_DSV41_OPT_PROFILE={name!r}: unknown profile "
++            f"(known: {', '.join(sorted(PROFILES))})")
++    for key, value in PROFILES[name].items():
++        os.environ.setdefault(key, value)
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index a931b23..9c3046d 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -4,6 +4,11 @@
+ import importlib.util
+ import os
+ 
++# DeepSeek V4.1 Flash on CMP 170HX: one switch for the per-patch switches (patch 0014).
++from vllm.dsv41_opt_profile import apply as _dsv41_apply_opt_profile
++
++_dsv41_apply_opt_profile()
++
+ 
+ def _get_torch_cuda_version():
+     """Peripheral function to _maybe_set_cuda_compatibility_path().
