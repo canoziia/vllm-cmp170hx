@@ -10,3 +10,4 @@
 0010-dsv41-thin-woa-packed-prologue.patch
 0011-dsv41-moe-prefill-split.patch
 0012-dsv41-indexer-prefill-fast.patch
+0013-dsv4-o2-dense-mxfp8-decode.patch

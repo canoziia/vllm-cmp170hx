@@ -86,6 +86,9 @@ services:
       VLLM_DSV41_MOE_PREFILL_SPLIT: "1"
       # patch 0012: fast sm80 prefill indexer (logits bitwise, same top-512 set).
       VLLM_DSV41_INDEXER_PREFILL_FAST: "1"
+      # patch 0013: dense MXFP8 decode GEMM for M 1-192 (Marlin elsewhere).
+      VLLM_DSV4_O2_DENSE: "1"
+      VLLM_DSV4_O2_LIB: /usr/local/lib/python3.12/dist-packages/vllm/_o2.so
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
