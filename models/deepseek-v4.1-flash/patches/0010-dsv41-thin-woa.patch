@@ -1,0 +1,122 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4.1: thin-M wo_a GEMM
+
+VLLM_DSV41_THIN_WOA (default 0): grouped wo_a projection (8 x [M,4096] x
+[4096,1024] bf16) for small M as a short-chain tensor-core Triton kernel
+(45-47 us vs cuBLAS 50 us at M=6; fp64 error <= cuBLAS, deterministic).
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5494590..aea5ad1 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -224,6 +224,7 @@ if TYPE_CHECKING:
+     ] = "relax"
+     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
+     VLLM_MOE_SKIP_PADDING: bool = True
++    VLLM_DSV41_THIN_WOA: bool = False
+     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
+     VLLM_KIMI_K3_GEMM_AR: bool = True
+@@ -642,6 +643,8 @@ def _resolve_rust_cli_path() -> str | None:
+ 
+ 
+ environment_variables: dict[str, Callable[[], Any]] = {
++    # Independent, opt-in decode paths. Off leaves the incumbent calls intact.
++    "VLLM_DSV41_THIN_WOA": lambda: os.getenv("VLLM_DSV41_THIN_WOA", "0") == "1",
+     # ================== Installation Time Env Vars ==================
+     # Target device of vLLM, supporting [cuda (by default),
+     # rocm, cpu]
+diff --git a/vllm/v1/attention/ops/dsv41_thin_woa.py b/vllm/v1/attention/ops/dsv41_thin_woa.py
+new file mode 100644
+index 0000000..86f5090
+--- /dev/null
++++ b/vllm/v1/attention/ops/dsv41_thin_woa.py
+@@ -0,0 +1,73 @@
++"""Experimental BF16 grouped thin GEMM and Markov tensor-core blockmax.
++No persistent scratch, no atomics; warm JIT specializations before capture.
++"""
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def wo_kernel(X, W, Y, M: tl.constexpr, G: tl.constexpr, N: tl.constexpr,
++              K: tl.constexpr, SX: tl.constexpr, SG: tl.constexpr,
++              BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    g = tl.program_id(1)
++    m = tl.arange(0, BM)
++    k = tl.arange(0, BK)
++    acc = tl.zeros((BM, BN), tl.float32)
++    for i in range(tl.cdiv(K, BK)):
++        kk = i * BK + k
++        a = tl.load(X + m[:, None] * SX + g * SG + kk[None, :],
++                    (m[:, None] < M) & (kk[None, :] < K), 0)
++        b = tl.load(W + g * N * K + n[None, :] * K + kk[:, None],
++                    (n[None, :] < N) & (kk[:, None] < K), 0)
++        # Short independent dot then FP32 add (not long-chain MMA).
++        tmp = tl.dot(a, b)
++        # Explicit asm blocks Triton's combine-dot-add pass, which otherwise
++        # folds even `acc + dot(a,b)` into a long MMA accumulator chain.
++        acc = tl.inline_asm_elementwise(
++            "add.rn.f32 $0, $1, $2;", constraints="=f,f,f",
++            args=[acc, tmp], dtype=tl.float32, is_pure=True, pack=1)
++    tl.store(Y + (m[:, None] * G + g) * N + n[None, :], acc,
++             (m[:, None] < M) & (n[None, :] < N))
++
++
++def wo(x, w, bn=32, bk=128, warps=4, stages=4, out=None):
++    m, g, k = x.shape
++    n = w.shape[1]
++    if out is None:
++        out = torch.empty((m, g, n), device=x.device, dtype=x.dtype)
++    return wo_launch(x, w, out, bn, bk, warps, stages)
++
++
++def wo_launch(x, w, out, bn, bk, warps, stages):
++    m, g, k = x.shape
++    n = w.shape[1]
++    wo_kernel[(triton.cdiv(n, bn), g)](
++        x, w, out, m, g, n, k, x.stride(0), x.stride(1),
++        max(16, triton.next_power_of_2(m)), bn, bk,
++        num_warps=warps, num_stages=stages, enable_fp_fusion=False)
++    return out
++
++
++# No persistent allocation or cross-stream scratch; graph-private outputs only.
++# An unwarmed specialization falls back during capture rather than JIT there.
++_READY = set()
++
++
++def thin_woa(x, w):
++    if not (
++        x.is_cuda and x.dtype == w.dtype == torch.bfloat16
++        and x.ndim == w.ndim == 3
++        and x.shape[1:] == (8, 4096) and w.shape == (8, 1024, 4096)
++        and 1 <= x.shape[0] <= 48 and x.stride(-1) == 1
++        and w.is_contiguous() and x.device == w.device
++        and torch.cuda.get_device_capability(x.device) == (8, 0)
++    ):
++        return torch.einsum("tgd,grd->tgr", x, w)
++    key = (x.device.index, x.shape[0], x.stride(0), x.stride(1))
++    if key not in _READY and torch.cuda.is_current_stream_capturing():
++        return torch.einsum("tgd,grd->tgr", x, w)
++    out = wo(x, w, 128, 128, 4, 3)
++    _READY.add(key)
++    return out
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index a9d3a3b..ec75450 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1390,6 +1390,10 @@ def rocm_inv_rope_einsum(
+         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]
+     )
+ 
++    if envs.VLLM_DSV41_THIN_WOA and current_platform.is_cuda():
++        from vllm.v1.attention.ops.dsv41_thin_woa import thin_woa
++
++        return thin_woa(o_ref, wo_a_weight)
+     return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+ 
+ 

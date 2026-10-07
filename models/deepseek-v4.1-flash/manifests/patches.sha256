@@ -16,7 +16,7 @@ aabc7c81ff1fea8089069b6b272dfae6f59e99bfa0f2564082bba7411e386004  models/deepsee
 bdbd36d110fe5ad6cb13e9ea7e96156cabdd09de496a3435d5ff9cd7f9d818fb  models/deepseek-v4.1-flash/patches/0007-dsv4-mhc-decode-v2.patch
 25038de8fe1e3b36bd3ded524fbe671dce0b68b700c388228131b4cdbb0ed158  models/deepseek-v4.1-flash/patches/0008-mxfp4-decode-v2-fused.patch
 c07c727af9b9f7c27c4e0bb48af770d0ec3f92234239694f7e6203ac7b28895f  models/deepseek-v4.1-flash/patches/0009-dspark-draft-head-fp8.patch
-3ae9277a205d8a7a6a61e72c548a3d788fea42aa48cee99224e54337e59f6392  models/deepseek-v4.1-flash/patches/0010-dsv41-thin-woa-packed-prologue.patch
 f17396c8c768a138c955e3d1aadf75c7c86a1221f0826191bf6df0ecaf82455d  models/deepseek-v4.1-flash/patches/0011-dsv41-moe-prefill-split.patch
 a74e0a191cec239f92189b414889051461d92c340af97919c720f378478b25c0  models/deepseek-v4.1-flash/patches/0012-dsv41-indexer-prefill-fast.patch
-c51eb01c629e9ccf3effcfb2d638f242609dd8aa8e8b980cd4b605f095799942  models/deepseek-v4.1-flash/patches/0013-dsv4-o2-dense-mxfp8-decode.patch
+ebe791970e10f9f97bbb0d7a50358b8adea2344ab6b49c7ece78cdd014280c75  models/deepseek-v4.1-flash/patches/0010-dsv41-thin-woa.patch
+dfb48539cc85ed52242378a165a2eff7743533b8b960d3ea2d8d101021e0479d  models/deepseek-v4.1-flash/patches/0013-dsv4-o2-dense-mxfp8-decode.patch

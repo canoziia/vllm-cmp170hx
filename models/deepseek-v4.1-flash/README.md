@@ -474,7 +474,7 @@ c8 925.6/750.4/347.6; cold prefill (same warm instance, median of 2)
 
 | patch | switch (compose sets 1) | what |
 |---|---|---|
-| 0010 | `VLLM_DSV41_THIN_WOA` (`VLLM_DSV41_PACKED_PROLOGUE` included, off) | grouped wo_a GEMM for small M, short-chain tensor-core Triton (45-47 vs 50 us at M=6), fp64 error <= cuBLAS |
+| 0010 | `VLLM_DSV41_THIN_WOA` | grouped wo_a GEMM for small M, short-chain tensor-core Triton (45-47 vs 50 us at M=6), fp64 error <= cuBLAS |
 | 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` (`VLLM_DSV41_SPARSE_PREFILL_64H` included, off) | MXFP4 MoE prefill split expert lists (27.4 -> 23.0 ms per 4096-token chunk) |
 | 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | prefill indexer logits + top-512 as two CUDA kernels (`native/dsv41_indexer`, built into the image): logits bitwise, same top-512 set (sorted by column); 80.2 -> 38.6 ms per 4096-row chunk at 114K KV |
 
