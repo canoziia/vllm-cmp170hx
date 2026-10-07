@@ -118,12 +118,12 @@ services:
     network_mode: host
     ipc: host
     devices:
-      - nvidia.com/gpu=0
-      - nvidia.com/gpu=1
-      - nvidia.com/gpu=2
-      - nvidia.com/gpu=3
-      - nvidia.com/gpu=4
-      - nvidia.com/gpu=5
+      - nvidia.com/gpu=${DSV41_GPU_0:-0}
+      - nvidia.com/gpu=${DSV41_GPU_1:-1}
+      - nvidia.com/gpu=${DSV41_GPU_2:-2}
+      - nvidia.com/gpu=${DSV41_GPU_3:-3}
+      - nvidia.com/gpu=${DSV41_GPU_4:-4}
+      - nvidia.com/gpu=${DSV41_GPU_5:-5}
     security_opt:
       - label=disable
       - apparmor=unconfined
