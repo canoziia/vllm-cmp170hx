@@ -492,3 +492,24 @@ prompt length shown, tok/s):
 The tail drop from 106k to 989k goes from -56 % to -33 %. Runs within a pair
 agree within ~1 %. Earlier jumpy long-prompt numbers came from the first
 requests on a fresh instance (one-time JIT/warm-up), not from steady state.
+
+## Dense MXFP8 decode GEMM (patch 0013)
+
+`VLLM_DSV4_O2_DENSE` (patch default 0, `compose.yml` sets 1): the dense MXFP8
+projections (q_b, o, qkv_a, shared expert w13/w2) use our kernels from
+`native/dsv4_o2` (built into the image as `vllm/_o2.so`) where a measured
+per-shape dispatch table shows them faster than Marlin, Marlin elsewhere:
+
+- M <= 8: warp-level stream-K; M 9-64: CTA-shared activations (cp.async once
+  per stage, ldmatrix by all warps), static split-K + fixed-order sum;
+  M 65-192: two warps per tile, each dequantising half the weights;
+- 236 of 250 scanned (shape, M) points use our kernel, each >= 1.04x Marlin
+  (median 1.11-1.54x per shape); layer sequence 1.08-1.29x for M 1-192;
+- fp64 error at Marlin's level (mean ratio 1.00000-1.00001, max <= 1.0024),
+  not bitwise; deterministic, CUDA-graph safe; `tests/test_o2_dense_gpu.py`.
+
+Engine (node1 PP6, development tree): c1 steps/s +2.6 % on all three loads
+(32.18/29.56/32.13 -> 33.01/30.34/32.96 with the M <= 8 kernel), acceptance
+and greedy self-scoring unchanged. c8 shows no measurable change: PP6
+schedules the c8 requests in micro-batches of 1-2 requests per stage step
+(M 6-12), so the larger-M kernels matter only at higher concurrency.
