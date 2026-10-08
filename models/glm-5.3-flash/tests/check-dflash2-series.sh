@@ -54,4 +54,6 @@ for test in test_kv_layout_dflash_pure.py test_adaptive_k_pure.py test_thin_gemm
   echo "-- $test"
   python3 "$TESTS/$test" | tail -n 1
 done
+python3 "$TESTS/test_sched_mamba_checkpoint_cpu.py" \
+  "$WORK/after/vllm/v1/core/sched/scheduler.py"
 echo "GLM DFlash2 CPU check passed."

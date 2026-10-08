@@ -4,15 +4,26 @@ Subject: [PATCH] kv cache: let DFlash drafter layers ride the GLM5Next MLA tenso
 KV init failed for every block size once a DFlash/DFlash2 drafter was
 attached: its sliding-window layers sent grouping to the generic page
 unifier, which cannot fit the kpool indexer page. Place the drafter layers
-on the MLA tensors with an exact-fit block (B/4 tokens), which needs
---block-size to be a multiple of 256 (use 4608); other sizes log a hint and
-fail as before. Grouping without a drafter is unchanged.
+on the MLA tensors at disjoint block ids, 1024 tokens per drafter block in
+one MLA page (the rest of the page is padding; 4 of 5 MiB at target block
+5120). 1024 divides the drafter's 2048-token window and the 5120-token
+target block/LMCache chunk, so the geometry needs no LMCache change. Padded
+pages are never split into smaller kernel blocks.
+
+The scheduler aligned Mamba (KDA) state checkpoints to the smallest group
+block, i.e. the drafter's 1024, instead of the target state page; local
+prefill and an LMCache restore could then snapshot the KDA state at
+different positions. Checkpoints now follow the homogeneous
+MambaSpec.block_size; mixed Mamba block sizes keep the old behaviour.
+At target block 5120, --max-num-batched-tokens must be 5184 so a full block
+still fits next to the draft input slots.
+
+Grouping without a drafter is unchanged.
 
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 7ee001d..e17e3fa 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -1181,10 +1181,23 @@ def _get_kv_cache_groups_glm5_next(
+@@ -1181,10 +1181,23 @@
          for name, spec in kv_cache_spec.items()
          if isinstance(spec, KpoolTailSpec)
      }
@@ -36,7 +47,7 @@ index 7ee001d..e17e3fa 100644
      }
      if not mamba_specs or not all(
          type(spec) is MLAAttentionSpec for spec in attn_specs.values()
-@@ -1241,13 +1254,151 @@ def _get_kv_cache_groups_glm5_next(
+@@ -1241,11 +1254,129 @@
      for index, name in enumerate(mamba_specs):
          mamba_grouped_names[index % num_groups].append(name)
  
@@ -61,10 +72,11 @@ index 7ee001d..e17e3fa 100644
          [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
          + ([tail_group] if tail_group is not None else [])
          + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
+-    )
 +        + draft_groups
-     )
- 
- 
++    )
++
++
 +def _glm5_next_draft_mla_slots(vllm_config: VllmConfig, mla_names: list[str]) -> int:
 +    """MLA tensors available to the drafter's layers on the stage that runs it.
 +
@@ -92,19 +104,18 @@ index 7ee001d..e17e3fa 100644
 +) -> list[KVCacheGroupSpec]:
 +    """KV groups for a DFlash-style drafter's sliding-window layers.
 +
-+    Exact-fit geometry only: the drafter's block size is chosen so its page is
-+    byte-for-byte the MLA page, so drafter layer i of a group rides MLA tensor
-+    i at disjoint block ids of the one shared pool -- the way the mamba
-+    groups already share those tensors. Bytes per block are unchanged; each
-+    drafter group only claims its (window-bounded) block ids per request.
++    Each drafter block holds 1024 tokens and occupies one padded MLA page.
++    Use target block 5120 for PD: both the target chunk and draft window
++    divide into complete draft blocks. The 1024-token data uses 4 MiB of
++    the 5 MiB page. Each layer rides its MLA tensor at disjoint block ids.
 +
 +    When the drafter's stage has fewer MLA tensors than the drafter has
 +    layers (PP: the last stage owns only its own MLA layers), the layers are
 +    split over several groups, each no wider than the tensors available.
 +
-+    ``page_size_padded`` is deliberately not used (a padded page is read
-+    through a strided view, invalid once the backend splits the manager block
-+    into kernel blocks). An empty list means "not supported".
++    Padded pages must NOT be split into smaller kernel blocks. The standard
++    KV view builder rejects such splitting; FlashAttention on sm80 supports
++    the full selected block (MultipleOf(16)). An empty list is unsupported.
 +    """
 +    any_draft = next(iter(draft_specs.values()))
 +    if not all(spec == any_draft for spec in draft_specs.values()):
@@ -120,33 +131,13 @@ index 7ee001d..e17e3fa 100644
 +        )
 +        return []
 +    bytes_per_token = any_draft.page_size_bytes // any_draft.block_size
-+    if not bytes_per_token or mla_page % bytes_per_token:
-+        logger.warning(
-+            "DFlash drafter KV: drafter %d B/token does not divide the MLA "
-+            "page (%d B); the GLM-5.3-Flash shared layout is not used",
-+            bytes_per_token,
-+            mla_page,
-+        )
-+        return []
-+    fit_block = mla_page // bytes_per_token
 +    mla_block = mla_specs[mla_names[0]].block_size
-+    mla_bytes_per_token = mla_page // mla_block
-+    if fit_block % 64 or (fit_block % mla_block and mla_block % fit_block):
-+        # A 64-divisible manager block splits cleanly into any kernel block
-+        # size the sliding-window backends register (16 / 32 / 64), and the
-+        # scheduler's block-size LCM stays at max(mla_block, fit_block).
-+        logger.warning(
-+            "DFlash drafter KV: the exact-fit drafter block (%d tokens for "
-+            "the %d-token MLA block) is not a multiple of 64; the "
-+            "GLM-5.3-Flash shared layout is not used. Choose --block-size so "
-+            "that block_size * %d / %d is a multiple of 64 (i.e. a multiple "
-+            "of %d).",
-+            fit_block,
-+            mla_block,
-+            mla_bytes_per_token,
-+            bytes_per_token,
-+            64 * bytes_per_token // math.gcd(64 * bytes_per_token, mla_bytes_per_token),
-+        )
++    window = any_draft.sliding_window
++    if bytes_per_token <= 0 or window <= 0:
++        return []
++    fit_block = 1024
++    if window % fit_block or fit_block * bytes_per_token > mla_page:
++        logger.warning("DFlash drafter KV: 1024 tokens do not fit the MLA page/window")
 +        return []
 +    slots = _glm5_next_draft_mla_slots(vllm_config, mla_names)
 +    if slots == 0:
@@ -163,7 +154,7 @@ index 7ee001d..e17e3fa 100644
 +    logger.info(
 +        "DFlash drafter KV: %d sliding-window layers ride the MLA tensors in "
 +        "%d group(s) of %s (block_size %d -> %d, page %d B, %d MLA tensor(s) "
-+        "on the drafter's stage, no extra bytes per block)",
++        "on the drafter's stage)",
 +        len(names),
 +        len(chunks),
 +        [len(c) for c in chunks],
@@ -175,7 +166,8 @@ index 7ee001d..e17e3fa 100644
 +    groups: list[KVCacheGroupSpec] = []
 +    for chunk in chunks:
 +        fitted: dict[str, KVCacheSpec] = {
-+            name: replace(draft_specs[name], block_size=fit_block) for name in chunk
++            name: replace(draft_specs[name], block_size=fit_block,
++                          page_size_padded=mla_page) for name in chunk
 +        }
 +        assert all(spec.page_size_bytes == mla_page for spec in fitted.values())
 +        draft_uniform = UniformTypeKVCacheSpecs.from_specs(fitted)
@@ -183,12 +175,10 @@ index 7ee001d..e17e3fa 100644
 +            return []
 +        groups.append(KVCacheGroupSpec(list(fitted), draft_uniform))
 +    return groups
-+
-+
+ 
+ 
  def _glm5_next_tensor_layout(
-     kv_cache_groups: list[KVCacheGroupSpec],
- ) -> (
-@@ -1260,10 +1411,15 @@ def _glm5_next_tensor_layout(
+@@ -1260,10 +1391,15 @@
          int,
          list[str],
          int,
@@ -205,7 +195,7 @@ index 7ee001d..e17e3fa 100644
      uniform_groups = [
          group
          for group in kv_cache_groups
-@@ -1274,12 +1430,16 @@ def _glm5_next_tensor_layout(
+@@ -1274,12 +1410,16 @@
      ]
      attn_group: KVCacheGroupSpec | None = None
      tail_group: KVCacheGroupSpec | None = None
@@ -222,18 +212,18 @@ index 7ee001d..e17e3fa 100644
      if attn_group is None or not mamba_groups:
          return None
      if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
-@@ -1306,6 +1466,19 @@ def _glm5_next_tensor_layout(
+@@ -1306,6 +1446,19 @@
      idx_page = idx_pages.pop()
      if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
          return None
 +    for draft_group in draft_groups:
-+        # Exact fit only: unpadded, one page per drafter layer equal to the
-+        # MLA page, and no more drafter layers per group than this worker's
-+        # MLA tensors to ride in.
++        # The padded page stride equals the shared MLA page; each draft
++        # layer owns a separate block-id space within that tensor.
 +        draft_inner = cast(
 +            UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
 +        ).kv_cache_specs
-+        if any(spec.page_size_padded is not None for spec in draft_inner.values()):
++        if any(spec.unpadded_page_size_bytes > mla_page
++               for spec in draft_inner.values()):
 +            return None
 +        if {spec.page_size_bytes for spec in draft_inner.values()} != {mla_page}:
 +            return None
@@ -242,7 +232,7 @@ index 7ee001d..e17e3fa 100644
  
      tail_names: list[str] = []
      tail_page = 0
-@@ -1333,6 +1506,7 @@ def _glm5_next_tensor_layout(
+@@ -1333,6 +1486,7 @@
          idx_page,
          tail_names,
          tail_page,
@@ -250,7 +240,7 @@ index 7ee001d..e17e3fa 100644
      )
  
  
-@@ -1564,7 +1738,9 @@ def _get_kv_cache_bytes_per_block(
+@@ -1564,7 +1718,9 @@
  ) -> int:
      """Return the largest cache group's bytes per block."""
      if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
@@ -261,7 +251,7 @@ index 7ee001d..e17e3fa 100644
          return len(mla_names) * mla_page + len(idx_names) * idx_page
  
      bytes_per_block = max(
-@@ -1650,7 +1826,15 @@ def get_kv_cache_config_from_groups(
+@@ -1650,7 +1806,15 @@
              idx_page,
              tail_names,
              _,
@@ -277,7 +267,7 @@ index 7ee001d..e17e3fa 100644
          bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
          num_blocks = may_override_num_blocks(
              vllm_config, available_memory // bytes_per_block
-@@ -1679,6 +1863,13 @@ def get_kv_cache_config_from_groups(
+@@ -1679,6 +1843,13 @@
              for group in mamba_groups:
                  if index < len(group.layer_names):
                      add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
@@ -291,7 +281,7 @@ index 7ee001d..e17e3fa 100644
  
          idx_base = len(mla_names) * mla_page * num_blocks
          for index, idx_name in enumerate(idx_names):
-@@ -2364,6 +2555,7 @@ def _max_memory_usage_bytes_from_groups(
+@@ -2364,6 +2535,7 @@
              idx_page,
              tail_names,
              _,
@@ -299,7 +289,7 @@ index 7ee001d..e17e3fa 100644
          ) = glm5_layout
          uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
          total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
-@@ -2376,6 +2568,13 @@ def _max_memory_usage_bytes_from_groups(
+@@ -2376,6 +2548,13 @@
          )
          if tail_names:
              total_blocks += 1
@@ -313,3 +303,20 @@ index 7ee001d..e17e3fa 100644
          return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
  
      bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -468,6 +468,12 @@
+             return num_new_tokens
+ 
+         block_size = self.cache_config.block_size
++        # A smaller drafter page must not move the target SSM checkpoint.
++        mamba_sizes = {g.kv_cache_spec.block_size
++                       for g in self.kv_cache_config.kv_cache_groups
++                       if isinstance(g.kv_cache_spec, MambaSpec)}
++        if len(mamba_sizes) == 1:
++            block_size = next(iter(mamba_sizes))
+         # The last block-aligned position whose state can be cached. With
+         # Eagle, FullAttn prunes the last matching block, so back off one
+         # block to avoid a Mamba cache miss.

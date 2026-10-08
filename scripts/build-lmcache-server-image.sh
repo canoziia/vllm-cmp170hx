@@ -55,6 +55,8 @@ payload_cid=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_PAYLOAD_IMAGE")
 payload_cid=
 
 "$REPO_ROOT/scripts/apply-lmcache-patches.sh" "$WORKDIR/context/lmcache-payload"
+python3 "$REPO_ROOT/scripts/test-lmcache-bounded-pd-groups.py" \
+  "$WORKDIR/context/lmcache-payload/lmcache/v1/kv_layer_groups.py"
 cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/"
 
 cat > "$WORKDIR/context/Containerfile" <<CONTAINERFILE

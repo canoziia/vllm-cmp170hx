@@ -154,6 +154,9 @@ class RegressionTests(unittest.TestCase):
             adapter = cls(client, base_path=directory, adopt_existing=True)
             try:
                 self.assertEqual(adapter.adopt_existing_keys(), 2)
+                # Native delete completions look sizes up here; adopted files
+                # must be in it or deleting them never releases their bytes.
+                self.assertEqual(sorted(adapter._key_sizes.values()), [4096, 5120])
             finally:
                 adapter.close()
 

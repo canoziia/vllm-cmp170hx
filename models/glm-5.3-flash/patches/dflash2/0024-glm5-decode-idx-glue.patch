@@ -1,9 +1,9 @@
 From: canoziia <canoziia@users.noreply.github.com>
 Subject: [PATCH] glm5: fold the indexer weight scale into the decode FWHT quant
 
-VLLM_GLM5_DECODE_IDX_GLUE_0024 (default 0; sm_80 only). Port of the "fwht"
+VLLM_GLM5_DECODE_IDX_GLUE (default 0; sm_80 only). Port of the "fwht"
 and "expand" items of Morrowmake's ampere_decode/idx_glue.py
-(ops/idx_glue_0024.py): for bf16 contiguous Q with <= 4096 rows and a
+(ops/idx_glue.py): for bf16 contiguous Q with <= 4096 rows and a
 power-of-two weight scale, one Triton launch does the FWHT, the FP8 quant
 and the indexer weight scaling (replacing fwht128_quant_fp8 +
 _fused_indexer_weight_scale), and the kpool indexer expands pool ids in one
@@ -19,10 +19,10 @@ index 4701b62..4e25072 100644
                  )
  
 -    topk_indices_buffer[: hidden_states.shape[0]] = -1
-+    from vllm.models.glm5next.nvidia.ops import idx_glue_0024
++    from vllm.models.glm5next.nvidia.ops import idx_glue
 +
 +    glue_direct = (
-+        idx_glue_0024.enabled() and has_decode and not has_prefill
++        idx_glue.enabled() and has_decode and not has_prefill
 +        and index_kpool > 1 and positions is not None
 +        and attn_metadata_narrowed.decode is not None
 +        and not attn_metadata_narrowed.decode.requires_padding
@@ -42,7 +42,7 @@ index 4701b62..4e25072 100644
 +        # Same pool writes/top-k, only the final data movement is folded.
 +        # Width is physical (typically 2176), never logical topk_tokens=2048.
 +        if glue_direct:
-+            idx_glue_0024.expand_pools_into_buffer(
++            idx_glue.expand_pools_into_buffer(
 +                pool_topk, positions, topk_indices_buffer,
 +                hidden_states.shape[0], index_kpool)
 +            return topk_indices_buffer
@@ -59,14 +59,14 @@ index 0780843..590fedb 100644
          assert self.scale_fmt == "ue8m0"
          q = q.view(-1, self.head_dim)
 -        q_fp8, q_scale = fwht128_quant_fp8(q)
-+        from vllm.models.glm5next.nvidia.ops import idx_glue_0024
++        from vllm.models.glm5next.nvidia.ops import idx_glue
 +
 +        wscale = self.softmax_scale * self.n_head**-0.5
-+        if (idx_glue_0024.enabled() and q.shape[0] <= 4096
++        if (idx_glue.enabled() and q.shape[0] <= 4096
 +                and q.dtype == torch.bfloat16 and q.is_contiguous()
 +                and weights.dtype == torch.float32
-+                and idx_glue_0024.is_pow2_float(wscale)):
-+            q_fp8, weights = idx_glue_0024.fwht128_quant_fp8_wscale(
++                and idx_glue.is_pow2_float(wscale)):
++            q_fp8, weights = idx_glue.fwht128_quant_fp8_wscale(
 +                q, weights, wscale)
 +        else:
 +            q_fp8, q_scale = fwht128_quant_fp8(q)
@@ -81,11 +81,11 @@ index 0780843..590fedb 100644
  
          # kpool: per-token gate score driving the softmax-weighted pool. Computed
          # from the same hidden_states that produced `k`, so it stays token-aligned.
-diff --git a/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py b/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py
+diff --git a/vllm/models/glm5next/nvidia/ops/idx_glue.py b/vllm/models/glm5next/nvidia/ops/idx_glue.py
 new file mode 100644
 index 0000000..a0d986f
 --- /dev/null
-+++ b/vllm/models/glm5next/nvidia/ops/idx_glue_0024.py
++++ b/vllm/models/glm5next/nvidia/ops/idx_glue.py
 @@ -0,0 +1,245 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# Fixed upstream excerpt: see patches-idx/upstream.json.
@@ -100,7 +100,7 @@ index 0000000..a0d986f
 +)
 +
 +def enabled():
-+    return os.getenv("VLLM_GLM5_DECODE_IDX_GLUE_0024", "0") == "1" and torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 0)
++    return os.getenv("VLLM_GLM5_DECODE_IDX_GLUE", "0") == "1" and torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 0)
 +
 +@triton.jit
 +def _fwht_quant_wscale_kernel(
