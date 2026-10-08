@@ -1,0 +1,1271 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: hand the prompt tail state from prefill to decode
+
+In the W4A16 + DFlash2 PD pair LMCache only stores whole 5120-token chunks:
+the KDA recurrent state is checkpointed at block boundaries, so the decode
+engine recomputed the last partial chunk (prompt length mod 5120, up to 5119
+tokens; 4600 tokens / ~1.8 s at 107k) on the decode GPUs.
+
+With VLLM_GLM53_PD_TAIL=1 the prefill engine, after its prompt pass, packs
+each PP rank's end-of-prompt state - KDA recurrent + conv state, the partial
+MLA / indexer / kpool tail, the DFlash2 drafter window and the last hidden /
+aux states - into GPU chunks of a separate LMCache namespace and stores them
+with LMCache's own STORE/RETRIEVE + CUDA IPC (L1/L2/LRU as usual; LMCache is
+not modified). A small generation record, published only once all four
+shards are stored, ties them to the exact prompt, cache_salt and model
+configuration. The decode engine loads the ordinary prefix chunks, then the
+tail into request-private pages.
+
+The loaded KDA state has already consumed the last prompt token, so the
+decode engine must not replay it: its first step is sample-only - no target
+forward; LM head, sampler and DFlash proposal run on the restored hidden
+state with the decode request's own sampling parameters. Target replay is 0
+tokens. Loaded state, first-step logits and draft candidates match a local
+full prefill bitwise.
+
+Anything unsupported (one side without the switch, missing tail or prefix,
+multimodal, LoRA, prompt logprobs, preempted requests, prompts that are a
+multiple of 5120) keeps the old path. Scope: PP4/TP1/DP1, mamba align,
+folded aux, DFlash2. The LMCache server needs --supported-transfer-mode=auto
+for the generation record. Default off; VLLM_GLM53_OPT_PROFILE=default
+enables it (it only acts with the LMCacheMPConnector).
+
+diff --git a/vllm/distributed/kv_transfer/kv_connector/factory.py b/vllm/distributed/kv_transfer/kv_connector/factory.py
+index aad7999..776c38c 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/factory.py
++++ b/vllm/distributed/kv_transfer/kv_connector/factory.py
+@@ -50,6 +50,13 @@ class KVConnectorFactory:
+         if kv_transfer_config is None:
+             raise ValueError("kv_transfer_config must be set to create a connector")
+         connector_cls = cls.get_connector_class(kv_transfer_config)
++        import os
++        if (os.environ.get("VLLM_GLM53_PD_TAIL", "0") == "1"
++                and kv_transfer_config.kv_connector == "LMCacheMPConnector"):
++            from vllm.distributed.kv_transfer.kv_connector.v1.glm_pd_tail_connector import (
++                GLMPDTailConnector,
++            )
++            connector_cls = GLMPDTailConnector
+ 
+         # check if the connector supports HMA
+         hma_enabled = not config.scheduler_config.disable_hybrid_kv_cache_manager
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_catalog.py b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_catalog.py
+new file mode 100644
+index 0000000..5e8d417
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_catalog.py
+@@ -0,0 +1,109 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Small immutable publication records, in the same LMCache LRU as GPU shards.
++
++No out-of-band database or data directory: the GPU payload stays on STORE /
++RETRIEVE. Only the 256-byte descriptor uses the existing engine-driven API.
++Publish AFTER all shards are visible. Concurrent publishers are harmless:
++reserve_write(new) chooses one complete generation; losing shards are ordinary
++LRU objects. A descriptor whose payload was evicted is a miss, never a reason
++to combine generations. Such a descriptor remains a miss until LRU eviction.
++"""
++from __future__ import annotations
++
++import pickle
++import struct
++import uuid
++
++import torch
++
++from vllm.distributed.kv_transfer.kv_connector.v1.glm_pd_tail_client import (
++    CHUNK, MAGIC, TailReference, synthetic_tokens,
++)
++
++
++class TailCatalog:
++    SIZE = 256
++
++    def __init__(self, client, namespace: str, timeout: float = 5.0):
++        from lmcache.v1.distributed.api import MemoryLayoutDesc
++        from lmcache.v1.multiprocess.custom_types import RegisterEngineDrivenContextPayload
++        from lmcache.v1.multiprocess.transfer_context.base import (
++            EngineDrivenContextMetadata, create_engine_driven_context,
++        )
++        self.client = client
++        self.namespace = namespace + "##catalog"
++        self.timeout = timeout
++        self.instance = uuid.uuid4().int & ((1 << 62) - 1)
++        self.shape = torch.Size([1, 1, self.SIZE])
++        response = client.register_kv_cache_engine_driven_context(
++            RegisterEngineDrivenContextPayload(
++                instance_id=self.instance, model_name=self.namespace, world_size=1,
++                block_size=CHUNK, num_layers=1, hidden_dim_size=self.SIZE,
++                dtype_str="uint8", use_mla=True, num_physical_slots=1,
++            )).result(timeout=timeout)
++        self.context = create_engine_driven_context(
++            EngineDrivenContextMetadata(
++                MemoryLayoutDesc([self.shape], [torch.uint8]), CHUNK, True),
++            client, timeout, response.shm_name, response.pool_size)
++
++    def _key(self, identity: bytes, salt: str, session: str):
++        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
++        return IPCCacheServerKey(
++            model_name=self.namespace, world_size=1, worker_id=0,
++            token_ids=synthetic_tokens(identity), start=0, end=CHUNK,
++            request_id=session, cache_salt=salt, num_kv_readers=1)
++
++    def publish(self, reference: TailReference) -> bool:
++        session = "tail-publish-" + uuid.uuid4().hex
++        key = self._key(reference.identity, reference.salt, session)
++        data = struct.pack("<8s32s16sQ", MAGIC, reference.identity,
++                           reference.generation, reference.length)
++        tensor = torch.zeros(self.shape, dtype=torch.uint8)
++        tensor.view(-1)[:len(data)] = torch.tensor(list(data), dtype=torch.uint8)
++        try:
++            # No PREPARE_STORE: avoid SHM write reservations/reaper finish_write.
++            # A True result does NOT prove our generation won the immutable key.
++            return bool(self.client.commit_store(
++                key, self.instance, pickle.dumps([tensor])).result(timeout=self.timeout))
++        finally:
++            self.client.end_session(session).result(timeout=self.timeout)
++
++    def get(self, identity: bytes, salt: str) -> TailReference | None:
++        session = "tail-catalog-" + uuid.uuid4().hex
++        key = self._key(identity, salt, session)
++        consumed = False
++        locked = False
++        try:
++            self.client.lookup(key.no_worker_id_version(), 1).result(timeout=self.timeout)
++            hit = self.client.wait_prefetch_status(session, self.timeout).result(
++                timeout=self.timeout + 1)
++            if hit != 1:
++                return None
++            locked = True
++            # Once handed to RETRIEVE, its server strategy owns lock release
++            # (pickle releases during prepare, SHM during commit). Never also
++            # call FREE_LOOKUP_LOCKS for that reader after a timeout/miss.
++            consumed = True
++            chunks = self.context.prepare_retrieve(key, self.instance)
++            if chunks is None:
++                return None
++            try:
++                # SHM views must be copied before commit releases the reader.
++                data = bytes(chunks[0].contiguous().view(-1)[:64].tolist())
++            finally:
++                self.context.commit_retrieve(key, self.instance)
++            magic, found, generation, length = struct.unpack("<8s32s16sQ", data)
++            if magic != MAGIC or found != identity or length <= 0:
++                return None
++            return TailReference(identity, generation, length, salt)
++        finally:
++            if locked and not consumed:
++                self.client.free_lookup_locks(
++                    key.no_worker_id_version(), 1).result(timeout=self.timeout)
++            self.client.end_session(session).result(timeout=self.timeout)
++
++    def close(self) -> None:
++        self.context.close()
++        self.client.unregister_kv_cache_engine_driven_context(self.instance).result(
++            timeout=self.timeout)
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_client.py b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_client.py
+new file mode 100644
+index 0000000..b3bc00e
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_client.py
+@@ -0,0 +1,234 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opaque GPU pages over the unmodified LMCache MP protocol.
++
++A namespace describes one fixed byte layout, not a model's attention cache.
++The caller owns request/generation publication and GLM gather/scatter. No
++producer buffer may be reused until the returned device future has completed.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import struct
++import uuid
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++
++CHUNK = 5120
++# Keep physical dimensions ordinary: the existing MLA copy kernel copies bits.
++WIDTH = 128
++PAGE_BYTES = CHUNK * WIDTH * 2
++HEADER_BYTES = 512
++MAGIC = b"GLMTAIL\x00"
++
++
++def prompt_identity(tokens: list[int], salt: str, fingerprint: str) -> bytes:
++    """Hash the entire prompt and domain, never just its remainder."""
++    digest = hashlib.sha256()
++    domain = json.dumps(["glm-pd-tail", fingerprint, salt, len(tokens)],
++                        ensure_ascii=True, separators=(",", ":")).encode()
++    digest.update(struct.pack("<Q", len(domain)))
++    digest.update(domain)
++    # Explicit endian and unsigned range, independent of Python hash seed.
++    for offset in range(0, len(tokens), CHUNK):
++        part = tokens[offset:offset + CHUNK]
++        digest.update(struct.pack(f"<{len(part)}I", *part))
++    return digest.digest()
++
++
++def synthetic_tokens(identity: bytes) -> tuple[int, ...]:
++    if len(identity) != 32:
++        raise ValueError("tail identity must be SHA256")
++    return struct.unpack("<8I", identity) + (0,) * (CHUNK - 8)
++
++
++@dataclass(frozen=True)
++class TailReference:
++    identity: bytes
++    generation: bytes
++    length: int
++    salt: str
++
++    def __post_init__(self) -> None:
++        if len(self.identity) != 32 or len(self.generation) != 16 or self.length < 1:
++            raise ValueError("invalid tail reference")
++
++    @property
++    def storage_identity(self) -> bytes:
++        # Immutable generations prevent assembling shards from separate forwards.
++        return hashlib.sha256(self.identity + self.generation).digest()
++
++
++class TailPages:
++    """Fixed rank-local layout, two nonzero staging slots plus a null block.
++
++    Pack/scatter use uint8 views; BF16 exists only as the registered wire layout.
++    One in-flight operation per instance keeps cancellation and ownership small.
++    Distinct prefill/decode instances can register the same namespace and rank.
++    """
++
++    def __init__(self, client: Any, namespace: str, rank: int, world_size: int,
++                 capacity: int, device: torch.device, timeout: float = 30.0):
++        from lmcache.v1.multiprocess.group_view import EngineGroupInfo
++        from lmcache.v1.multiprocess.transfer_context.worker_transfer import (
++            LMCacheDrivenTransferContext,
++        )
++
++        if capacity <= HEADER_BYTES or not 0 <= rank < world_size:
++            raise ValueError("invalid opaque tail geometry")
++        self.client = client
++        self.namespace = namespace
++        self.rank = rank
++        self.world_size = world_size
++        self.device = device
++        self.capacity = capacity
++        self.timeout = timeout
++        self.instance = uuid.uuid4().int & ((1 << 62) - 1)
++        self.pages = {
++            str(i): torch.zeros((3, CHUNK, WIDTH), dtype=torch.bfloat16,
++                               device=device)
++            for i in range((capacity + PAGE_BYTES - 1) // PAGE_BYTES)
++        }
++        self.context = LMCacheDrivenTransferContext()
++        self.pending: tuple[Any, Any] | None = None
++        self.failed = False
++        self.closed = False
++        self.context.register(
++            self.instance, self.pages, namespace, world_size, 1, client, timeout,
++            layout_hints={"mp_worker_rank": rank},
++            engine_group_infos=[EngineGroupInfo(
++                engine_group_id=0, layer_indices=tuple(range(len(self.pages))),
++                tokens_per_block=CHUNK)],
++        )
++
++    def _key(self, ref: TailReference, session: str):
++        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
++
++        return IPCCacheServerKey(
++            model_name=self.namespace, world_size=self.world_size,
++            worker_id=self.rank, token_ids=synthetic_tokens(ref.storage_identity),
++            start=0, end=CHUNK, request_id=session, cache_salt=ref.salt,
++            num_kv_readers=1,
++        )
++
++    def _available(self) -> None:
++        if self.closed or self.failed or self.pending is not None:
++            raise RuntimeError("tail staging is closed, failed, or still in flight")
++
++    def _copy(self, value: torch.Tensor, offset: int, slot: int,
++              into_pages: bool) -> None:
++        if value.dtype != torch.uint8 or not value.is_contiguous():
++            raise ValueError("tail copy requires a contiguous uint8 view")
++        value = value.view(-1)
++        if offset < 0 or offset + value.numel() > self.capacity:
++            raise ValueError("tail payload exceeds registered capacity")
++        consumed = 0
++        while consumed < value.numel():
++            layer, column = divmod(offset, PAGE_BYTES)
++            n = min(PAGE_BYTES - column, value.numel() - consumed)
++            page = self.pages[str(layer)][slot].view(torch.uint8).view(-1)
++            a, b = page[column:column + n], value[consumed:consumed + n]
++            (a if into_pages else b).copy_(b if into_pages else a)
++            consumed += n
++            offset += n
++
++    def pack(self, ref: TailReference, tensors: list[torch.Tensor]) -> None:
++        self._available()
++        sizes = [t.numel() * t.element_size() for t in tensors]
++        used = HEADER_BYTES + sum(sizes)
++        if used > self.capacity:
++            raise ValueError("tail payload exceeds registered capacity")
++        for page in self.pages.values():
++            page[1].zero_()
++        header = struct.pack("<8s32s16sQQII", MAGIC, ref.identity,
++                             ref.generation, ref.length, used,
++                             self.rank, self.world_size)
++        self._copy(torch.tensor(list(header), device=self.device,
++                                dtype=torch.uint8), 0, 1, True)
++        offset = HEADER_BYTES
++        for tensor, size in zip(tensors, sizes):
++            self._copy(tensor.contiguous().reshape(-1).view(torch.uint8),
++                       offset, 1, True)
++            offset += size
++
++    def store(self, ref: TailReference, session: str) -> None:
++        self._available()
++        event = self.context.create_recorded_event()
++        future = self.context.submit_store(
++            session, self._key(ref, session), self.instance, self.pages,
++            [[1]], event, 1)
++        self.pending = future, event
++
++    def retrieve(self, ref: TailReference, session: str) -> None:
++        self._available()
++        event = self.context.create_recorded_event()
++        future = self.context.submit_retrieve(
++            session, self._key(ref, session), self.instance, self.pages,
++            [[2]], event, 1)
++        self.pending = future, event
++
++    def wait(self) -> bool:
++        """Keep the event and pages alive on timeout; never reuse failed staging."""
++        if self.pending is None:
++            raise RuntimeError("no tail transfer is pending")
++        future, _event = self.pending
++        try:
++            result = bool(future.result(timeout=self.timeout))
++        except Exception:
++            self.failed = True
++            raise
++        self.pending = None
++        return result
++
++    def unpack(self, ref: TailReference, tensors: list[torch.Tensor]) -> None:
++        self._available()
++        header_size = struct.calcsize("<8s32s16sQQII")
++        header_gpu = torch.empty(header_size, device=self.device, dtype=torch.uint8)
++        self._copy(header_gpu, 0, 2, False)
++        header = struct.unpack("<8s32s16sQQII", bytes(header_gpu.cpu().tolist()))
++        used = HEADER_BYTES + sum(t.numel() * t.element_size() for t in tensors)
++        expected = (MAGIC, ref.identity, ref.generation, ref.length, used,
++                    self.rank, self.world_size)
++        if header != expected:
++            raise ValueError("tail generation/layout mismatch; do not restore")
++        offset = HEADER_BYTES
++        for tensor in tensors:
++            # A strided cache destination needs an explicit writeback.
++            value = torch.empty(tensor.shape, device=tensor.device, dtype=tensor.dtype)
++            raw = value.reshape(-1).view(torch.uint8)
++            self._copy(raw, offset, 2, False)
++            tensor.copy_(value)
++            offset += raw.numel()
++
++    def lookup(self, ref: TailReference, session: str) -> bool:
++        """Only the coordinator calls this, once for all registered PP shards."""
++        key = self._key(ref, session).no_worker_id_version()
++        self.client.lookup(key, 1).result(timeout=self.timeout)
++        hits = self.client.wait_prefetch_status(session, self.timeout).result(
++            timeout=self.timeout + 1)
++        return hits == 1
++
++    def release_lookup(self, ref: TailReference, session: str) -> None:
++        """For a lookup NOT consumed by any rank's RETRIEVE; never double release."""
++        key = self._key(ref, session).no_worker_id_version()
++        self.client.free_lookup_locks(key, 1).result(timeout=self.timeout)
++        self.client.end_session(session).result(timeout=self.timeout)
++
++    def ping(self) -> None:
++        self.client.ping(self.instance).result(timeout=self.timeout)
++
++    def close(self) -> None:
++        if self.closed:
++            return
++        if self.pending is not None:
++            # The caller must quarantine this owner if completion times out.
++            # Unregister/free before completion can invalidate remote IPC views.
++            self.wait()
++        self.client.unregister_kv_cache(self.instance).result(timeout=self.timeout)
++        self.context.close()
++        self.closed = True
++        self.pages.clear()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_connector.py
+new file mode 100644
+index 0000000..81fc4ce
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/glm_pd_tail_connector.py
+@@ -0,0 +1,366 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLM exact-prompt tail sidecar to the unmodified LMCache connector.
++
++Not a replacement chunk connector: super() retains prefix lookup, copy-on-write
++boundaries, transfer errors and ordinary storage. Tail namespaces are disjoint.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import time
++import threading
++import uuid
++from pathlib import Path
++
++import torch
++from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector
++from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++from vllm.distributed.kv_transfer.kv_connector.v1.glm_pd_tail_catalog import TailCatalog
++from vllm.distributed.kv_transfer.kv_connector.v1.glm_pd_tail_client import (
++    CHUNK, HEADER_BYTES, TailPages, TailReference, prompt_identity, synthetic_tokens,
++)
++from vllm.logger import init_logger
++from vllm.v1.worker.gpu.glm_pd_tail import GLMTailLayout
++
++logger = init_logger(__name__)
++
++
++class GLMPDTailConnector(LMCacheMPConnector):
++    def __init__(self, config, role, kv_cache_config=None):
++        # Tail errors are optional-cache misses, never user request failures.
++        config.kv_transfer_config.kv_load_failure_policy = "recompute"
++        super().__init__(config, role, kv_cache_config)
++        parallel = config.parallel_config
++        if (parallel.pipeline_parallel_size != 4 or parallel.tensor_parallel_size != 1
++                or parallel.data_parallel_size != 1
++                or parallel.decode_context_parallel_size != 1
++                or self.lazy_offload):
++            raise ValueError("GLM tail requires PP4/TP1/DP1, block5120, eager offload")
++        extra = config.kv_transfer_config
++        if extra.get_from_extra_config("lmcache.mp.server_urls", None):
++            raise ValueError("GLM tail requires one LMCache server")
++        host = extra.get_from_extra_config("lmcache.mp.host", "tcp://localhost")
++        port = extra.get_from_extra_config("lmcache.mp.port", 5555)
++        if "://" not in host:
++            host = "tcp://" + host
++        self.tail_client = RequestClientFactory.create(f"{host}:{port}")
++        fingerprint = json.dumps({
++            "schema": "glm-pd-tail", "model": config.model_config.model,
++            "dtype": str(config.model_config.dtype),
++            "hf": config.model_config.hf_config.to_dict(),
++            # The loaded draft config is mutated on the last PP rank (folded
++            # aux, shared layers). Hash its on-disk config, identical on all ranks.
++            "draft": hashlib.sha256((Path(config.speculative_config.draft_model_config.model)
++                                     / "config.json").read_bytes()).hexdigest(),
++            "spec_tokens": config.speculative_config.num_speculative_tokens,
++            "kv_dtype": config.cache_config.cache_dtype,
++            "group_spans": self._group_tokens_per_block,
++            "mamba_mode": config.cache_config.mamba_cache_mode,
++            "switches": sorted((k, v) for k, v in os.environ.items()
++                               if k.startswith(("VLLM_GLM5", "VLLM_DFLASH", "VLLM_PP_"))),
++        }, sort_keys=True, default=str)
++        self.tail_fingerprint = hashlib.sha256(fingerprint.encode()).hexdigest()
++        self.tail_namespace = "glm-pd-tail##" + self.tail_fingerprint
++        self.catalog = TailCatalog(self.tail_client, self.tail_namespace)
++        self.tail_refs: dict[str, TailReference] = {}
++        self.tail_loads: dict[str, tuple] = {}
++        self.tail_restored: dict[str, tuple] = {}
++        self.tail_receiving: set[str] = set()
++        self.tail_received: set[str] = set()
++        self.tail_worker_loads: dict[str, tuple] = {}
++        self.tail_invalid: set[int] = set()
++        self.tail_disabled: set[str] = set()
++        self.tail_source_caches = None
++        self.tail_layout = None
++        self.tail_pages = None
++        self.tail_role = role
++        self._tail_stop = threading.Event()
++        self._tail_heartbeat = threading.Thread(target=self._heartbeat, daemon=True)
++        self._tail_heartbeat.start()
++
++    def _heartbeat(self):
++        while not self._tail_stop.wait(10):
++            try:
++                self.tail_client.ping(self.catalog.instance).result(timeout=5)
++                if self.tail_pages is not None:
++                    self.tail_pages.ping()
++            except Exception:
++                logger.warning("Tail heartbeat failed; subsequent lookups may miss")
++
++    def _key(self, ref, session):
++        from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
++        return IPCCacheServerKey(
++            model_name=self.tail_namespace, world_size=4, worker_id=None,
++            token_ids=synthetic_tokens(ref.storage_identity), start=0, end=CHUNK,
++            request_id=session, cache_salt=ref.salt, num_kv_readers=1)
++
++    def _lookup(self, ref, session):
++        self.tail_client.lookup(self._key(ref, session), 1).result(timeout=5)
++        return self.tail_client.wait_prefetch_status(session, 5).result(timeout=6) == 1
++
++    def _release(self, ref, session):
++        self.tail_client.free_lookup_locks(self._key(ref, session), 1).result(timeout=5)
++        self.tail_client.end_session(session).result(timeout=5)
++
++    def get_num_new_matched_tokens(self, request, num_computed_tokens):
++        matched, asynchronous = super().get_num_new_matched_tokens(request, num_computed_tokens)
++        if matched is None or request.request_id in self.tail_disabled:
++            return matched, asynchronous
++        if request.request_id in self.tail_receiving:
++            return request.num_prompt_tokens - num_computed_tokens, True
++        # No multimodal/LoRA/prompt-logprob shortcut: these need their own complete
++        # state contract. The ordinary path is always available.
++        if (request.num_preemptions or request.mm_features or request.lora_request
++                or request.sampling_params is None
++                or request.sampling_params.prompt_logprobs is not None
++                or request.num_output_tokens):
++            return matched, asynchronous
++        length = request.num_prompt_tokens
++        if length % CHUNK == 0:
++            return matched, asynchronous
++        prefix = length // CHUNK * CHUNK
++        tracker = self._get_request_tracker(request.request_id)
++        if tracker.num_lmcache_hit_tokens < prefix:
++            return matched, asynchronous
++        try:
++            identity = prompt_identity(list(request.prompt_token_ids), request.cache_salt or "",
++                                       self.tail_fingerprint)
++            ref = self.catalog.get(identity, request.cache_salt or "")
++            if ref is not None and ref.length == length:
++                session = "tail-read-" + request.request_id
++                if self._lookup(ref, session):
++                    self.tail_refs[request.request_id] = ref
++                    self.tail_receiving.add(request.request_id)
++                    # No APC sharing: the restored window can overlap prefix
++                    # pages. Ordinary retrieval must populate private pages.
++                    tracker.num_vllm_hit_tokens = 0
++                    return length - num_computed_tokens, True
++                self.tail_client.end_session(session).result(timeout=5)
++        except Exception:
++            logger.exception("Tail lookup failed; using ordinary prefix path")
++            self.tail_disabled.add(request.request_id)
++        return matched, asynchronous
++
++    def tail_requires_private_pages(self, request):
++        return request.request_id in self.tail_receiving
++
++    def tail_sample_ready(self, request):
++        return (request.request_id in self.tail_refs
++                and request.request_id not in self.tail_disabled
++                and request.num_computed_tokens == request.num_prompt_tokens)
++
++    def update_state_after_alloc(self, request, blocks, num_external_tokens):
++        super().update_state_after_alloc(request, blocks, num_external_tokens)
++        req = request.request_id
++        if req in self.tail_receiving:
++            self.tail_loads[req] = (self.tail_refs[req], blocks.get_block_ids())
++            self._get_request_tracker(req).num_scheduled_tokens = self.tail_refs[req].length
++            self.tail_receiving.remove(req)
++
++    def build_connector_meta(self, output):
++        counters = {}
++        if output.sample_only:
++            for req in output.num_scheduled_tokens:
++                tracker = self._get_request_tracker(req)
++                counters[req] = (tracker.num_scheduled_tokens, tracker.num_stored_tokens)
++        meta = super().build_connector_meta(output)
++        # A sample slot does not produce any new cache bytes. Keep original
++        # block tracking, but undo scheduling/store counters for those slots.
++        if output.sample_only:
++            meta.requests = [m for m in meta.requests if m.direction != "STORE"]
++            for req, (scheduled, stored) in counters.items():
++                tracker = self._get_request_tracker(req)
++                tracker.num_scheduled_tokens = scheduled
++                tracker.num_stored_tokens = stored
++        meta.tail_loads = self.tail_loads
++        self.tail_loads = {}
++        meta.tail_snapshots = {}
++        if not output.sample_only:
++            for req, count in output.num_scheduled_tokens.items():
++                tracker = self._get_request_tracker(req)
++                # The original tracker counts tokens scheduled in this round.
++                # Snapshot only a final prefill, not an arbitrary decode suffix.
++                new = next((x for x in output.scheduled_new_reqs if x.req_id == req), None)
++                if new is not None:
++                    tokens = new.prompt_token_ids
++                    before = new.num_computed_tokens
++                else:
++                    cached = output.scheduled_cached_reqs
++                    if req not in cached.req_ids:
++                        continue
++                    idx = cached.req_ids.index(req)
++                    before = cached.num_computed_tokens[idx]
++                    tokens = tracker.get_token_ids()
++                    if cached.num_output_tokens[idx] != 0:
++                        continue
++                if tokens and before + count == len(tokens) and len(tokens) % CHUNK:
++                    ref = TailReference(prompt_identity(list(tokens), tracker.cache_salt,
++                                        self.tail_fingerprint), uuid.uuid4().bytes,
++                                        len(tokens), tracker.cache_salt)
++                    meta.tail_snapshots[req] = ref
++        return meta
++
++    def register_kv_caches(self, caches):
++        self.tail_source_caches = dict(caches)
++        super().register_kv_caches(caches)
++
++    def attach_tail_runner(self, runner):
++        self.tail_layout = GLMTailLayout(runner.kv_cache_config,
++                                        self.tail_source_caches, runner.block_tables)
++        # Include final hidden and folded aux (or all un-folded aux rows) on
++        # the last rank. Layout capacity is fixed for the model's lifetime.
++        self.tail_runner = runner
++        self.tail_hidden_size = runner.model_config.get_hidden_size()
++        if os.environ.get("VLLM_GLM5_PP_FOLD_DRAFT_FC") != "1":
++            raise ValueError("tail currently requires the deployed folded aux layout")
++        hidden_bytes = self.tail_hidden_size * 6
++        self.tail_pages = TailPages(
++            self.tail_client, self.tail_namespace, self.worker_adapter.worker_id,
++            4, HEADER_BYTES + self.tail_layout.max_payload_bytes() + hidden_bytes,
++            runner.device)
++
++    def _hidden_buffers(self):
++        if not self.tail_runner.is_last_pp_rank:
++            return []
++        return [torch.empty((1, self.tail_hidden_size), device=self.tail_runner.device,
++                            dtype=dtype) for dtype in
++                (self.tail_runner.model_config.dtype, torch.float32)]
++
++    def snapshot_tail_batch(self, runner, batch, hidden, aux):
++        if self._connector_metadata is None or self.tail_pages.failed or batch.sample_only:
++            return
++        try:
++            self._snapshot_tail_batch(runner, batch, hidden, aux)
++        except Exception:
++            logger.exception("Tail store failed; retain ordinary prefill/replay path")
++
++    def _snapshot_tail_batch(self, runner, batch, hidden, aux):
++        meta = self._get_connector_metadata()
++        snapshots = getattr(meta, "tail_snapshots", {})
++        for row, req in enumerate(batch.req_ids):
++            if req not in snapshots:
++                continue
++            ref = snapshots[req]
++            selections = self.tail_layout.selections(int(batch.idx_mapping_np[row]), ref.length)
++            tensors = [s.gather() for s in selections]
++            if runner.is_last_pp_rank:
++                if aux is None or len(aux) != 1 or aux[0].dtype != torch.float32:
++                    raise RuntimeError("tail snapshot requires folded FP32 aux")
++                end = int(batch.query_start_loc_np[row + 1])
++                tensors += [hidden[end - 1:end], aux[0][end - 1:end]]
++            # All copying precedes reuse of model output/cache buffers. Keep a
++            # single rank-local staging allocation; serialize multiple requests.
++            self.tail_pages.pack(ref, tensors)
++            session = f"tail-write-{ref.generation.hex()}-{self.worker_adapter.worker_id}"
++            self.tail_pages.store(ref, session)
++            if not self.tail_pages.wait():
++                continue
++            self.tail_client.end_session(session).result(timeout=5)
++            # Publication is coordinated by the last rank after all PP shards are
++            # visible. Polling the ordinary lookup also fences finish_write.
++            if self.worker_adapter.worker_id == 3:
++                deadline = time.monotonic() + 5
++                probe = "tail-publish-check-" + ref.generation.hex()
++                while time.monotonic() < deadline:
++                    if self._lookup(ref, probe):
++                        self._release(ref, probe)
++                        self.catalog.publish(ref)
++                        break
++                    self.tail_client.end_session(probe).result(timeout=5)
++                    time.sleep(.005)
++
++    def start_load_kv(self, forward_context, **kwargs):
++        super().start_load_kv(forward_context, **kwargs)
++        meta = self._get_connector_metadata()
++        self.tail_worker_loads.update(getattr(meta, "tail_loads", {}))
++
++    def _finish_tail_loads(self):
++        for req, (ref, blocks) in list(self.tail_worker_loads.items()):
++            # super().get_finished() retires the original device future. Never
++            # scatter, report completion or free these pages before that fence.
++            if req in self.worker_adapter.retrieve_futures:
++                continue
++            del self.tail_worker_loads[req]
++            try:
++                selections = self.tail_layout.selections(0, ref.length, blocks)
++                # Allocate exact-shape temporary destinations, not full pages.
++                tensors = [torch.empty_like(s.gather()) for s in selections]
++                hidden = self._hidden_buffers()
++                self.tail_pages.retrieve(ref, "tail-read-" + req)
++                if not self.tail_pages.wait():
++                    raise RuntimeError("tail retrieve failed")
++                self.tail_pages.unpack(ref, tensors + hidden)
++                for selection, tensor in zip(selections, tensors):
++                    selection.scatter(tensor)
++                self.tail_restored[req] = (ref, hidden)
++                self.tail_received.add(req)
++            except Exception:
++                logger.exception("Tail restore failed for %s; recompute", req)
++                self.tail_invalid.update(b for group in blocks for b in group if b)
++                self.tail_received.add(req)
++
++    def update_connector_output(self, output):
++        super().update_connector_output(output)
++        for req in output.finished_recving or ():
++            if req in self.tail_refs:
++                self.tail_client.end_session("tail-read-" + req).result(timeout=5)
++
++    def get_finished(self, finished_req_ids):
++        sent, received = super().get_finished(finished_req_ids)
++        received = set(received or ()) - self.tail_worker_loads.keys()
++        self._finish_tail_loads()
++        received |= self.tail_received
++        self.tail_received.clear()
++        for req in finished_req_ids:
++            self.tail_restored.pop(req, None)
++        return sent, received
++
++    def get_block_ids_with_load_errors(self):
++        invalid = super().get_block_ids_with_load_errors() | self.tail_invalid
++        self.tail_invalid.clear()
++        return invalid
++
++    def restore_tail_batch(self, runner, batch):
++        hidden_rows, aux_rows = [], []
++        for row, req in enumerate(batch.req_ids):
++            ref, hidden = self.tail_restored.pop(req)
++            index = int(batch.idx_mapping_np[row])
++            runner.req_states.num_computed_tokens.gpu[index] = ref.length
++            if runner.is_last_pp_rank:
++                logger.info("GLM PD tail sample-only: prompt_tokens=%d target_replay_tokens=0", ref.length)
++            state = runner.model_state
++            state.num_accepted_tokens_gpu[index] = 1
++            state._mamba_state_idx_gpu[index] = (ref.length - 1) // state._mamba_spec.block_size
++            if runner.is_last_pp_rank:
++                hidden_rows.append(hidden[0])
++                aux_rows.append(hidden[1])
++        if runner.is_last_pp_rank:
++            return torch.cat(hidden_rows), [torch.cat(aux_rows)]
++        return None, None
++
++    def tail_load_failed(self, request):
++        self.tail_disabled.add(request.request_id)
++        self.tail_refs.pop(request.request_id, None)
++
++    def request_finished_all_groups(self, request, block_ids):
++        req = request.request_id
++        ref = self.tail_refs.pop(req, None)
++        if ref is not None and (req in self.tail_receiving or req in self.tail_loads):
++            self._release(ref, "tail-read-" + req)
++        self.tail_receiving.discard(req)
++        self.tail_disabled.discard(req)
++        self.tail_loads.pop(req, None)
++        return super().request_finished_all_groups(request, block_ids)
++
++    def shutdown(self):
++        self._tail_stop.set()
++        self._tail_heartbeat.join(timeout=12)
++        if self.tail_pages is not None:
++            self.tail_pages.close()
++        self.catalog.close()
++        self.tail_client.close()
++        super().shutdown()
+diff --git a/vllm/glm53_opt_profile.py b/vllm/glm53_opt_profile.py
+index c9609b6..091809d 100644
+--- a/vllm/glm53_opt_profile.py
++++ b/vllm/glm53_opt_profile.py
+@@ -69,6 +69,8 @@ PROFILES: dict[str, dict[str, str]] = {
+         # 0030 PP metadata cache, 0031 packed PP hop tensors
+         "VLLM_PP_METADATA_CACHE": "1",
+         "VLLM_PP_PACK_TENSORS": "1",
++        # 0034 prompt tail state from prefill to decode (LMCache PD only)
++        "VLLM_GLM53_PD_TAIL": "1",
+     },
+ }
+ 
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index b299167..089f024 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -282,6 +282,11 @@ class SchedulerOutput:
+     # synchronously during this step (load_async=False).
+     has_sync_kv_loads: bool = False
+ 
++    # Tail resume uses one sampling slot per request, but executes no target
++    # tokens. It is an isolated batch; num_scheduled_tokens still counts slots
++    # for async output ownership/fences, not target replay.
++    sample_only: bool = False
++
+     # EC Cache Connector metadata
+     ec_connector_metadata: ECConnectorMetadata | None = None
+     # EC Cache Manager metadata
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 03776fa..4cb3a1c 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -665,6 +665,7 @@ class Scheduler(SchedulerInterface):
+ 
+         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+         num_scheduled_tokens: dict[str, int] = {}
++        sample_only_batch = False
+         token_budget = self.max_num_scheduled_tokens
+         spec = self.vllm_config.speculative_config
+         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+@@ -1052,7 +1053,14 @@ class Scheduler(SchedulerInterface):
+                             step_skipped_waiting.prepend_request(request)
+                             continue
+ 
+-                        if partial_tail and ext_tokens > partial_tail:
++                        if getattr(self.connector, "tail_requires_private_pages", lambda _r: False)(request):
++                            # Restoring the drafter window may overlap a full
++                            # local APC page. Do not overwrite a shared page:
++                            # fetch the prefix into private external-load pages.
++                            new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
++                            num_new_local_computed_tokens = 0
++                            num_external_computed_tokens = request.num_prompt_tokens
++                        elif partial_tail and ext_tokens > partial_tail:
+                             # Remote strictly exceeds the full local hit: drop the
+                             # sub-block tail so no CoW is needed, and let the load
+                             # cover it. Trim the partial block out of the local
+@@ -1123,6 +1131,15 @@ class Scheduler(SchedulerInterface):
+                         step_skipped_waiting.prepend_request(request)
+                         continue
+ 
++                tail_ready = (
++                    self.connector is not None
++                    and getattr(self.connector, "tail_sample_ready", lambda _r: False)(request)
++                )
++                if num_scheduled_tokens and tail_ready != sample_only_batch:
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
++
+                 encoder_inputs_to_schedule = None
+                 external_load_encoder_input = []
+                 new_encoder_compute_budget = encoder_compute_budget
+@@ -1132,6 +1149,11 @@ class Scheduler(SchedulerInterface):
+                     # KVTransfer: loading remote KV, do not allocate for new work.
+                     assert num_external_computed_tokens > 0
+                     num_new_tokens = 0
++                elif tail_ready:
++                    # Reserve one output-ownership slot, no target forward. The
++                    # request already owns S(L), so computed tokens stay at L.
++                    assert num_computed_tokens == request.num_prompt_tokens
++                    num_new_tokens = 1
+                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                     # DP prefill balancing: defer this step's local prefill
+                     # compute to a cadence-aligned step.
+@@ -1380,6 +1402,7 @@ class Scheduler(SchedulerInterface):
+                     request_id
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
++                sample_only_batch = tail_ready
+                 if is_decode:
+                     scheduled_decode_req_ids.add(request_id)
+                 token_budget -= num_new_tokens
+@@ -1550,6 +1573,7 @@ class Scheduler(SchedulerInterface):
+             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
+             has_sync_kv_loads=has_sync_kv_loads,
++            sample_only=sample_only_batch,
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+@@ -1666,7 +1690,8 @@ class Scheduler(SchedulerInterface):
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+         for req_id, num_scheduled_token in num_scheduled_tokens.items():
+             request = self.requests[req_id]
+-            request.num_computed_tokens += num_scheduled_token
++            if not scheduler_output.sample_only:
++                request.num_computed_tokens += num_scheduled_token
+             request.num_in_flight_tokens += num_scheduled_token
+             if self.defer_block_free:
+                 # Record the in-flight step, to fence deferred block freeing.
+@@ -3091,6 +3116,8 @@ class Scheduler(SchedulerInterface):
+         assert self.connector is not None
+ 
+         if request.request_id in self.failed_recving_kv_req_ids:
++            if hasattr(self.connector, "tail_load_failed"):
++                self.connector.tail_load_failed(request)
+             # Request had KV load failures; num_computed_tokens was already
+             # updated in _update_requests_with_invalid_blocks
+             if request.num_computed_tokens:
+@@ -3118,7 +3145,8 @@ class Scheduler(SchedulerInterface):
+ 
+             # on a full prompt hit, we need to re-compute the last token
+             # in order to be able to sample the next token
+-            if request.num_computed_tokens == request.num_tokens:
++            if (request.num_computed_tokens == request.num_tokens
++                    and not getattr(self.connector, "tail_sample_ready", lambda _r: False)(request)):
+                 request.num_computed_tokens = request.num_tokens - 1
+ 
+         self.finished_recving_kv_req_ids.remove(request.request_id)
+diff --git a/vllm/v1/worker/gpu/glm_pd_tail.py b/vllm/v1/worker/gpu/glm_pd_tail.py
+new file mode 100644
+index 0000000..640e0db
+--- /dev/null
++++ b/vllm/v1/worker/gpu/glm_pd_tail.py
+@@ -0,0 +1,147 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Logical GLM tail cache views; independent of physical allocator block IDs.
++
++Only request-owned destination pages may be restored. The scheduler/connector
++must finish ordinary prefix retrieval before scattering these views. This
++module does not advance KDA, run target forward, or publish prefix checkpoints.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from math import prod
++
++import torch
++
++from vllm.v1.kv_cache_interface import (
++    AttentionSpec,
++    KpoolTailSpec,
++    MambaSpec,
++    SlidingWindowSpec,
++)
++
++
++@dataclass
++class CacheSelection:
++    name: str
++    cache: torch.Tensor
++    blocks: torch.Tensor
++    offsets: torch.Tensor | None
++
++    def gather(self) -> torch.Tensor:
++        if self.offsets is None:
++            return self.cache[self.blocks].contiguous()
++        return self.cache[self.blocks, :, self.offsets, :].contiguous()
++
++    def scatter(self, value: torch.Tensor) -> None:
++        if value.dtype != self.cache.dtype:
++            raise ValueError(f"tail dtype mismatch for {self.name}")
++        if self.offsets is None:
++            expected = (self.blocks.numel(), *self.cache.shape[1:])
++            if tuple(value.shape) != expected:
++                raise ValueError(f"tail shape mismatch for {self.name}")
++            self.cache[self.blocks] = value
++        else:
++            expected = (self.blocks.numel(), self.cache.shape[1], self.cache.shape[3])
++            if tuple(value.shape) != expected:
++                raise ValueError(f"tail shape mismatch for {self.name}")
++            self.cache[self.blocks, :, self.offsets, :] = value
++
++
++class GLMTailLayout:
++    """Read the runner's original [block, head, state, content] cache views.
++
++    Cache registration can normalize/re-view tensors for LMCache. Keep a shallow
++    copy of the original dictionary before registering the ordinary connector.
++    Never derive a manager block ID from the normalized connector tensor shape.
++    """
++
++    def __init__(self, kv_cache_config, caches: dict[str, torch.Tensor],
++                 block_tables, chunk_size: int = 5120):
++        self.config = kv_cache_config
++        self.caches = dict(caches)
++        self.tables = block_tables
++        self.chunk_size = chunk_size
++        self.layers = []
++        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
++            specs = getattr(group.kv_cache_spec, "kv_cache_specs", None)
++            for name in sorted(group.layer_names):
++                if name not in caches:
++                    continue
++                spec = specs[name] if specs is not None else group.kv_cache_spec
++                if not isinstance(spec, (AttentionSpec, MambaSpec)):
++                    raise ValueError(f"unsupported tail cache {name}: {type(spec)}")
++                cache = caches[name]
++                if cache.ndim != 4:
++                    raise ValueError(f"tail requires original 4D cache: {name}")
++                if isinstance(spec, MambaSpec) and spec.mamba_cache_mode != "align":
++                    raise ValueError("tail resume requires Mamba align mode")
++                self.layers.append((gid, name, spec, cache))
++
++    def descriptor(self) -> list[tuple]:
++        """Stable layout fingerprint components, excluding allocator addresses."""
++        return [(name, type(spec).__name__, spec.block_size,
++                 spec.tokens_per_state, tuple(cache.shape[1:]), str(cache.dtype),
++                 tuple(getattr(spec, "shapes", ())))
++                for _, name, spec, cache in self.layers]
++
++    def selections(self, req_index: int, length: int,
++                   block_ids: tuple[list[int], ...] | None = None) -> list[CacheSelection]:
++        if length <= 0:
++            raise ValueError("tail snapshot needs a nonempty prompt")
++        result = []
++        prefix = length // self.chunk_size * self.chunk_size
++        # An exact multiple needs the last chunk's live recurrent state too;
++        # keep its positional bytes to avoid relying on retention conventions.
++        if prefix == length:
++            prefix = max(0, prefix - self.chunk_size)
++        for gid, name, spec, cache in self.layers:
++            if block_ids is None:
++                table = self.tables.block_tables[gid].gpu[req_index]
++                kernel_span = self.tables.kernel_block_sizes[gid]
++                ratio = spec.block_size // kernel_span
++                manager_table = table[::ratio] // ratio
++            else:
++                manager_table = torch.tensor(block_ids[gid], device=cache.device,
++                                             dtype=torch.int64)
++            if isinstance(spec, MambaSpec):
++                column = (length - 1) // spec.block_size
++                ids = manager_table[column:column + 1].long()
++                result.append(CacheSelection(name, cache, ids, None))
++                continue
++            if isinstance(spec, KpoolTailSpec):
++                # A non-pruned one-block ring, not a sequence-positioned page.
++                ids = manager_table[:1].long()
++                result.append(CacheSelection(name, cache, ids, None))
++                continue
++            start = prefix
++            if isinstance(spec, SlidingWindowSpec):
++                start = max(0, length - spec.sliding_window)
++            step = spec.tokens_per_state
++            if step <= 0:
++                raise ValueError(f"invalid positional cache stride: {name}")
++            positions = torch.arange(
++                (start + step - 1) // step * step, length, step,
++                device=cache.device, dtype=torch.int64)
++            span = cache.shape[2] * step
++            if spec.block_size % span:
++                raise ValueError(f"unsupported tail cache span: {name}")
++            ids = (manager_table[positions // spec.block_size].long()
++                   * (spec.block_size // span)
++                   + positions.remainder(spec.block_size) // span)
++            offsets = positions.remainder(span) // step
++            result.append(CacheSelection(name, cache, ids, offsets))
++        return result
++
++    def max_payload_bytes(self) -> int:
++        total = 0
++        for _, _, spec, cache in self.layers:
++            size = cache.element_size()
++            if isinstance(spec, (MambaSpec, KpoolTailSpec)):
++                total += prod(cache.shape[1:]) * size
++            else:
++                tokens = (spec.sliding_window if isinstance(spec, SlidingWindowSpec)
++                          else self.chunk_size)
++                slots = (tokens + spec.tokens_per_state - 1) // spec.tokens_per_state
++                total += slots * cache.shape[1] * cache.shape[3] * size
++        return total
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 2a38c3d..dc86521 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -109,6 +109,48 @@ class InputBatch:
+     # stays valid for every replay the graph serves.
+     max_query_len: int | None = None
+ 
++    # One logical sampling position per row, but no target tokens executed.
++    # Never mixed with a normal forward batch.
++    sample_only: bool = False
++
++    @classmethod
++    def make_sample_only(
++        cls, req_ids: list[str], req_states, input_buffers: InputBuffers,
++        has_structured_output_reqs: bool = False,
++    ) -> "InputBatch":
++        """A sampling-position view of already restored S(L), not target work.
++
++        The single row has position L-1 so sampling seeds/penalties and DFlash
++        anchor positioning match a final prefill. Request state stays at L;
++        callers must NOT run normal computed-token advancement on this view.
++        """
++        n = len(req_ids)
++        if not n:
++            raise ValueError("empty sample-only batch")
++        indices = np.asarray([req_states.req_id_to_index[r] for r in req_ids],
++                             dtype=np.int64)
++        lengths = req_states.prompt_len.np[indices].astype(np.int32, copy=True)
++        if np.any(lengths <= 0):
++            raise ValueError("sample-only requires a nonempty restored prompt")
++        device = input_buffers.device
++        mapping = torch.as_tensor(indices, device=device)
++        batch = cls.make_dummy(n, n, input_buffers, max_query_len=1)
++        batch.req_ids = req_ids
++        batch.idx_mapping = batch.expanded_idx_mapping = mapping
++        batch.idx_mapping_np = indices
++        batch.positions.copy_(torch.as_tensor(lengths - 1, device=device))
++        batch.input_ids.copy_(req_states.all_token_ids.gpu[
++            mapping, batch.positions])
++        batch.seq_lens.copy_(torch.as_tensor(lengths, device=device))
++        batch.seq_lens_cpu_upper_bound = torch.from_numpy(lengths.copy())
++        batch.num_computed_tokens_np = lengths.copy()
++        batch.num_computed_prefill_tokens_np = lengths.copy()
++        batch.prefill_len_np = lengths.copy()
++        batch.is_padding.zero_()
++        batch.has_structured_output_reqs = has_structured_output_reqs
++        batch.sample_only = True
++        return batch
++
+     @classmethod
+     def make_dummy(
+         cls,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fd77371..383da09 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -790,6 +790,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.kv_connector = NO_OP_KV_CONNECTOR
+         else:
+             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
++            connector = getattr(self.kv_connector, "kv_connector", None)
++            if connector is not None and hasattr(connector, "attach_tail_runner"):
++                connector.attach_tail_runner(self)
+ 
+     def _init_kv_zero_meta(self) -> None:
+         """Build KV-block zeroing metadata; invoked from gpu_worker."""
+@@ -1716,6 +1719,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
+         )
+ 
++    def _execute_tail_sample_only(self, scheduler_output: SchedulerOutput):
++        """Restore S(L) without a target forward, then use normal sample_tokens.
++
++        All ranks see the same isolated scheduler batch. No target PP activation
++        is sent; the existing sampled-token/draft feedback still runs on every
++        rank. Cache restoration must complete before the first sample can run.
++        """
++        if (not self.use_pp or self.pcp_manager is not None
++                or scheduler_output.scheduled_spec_decode_tokens):
++            raise RuntimeError("unsupported tail sample-only batch")
++        req_ids = list(scheduler_output.num_scheduled_tokens)
++        batch = InputBatch.make_sample_only(
++            req_ids, self.req_states, self.input_buffers,
++            scheduler_output.has_structured_output_requests,
++        )
++        connector = getattr(self.kv_connector, "kv_connector", None)
++        if connector is None or not hasattr(connector, "restore_tail_batch"):
++            raise RuntimeError("sample-only requires the GLM tail connector")
++        self.kv_connector.pre_forward(scheduler_output)
++        hidden, aux = connector.restore_tail_batch(self, batch)
++        # Gather draft block tables/positions only. Do NOT run Mamba pre-copy or
++        # target attention metadata construction on the already restored state.
++        _, slots = self.prepare_attn(batch)
++        self.execute_model_state = ExecuteModelState(
++            input_batch=batch, attn_metadata=None,
++            slot_mappings_by_layer=build_slot_mappings_by_layer(slots, self.kv_cache_config),
++            hidden_states=hidden, aux_hidden_states=aux, dp_sync=None,
++            finished_req_ids=scheduler_output.finished_req_ids,
++            ec_connector_output=None, routed_experts=None, cudagraph_stats=None,
++        )
++        return None
++
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -1742,6 +1777,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 and self.pp_handler.remote_drafts is not None
+             ):
+                 self._apply_remote_drafts(scheduler_output)
++            if scheduler_output.sample_only:
++                return self._execute_tail_sample_only(scheduler_output)
+             if scheduler_output.total_num_scheduled_tokens == 0:
+                 # No need to run the model.
+                 empty_output = self.kv_connector.no_forward(scheduler_output)
+@@ -2158,12 +2195,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+             # Optimistically update num_computed_tokens for entire batch here.
+             # Will be adjusted for rejections if necessary in update_requests.
+-            self.postprocess_num_computed_tokens(input_batch)
++            if not input_batch.sample_only:
++                self.postprocess_num_computed_tokens(input_batch)
+             if not all_decode_next:
+                 # Might contain non-final prefill chunks, which will be scheduled
+                 # in the immediate next step (rather than in pp_size steps).
+                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+ 
++            # Snapshot only after this rank's final prefill state is complete.
++            connector = getattr(self.kv_connector, "kv_connector", None)
++            if connector is not None and hasattr(connector, "snapshot_tail_batch"):
++                connector.snapshot_tail_batch(self, input_batch, None, None)
+             # Post-step KV connector related operations.
+             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+             # The first PP rank holds the encoder cache, so pass its EC output on.
+@@ -2247,7 +2289,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sampler_output.sampled_token_ids,
+             num_sampled,
+             num_rejected,
+-            input_batch.query_start_loc,
++            None if input_batch.sample_only else input_batch.query_start_loc,
+         )
+ 
+         remote_tail = False
+@@ -2314,6 +2356,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     if self.adaptive_verification is not None else None,
+                 )
+ 
++        connector = getattr(self.kv_connector, "kv_connector", None)
++        if connector is not None and hasattr(connector, "snapshot_tail_batch"):
++            connector.snapshot_tail_batch(self, input_batch, hidden_states, aux_hidden_states)
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+         model_runner_output.kv_connector_output = kv_connector_output
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index cd782e0..42ba07d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -359,13 +359,14 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # number of rejected tokens, we maintain the size of input_ids and
+         # hidden_states the same as the target model's. This means, we pad each
+         # request's query length to include any rejected positions.
+-        if aux_hidden_states:
+-            hidden_states = self.model.combine_hidden_states(
+-                torch.cat(aux_hidden_states, dim=-1)
+-            )
+-        else:
+-            hidden_states = last_hidden_states
+-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
++        if not input_batch.sample_only:
++            if aux_hidden_states:
++                hidden_states = self.model.combine_hidden_states(
++                    torch.cat(aux_hidden_states, dim=-1)
++                )
++            else:
++                hidden_states = last_hidden_states
++            self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+ 
+         if dummy_run and skip_attn_for_dummy_run:
+             # Memory profiling path: block_tables / kv_cache_config are not initialized.
+@@ -437,11 +438,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+             ]
+         else:
+             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+-        self.model.precompute_and_store_context_kv(
+-            self.hidden_states[:num_target_tokens],
+-            self.context_positions[:num_target_tokens],
+-            context_slots,
+-        )
++        if not input_batch.sample_only:
++            self.model.precompute_and_store_context_kv(
++                self.hidden_states[:num_target_tokens],
++                self.context_positions[:num_target_tokens],
++                context_slots,
++            )
+ 
+         batch_sync, num_batch_tokens = (
+             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index dab5ca9..761a42f 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1224,7 +1224,8 @@ class Worker(WorkerBase):
+ 
+         intermediate_tensors = None
+         verification_kwargs = {}
+-        forward_pass = scheduler_output.total_num_scheduled_tokens > 0
++        forward_pass = (scheduler_output.total_num_scheduled_tokens > 0
++                        and not scheduler_output.sample_only)
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+         all_gather_tensors = {}
+         compilation_config = self.vllm_config.compilation_config

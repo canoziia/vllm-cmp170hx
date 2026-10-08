@@ -31,3 +31,4 @@
 0031-pp-pack-hop-tensors.patch
 0032-glm5-pp-prefill-large-rows.patch
 0033-glm53-opt-profile.patch
+0034-glm53-pd-tail-sample-only.patch
