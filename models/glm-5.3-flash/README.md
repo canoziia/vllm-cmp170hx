@@ -43,6 +43,27 @@ L2：`fs_native`，容量 400 GiB，占用到 60% 开始按 LRU 回收，每次�
 key；`adopt_existing=true` 时重启前的文件也计入容量并能被回收
 （`patches/lmcache/0006`）。这是水位策略，不是硬配额。
 
+### 尾段状态传递（0034）
+
+LMCache 只存完整的 5120-token chunk（KDA 状态只在 block 边界有检查点），原先 decode
+要重算提示最后不满一个 chunk 的部分（最多 5119 token；107k 时 4600 token，约 1.8 s，
+在 decode GPU 上）。`VLLM_GLM53_PD_TAIL=1`（profile 打开；补丁默认关；只对
+LMCacheMPConnector 生效）时，prefill 在提示算完后把每个 PP 段的末尾状态（KDA 循环与
+conv 状态、MLA/indexer/kpool 尾段、DFlash2 drafter 窗口、最后的 hidden/aux）作为独立
+namespace 的 GPU chunk，用 LMCache 原有的 STORE/RETRIEVE＋CUDA IPC 存入（L1/L2/LRU
+照常，LMCache 不改）；四段都存好后才发布一条与完整提示、cache_salt、模型配置绑定的
+generation 记录（走 LMCache 已有的 engine-driven API，所以 LMCache server 要
+`--supported-transfer-mode=auto`）。decode 先装入普通前缀 chunk，再把尾段装进请求私有页。
+
+装入的 KDA 状态已经读过最后一个提示 token，所以 decode 第一步只采样：不跑 target
+前向，用恢复的 hidden 和 decode 请求自己的采样参数跑 LM head、sampler 和 DFlash 提议。
+target 重算 0 token；装入状态、首步 logits 与候选和本地完整 prefill 逐位一致。107k
+一次实测两跳合计 23.55 s → 20.17 s。
+
+只有一端打开、尾段或前缀缺失、多模态、LoRA、prompt logprobs、被抢占的请求、提示长度
+正好是 5120 的整数倍时走原路径。适用范围：PP4/TP1/DP1、mamba align、folded aux、
+DFlash2。测试：`tests/dflash2/test_pd_tail_gpu.py`（真实状态与首步逐位比较＋一轮端到端）。
+
 ### 优化开关
 
 `VLLM_GLM53_OPT_PROFILE=default`（dflash2/0033）在每个进程启动时把下表开关设为
@@ -73,6 +94,7 @@ key；`adopt_existing=true` 时重启前的文件也计入容量并能被回收
 | 0027 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 1 |
 | 0029 | `VLLM_GLM5_IDX_DUAL_GEMM` | 1 |
 | 0030 / 0031 | `VLLM_PP_METADATA_CACHE` / `VLLM_PP_PACK_TENSORS` | 1 |
+| 0034 | `VLLM_GLM53_PD_TAIL` | 1 |
 
 0030/0031 改变 PP 段之间的传输格式，所有段必须一致（profile 在每个进程里
 相同）。不在 profile 里、默认值即部署值的：`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS`
@@ -252,7 +274,7 @@ the server to log `Reaped GPU instance` before starting the replacement.
 
 ### 补丁系列（`patches/dflash2/`）
 
-33 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
+34 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
 git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何默认行为；compose 用
 `VLLM_GLM53_OPT_PROFILE=default`（0033）一次打开，开关表见上文“优化开关”。
 详细说明（英文）以及与开发编号的对照见 `patches/dflash2/README.md`。
@@ -291,7 +313,8 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0030 | PP 段间跳的元数据缓存：每跳先发 32 字节 CPU header，元数据 pickle 字节与上一跳相同时不再发送 payload；张量与顺序不变 | `VLLM_PP_METADATA_CACHE`（默认 0；**profile 打开**；所有 PP rank 必须一致） | 与 0031 一起见“本轮实测”；CPU 逻辑 5 项 + 真实 Gloo 160 步通过 |
 | 0031 | PP 段间跳的多个张量打包为一次 NCCL P2P（mHC hidden_states + fc 折叠部分和，每跳 2 次 → 1 次；字节与 padded 行数不变） | `VLLM_PP_PACK_TENSORS`（默认 0；**profile 打开**；启动时校验所有 PP rank 一致，不一致即报错） | 两卡 NCCL 120 步 packed=False/True 逐位一致；与 0030 一起 c1 counting 29.32→29.44 步/秒，c8 739.5→752.4 |
 | 0032 | PP sparse MLA / KDA prefill 放开到 2312 行以上（原限制只是验证时的 chunk 大小） | 随 0012/0014；`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` 默认 16384 | 2312/5120/8192/10240 行与分块调用逐位一致（输出与 KDA 末状态） |
-| 0033 | 一个 profile 开关打开整个系列 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
+| 0033 | 一个 profile 开关设置系列部署值 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
+| 0034 | prefill 把提示尾段状态交给 decode，decode 首步只采样（PD） | `VLLM_GLM53_PD_TAIL`（profile 打开） | 四段状态与首步 logits/候选逐位一致；107k 两跳 23.55 → 20.17 s |
 
 **route v2 用 tc 模式（profile 中 `VLLM_GLM5_ROUTE_V2_GEMV=tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
 **不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：

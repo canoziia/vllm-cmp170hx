@@ -56,6 +56,8 @@ services:
       - --http-host=127.0.0.1
       - --http-port=18559
       - --chunk-size=5120
+      # dflash2/0034 publishes its small tail generation record over this API
+      - --supported-transfer-mode=auto
       - --separate-object-groups
       - --l1-size-gb=64
       - --eviction-policy=LRU
