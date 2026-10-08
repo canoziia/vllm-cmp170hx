@@ -41,7 +41,7 @@ def env_default(text: str, name: str, default: str) -> bool:
 
 series = [line.strip() for line in (PATCH_DIR / "series").read_text().splitlines()
           if line.strip() and not line.startswith("#")]
-check("series has 34 patches", len(series) == 34, str(len(series)))
+check("series has 35 patches", len(series) == 35, str(len(series)))
 
 touched: set[str] = set()
 for name in series:
