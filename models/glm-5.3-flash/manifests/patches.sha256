@@ -1,4 +1,4 @@
-6764360a96c5d3c47e4d6c1bb74f21bc6a9e25d9a4fda0cab9c1df0b6ab7e171  models/glm-5.3-flash/patches/dflash2/series
+fd1aeee1d867b49727e48fa4d6186b5c391b4523a2dad9ffe8eb6b94ea88744e  models/glm-5.3-flash/patches/dflash2/series
 bdcc76eaf40505fdac9b7c682941f6a44724d170ad5f842225fe3c35a7d3378c  models/glm-5.3-flash/patches/dflash2/0001-glm5next-aux-hidden-states-pp.patch
 c60b635099acf40f5e3ce3996ed104ba194898f1636e7dac38be528dc281011e  models/glm-5.3-flash/patches/dflash2/0002-glm5next-kpool-tail-ring-spec-decode.patch
 73fda6363a59fc26895d0d5f33296692b03f52632e44603f8b96c5b32c02aab9  models/glm-5.3-flash/patches/dflash2/0003-glm5next-kv-layout-dflash-drafter-groups.patch
@@ -43,8 +43,9 @@ a1c676bd305156bedac32bf719a3fc66b4eb3e294770026e091cddf85891699e  models/glm-5.3
 81add119856a3d5d14d830a7e1945d7cdfc63a96fc3eb01c99c2522677d53fcf  models/glm-5.3-flash/manifests/source.env
 23b9789ae61609dff92a4efb43a1e39c5b8dae391452f6acac37dc789931d33c  scripts/apply-glm53-dflash2-patches.sh
 23f4db81071ab496e778d0b821d1b9d11ede11a687203a02f14d4d12b55fb872  scripts/build-glm53-dflash2-image.sh
-7c4b2239e59fce055c3d4ea86d5d8bc36c79eb857da4257711fdd60cf078af4b  scripts/test-glm53-dflash2-patches.py
+cbac1dbad304fc2ce0287301bc84393a9d5d30476fae15979694a51da242ef5f  scripts/test-glm53-dflash2-patches.py
 7dff204fc3f9699ddcc7dd8143467c573b62aa340b98e63f44b2d9c1270706b9  models/glm-5.3-flash/tests/check-dflash2-series.sh
 ac2a2b81d063cf92fea258e8adc9e6560b09ff8d6e147d2df6850dae12dcfe23  models/glm-5.3-flash/chat_template.jinja
 96bd7f798f49ac2fa18d4b83354daaae682cfdc84951d7ea442944f3ea3b208e  models/glm-5.3-flash/patches/dflash2/0034-glm53-pd-tail-sample-only.patch
 855af107f0d37825652f3f5d2bf925c8e219ae82cfa72b2e64d93e6725a064c8  models/glm-5.3-flash/patches/dflash2/0035-glm53-prefix-retention.patch
+eb3eb1e66a1dc2a89fcc2afb8269d0b082f62b57bf9c62ba4f9b79555fa2c2b7  models/glm-5.3-flash/patches/dflash2/0036-glm53-dflash-context-prefix.patch

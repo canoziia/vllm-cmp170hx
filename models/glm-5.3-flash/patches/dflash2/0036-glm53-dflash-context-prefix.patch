@@ -1,0 +1,286 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: cache finalized DFlash context prefixes without shifted markers
+
+DFlash context is position preserving, unlike EAGLE. Restrict publication to
+complete prompt pages; query and rejected suffixes are never cache evidence.
+Reuse Qwen group-scoped CoW to isolate heterogeneous cache state.
+
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index 9903235..13df10c 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -112,6 +112,12 @@ class KVCacheCoordinator(ABC):
+         if use_eagle and not self.eagle_group_ids:
+             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
+ 
++        if kv_cache_config.dflash_context_prefix:
++            # Complete prompt pages contain only position-preserving context KV.
++            # Keep group identity in the config, but do not consume a future
++            # page as an EAGLE marker for this explicitly different write path.
++            self.eagle_group_ids.clear()
++
+         # During chunked prefill with EAGLE, the single next prefill lookahead
+         # token past the chunk boundary is combined with the final hidden state
+         # and written to the KV cache. Therefore, the final chunk token must be
+@@ -151,6 +157,8 @@ class KVCacheCoordinator(ABC):
+             )
+             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
+         )
++        for manager in self.single_type_managers:
++            manager.dflash_context_prefix = kv_cache_config.dflash_context_prefix
+         # Match Mamba checkpoints to Eagle's attention replay boundary.
+         if use_eagle:
+             for manager in self.single_type_managers:
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 2842ad9..05cffc0 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -861,17 +861,18 @@ class KVCacheManager:
+         self,
+     ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:
+         """Drain pending copies and return their retained endpoints."""
+-        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
++        copies: list[KVCacheBlockCopy] = []
++        retained_blocks: list[KVCacheBlock] = []
+         for mgr in self.coordinator.single_type_managers:
+-            pending_copies.extend(mgr.take_pending_cow_copies())
+-        copies = [
+-            KVCacheBlockCopy(
+-                src_block_id=source_block.block_id,
+-                dst_block_id=cow_block.block_id,
+-            )
+-            for source_block, cow_block in pending_copies
+-        ]
+-        retained_blocks = [block for pair in pending_copies for block in pair]
++            for source_block, cow_block in mgr.take_pending_cow_copies():
++                copies.append(
++                    KVCacheBlockCopy(
++                        src_block_id=source_block.block_id,
++                        dst_block_id=cow_block.block_id,
++                        kv_cache_group_id=mgr.kv_cache_group_id,
++                    )
++                )
++                retained_blocks.extend((source_block, cow_block))
+         return copies, retained_blocks
+ 
+     def take_boundary_state_offloads(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 82df948..ae84858 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -226,6 +226,8 @@ class KVCacheBlock:
+ class KVCacheBlockCopy(NamedTuple):
+     src_block_id: int
+     dst_block_id: int
++    # Scheduler block IDs are group-scoped under heterogeneous geometries.
++    kv_cache_group_id: int = -1
+ 
+ 
+ class FreeKVCacheBlockQueue:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 4cb3a1c..20164a6 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -321,6 +322,19 @@ class Scheduler(SchedulerInterface):
+                     "acceptance rates."
+                 )
+ 
++        # Unlike EAGLE's shifted inputs, DFlash stores target context KV at
++        # the original positions and writes queries strictly AFTER that context.
++        # Limit this policy to the validated GLM profile and prompt-only cache
++        # publication; speculative/rejected suffixes are never evidence of a hit.
++        kv_cache_config.dflash_context_prefix = bool(
++            speculative_config is not None
++            and speculative_config.use_dflash()
++            and os.environ.get("VLLM_GLM53_PREFIX_RETENTION", "0") == "1"
++        )
++        if kv_cache_config.dflash_context_prefix:
++            self.use_eagle_block_drop = False
++            self.num_prefill_lookahead = 0
++
+         # Create the KV cache manager.
+         if hash_block_size is None:
+             hash_block_size = block_size
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 1eaf298..454cd57 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -468,6 +468,13 @@ class SingleTypeKVCacheManager(ABC):
+             replay_boundaries: Positions a later request replaying this prompt
+                 can resume at, from ``get_replay_boundaries``.
+         """
++        if getattr(self, "dflash_context_prefix", False):
++            # The final prompt page may also hold query masks / rejected tokens.
++            # Never publish it as a complete page merely because decode advanced.
++            # Earlier complete pages were filled from causal target context and
++            # later context/query writes cannot address positions before them.
++            if num_tokens > request.num_prompt_tokens:
++                return
+         num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+         num_full_blocks = num_tokens // self.block_size
+ 
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index f31ae7e..82bd5f6 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -1296,6 +1296,9 @@ class KVCacheConfig:
+     For models with multiple types of attention, there will be multiple groups,
+     see `_get_kv_cache_config_uniform_page_size` for more details.
+     """
++    # DFlash context KV is position-preserving; only complete prompt pages
++    # may be published under this policy (never speculative decode pages).
++    dflash_context_prefix: bool = False
+     prefix_cache_retention_interval: int | None = None
+     """Resolved retention policy for local prefix-cache checkpoints."""
+     kv_cache_layout: str | None = None
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 383da09..455e548 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -786,6 +786,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.vllm_config,
+                 kv_cache_allocation_context=kv_cache_allocation_context,
+             )
++        # Scheduler block IDs are scoped to a KV cache group. Keep the raw
++        # per-group allocations so partial-tail CoW copies never touch another
++        # group's page that happens to have the same numeric block ID.
++        self.kv_caches_by_group = [
++            [kv_caches_dict[name] for name in group.layer_names]
++            for group in self.kv_cache_config.kv_cache_groups
++        ]
+         if is_profiling:
+             self.kv_connector = NO_OP_KV_CONNECTOR
+         else:
+@@ -1278,6 +1285,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.kv_caches,
+                 self.kv_cache_config.num_blocks,
+                 scheduler_output.kv_cache_block_copies,
++                kv_caches_by_group=self.kv_caches_by_group,
+             )
+ 
+     def gather_batch_req_state(
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9250498..0225457 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -695,52 +695,78 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+ 
+ 
+ def copy_kv_cache_blocks_inplace(
+-    kv_caches: Iterable[torch.Tensor],
++    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],
+     num_blocks: int,
+     kv_cache_block_copies: Sequence[KVCacheBlockCopy],
++    kv_caches_by_group: list[
++        list[torch.Tensor | list[torch.Tensor]]
++    ] | None = None,
+ ) -> None:
+     if not kv_cache_block_copies:
+         return
+ 
+-    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
++    if kv_caches_by_group is not None:
++        by_group: dict[int, list[KVCacheBlockCopy]] = defaultdict(list)
++        for copy in kv_cache_block_copies:
++            by_group[copy.kv_cache_group_id].append(copy)
++        for group_id, copies in by_group.items():
++            group_caches = (
++                kv_caches if group_id < 0 else kv_caches_by_group[group_id]
++            )
++            copy_kv_cache_blocks_inplace(
++                group_caches,
++                num_blocks,
++                [KVCacheBlockCopy(c.src_block_id, c.dst_block_id) for c in copies],
++            )
++        return
++
++    indices_np = np.array(
++        [(copy.src_block_id, copy.dst_block_id) for copy in kv_cache_block_copies],
++        dtype=np.int64,
++    )
+     indices: torch.Tensor | None = None
+     seen: set[tuple[torch.device, int]] = set()
+     copied_storages: set[tuple[torch.device, int]] = set()
+-    for cache in kv_caches:
+-        # Layers sharing KV (cross-layer sharing) alias the same view; copy it
++    for cache_entry in kv_caches:
++        for cache in (
++            cache_entry
++            if isinstance(cache_entry, (list, tuple))
++            else (cache_entry,)
++        ):
++            # Layers sharing KV (cross-layer sharing) alias the same view; copy it
+         # once. data_ptr distinguishes per-layer views of a shared allocation.
+-        key = (cache.device, cache.data_ptr())
+-        if key in seen:
+-            continue
+-        seen.add(key)
++            key = (cache.device, cache.data_ptr())
++            if key in seen:
++                continue
++            seen.add(key)
+ 
+-        if indices is None:
+-            indices = async_tensor_h2d(indices_np, device=cache.device)
+-        assert cache.device == indices.device
+-        src, dst = indices.unbind(dim=1)
++            if indices is None:
++                indices = async_tensor_h2d(indices_np, device=cache.device)
++            assert cache.device == indices.device
++            src, dst = indices.unbind(dim=1)
+ 
+-        kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+-        assert remainder == 0, (
+-            f"{cache.shape[0]} kernel blocks not divisible by "
+-            f"{num_blocks} scheduler blocks"
+-        )
+-        storage = cache.untyped_storage()
+-        storage_key = (cache.device, storage.data_ptr())
+-        scheduler_block_stride = (
+-            cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+-        )
+-        if storage.nbytes() == num_blocks * scheduler_block_stride:
+-            if storage_key in copied_storages:
+-                continue
+-            copied_storages.add(storage_key)
+-            blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
+-            blocks.set_(storage)
+-            blocks = blocks.view(num_blocks, -1)
+-        else:
+-            # Fold virtual block splitting into the shape so that dim 0 counts
+-            # scheduler blocks; unflatten of dim 0 is always a view.
+-            blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+-        blocks[dst] = blocks[src]
++            kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
++            assert remainder == 0, (
++                f"{cache.shape[0]} kernel blocks not divisible by "
++                f"{num_blocks} scheduler blocks"
++            )
++            storage = cache.untyped_storage()
++            storage_key = (cache.device, storage.data_ptr())
++            scheduler_block_stride = (
++                cache.stride(0) * cache.element_size() * kernel_blocks_per_block
++            )
++            if storage.nbytes() == num_blocks * scheduler_block_stride:
++                if storage_key in copied_storages:
++                    continue
++                copied_storages.add(storage_key)
++                blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
++                blocks.set_(storage)
++                blocks = blocks.view(num_blocks, -1)
++            else:
++                # Fold virtual block splitting into the shape so that dim 0 counts
++                # scheduler blocks; unflatten of dim 0 is always a view.
++                blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
++            blocks[dst] = blocks[src]
+ 
+ 
+ def is_uniform_query_len(num_reqs: int, num_tokens: int, max_query_len: int) -> bool:
