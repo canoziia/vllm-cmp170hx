@@ -86,8 +86,8 @@ def main():
 
     def run_route(env26, env26b):
         def f(x, fn, out, sq):
-            os.environ["VLLM_GLM5_TARGET_PRENORM_FP32_0026"] = env26
-            os.environ["VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS"] = env26b
+            os.environ["VLLM_GLM5_TARGET_PRENORM_FP32"] = env26
+            os.environ["VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS"] = env26b
             ours._tilelang_hc_prenorm_gemm(x, fn, out, sq, H, hc)
         return f
 
@@ -144,7 +144,7 @@ def main():
                 i[0] += 1
             line.append(f"{name}={bench(call):8.1f}us err={err(name):.2e}")
         print("  ".join(line))
-    os.environ.pop("VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS", None)
+    os.environ.pop("VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS", None)
     print("ALL BITWISE OK" if ok_all else "BITWISE MISMATCH")
     sys.exit(0 if ok_all else 1)
 

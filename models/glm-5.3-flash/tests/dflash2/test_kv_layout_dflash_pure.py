@@ -289,9 +289,9 @@ def test_root_cause_is_indexer_vs_mla_not_drafter_size():
     assert _raises(generic_path, ns, specs)
 
 
-def test_after_4608_uses_shared_layout():
+def test_after_5120_uses_shared_layout():
     ns = load(PATCHED)
-    block = 4608
+    block = 5120
     groups = ns["_get_kv_cache_groups_glm5_next"](vllm_config(), merged_specs(block, True))
     assert groups is not None
     draft = [g for g in groups if g.layer_names[0].startswith("draft.")]
@@ -302,19 +302,25 @@ def test_after_4608_uses_shared_layout():
     for g in draft:
         assert g.is_eagle_group
         for spec in g.kv_cache_spec.kv_cache_specs.values():
-            assert spec.block_size == 1152
-            assert spec.page_size_bytes == block * 1024  # == MLA page, no padding
+            assert spec.block_size == 1024
+            assert spec.page_size_bytes == block * 1024
+            assert spec.page_size_padded == block * 1024
+            assert spec.unpadded_page_size_bytes == 4 * 1024**2
     # existing groups keep their positions and specs
     assert type(groups[0].kv_cache_spec).__name__ == "UniformTypeKVCacheSpecs"
     assert groups[-len(draft):] == draft
 
 
-def test_after_4480_still_declines_with_hint():
+def test_after_no_256_requirement():
     ns = load(PATCHED)
     specs = merged_specs(4480, True)
-    assert ns["_get_kv_cache_groups_glm5_next"](vllm_config(), specs) is None
-    assert any("multiple of 64" in r and "multiple of 256" in r
-               for r in ns["_log"].records), ns["_log"].records
+    # K3 stand-in fits this page; actual K7 requires >=4608. No geometric
+    # B/4 or 256-multiple restriction remains in the sharing helper.
+    groups = ns["_get_kv_cache_groups_glm5_next"](vllm_config(), specs)
+    assert groups is not None
+    for g in groups:
+        if g.layer_names[0].startswith('draft.'):
+            assert g.kv_cache_spec.block_size == 1024
 
 
 def test_no_drafter_behaviour_unchanged():

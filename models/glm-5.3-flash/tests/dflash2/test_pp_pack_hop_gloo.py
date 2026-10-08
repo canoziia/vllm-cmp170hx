@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Patch 0031 (dev 0029, VLLM_PP_PACK_TENSORS_0029): two CPU processes, real Gloo.
+"""Patch 0031 (dev 0029, VLLM_PP_PACK_TENSORS): two CPU processes, real Gloo.
 
 The *real* ``isend_tensor_dict`` / ``irecv_tensor_dict`` / ``isend_object`` /
 ``recv_object`` / ``_reap_completed_isends`` / ``_should_use_all_gather`` are
 AST-extracted from the patched ``parallel_state.py`` and bound to a stand-in
-coordinator; ``pp_pack_0029.py`` is imported from the patched tree.
+coordinator; ``pp_pack.py`` is imported from the patched tree.
 vLLM itself need not be importable (no GPU, no node2).
 
 Checks
@@ -47,21 +47,21 @@ TREE = os.environ.get("PP_PACK_TREE", os.environ.get("GLM_DFLASH2_TREE", "/usr/l
 if "--tree" in sys.argv:
     TREE = sys.argv[sys.argv.index("--tree") + 1]
 PS = os.path.join(TREE, "vllm", "distributed", "parallel_state.py")
-PK = os.path.join(TREE, "vllm", "distributed", "pp_pack_0029.py")
+PK = os.path.join(TREE, "vllm", "distributed", "pp_pack.py")
 
 METHODS = ("isend_tensor_dict", "irecv_tensor_dict", "isend_object", "recv_object",
            "_reap_completed_isends", "_should_use_all_gather")
 
 
 def load():
-    spec = importlib.util.spec_from_file_location("vllm.distributed.pp_pack_0029", PK)
+    spec = importlib.util.spec_from_file_location("vllm.distributed.pp_pack", PK)
     pack = importlib.util.module_from_spec(spec)
-    sys.modules["vllm.distributed.pp_pack_0029"] = pack  # for the method-local import
+    sys.modules["vllm.distributed.pp_pack"] = pack  # for the method-local import
     import types
     for name in ("vllm", "vllm.distributed"):
         m = sys.modules.setdefault(name, types.ModuleType(name))
         m.__path__ = []
-    sys.modules["vllm.distributed"].pp_pack_0029 = pack
+    sys.modules["vllm.distributed"].pp_pack = pack
     spec.loader.exec_module(pack)
 
     src = open(PS).read()
@@ -105,7 +105,7 @@ def make_coord(methods, rank, packed):
     c.world_size = 2; c.rank_in_group = rank; c.ranks = [0, 1]
     c.cpu_group = dist.group.WORLD; c.device_group = dist.group.WORLD
     c.use_cpu_custom_send_recv = False; c.device_communicator = None
-    c._pending_isends = deque(); c._pp_pack_0029 = packed
+    c._pending_isends = deque(); c._pp_pack = packed
     return c
 
 
@@ -198,7 +198,7 @@ def run_steps(rank, methods, packed, steps, counts):
 
 
 def worker(rank, path, mode, out):
-    os.environ["VLLM_PP_PACK_TENSORS_0029"] = mode[rank] if isinstance(mode, tuple) else mode
+    os.environ["VLLM_PP_PACK_TENSORS"] = mode[rank] if isinstance(mode, tuple) else mode
     dist.init_process_group("gloo", init_method="file://" + path, rank=rank, world_size=2,
                             timeout=datetime.timedelta(seconds=60))
     pack, ns, methods = load()

@@ -1,0 +1,231 @@
+# GLM-5.3-Flash W4A16 + DFlash2 prefill/decode pair: PP4 prefill on four
+# CMP 170HX GPUs, PP4 decode on four more, one LMCache server, PD router.
+# Same container names and ports as compose.pd.yml (the NVFP4 pair); run one
+# of the two.
+#
+# Images: scripts/build-glm53-dflash2-image.sh (engine) and
+# scripts/build-lmcache-server-image.sh (server; LMCache patch 0009 is needed on
+# both sides). The DFlash2 drafter (incoai/GLM-5.3-Flash-DFlash2) is
+# CC BY-NC-ND 4.0: non-commercial testing only.
+#
+# .env (0600, not committed): see .env.example, all variables required.
+# Start: podman compose -f compose.pd.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
+#
+# Geometry (README "W4A16 + DFlash2 PD"): target block = LMCache chunk =
+# prefix-cache retention = 5120 tokens; the drafter's 2048-token sliding window
+# uses 1024-token blocks (dflash2/0003); every prefill step must advance one
+# full block, plus the draft input slots: --max-num-batched-tokens=5184.
+# Prefill and decode must use the same partition, block, chunk and profile.
+services:
+  glm-5.3-flash-lmcache:
+    image: ${LMCACHE_IMAGE:?set LMCACHE_IMAGE}
+    container_name: glm-5.3-flash-lmcache
+    restart: "no"
+    entrypoint: ["lmcache"]
+    network_mode: host
+    ipc: host
+    devices:
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_0:?set GLM_PREFILL_GPU_0}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_1:?set GLM_PREFILL_GPU_1}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_2:?set GLM_PREFILL_GPU_2}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_3:?set GLM_PREFILL_GPU_3}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_0:?set GLM_DECODE_GPU_0}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_1:?set GLM_DECODE_GPU_1}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_2:?set GLM_DECODE_GPU_2}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_3:?set GLM_DECODE_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+      # LMCache 0009: same object-group buckets on every PP rank (the drafter
+      # only lives on the last one). Server and both engines must agree.
+      LMCACHE_MERGE_BOUNDED_PD: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:?set LMCACHE_L2_PATH}:/lmcache-l2
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=5559
+      - --http-host=127.0.0.1
+      - --http-port=18559
+      - --chunk-size=5120
+      - --separate-object-groups
+      - --l1-size-gb=64
+      - --eviction-policy=LRU
+      - --max-workers=8
+      # L2 eviction starts at 60% of 400 GiB and frees 20% of the keys per pass
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":400,"adopt_existing":true,"eviction":{"eviction_policy":"LRU","trigger_watermark":0.6,"eviction_ratio":0.2}}'
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18559/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+
+  glm-5.3-flash-prefill:
+    image: ${GLM_DFLASH2_IMAGE:?set GLM_DFLASH2_IMAGE}
+    container_name: glm-5.3-flash-prefill
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_0:?set GLM_PREFILL_GPU_0}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_1:?set GLM_PREFILL_GPU_1}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_2:?set GLM_PREFILL_GPU_2}
+      - nvidia.com/gpu=${GLM_PREFILL_GPU_3:?set GLM_PREFILL_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP:/root/app/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - /root/app/models/GLM-5.3-Flash-DFlash2:/root/app/models/GLM-5.3-Flash-DFlash2:ro
+      - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_PP_LAYER_PARTITION: "13,11,11,10"
+      VLLM_PP_DECODE_COHORT_BALANCE: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      # every DFlash2 series switch at its deployed value (dflash2/0034)
+      VLLM_GLM53_OPT_PROFILE: "default"
+      LMCACHE_MERGE_BOUNDED_PD: "1"
+    command:
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP
+      - --host=0.0.0.0
+      - --port=8301
+      - --served-model-name=canada-quant/GLM-5.3-Flash-W4A16-MTP
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --enable-prompt-tokens-details
+      - '--speculative-config={"method":"dflash","model":"/root/app/models/GLM-5.3-Flash-DFlash2","num_speculative_tokens":3}'
+      - --block-size=5120
+      - --max-model-len=1048576
+      - --max-num-seqs=8
+      - --max-num-batched-tokens=5184
+      - --long-prefill-token-threshold=0
+      - --kv-cache-memory=${GLM_PREFILL_KV_CACHE_MEMORY:?set GLM_PREFILL_KV_CACHE_MEMORY}
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - --enable-prefix-caching
+      - --mamba-cache-mode=align
+      - --prefix-cache-retention-interval=5120
+      - --enable-auto-tool-choice
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm47
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14591,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      # drain on stop so every worker unregisters its KV cache from LMCache
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8301/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+
+  glm-5.3-flash-decode:
+    image: ${GLM_DFLASH2_IMAGE:?set GLM_DFLASH2_IMAGE}
+    container_name: glm-5.3-flash-decode
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${GLM_DECODE_GPU_0:?set GLM_DECODE_GPU_0}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_1:?set GLM_DECODE_GPU_1}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_2:?set GLM_DECODE_GPU_2}
+      - nvidia.com/gpu=${GLM_DECODE_GPU_3:?set GLM_DECODE_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP:/root/app/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - /root/app/models/GLM-5.3-Flash-DFlash2:/root/app/models/GLM-5.3-Flash-DFlash2:ro
+      - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_PP_LAYER_PARTITION: "13,11,11,10"
+      VLLM_PP_DECODE_COHORT_BALANCE: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      VLLM_GLM53_OPT_PROFILE: "default"
+      LMCACHE_MERGE_BOUNDED_PD: "1"
+    command:
+      - /root/app/models/GLM-5.3-Flash-W4A16-MTP
+      - --host=0.0.0.0
+      - --port=8302
+      - --served-model-name=canada-quant/GLM-5.3-Flash-W4A16-MTP
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --enable-prompt-tokens-details
+      - '--speculative-config={"method":"dflash","model":"/root/app/models/GLM-5.3-Flash-DFlash2","num_speculative_tokens":3}'
+      - --block-size=5120
+      - --max-model-len=1048576
+      - --max-num-seqs=8
+      - --max-num-batched-tokens=5184
+      - --long-prefill-token-threshold=0
+      - --kv-cache-memory=${GLM_DECODE_KV_CACHE_MEMORY:?set GLM_DECODE_KV_CACHE_MEMORY}
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - --enable-prefix-caching
+      - --mamba-cache-mode=align
+      - --prefix-cache-retention-interval=5120
+      - --enable-auto-tool-choice
+      - --tool-call-parser=glm47
+      - --reasoning-parser=glm47
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14592,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5559}}'
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8302/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+
+  glm-5.3-flash-pd-router:
+    # Built from patches/router/ (scripts/build-router-image.sh): the router
+    # merges both hops' usage into the standard fields before returning.
+    image: ${ROUTER_IMAGE:?set ROUTER_IMAGE}
+    container_name: glm-5.3-flash-pd-router
+    restart: "no"
+    network_mode: host
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    entrypoint: ["vllm-router"]
+    environment:
+      OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+      PYTHONUNBUFFERED: "1"
+    command:
+      - --service-discovery=static
+      - --static-backends=http://127.0.0.1:8301,http://127.0.0.1:8302
+      - --static-models=canada-quant/GLM-5.3-Flash-W4A16-MTP,canada-quant/GLM-5.3-Flash-W4A16-MTP
+      - --static-model-labels=prefill,decode
+      - --prefill-model-labels=prefill
+      - --decode-model-labels=decode
+      - --routing-logic=disaggregated_prefill
+      - --host=0.0.0.0
+      - --port=9103

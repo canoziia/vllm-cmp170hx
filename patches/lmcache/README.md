@@ -75,6 +75,10 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
 6. `0006-adopt-existing-native-fs.patch`
    - scans completed native-FS object files after restart;
    - seeds byte accounting and eviction listeners oldest-first;
+   - records each adopted file's size in the per-key table that native delete
+     completions consult, so evicting an adopted file releases its bytes and
+     LRU entry (without it, old files were deleted but stayed counted and the
+     directory grew past `max_capacity_gb`);
    - makes the configured `adopt_existing=true` meaningful instead of leaving
      old files unaccounted.
 
@@ -83,6 +87,20 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
      request tracker and nulls the old slot;
    - permits multi-block prefill with MTP after fixing its store metadata,
      instead of requiring `max_num_batched_tokens == block_size`.
+
+8. `0008-shared-server-mp-worker-rank.patch`
+   - derives the MP worker rank when one server is shared by several engines.
+
+9. `0009-bounded-pd-object-groups.patch`
+   - `LMCACHE_MERGE_BOUNDED_PD=1` (default off; client and server must both
+     set it) groups regular KV layer groups into object buckets by their
+     cross-chunk window instead of by attention/recurrent kind, so PP ranks
+     that differ only by an extra bounded group (the GLM-5.3 DFlash2 drafter
+     on the last rank) register the same object-group description. Kernel
+     groups, layer membership, block IDs, physical layout and transfer
+     windows are unchanged; registry validation stays on.
+   - only for plain PD store/retrieve: `enable_full_sw_kv` (CacheBlend)
+     rejects it. All ranks must still have identical window buckets.
 
 The server-image build runs `scripts/test-lmcache-patches.py`. It checks native
 extension ABI, salt isolation, mixed-size native-FS round trips, six-rank

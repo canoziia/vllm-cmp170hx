@@ -1,7 +1,108 @@
-# GLM-5.3-Flash NVFP4 PD (prefill/decode disaggregated) on eight CMP 170HX GPUs
+# GLM-5.3-Flash on CMP 170HX
 
-> The W4A16 + DFlash2 PP4 deployment (own image, own patch series) is described
-> in [W4A16 + DFlash2](#w4a16--dflash2pp4单引擎) below.
+Two prefill/decode pairs share container names and ports; run one of them:
+
+| compose | target | speculative | image |
+|---|---|---|---|
+| `compose.pd.w4a16-dflash2.yml` (**production**) | `canada-quant/GLM-5.3-Flash-W4A16-MTP` | DFlash2 | `glm-5.3-flash-w4a16-dflash2` |
+| `compose.pd.yml` | `nvidia/GLM-5.3-Flash-NVFP4` | MTP-3 | `deepseek-v4.1-flash` |
+
+`compose.w4a16-dflash2.yml` runs the W4A16 + DFlash2 engine alone (PP4, one
+role), see [below](#w4a16--dflash2pp4单引擎).
+
+## W4A16 + DFlash2 PD（生产）
+
+prefill PP4 用 GPU1–4（:8301），decode PP4 用 GPU5–8（:8302），一个 LMCache
+server（:5559，HTTP :18559），PD router 入口 **:9103**；模型名
+`canada-quant/GLM-5.3-Flash-W4A16-MTP`，max-model-len 1048576。
+
+```bash
+scripts/build-glm53-dflash2-image.sh                       # engine image
+REBUILD_LMCACHE_IMAGE=1 scripts/build-lmcache-server-image.sh   # when patches/lmcache changes
+cd models/glm-5.3-flash
+cp .env.example .env && chmod 600 .env                     # fill in VLLM_API_KEY, paths, GPUs
+podman compose -f compose.pd.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
+```
+
+### 几何
+
+| 参数 | 值 | 原因 |
+|---|---|---|
+| target block = LMCache chunk = retention | 5120 | KDA 状态页在 DFlash 最大深度 7 时需要 ≥4608 token；还要能被 drafter block 整除 |
+| drafter block | 1024 | drafter 滑窗 2048 与 chunk 5120 都必须是 drafter block 的整数倍（LMCache 校验）；dflash2/0003 把 1024 token 的 drafter block 放在一个 5 MiB 的 MLA 页里（4 MiB 数据） |
+| `--max-num-batched-tokens` | 5184 | 带 LMCache 的混合模型每步必须推进一个完整 block，再加上 draft 输入槽 |
+| KV | 12 GiB/卡 | 按 1M 口径 2,691,005 tokens（2.57×）；峰值显存余量约 1.4 GiB |
+| KDA 页填充 | 11.89% | |
+
+PP 下最后一段比其他段多一个 drafter 滑窗分组，LMCache 默认会认为各段对象
+分组描述不一致而拒绝注册；`LMCACHE_MERGE_BOUNDED_PD=1`（`patches/lmcache/0009`，
+默认关）让各段按跨 chunk 窗口分组，描述一致。server 与两个引擎都要设。
+不兼容 CacheBlend（`full_sw_kv`），也不要与别的布局共用 L2 目录。
+
+L2：`fs_native`，容量 400 GiB，占用到 60% 开始按 LRU 回收，每次回收约 20% 的
+key；`adopt_existing=true` 时重启前的文件也计入容量并能被回收
+（`patches/lmcache/0006`）。这是水位策略，不是硬配额。
+
+### 优化开关
+
+`VLLM_GLM53_OPT_PROFILE=default`（dflash2/0034）在每个进程启动时把下表开关设为
+部署值，**已设置的变量不覆盖**，所以单独关某一项只需在 compose 里写
+`VLLM_XXX: "0"`。不设 profile 时所有补丁回到各自默认（关）。
+
+| 补丁 | 开关 | 值 |
+|---|---|---|
+| 0001 | `VLLM_GLM5_AUX_HIDDEN_TENSOR` | `stream_mean` |
+| 0004 | `VLLM_GLM5_DFLASH_ADAPTIVE_K` / `_DEPTHS` / `_ACCEPT` | `1` / `7,5` / `0` |
+| 0005 | `VLLM_GLM5_THIN_GEMM` | 1 |
+| 0006 | `VLLM_GLM5_MARLIN_DECODE_CUDA` / `VLLM_GLM5_MARLIN_DECODE_VARIANT` | 1 / `orig` |
+| 0007 | `VLLM_DFLASH2_FUSED_GROUPED_CONV` | 1 |
+| 0008 | `VLLM_GLM5_ROUTER_ALIGN_DECODE` | 1 |
+| 0009 | `VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL` | 1 |
+| 0010 / 0023 | `VLLM_GLM5_ROUTE_V2` / `VLLM_GLM5_ROUTE_V2_GEMV` / `VLLM_GLM5_ROUTE_V2_FIRST` | 1 / `tc` / 0 |
+| 0011 | `VLLM_GLM5_INDEXER_GATHER_CLAMP` | 1 |
+| 0012–0014 | `VLLM_GLM5_PP_SPARSE_MLA_PREFILL` / `VLLM_GLM5_PP_MARLIN_PREFILL` / `VLLM_GLM5_PP_KDA_PREFILL` | 1 |
+| 0016 | `VLLM_GLM5_PP_FOLD_DRAFT_FC` | 1 |
+| 0017 | `VLLM_GLM5_DECODE_MHC_V2` | 1 |
+| 0018 / 0019 | `VLLM_GLM5_PROLOGUE_FUSE` / `VLLM_GLM5_PROLOGUE_PACKED_H2D` | 1 |
+| 0020 | `VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS` | 1 |
+| 0021 | `VLLM_PP_DRAFT_TAIL_STAGE` | 2 |
+| 0022 | `VLLM_GLM5_MLA_PROFILE_WS_CLAMP` | 1 |
+| 0024 | `VLLM_GLM5_DECODE_IDX_GLUE` | 1 |
+| 0025 / 0028 | `VLLM_GLM5_TARGET_PRENORM_FP32` / `VLLM_MHC_POST_FUSE_SQRSUM` | 1 / 0 |
+| 0026 | `VLLM_GLM5_MOE_SUM_ADD` | 1 |
+| 0027 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 1 |
+| 0029 | `VLLM_GLM5_IDX_DUAL_GEMM` | 1 |
+| 0030 / 0031 | `VLLM_PP_METADATA_CACHE` / `VLLM_PP_PACK_TENSORS` | 1 |
+| 0033 | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` | 1 |
+
+0030/0031 改变 PP 段之间的传输格式，所有段必须一致（profile 在每个进程里
+相同）。不在 profile 里、默认值即部署值的：`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS`
+（16384，0032）、`VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS`（384，0028）。
+
+### 思考与正文
+
+GLM-5.3 的模板每次都以未闭合的 `<think>` 结尾，`enable_thinking=false` 和
+`reasoning_effort=none` 也一样，模型照常思考；glm45/glm47 parser（同一个类）
+原先信任这个标志，把思考连同正文都放进 `content`。0033 让 parser 始终以
+`</think>` 切分：`content` 不再混入思考，但模型并不会因此不思考。思考在
+`message.reasoning` 字段。
+
+### 实测（node2，出厂设置）
+
+| 模式 | c1 tok/s | c8 tok/s |
+|---|---:|---:|
+| counting | 222.7 | 720.5（KV 12 GiB 单轮 744.1） |
+| prose | 65.9 | 328.6 |
+| code | 155.2 | 594.2（12 GiB 单轮 595.8） |
+
+- 107,000 token prefill：prefill 直连约 5,500 tok/s，经 PD 约 4,900 tok/s；差别
+  主要是 decode 侧重算最后一个不满 chunk 的尾段（107000 mod 5120 = 4600 token）。
+- 524,288 token 107.5 s，1,040,000 token 248 s，decode 从 LMCache 命中 1,039,360。
+- chunk 边界处 decode 侧从 LMCache 恢复的 drafter 窗口 KV、target 末 chunk KV、
+  KDA 状态、aux hidden 与本地 prefill 逐位一致；16/504 token 后缀的同一序列
+  直连与 PD 接受数相同（5.735 / 5.543 draft/step）。
+
+## NVFP4 + MTP-3 PD (`compose.pd.yml`, previous production)
 
 Model: [`nvidia/GLM-5.3-Flash-NVFP4`](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4)
 at revision `da920bb0b9f4a06727223a349e55468e38352348`.
@@ -127,10 +228,8 @@ the server to log `Reaped GPU instance` before starting the replacement.
 
 ## W4A16 + DFlash2（PP4，单引擎）
 
-本节对应 `compose.w4a16-dflash2.yml` 与镜像
-`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`。它与上面的 NVFP4 PD
-部署相互独立：目标模型是 W4A16 量化的 GLM-5.3-Flash，投机解码使用 DFlash2
-drafter，不使用 LMCache。
+本节对应 `compose.w4a16-dflash2.yml`（单引擎，不使用 LMCache）与镜像
+`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`；生产 PD 用的是同一镜像。
 
 > **许可证提醒**：DFlash2 drafter `incoai/GLM-5.3-Flash-DFlash2` 采用
 > **CC BY-NC-ND 4.0**，只能用于非商业测试，不得用于商业服务，也不得分发其修改版本。
@@ -151,23 +250,23 @@ drafter，不使用 LMCache。
 
 ### 补丁系列（`patches/dflash2/`）
 
-28 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
-git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何默认行为；compose 通过 env 打开它们
-（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST` 除外，见下）。
+34 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
+git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何默认行为；compose 用
+`VLLM_GLM53_OPT_PROFILE=default`（0034）一次打开，开关表见上文“优化开关”。
 详细说明（英文）以及与开发编号的对照见 `patches/dflash2/README.md`。
 
 | # | 作用 | 开关 | GPU 实测结论 |
 |---|---|---|---|
 | 0001 | GLM 目标模型提供 DFlash aux hidden state，并支持 PP 转发 | `VLLM_GLM5_AUX_HIDDEN_TENSOR=stream_mean` | 必需（启动通过） |
 | 0002 | kpool tail ring 按草稿深度扩容，修复被拒草稿写坏 pool key 的问题 | 常开 | 正确性修复，293 项回滚矩阵通过 |
-| 0003 | drafter 的滑窗层复用 MLA KV 张量 | 常开；需要 `--block-size=4608` | 必需 |
+| 0003 | drafter 的滑窗层复用 MLA KV 张量（1024 token 一块，放在一个 MLA 页内）；Mamba 检查点按 target 状态页对齐 | 常开；`--block-size=5120`、`--max-num-batched-tokens=5184` | 必需 |
 | 0004 | 自适应验证深度 | `VLLM_GLM5_DFLASH_ADAPTIVE_K*` | 有效 |
 | 0005 | sm_80 thin-M BF16 GEMM | `VLLM_GLM5_THIN_GEMM` | 小幅有效 |
 | 0006 | 编译版 sm_80 Marlin MoE decode（`vllm._ampere_marlin_C`） | `VLLM_GLM5_MARLIN_DECODE_CUDA` | 有效，11 项 GPU 测试通过 |
 | 0007 | DFlash2 融合 grouped conv | `VLLM_DFLASH2_FUSED_GROUPED_CONV` | 小幅有效 |
 | 0008 | 确定性小 M MoE 对齐（route v2 的回退路径） | `VLLM_GLM5_ROUTER_ALIGN_DECODE` | 约 1% |
 | 0009 | sparse MLA decode 调度 | `VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL` | 有效 |
-| 0010 | MoE route v2（gate 模式与原路由逐位一致；tc 模式与对方 `_moe_route_kernel` 逐位一致） | `VLLM_GLM5_ROUTE_V2=1`；补丁默认 `_GEMV=gate`，**compose 用 `tc`**（见下） | 约 +9%；tc 再 +0.6%（c1 29.05→29.21 步/秒） |
+| 0010 | MoE route v2（gate 模式与原路由逐位一致；tc 模式与对方 `_moe_route_kernel` 逐位一致） | `VLLM_GLM5_ROUTE_V2=1`；补丁默认 `_GEMV=gate`，**profile 用 `tc`**（见下） | 约 +9%；tc 再 +0.6%（c1 29.05→29.21 步/秒） |
 | 0011 | indexer gather 工作区收紧 | `VLLM_GLM5_INDEXER_GATHER_CLAMP` | KV 池 +25%（配合 util 0.95、logits 128 MiB） |
 | 0012 | PP sparse MLA prefill（Gluon 64 头） | `VLLM_GLM5_PP_SPARSE_MLA_PREFILL` | 有效 |
 | 0013 | PP Marlin MoE prefill 拆块 | `VLLM_GLM5_PP_MARLIN_PREFILL` | MoE prefill 1.23–1.31×，99.9% 逐位一致 |
@@ -180,33 +279,34 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0020 | sparse MLA `req_id_per_token` 在设备端生成 | `VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS` | GPU 逐位一致 |
 | 0021 | drafter 尾段（候选 lm_head、top-k、selector）移到 PP stage 2（含审计加固） | `VLLM_PP_DRAFT_TAIL_STAGE=2` | VERIFY 33,059 行零差异；FlashInfer 双流隔离 GPU 测试通过；c8 +11% |
 | 0022 | sparse MLA profile 占位缓冲收紧到 16384 行 | `VLLM_GLM5_MLA_PROFILE_WS_CLAMP` | KV 池 1.68M → 2.095M；243k 单请求与 8×114k 压力通过 |
-| 0023 | route v2 tile 读取顺序；可选“router 先于 shared experts 入队” | `VLLM_GLM5_ROUTE_V2_FIRST`（**默认 0**，compose 也设 0） | kernel 部分逐位不变；`=1` 整机变慢 |
-| 0024 | indexer 权重缩放并入 decode FWHT 量化 | `VLLM_GLM5_DECODE_IDX_GLUE_0024` | GPU 逐位一致 |
-| 0025 | mHC prenorm GEMM 在所有 T 走 fp32 TileLang | `VLLM_GLM5_TARGET_PRENORM_FP32_0026` | 与 0017 一起：相同历史首块与对方逐位一致，prose 接受率恢复 |
+| 0023 | route v2 tile 读取顺序；可选“router 先于 shared experts 入队” | `VLLM_GLM5_ROUTE_V2_FIRST`（**默认 0**，profile 也设 0） | kernel 部分逐位不变；`=1` 整机变慢 |
+| 0024 | indexer 权重缩放并入 decode FWHT 量化 | `VLLM_GLM5_DECODE_IDX_GLUE` | GPU 逐位一致 |
+| 0025 | mHC prenorm GEMM 在所有 T 走 fp32 TileLang | `VLLM_GLM5_TARGET_PRENORM_FP32` | 与 0017 一起：相同历史首块与对方逐位一致，prose 接受率恢复 |
 | 0026 | routed moe_sum 与 shared expert 加法融合 | `VLLM_GLM5_MOE_SUM_ADD` | GPU 逐位 512/512 |
 | 0027 | shared experts 在 routed experts 之后入队 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 逐位一致；与 0026 一起 c8 counting 752.9 |
-| 0028 | T ≥ 384 的 prenorm GEMM 改用对方的 bf16x3 张量核 Triton kernel（Apache-2.0，原样复制） | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS`（默认 384，0 = 等同 0025）；**只在 0025 打开时生效** | T=2312 prenorm 923 → 154 μs；T ≥ 384 与对方逐位一致，T < 384 与 0025 逐位一致；冷 prefill 见下 |
-| 0029 | indexer wk+weights 合成一次双输出 thin GEMM（k 列 bf16 逐位不变；head weights 以 fp32 累加值输出，替代 cast + fp32 sgemm） | `VLLM_GLM5_IDX_DUAL_GEMM`（默认 0；需 `VLLM_GLM5_THIN_GEMM=1`；**compose 打开**） | 每 MLA 层省 15.7 μs；c1 counting 28.87→29.05 步/秒，c8 727.8→742.7；接受率不变；weights 误差为 sgemm 的 1.07×/1.24×（outlier/cancel 输入的 mean），max 更低 |
-| 0030 | PP 段间跳的元数据缓存：每跳先发 32 字节 CPU header，元数据 pickle 字节与上一跳相同时不再发送 payload；张量与顺序不变 | `VLLM_PP_METADATA_CACHE_0025`（默认 0；**compose 打开**；所有 PP rank 必须一致） | 与 0031 一起见“本轮实测”；CPU 逻辑 5 项 + 真实 Gloo 160 步通过 |
-| 0031 | PP 段间跳的多个张量打包为一次 NCCL P2P（mHC hidden_states + fc 折叠部分和，每跳 2 次 → 1 次；字节与 padded 行数不变） | `VLLM_PP_PACK_TENSORS_0029`（默认 0；**compose 打开**；启动时校验所有 PP rank 一致，不一致即报错） | 两卡 NCCL 120 步 packed=False/True 逐位一致；与 0030 一起 c1 counting 29.32→29.44 步/秒，c8 739.5→752.4 |
+| 0028 | T ≥ 384 的 prenorm GEMM 改用对方的 bf16x3 张量核 Triton kernel（Apache-2.0，原样复制） | `VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS`（默认 384，0 = 等同 0025）；**只在 0025 打开时生效** | T=2312 prenorm 923 → 154 μs；T ≥ 384 与对方逐位一致，T < 384 与 0025 逐位一致；冷 prefill 见下 |
+| 0029 | indexer wk+weights 合成一次双输出 thin GEMM（k 列 bf16 逐位不变；head weights 以 fp32 累加值输出，替代 cast + fp32 sgemm） | `VLLM_GLM5_IDX_DUAL_GEMM`（默认 0；需 `VLLM_GLM5_THIN_GEMM=1`；**profile 打开**） | 每 MLA 层省 15.7 μs；c1 counting 28.87→29.05 步/秒，c8 727.8→742.7；接受率不变；weights 误差为 sgemm 的 1.07×/1.24×（outlier/cancel 输入的 mean），max 更低 |
+| 0030 | PP 段间跳的元数据缓存：每跳先发 32 字节 CPU header，元数据 pickle 字节与上一跳相同时不再发送 payload；张量与顺序不变 | `VLLM_PP_METADATA_CACHE`（默认 0；**profile 打开**；所有 PP rank 必须一致） | 与 0031 一起见“本轮实测”；CPU 逻辑 5 项 + 真实 Gloo 160 步通过 |
+| 0031 | PP 段间跳的多个张量打包为一次 NCCL P2P（mHC hidden_states + fc 折叠部分和，每跳 2 次 → 1 次；字节与 padded 行数不变） | `VLLM_PP_PACK_TENSORS`（默认 0；**profile 打开**；启动时校验所有 PP rank 一致，不一致即报错） | 两卡 NCCL 120 步 packed=False/True 逐位一致；与 0030 一起 c1 counting 29.32→29.44 步/秒，c8 739.5→752.4 |
+| 0032 | PP sparse MLA / KDA prefill 放开到 2312 行以上（原限制只是验证时的 chunk 大小） | 随 0012/0014；`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` 默认 16384 | 2312/5120/8192/10240 行与分块调用逐位一致（输出与 KDA 末状态） |
+| 0033 | GLM-5.3 模板下 parser 始终按 `</think>` 切分思考与正文 | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` | `enable_thinking=false` / `reasoning_effort=none` 时 content 不再混入思考 |
+| 0034 | 一个 profile 开关打开整个系列 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
 
-**route v2 用 tc 模式（compose 中 `VLLM_GLM5_ROUTE_V2_GEMV: tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
+**route v2 用 tc 模式（profile 中 `VLLM_GLM5_ROUTE_V2_GEMV=tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
 **不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：
 一是与对方数值对齐，prose 接受率 1.232/轮，与对方相同（gate 为 1.218）；二是减少 SM 争用。gate 模式的 GEMV 一次铺开
 288 个 8-warp CTA，shared experts（侧流）只能等它排空，结果与 routed Marlin 重叠更多；tc 是一次 80-CTA launch。
 单卡 MoE 层 bench（M=8）：gate 385.5、tc 375.9、无路由 363.8 μs/层；整机 c1 counting 29.05→29.21 步/秒
 （`/tmp/dcp/dflash-port/STEP-GAP-2.md` §7–8）。
 
-0028 的代码位于 0025 的 `VLLM_GLM5_TARGET_PRENORM_FP32_0026=1` 分支内部，0025 关闭时完全不可达，所以系列默认行为不变
-（静态检查断言了这一点）。0028 的 kernel 会重写 sqrsum，因此 compose 显式设 `VLLM_MHC_POST_FUSE_SQRSUM=0`
+0028 的代码位于 0025 的 `VLLM_GLM5_TARGET_PRENORM_FP32=1` 分支内部，0025 关闭时完全不可达，所以系列默认行为不变
+（静态检查断言了这一点）。0028 的 kernel 会重写 sqrsum，因此 profile 显式设 `VLLM_MHC_POST_FUSE_SQRSUM=0`
 （该变量在我们树中已存在、默认 0；设 1 会让 mhc_post 额外计算一次随后被覆盖的 sqrsum）。
 
-0017–0028 的开关名沿用开发编号（如 `_0024`、`_0026` 后缀），以免已有部署改名；补丁编号与开发编号的
-对照见 `patches/dflash2/README.md`。0023 的 `VLLM_GLM5_ROUTE_V2_FIRST` 在开发版中随 route v2 默认开启，
-整机实测 `=1` 变慢，因此正式补丁把默认值改为 0（只有设为 `1` 才启用），compose 仍显式设 `0`；
+0023 的 `VLLM_GLM5_ROUTE_V2_FIRST` 在开发版中随 route v2 默认开启，
+整机实测 `=1` 变慢，因此正式补丁把默认值改为 0（只有设为 `1` 才启用），profile 仍显式设 `0`；
 这样即使有人漏掉这项 env，也不会进入较慢的顺序。
 
-0030/0031 的开关名同样沿用开发编号（`_0025`、`_0029` 后缀，开发编号与生产编号无关）。
 
 未纳入的开发补丁：context-KV graph、旧版 mHC v2（开发 0009，已由 0017 完整移植取代）、KDA 双投影（三者均无整机收益）；mHC v1 数值
 （未在 GPU 上验证）；force-file、draft trace、PP trace、相同历史（accept-same-history）overlay（仅用于诊断）。去掉这些补丁后，其余补丁只有
@@ -250,16 +350,17 @@ GPU 测试的运行方法见 `tests/dflash2/README.md`。
 ```bash
 cd models/glm-5.3-flash
 # .env：VLLM_API_KEY=...，GLM_DFLASH2_CACHE=/root/app/vllm/cache/glm53f-w4a16-dflash2
-# GPU 默认使用 5..8（测试卡）。生产 prefill 使用 1..4：GLM_GPU_0=1 ... GLM_GPU_3=4
+# GPU 默认 5..8：GLM_GPU_0..GLM_GPU_3
 mkdir -p /root/app/vllm/cache/glm53f-w4a16-dflash2/{tmp,triton,inductor}
-podman compose -f compose.w4a16-dflash2.yml up -d
+podman compose -f compose.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
 ```
 
-主要参数：V2 runner；`VLLM_PP_LAYER_PARTITION=13,11,11,10`；`--block-size=4608`；
-`--max-num-batched-tokens=2312`；`--long-prefill-token-threshold=0`；
-`--gpu-memory-utilization=0.95`；`FULL_AND_PIECEWISE`；prefix caching；
-`--mamba-cache-mode=align`；DFlash2 `num_speculative_tokens=3`，自适应深度 `7,5`，`ACCEPT=0`（只按负载选深度：1 个请求验证 7、2 个 5、更多 3）；
-0005–0031 全部开启（0023 的 `VLLM_GLM5_ROUTE_V2_FIRST=0`；0010 用 `_GEMV=tc`）；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
+主要参数：V2 runner；`VLLM_PP_LAYER_PARTITION=13,11,11,10`；`--block-size=5120`；
+`--max-num-batched-tokens=5184`；`--long-prefill-token-threshold=0`；KV 12 GiB；
+`FULL_AND_PIECEWISE`；prefix caching；`--mamba-cache-mode=align`；DFlash2
+`num_speculative_tokens=3`，自适应深度 `7,5`，`ACCEPT=0`（只按负载选深度：1 个请求验证 7、2 个 5、更多 3）；
+`VLLM_GLM53_OPT_PROFILE=default`；`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=128`；Triton 与 Inductor 缓存放在挂载目录中。
+下面“实测性能”“本轮实测”是 block 4608、batch 2312 时测得的单引擎数据。
 
 分层的另一选择是 `GLM_PP_LAYER_PARTITION=12,12,12,9`：c8 约 +10%，但 KV 池从 1.68M
 降到 1.24M token（这两个数是 0022 之前测得的）。
@@ -379,7 +480,7 @@ GPU5–8，PP4，2 轮预热、5 轮正式取中位数，每次 500 token。我�
 
 无收益、未纳入的项：
 
-PP metadata cache（`VLLM_PP_METADATA_CACHE_0025`）与 PP 传输张量打包（`VLLM_PP_PACK_TENSORS_0029`）之前列在此表中，
+PP metadata cache（`VLLM_PP_METADATA_CACHE`）与 PP 传输张量打包（`VLLM_PP_PACK_TENSORS`）之前列在此表中，
 记为“整机无收益”；那是在较早的基线上测的（当时其他 decode 瓶颈占主导，PP 通信不在关键路径上）。
 在 0001–0029 完整栈 + tc 路由上两项一起打开测得有效（c1 counting 29.32→29.44 步/秒，c8 counting 739.5→752.4、
 code 589.9→609.2、prose 324.0→335.4），已作为 0030、0031 纳入，从此表移除。

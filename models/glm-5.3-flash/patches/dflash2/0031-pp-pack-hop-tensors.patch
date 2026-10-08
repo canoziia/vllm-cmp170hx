@@ -1,7 +1,7 @@
 From: canoziia <canoziia@users.noreply.github.com>
 Subject: [PATCH] PP: pack the per-hop tensors into one NCCL P2P
 
-VLLM_PP_PACK_TENSORS_0029 (default 0; read once; the "pp" group exchanges
+VLLM_PP_PACK_TENSORS (default 0; read once; the "pp" group exchanges
 the value over its gloo group at start-up and every rank raises if the PP
 ranks disagree). With the GLM mHC boundary plus the folded drafter fc
 partial each hop carries two tensors ([rows,4,4096] bf16 hidden_states and
@@ -17,7 +17,7 @@ bytes of padding per segment); results are bit-identical. The pack copy runs
 on the current stream before the isend is enqueued, so the source (the full
 CUDA graph's persistent outputs) is no longer read by the send afterwards;
 the buffer inherits the existing record_stream / pending-isend retention.
-Composes with VLLM_PP_METADATA_CACHE_0025.
+Composes with VLLM_PP_METADATA_CACHE.
 
 diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
 index 0337a6c..dc7b6b4 100644
@@ -27,13 +27,13 @@ index 0337a6c..dc7b6b4 100644
          # without calling ``super().__init__``.
          self._pending_isends: deque[tuple[list[Handle], list[torch.Tensor]]] = deque()
  
-+        # VLLM_PP_PACK_TENSORS_0029 (patch 0029): one P2P op per PP hop.
++        # VLLM_PP_PACK_TENSORS (patch 0029): one P2P op per PP hop.
 +        # Startup collective on the PP CPU group; raises if ranks disagree.
-+        self._pp_pack_0029 = False
++        self._pp_pack = False
 +        if group_name == "pp" and self.world_size > 1:
-+            from vllm.distributed.pp_pack_0029 import configure
++            from vllm.distributed.pp_pack import configure
 +
-+            self._pp_pack_0029 = configure(self)
++            self._pp_pack = configure(self)
 +
      def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
          """Create a new device-side ProcessGroup with the same per-rank membership
@@ -42,10 +42,10 @@ index 0337a6c..dc7b6b4 100644
  
          tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
          assert len(tensor_keys) == len(tensor_list)
-+        if getattr(self, "_pp_pack_0029", False):
++        if getattr(self, "_pp_pack", False):
 +            # Patch 0029: metadata unchanged; packable tensors become one
 +            # leading uint8 buffer sent (and retained) by the loop below.
-+            from vllm.distributed.pp_pack_0029 import pack_for_send
++            from vllm.distributed.pp_pack import pack_for_send
 +
 +            tensor_keys, tensor_list, all_gather_tensors = pack_for_send(
 +                tensor_keys,
@@ -62,9 +62,9 @@ index 0337a6c..dc7b6b4 100644
          handles: list[Handle] = []
          postprocess: list[Callable[[], None]] = []
 +        pack_plan = None
-+        if getattr(self, "_pp_pack_0029", False):
++        if getattr(self, "_pp_pack", False):
 +            # Patch 0029: same layout as the sender, derived from metadata.
-+            from vllm.distributed.pp_pack_0029 import plan_recv
++            from vllm.distributed.pp_pack import plan_recv
 +
 +            recv_metadata_list, pack_plan, all_gather_tensors = plan_recv(
 +                recv_metadata_list,
@@ -88,16 +88,16 @@ index 0337a6c..dc7b6b4 100644
          return tensor_dict, handles, postprocess
  
      def barrier(self):
-diff --git a/vllm/distributed/pp_pack_0029.py b/vllm/distributed/pp_pack_0029.py
+diff --git a/vllm/distributed/pp_pack.py b/vllm/distributed/pp_pack.py
 new file mode 100644
 index 0000000..0b0e71e
 --- /dev/null
-+++ b/vllm/distributed/pp_pack_0029.py
++++ b/vllm/distributed/pp_pack.py
 @@ -0,0 +1,226 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Patch 0029: pack one PP hop's tensors into one byte buffer (one P2P op).
 +
-+``VLLM_PP_PACK_TENSORS_0029=1`` (default off). Only the device payload of
++``VLLM_PP_PACK_TENSORS=1`` (default off). Only the device payload of
 +``GroupCoordinator.isend_tensor_dict`` / ``irecv_tensor_dict`` changes:
 +
 +* the pickled metadata list is sent exactly as before (same keys, order,
@@ -134,8 +134,8 @@ index 0000000..0b0e71e
 +
 +import torch
 +
-+ENV = "VLLM_PP_PACK_TENSORS_0029"
-+PACK_KEY = "__pp_pack_0029"
++ENV = "VLLM_PP_PACK_TENSORS"
++PACK_KEY = "__pp_pack"
 +ALIGN = 16
 +
 +

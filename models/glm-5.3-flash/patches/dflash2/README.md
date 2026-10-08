@@ -18,14 +18,15 @@ exception: `VLLM_GLM5_ROUTE_V2_FIRST` (0023) defaulted to 1 under route v2 in
 development and defaults to 0 here (whole-machine runs were slower with 1).
 Only `VLLM_GLM5_INDEXER_JIT_WARMUP` (0015) defaults to on, and it is
 compile-only.
-`compose.w4a16-dflash2.yml` turns the rest on (0010 in `tc` mode, see below). With no GLM env set the image
-behaves as the DeepSeek image for every other model.
+`VLLM_GLM53_OPT_PROFILE=default` (0034) turns the rest on (0010 in `tc` mode,
+see below); both W4A16 composes set it. With no GLM env set the image behaves
+as the DeepSeek image for every other model.
 
 | # | patch | switch (default) | development no. |
 |---|---|---|---|
 | 0001 | aux hidden states over PP (`SupportsEagle3`, `stream_mean`) | `VLLM_GLM5_AUX_HIDDEN_TENSOR` (`stream_mean`); active only with a drafter | 0001 |
 | 0002 | kpool tail ring sized for the draft depth (correctness) | always | 0002 |
-| 0003 | drafter KV groups ride the MLA tensors; needs `--block-size=4608` | always (only with a DFlash drafter) | 0003 |
+| 0003 | drafter KV rides the MLA pages (1024-token blocks, page padded) and Mamba checkpoints follow the target state page | always (only with a DFlash drafter); `--block-size=5120`, `--max-num-batched-tokens=5184` | 0003, revised |
 | 0004 | adaptive DFlash verification depth | `VLLM_GLM5_DFLASH_ADAPTIVE_K` (0) | 0004 |
 | 0005 | sm_80 thin-M BF16 GEMM | `VLLM_GLM5_THIN_GEMM` (0) | 0005 |
 | 0006 | compiled Marlin MoE decode (`vllm._ampere_marlin_C`) | `VLLM_GLM5_MARLIN_DECODE_CUDA` (0) | 0006 |
@@ -46,14 +47,37 @@ behaves as the DeepSeek image for every other model.
 | 0021 | DFlash2 draft tail on an earlier PP stage (audited) | `VLLM_PP_DRAFT_TAIL_STAGE` (-1), `_VERIFY` (0) | 0021 (`patches-tail/`) |
 | 0022 | sparse-MLA profile placeholder clamp | `VLLM_GLM5_MLA_PROFILE_WS_CLAMP` (0) | 0022 (`patches-kv/`) |
 | 0023 | route v2 tile load order; optional route-before-shared | `VLLM_GLM5_ROUTE_V2_FIRST` (**0**; dev default 1) | 0023 (`patches-route/`) |
-| 0024 | indexer weight scale folded into the decode FWHT quant | `VLLM_GLM5_DECODE_IDX_GLUE_0024` (0) | 0024 (`patches-idx/`, fixed) |
-| 0025 | fp32 TileLang mHC prenorm GEMM at every T | `VLLM_GLM5_TARGET_PRENORM_FP32_0026` (0) | 0026 (`patches/`, was "diagnostic") |
+| 0024 | indexer weight scale folded into the decode FWHT quant | `VLLM_GLM5_DECODE_IDX_GLUE` (0) | 0024 (`patches-idx/`, fixed) |
+| 0025 | fp32 TileLang mHC prenorm GEMM at every T | `VLLM_GLM5_TARGET_PRENORM_FP32` (0) | 0026 (`patches/`, was "diagnostic") |
 | 0026 | routed moe_sum fused with the shared-expert add | `VLLM_GLM5_MOE_SUM_ADD` (0) | 0027 (`patches-step/`) |
 | 0027 | shared experts enqueued after the routed experts | `VLLM_GLM5_SHARED_EXPERT_REORDER` (0) | 0028 (`patches-step/`) |
-| 0028 | bf16x3 tensor-core prenorm GEMM for T >= 384 (vendored Morrowmake kernel, Apache-2.0) | `VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS` (384; only inside 0025's `=1` branch) | 0026b (`patches/`) |
-| 0029 | indexer wk+weights as one dual-store thin GEMM (k bf16 bitwise, head weights fp32; replaces cast + fp32 sgemm) | `VLLM_GLM5_IDX_DUAL_GEMM` (0; needs `VLLM_GLM5_THIN_GEMM=1`; **on in compose**) | - (STEP-GAP-2) |
-| 0030 | PP hop metadata cache (32-byte header; payload only when the pickled bytes change) | `VLLM_PP_METADATA_CACHE_0025` (0; **on in compose**; same on every PP rank) | 0025 (`patches-pp/`) |
-| 0031 | PP hop tensors packed into one NCCL P2P | `VLLM_PP_PACK_TENSORS_0029` (0; **on in compose**; checked equal on every PP rank) | 0029 (`patches-pp/`) |
+| 0028 | bf16x3 tensor-core prenorm GEMM for T >= 384 (vendored Morrowmake kernel, Apache-2.0) | `VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS` (384; only inside 0025's `=1` branch) | 0026b (`patches/`) |
+| 0029 | indexer wk+weights as one dual-store thin GEMM (k bf16 bitwise, head weights fp32; replaces cast + fp32 sgemm) | `VLLM_GLM5_IDX_DUAL_GEMM` (0; needs `VLLM_GLM5_THIN_GEMM=1`; **on in the profile**) | - (STEP-GAP-2) |
+| 0030 | PP hop metadata cache (32-byte header; payload only when the pickled bytes change) | `VLLM_PP_METADATA_CACHE` (0; **on in the profile**; same on every PP rank) | 0025 (`patches-pp/`) |
+| 0031 | PP hop tensors packed into one NCCL P2P | `VLLM_PP_PACK_TENSORS` (0; **on in the profile**; checked equal on every PP rank) | 0029 (`patches-pp/`) |
+| 0032 | PP sparse-MLA / KDA prefill above 2312 rows (the old limit was the validation chunk, not a kernel limit) | with 0012/0014; `VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` (16384) | - |
+| 0033 | parser splits on `</think>` with the GLM-5.3 template even when thinking is "off" | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` (0) | - |
+| 0034 | one profile switch for the series | `VLLM_GLM53_OPT_PROFILE` (unset) | - |
+
+0003: each drafter block holds 1024 tokens in one MLA page (4 of 5 MiB at
+target block 5120); padded pages are never split into kernel blocks. With
+LMCache both the 5120 chunk and the 2048-token drafter window must divide by
+the drafter block. The KDA state page at the deepest DFlash verification (7)
+is 4,685,824 bytes, so the target block cannot be below 4608. The scheduler
+used to align Mamba checkpoints to the smallest group block (the drafter's
+1024); it now follows the homogeneous `MambaSpec.block_size`, so local prefill
+and an LMCache restore snapshot the KDA state at the same positions. Mixed
+Mamba block sizes keep the old behaviour. A 5120 block needs
+`--max-num-batched-tokens=5184` to fit next to the draft input slots.
+
+0032: sparse MLA runs one independent CTA per query row, so the row count only
+changes the grid; the int32 offset guard remains the real bound (32768 rows).
+KDA sizes its chunk workspaces dynamically under a 32768-token ceiling; the
+default dispatch limit is 16384. 2312/5120/8192/10240-row calls match chunked
+calls bitwise (output and final KDA state). Marlin MoE never had a row limit.
+
+0034: `VLLM_GLM53_OPT_PROFILE=default` sets each switch to its deployed value
+unless that variable is already set; the table is in the model README.
 
 Left out of the development series:
 
@@ -87,8 +111,7 @@ slightly different trees, so they were re-applied in the order above on top of
   (`--- a/...`); rewritten as a new file and the trailing blank lines dropped
   (`git diff --check`);
 - 0023: `VLLM_GLM5_ROUTE_V2_FIRST` default changed to 0 (opt-in with `1`);
-- 0025: only the code comment changed (no longer called a diagnostic); the env
-  name keeps its `_0026` suffix so deployed configs keep working.
+- 0025: only the code comment changed (no longer called a diagnostic).
 0028 (dev 0026b) was a `diff -ruN` patch; converted to git format (new file
 mode), a provenance comment added to the vendored file and the code comment
 renumbered. Apart from these comment/default edits the final tree equals the development
@@ -109,8 +132,8 @@ launch leaves SMs to the shared experts (c1 29.05 -> 29.21 steps/s).
 on node2 with `patch -p1` (offsets only) on the image tree (0001-0028) + 0029;
 here they were regenerated as clean git diffs against the tree that
 `check-dflash2-series.sh` builds (0030 on 0001-0029, 0031 on 0001-0030). The
-env names keep their development suffixes (`VLLM_PP_METADATA_CACHE_0025`,
-`VLLM_PP_PACK_TENSORS_0029`); both default to 0 and change the PP wire
+env names keep their development suffixes (`VLLM_PP_METADATA_CACHE`,
+`VLLM_PP_PACK_TENSORS`); both default to 0 and change the PP wire
 protocol, so every PP rank must use the same value (0031 checks this at
 start-up). They were earlier listed as "no end-to-end gain"; that was on an
 older baseline. On the full 0001-0029 stack + tc routing, both on: c1 counting

@@ -41,7 +41,7 @@ def env_default(text: str, name: str, default: str) -> bool:
 
 series = [line.strip() for line in (PATCH_DIR / "series").read_text().splitlines()
           if line.strip() and not line.startswith("#")]
-check("series has 31 patches", len(series) == 31, str(len(series)))
+check("series has 34 patches", len(series) == 34, str(len(series)))
 
 touched: set[str] = set()
 for name in series:
@@ -103,10 +103,10 @@ markers = [
      "VLLM_GLM5_MLA_PROFILE_WS_CLAMP"),
     ("0023 route first", ops + "route_v2_decode.py", "def route_first("),
     ("0023 runner hook", "vllm/model_executor/layers/fused_moe/runner/moe_runner.py", "route_first()"),
-    ("0024 idx glue", ops + "idx_glue_0024.py", "native_fp8_cast_supported"),
+    ("0024 idx glue", ops + "idx_glue.py", "native_fp8_cast_supported"),
     ("0024 attention hook", "vllm/models/glm5next/nvidia/attention.py", "fwht128_quant_fp8_wscale"),
-    ("0024 kpool hook", "vllm/model_executor/layers/sparse_attn_indexer_kpool.py", "idx_glue_0024"),
-    ("0025 fp32 prenorm", "vllm/model_executor/kernels/mhc/tilelang.py", "VLLM_GLM5_TARGET_PRENORM_FP32_0026"),
+    ("0024 kpool hook", "vllm/model_executor/layers/sparse_attn_indexer_kpool.py", "idx_glue"),
+    ("0025 fp32 prenorm", "vllm/model_executor/kernels/mhc/tilelang.py", "VLLM_GLM5_TARGET_PRENORM_FP32"),
     ("0026 moe sum add", ops + "moe_sum_add.py", ""),
     ("0026 runner hook", "vllm/model_executor/layers/fused_moe/runner/moe_runner.py", "VLLM_GLM5_MOE_SUM_ADD"),
     ("0028 bf16x3 prenorm kernel (vendored, Apache-2.0)", "vllm/model_executor/kernels/mhc/mm_prenorm_bf16x3.py",
@@ -121,8 +121,11 @@ markers = [
     ("0029 warmup before capture", "vllm/model_executor/warmup/kernel_warmup.py", "warmup_idx_dual"),
     ("0030 PP metadata cache", "vllm/distributed/pp_metadata_cache.py", "class PPMetadataCache"),
     ("0030 hook", "vllm/distributed/parallel_state.py", "_pp_metadata_cache"),
-    ("0031 PP pack module", "vllm/distributed/pp_pack_0029.py", 'ENV = "VLLM_PP_PACK_TENSORS_0029"'),
-    ("0031 hook", "vllm/distributed/parallel_state.py", "_pp_pack_0029"),
+    ("0031 PP pack module", "vllm/distributed/pp_pack.py", 'ENV = "VLLM_PP_PACK_TENSORS"'),
+    ("0031 hook", "vllm/distributed/parallel_state.py", "_pp_pack"),
+    ("0033 think boundaries", "vllm/parser/glm47_moe.py", "VLLM_GLM53_FORCE_THINK_BOUNDARIES"),
+    ("0034 profile", "vllm/glm53_opt_profile.py", "VLLM_GLM53_OPT_PROFILE"),
+    ("0034 hook", "vllm/env_override.py", "_glm53_apply_opt_profile()"),
 ]
 for label, rel, needle in markers:
     text = src(rel)
@@ -143,7 +146,7 @@ defaults = [
     (envs, "VLLM_GLM5_PP_MARLIN_PREFILL", "0"),
     (envs, "VLLM_GLM5_PP_MARLIN_PREFILL_MIN_TOKENS", "384"),
     (envs, "VLLM_GLM5_PP_KDA_PREFILL", "0"),
-    (envs, "VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS", "2312"),
+    (envs, "VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS", "16384"),
     (envs, "VLLM_GLM5_INDEXER_JIT_WARMUP", "1"),
     (envs, "VLLM_GLM5_PP_FOLD_DRAFT_FC", "0"),
     (src(model), "VLLM_GLM5_AUX_HIDDEN_TENSOR", "stream_mean"),
@@ -163,26 +166,26 @@ defaults = [
     (envs, "VLLM_PP_DRAFT_TAIL_VERIFY", "0"),
     (envs, "VLLM_GLM5_MLA_PROFILE_WS_CLAMP", "0"),
     (src(ops + "route_v2_decode.py"), "VLLM_GLM5_ROUTE_V2_FIRST", "0"),
-    (src(ops + "idx_glue_0024.py"), "VLLM_GLM5_DECODE_IDX_GLUE_0024", "0"),
-    (src("vllm/model_executor/kernels/mhc/tilelang.py"), "VLLM_GLM5_TARGET_PRENORM_FP32_0026", "0"),
+    (src(ops + "idx_glue.py"), "VLLM_GLM5_DECODE_IDX_GLUE", "0"),
+    (src("vllm/model_executor/kernels/mhc/tilelang.py"), "VLLM_GLM5_TARGET_PRENORM_FP32", "0"),
     (src("vllm/model_executor/layers/fused_moe/runner/moe_runner.py"), "VLLM_GLM5_MOE_SUM_ADD", "0"),
     (src(ops + "moe_sum_add.py"), "VLLM_GLM5_MOE_SUM_ADD", "0"),
     (src("vllm/model_executor/layers/fused_moe/runner/moe_runner.py"), "VLLM_GLM5_SHARED_EXPERT_REORDER", "0"),
-    (src("vllm/model_executor/kernels/mhc/tilelang.py"), "VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS", "384"),
+    (src("vllm/model_executor/kernels/mhc/tilelang.py"), "VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS", "384"),
     (envs, "VLLM_MHC_POST_FUSE_SQRSUM", "0"),
     (src(ops + "idx_dual_gemm.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
     (src("vllm/models/glm5next/nvidia/attention.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
     (src("vllm/model_executor/warmup/kernel_warmup.py"), "VLLM_GLM5_IDX_DUAL_GEMM", "0"),
-    (src("vllm/distributed/parallel_state.py"), "VLLM_PP_METADATA_CACHE_0025", "0"),
+    (src("vllm/distributed/parallel_state.py"), "VLLM_PP_METADATA_CACHE", "0"),
 ]
 for text, name, default in defaults:
     check(f"{name} defaults to {default!r}", env_default(text, name, default))
-# 0028 must only be reachable inside 0025's VLLM_GLM5_TARGET_PRENORM_FP32_0026=1
+# 0028 must only be reachable inside 0025's VLLM_GLM5_TARGET_PRENORM_FP32=1
 # branch, so the series default (0025 off) is unchanged.
 def _gated_by_0025(text: str) -> bool:
     lines = text.splitlines()
     gate = [i for i, l in enumerate(lines)
-            if 'os.environ.get("VLLM_GLM5_TARGET_PRENORM_FP32_0026", "0") == "1"' in l]
+            if 'os.environ.get("VLLM_GLM5_TARGET_PRENORM_FP32", "0") == "1"' in l]
     if len(gate) != 1:
         return False
     i = gate[0]
@@ -195,21 +198,21 @@ def _gated_by_0025(text: str) -> bool:
         j += 1
     inside = "\n".join(lines[i + 1:j])
     outside = "\n".join(lines[:i + 1] + lines[j:])
-    needles = ("VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS", "mm_prenorm_bf16x3")
+    needles = ("VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS", "mm_prenorm_bf16x3")
     return all(n in inside and n not in outside for n in needles)
 
 
-check("0028 bf16x3 route only inside the 0025 (FP32_0026=1) branch",
+check("0028 bf16x3 route only inside the 0025 (TARGET_PRENORM_FP32=1) branch",
       _gated_by_0025(src("vllm/model_executor/kernels/mhc/tilelang.py")))
 route_v2 = src(ops + "route_v2_decode.py")
 check("VLLM_GLM5_ROUTE_V2_FIRST is opt-in (only '1' enables it)",
       '"VLLM_GLM5_ROUTE_V2_FIRST", "0").strip() == "1"' in route_v2)
 check("VLLM_GLM5_IDX_DUAL_GEMM is opt-in (only '1' enables it)",
       '"VLLM_GLM5_IDX_DUAL_GEMM", "0").strip() != "1"' in src(ops + "idx_dual_gemm.py"))
-check("VLLM_PP_METADATA_CACHE_0025 is opt-in (only '1' enables it)",
-      'os.environ.get("VLLM_PP_METADATA_CACHE_0025", "0") == "1"' in src("vllm/distributed/parallel_state.py"))
-_pack = src("vllm/distributed/pp_pack_0029.py")
-check("VLLM_PP_PACK_TENSORS_0029 defaults to '0' (only '1' enables it)",
+check("VLLM_PP_METADATA_CACHE is opt-in (only '1' enables it)",
+      'os.environ.get("VLLM_PP_METADATA_CACHE", "0") == "1"' in src("vllm/distributed/parallel_state.py"))
+_pack = src("vllm/distributed/pp_pack.py")
+check("VLLM_PP_PACK_TENSORS defaults to '0' (only '1' enables it)",
       'os.environ.get(ENV, "0")' in _pack and 'return value == "1"' in _pack)
 check("VLLM_GLM5_MARLIN_DECODE_VARIANT defaults to 'orig'",
       re.search(r'"VLLM_GLM5_MARLIN_DECODE_VARIANT",\s*"orig"', envs) is not None)

@@ -1,0 +1,117 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: one profile switch for the DFlash2 series
+
+VLLM_GLM53_OPT_PROFILE=default sets every switch of the DFlash2 series to
+its deployed value unless that variable is already set, so each switch can
+still be overridden. Unset/0/off changes nothing. Applied from
+vllm.env_override, before any other vLLM import, in every process.
+
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index 9c3046d..786154f 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -9,6 +9,11 @@ from vllm.dsv41_opt_profile import apply as _dsv41_apply_opt_profile
+ 
+ _dsv41_apply_opt_profile()
+ 
++# GLM-5.3-Flash W4A16 + DFlash2: one switch for the DFlash2 series switches.
++from vllm.glm53_opt_profile import apply as _glm53_apply_opt_profile
++
++_glm53_apply_opt_profile()
++
+ 
+ def _get_torch_cuda_version():
+     """Peripheral function to _maybe_set_cuda_compatibility_path().
+diff --git a/vllm/glm53_opt_profile.py b/vllm/glm53_opt_profile.py
+new file mode 100644
+index 0000000..bf9dcaf
+--- /dev/null
++++ b/vllm/glm53_opt_profile.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One switch for the GLM-5.3-Flash W4A16 + DFlash2 patch series.
++
++VLLM_GLM53_OPT_PROFILE=default sets every switch below to its deployed value
++*unless that variable is already set*, so a single switch can still be
++overridden (e.g. VLLM_PP_PACK_TENSORS=0). Unset / "0" / "off": nothing is
++changed and every patch keeps its own default (off). Applied from
++vllm.env_override, i.e. before any other vLLM module is imported, in the API
++server and in every spawned worker. The switch list is documented in
++models/glm-5.3-flash/README.md. LMCache's LMCACHE_MERGE_BOUNDED_PD is not
++here: the LMCache server does not import vLLM, so compose sets it on all
++three containers.
++"""
++import os
++
++PROFILES: dict[str, dict[str, str]] = {
++    "default": {
++        # 0001 aux hidden states for the drafter under PP
++        "VLLM_GLM5_AUX_HIDDEN_TENSOR": "stream_mean",
++        # 0004 adaptive DFlash depth
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K": "1",
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS": "7,5",
++        "VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT": "0",
++        # 0005 thin-M BF16 GEMM
++        "VLLM_GLM5_THIN_GEMM": "1",
++        # 0006 compiled Marlin MoE decode
++        "VLLM_GLM5_MARLIN_DECODE_CUDA": "1",
++        "VLLM_GLM5_MARLIN_DECODE_VARIANT": "orig",
++        # 0007 fused grouped conv in the drafter
++        "VLLM_DFLASH2_FUSED_GROUPED_CONV": "1",
++        # 0008 deterministic router alignment at decode
++        "VLLM_GLM5_ROUTER_ALIGN_DECODE": "1",
++        # 0009 sparse MLA matmul path
++        "VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL": "1",
++        # 0010 / 0023 MoE route v2
++        "VLLM_GLM5_ROUTE_V2": "1",
++        "VLLM_GLM5_ROUTE_V2_GEMV": "tc",
++        "VLLM_GLM5_ROUTE_V2_FIRST": "0",
++        # 0011 indexer gather clamp
++        "VLLM_GLM5_INDEXER_GATHER_CLAMP": "1",
++        # 0012 / 0013 / 0014 PP prefill kernels (row range: 0032)
++        "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": "1",
++        "VLLM_GLM5_PP_MARLIN_PREFILL": "1",
++        "VLLM_GLM5_PP_KDA_PREFILL": "1",
++        # 0016 fold the drafter fc into the last PP rank
++        "VLLM_GLM5_PP_FOLD_DRAFT_FC": "1",
++        # 0017 mHC decode v2
++        "VLLM_GLM5_DECODE_MHC_V2": "1",
++        # 0018 / 0019 GDN prologue fusion, packed H2D
++        "VLLM_GLM5_PROLOGUE_FUSE": "1",
++        "VLLM_GLM5_PROLOGUE_PACKED_H2D": "1",
++        # 0020 sparse MLA request ids on device
++        "VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS": "1",
++        # 0021 drafter tail on PP stage 2
++        "VLLM_PP_DRAFT_TAIL_STAGE": "2",
++        # 0022 MLA profile workspace clamp
++        "VLLM_GLM5_MLA_PROFILE_WS_CLAMP": "1",
++        # 0024 decode indexer glue
++        "VLLM_GLM5_DECODE_IDX_GLUE": "1",
++        # 0025 / 0028 target prenorm in fp32 (bf16x3 prefill route)
++        "VLLM_GLM5_TARGET_PRENORM_FP32": "1",
++        "VLLM_MHC_POST_FUSE_SQRSUM": "0",
++        # 0026 MoE sum + add fusion
++        "VLLM_GLM5_MOE_SUM_ADD": "1",
++        # 0027 shared expert reorder
++        "VLLM_GLM5_SHARED_EXPERT_REORDER": "1",
++        # 0029 indexer dual thin GEMM
++        "VLLM_GLM5_IDX_DUAL_GEMM": "1",
++        # 0030 PP metadata cache, 0031 packed PP hop tensors
++        "VLLM_PP_METADATA_CACHE": "1",
++        "VLLM_PP_PACK_TENSORS": "1",
++        # 0033 split reasoning on </think> with the GLM-5.3 template
++        "VLLM_GLM53_FORCE_THINK_BOUNDARIES": "1",
++    },
++}
++
++
++def apply() -> None:
++    name = os.environ.get("VLLM_GLM53_OPT_PROFILE", "").strip().lower()
++    if name in ("", "0", "off", "none"):
++        return
++    if name not in PROFILES:
++        raise ValueError(
++            f"VLLM_GLM53_OPT_PROFILE={name!r}: unknown profile "
++            f"(known: {', '.join(sorted(PROFILES))})")
++    for key, value in PROFILES[name].items():
++        os.environ.setdefault(key, value)

@@ -1,0 +1,77 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] lmcache: opt-in bounded PD object buckets
+
+PP ranks that differ only by an extra bounded group (GLM-5.3 DFlash2's
+sliding-window drafter lives on the last rank only) registered different
+object-group descriptions ([-1,1] vs [-1,1,1]) and the registry rejected the
+model. With LMCACHE_MERGE_BOUNDED_PD=1 regular groups are bucketed by their
+cross-chunk window rather than by attention/recurrent kind, so every rank
+describes the same buckets. Kernel groups, layer membership, block IDs,
+physical layout and transfer windows are unchanged; registry validation stays
+on. Not valid with CacheBlend (enable_full_sw_kv rejects it). Default off.
+
+diff --git a/lmcache/v1/kv_layer_groups.py b/lmcache/v1/kv_layer_groups.py
+--- a/lmcache/v1/kv_layer_groups.py
++++ b/lmcache/v1/kv_layer_groups.py
+@@ -7,6 +7,7 @@
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, NamedTuple
++import os
+ 
+ # Third Party
+ import torch
+@@ -470,6 +471,12 @@
+ 
+         # When True, sliding-window groups store/transfer FULL per-chunk KV
+         self._full_sw_kv = False
++        # Opt-in PD-only policy: snapshots and bounded attention have the
++        # same cross-chunk lookup rule. Keep their kernel geometry separate,
++        # but use one object bucket so PP ranks without a drafter agree.
++        self._merge_bounded_pd = os.environ.get("LMCACHE_MERGE_BOUNDED_PD", "0") == "1"
++        if self._merge_bounded_pd and not separate_object_groups:
++            raise ValueError("LMCACHE_MERGE_BOUNDED_PD requires separate object groups")
+ 
+         logger.info(
+             "KV layer groups: ---\n%s\n---",
+@@ -573,6 +580,8 @@
+         Keeps every block so a chunk stays valid when reused at any position
+         (default windowing keeps only each chunk's last sub-chunk window).
+         """
++        if self._merge_bounded_pd:
++            raise ValueError("LMCACHE_MERGE_BOUNDED_PD is incompatible with full_sw_kv/CacheBlend")
+         self._full_sw_kv = True
+ 
+     def get_subchunk_sw_size_tokens(self, kernel_group_idx: int) -> int:
+@@ -698,7 +707,7 @@
+                 sw_size_chunks = (group.sw_size_tokens + chunk_size - 1) // chunk_size
+             bucket = _ObjectBucket(
+                 extra_tag=group.extra_object_group_tag,
+-                recurrent=group.recurrent_state,
++                recurrent=(False if self._merge_bounded_pd else group.recurrent_state),
+                 sw_chunks=sw_size_chunks,
+             )
+             groups_by_bucket[bucket].append(kernel_group_idx)
+@@ -711,13 +720,19 @@
+                 kernel_group_indices=kernel_group_indices,
+                 sw_size_chunks=bucket_sw_size[bucket],
+                 aux=bucket.extra_tag != 0,
+-                recurrent=all(
+-                    self._kernel_groups[i].recurrent_state for i in kernel_group_indices
++                recurrent=(
++                    bucket.extra_tag == 0 and bucket.sw_chunks >= 1
++                    if self._merge_bounded_pd
++                    else all(self._kernel_groups[i].recurrent_state for i in kernel_group_indices)
+                 ),
+             )
+             for bucket, kernel_group_indices in sorted(
+                 groups_by_bucket.items(),
+-                key=lambda kv: (kv[0].extra_tag != 0, kv[1][0]),
++                key=lambda kv: (
++                    (kv[0].extra_tag != 0, kv[0].extra_tag, kv[0].sw_chunks)
++                    if self._merge_bounded_pd
++                    else (kv[0].extra_tag != 0, kv[1][0])
++                ),
+             )
+         ]
+ 

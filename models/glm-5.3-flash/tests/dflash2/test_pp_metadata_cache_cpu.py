@@ -1,4 +1,4 @@
-"""Patch 0030 (dev 0025, VLLM_PP_METADATA_CACHE_0025) CPU wire tests, including real patched coordinator method execution."""
+"""Patch 0030 (dev 0025, VLLM_PP_METADATA_CACHE) CPU wire tests, including real patched coordinator method execution."""
 import ast
 import importlib.util
 import os
@@ -126,6 +126,6 @@ class Tests(unittest.TestCase):
         init=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__init__')
         text=ast.unparse(init)
         self.assertIn("group_name == 'pp'",text)
-        self.assertIn("os.environ.get('VLLM_PP_METADATA_CACHE_0025', '0') == '1'",text)
+        self.assertIn("os.environ.get('VLLM_PP_METADATA_CACHE', '0') == '1'",text)
 
 if __name__=='__main__': unittest.main()

@@ -9,7 +9,7 @@ if not a.run_gpu:
     print('GPU NOT RUN (use --run-gpu)')
     raise SystemExit()
 import torch
-from vllm.models.glm5next.nvidia.ops import idx_glue_0024 as g
+from vllm.models.glm5next.nvidia.ops import idx_glue as g
 from vllm.models.glm5next.nvidia.ops import kpool_compress as k
 assert torch.cuda.get_device_capability() == (8, 0)
 print(json.dumps({'device': torch.cuda.get_device_name(), 'torch': torch.__version__, 'module': g.__file__}))

@@ -56,6 +56,7 @@ cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 cp -a "$GLM_DIR/native/ampere_marlin" "$WORKDIR/context/ampere_marlin"
 cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
 cp "$GLM_DIR/native/ampere-marlin-selfcheck.py" "$WORKDIR/context/ampere-marlin-selfcheck.py"
+cp "$GLM_DIR/tests/dflash2/test_kv_draft_pages.py" "$GLM_DIR/tests/dflash2/test_think_boundaries.py" "$WORKDIR/context/"
 INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 SERIES_SHA=$(sha256sum "$GLM_DIR/patches/dflash2/series" | cut -c1-12)
 
@@ -67,6 +68,7 @@ COPY lmcache-payload/ /opt/lmcache-patched/
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 COPY ampere_marlin/ /tmp/ampere_marlin/
 COPY ampere-marlin-selfcheck.py /tmp/ampere-marlin-selfcheck.py
+COPY test_kv_draft_pages.py test_think_boundaries.py /tmp/
 ENV PYTHONPATH=/opt/lmcache-patched
 # Compiled sm_80 W4A16 MoE decode (dflash2/0006): no GPU needed to build.
 RUN MAX_JOBS=$MARLIN_MAX_JOBS bash /tmp/ampere_marlin/install-into-vllm.sh /tmp/ampere_marlin \\
@@ -76,7 +78,10 @@ RUN python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/vllm /opt/l
     && python3 /tmp/test-lmcache-patches.py \\
     && rm /tmp/test-lmcache-patches.py \\
     && env -u VLLM_GLM5_MARLIN_DECODE_LIB python3 /tmp/ampere-marlin-selfcheck.py \\
-    && rm /tmp/ampere-marlin-selfcheck.py
+    && rm /tmp/ampere-marlin-selfcheck.py \\
+    && python3 /tmp/test_kv_draft_pages.py \\
+    && python3 /tmp/test_think_boundaries.py \\
+    && rm /tmp/test_kv_draft_pages.py /tmp/test_think_boundaries.py
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \\
       org.opencontainers.image.revision="$SOURCE_COMMIT" \\
       io.canoziia.integration.revision="$INTEGRATION_REVISION" \\

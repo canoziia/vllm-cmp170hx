@@ -12,7 +12,8 @@
 #   GLM_GPU_0..GLM_GPU_3                 default 5,6,7,8 (test GPUs);
 #                                        production prefill runs on 1,2,3,4
 #   GLM_PORT                             default 8303
-# Start: podman compose -f compose.w4a16-dflash2.yml up -d
+#   GLM_KV_CACHE_MEMORY                  default 12884901888 (12 GiB)
+# Start: podman compose -f compose.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
 services:
   glm-5.3-flash-w4a16-dflash2:
     image: ${GLM_DFLASH2_IMAGE:-localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2}
@@ -53,68 +54,11 @@ services:
       # embed table. 12,12,12,9: c8 about +10%, KV pool 1.68M -> 1.24M tokens.
       VLLM_PP_LAYER_PARTITION: ${GLM_PP_LAYER_PARTITION:-13,11,11,10}
       VLLM_PP_DECODE_COHORT_BALANCE: "1"
-      # dflash2/0001: drafter aux = mean of the mHC streams (default anyway)
-      VLLM_GLM5_AUX_HIDDEN_TENSOR: stream_mean
-      # dflash2/0004: verify up to 7 at 1 request, 5 at 2, 3 (=num_speculative_tokens) beyond
-      VLLM_GLM5_DFLASH_ADAPTIVE_K: "1"
-      VLLM_GLM5_DFLASH_ADAPTIVE_K_DEPTHS: "7,5"
-      # Load-only depth choice (7 at one request, 5 at two, 3 otherwise); this is
-      # the setting all published numbers were measured with.
-      VLLM_GLM5_DFLASH_ADAPTIVE_K_ACCEPT: "0"
-      # dflash2/0005 thin GEMM, 0006 compiled Marlin decode (orig variant)
-      VLLM_GLM5_THIN_GEMM: "1"
-      VLLM_GLM5_MARLIN_DECODE_CUDA: "1"
-      VLLM_GLM5_MARLIN_DECODE_VARIANT: orig
-      # dflash2/0007 fused grouped conv
-      VLLM_DFLASH2_FUSED_GROUPED_CONV: "1"
-      # dflash2/0008 deterministic alignment (route v2 fallback), 0010 route v2 (tc mode, see below)
-      VLLM_GLM5_ROUTER_ALIGN_DECODE: "1"
-      VLLM_GLM5_ROUTE_V2: "1"
-      # tc: router logits bitwise MM's _moe_route_kernel (not our old gate
-      # path); one 80-CTA launch leaves SMs for the shared experts (STEP-GAP-2 §7)
-      VLLM_GLM5_ROUTE_V2_GEMV: tc
-      # dflash2/0009 sparse MLA decode schedule
-      VLLM_GLM5_SPARSE_MLA_MM_EXPERIMENTAL: "1"
-      # dflash2/0011 indexer gather clamp + 128 MiB logits budget (KV pool +25%)
-      VLLM_GLM5_INDEXER_GATHER_CLAMP: "1"
+      # 128 MiB indexer logits budget (KV pool +25% with dflash2/0011)
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
-      # dflash2/0012-0014 PP prefill kernels
-      VLLM_GLM5_PP_SPARSE_MLA_PREFILL: "1"
-      VLLM_GLM5_PP_MARLIN_PREFILL: "1"
-      VLLM_GLM5_PP_KDA_PREFILL: "1"
-      # dflash2/0015 indexer JIT warmup is on by default
-      # dflash2/0016 drafter fc fold
-      VLLM_GLM5_PP_FOLD_DRAFT_FC: "1"
-      # dflash2/0017 Gluon mHC decode v2; 0025 fp32 prenorm GEMM. Turn on together:
-      # only both give the reference target numerics (prose acceptance).
-      VLLM_GLM5_DECODE_MHC_V2: "1"
-      VLLM_GLM5_TARGET_PRENORM_FP32_0026: "1"
-      # dflash2/0028: T >= 384 prenorm on the bf16x3 tensor-core kernel (default 384).
-      # That kernel rewrites sqrsum, so do not also fuse sqrsum into mhc_post.
-      VLLM_GLM5_TARGET_PRENORM_FP32_0026B_MIN_TOKENS: "384"
-      VLLM_MHC_POST_FUSE_SQRSUM: "0"
-      # dflash2/0018-0020 host-side input preparation (bit-identical)
-      VLLM_GLM5_PROLOGUE_FUSE: "1"
-      VLLM_GLM5_PROLOGUE_PACKED_H2D: "1"
-      VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS: "1"
-      # dflash2/0021 drafter tail (lm_head pass, top-k, selector) on PP stage 2
-      VLLM_PP_DRAFT_TAIL_STAGE: "2"
-      # dflash2/0022 sparse-MLA profile placeholder clamp (KV pool 1.68M -> 2.10M)
-      VLLM_GLM5_MLA_PROFILE_WS_CLAMP: "1"
-      # dflash2/0023: route-before-shared measured slower end to end; keep 0
-      VLLM_GLM5_ROUTE_V2_FIRST: "0"
-      # dflash2/0024 indexer weight scale folded into the decode FWHT quant
-      VLLM_GLM5_DECODE_IDX_GLUE_0024: "1"
-      # dflash2/0026 fused moe_sum + shared add, 0027 shared experts after routed
-      VLLM_GLM5_MOE_SUM_ADD: "1"
-      VLLM_GLM5_SHARED_EXPERT_REORDER: "1"
-      # dflash2/0029: indexer wk+weights as one dual thin GEMM (needs THIN_GEMM)
-      VLLM_GLM5_IDX_DUAL_GEMM: "1"
-      # dflash2/0030 PP metadata cache, 0031 one packed NCCL P2P per PP hop.
-      # Both change the PP wire protocol: all PP ranks must use the same setting
-      # (single engine here, so this environment covers every rank).
-      VLLM_PP_METADATA_CACHE_0025: "1"
-      VLLM_PP_PACK_TENSORS_0029: "1"
+      # Every DFlash2 series switch at its deployed value (dflash2/0034); the
+      # list is in README.md. Set a single switch here to override it.
+      VLLM_GLM53_OPT_PROFILE: "default"
     command:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0
@@ -125,19 +69,22 @@ services:
       - --trust-remote-code
       - --enable-prompt-tokens-details
       - '--speculative-config={"method":"dflash","model":"/root/app/models/GLM-5.3-Flash-DFlash2","num_speculative_tokens":3}'
-      # required by dflash2/0003 (multiple of 256; 4480 does not work)
-      - --block-size=4608
-      - --max-model-len=${GLM_MAX_MODEL_LEN:-262144}
+      # dflash2/0003: 1024-token drafter blocks in the 5120-token target page
+      - --block-size=5120
+      - --max-model-len=${GLM_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${GLM_MAX_NUM_SEQS:-8}
-      - --max-num-batched-tokens=2312
+      # a full 5120 block plus the draft input slots (dflash2/0003)
+      - --max-num-batched-tokens=5184
       - --long-prefill-token-threshold=0
-      - --gpu-memory-utilization=0.95
+      # fixed KV budget: automatic sizing leaves too little room for the
+      # first-run autotune of 5184-row prefill steps
+      - --kv-cache-memory=${GLM_KV_CACHE_MEMORY:-12884901888}
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - --enable-prefix-caching
       - --mamba-cache-mode=align
       - --enable-auto-tool-choice
       - --tool-call-parser=glm47
-      - --reasoning-parser=${GLM_REASONING_PARSER:-glm47}
+      - --reasoning-parser=glm47
       - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:

@@ -157,7 +157,7 @@ podman run --rm -it --device nvidia.com/gpu=5 --device nvidia.com/gpu=6 --securi
 
 - **必须加 `--no-bench`**：脚本中原有的微基准（raw NCCL：两次非 batched `isend` 走默认组）在 node2 上挂起；
   正确性部分不依赖它。`--no-bench` 只跑正确性（packed=False/True 各 120 步逐位比较），node2 上通过。
-- 两项开关（`VLLM_PP_METADATA_CACHE_0025`、`VLLM_PP_PACK_TENSORS_0029`）已在 compose 中打开；所有 PP rank 必须一致设置。
+- 两项开关（`VLLM_PP_METADATA_CACHE`、`VLLM_PP_PACK_TENSORS`）由 profile（0034）打开；所有 PP rank 必须一致设置。
 
 - 所有脚本默认从镜像 site-packages 读取被测文件；要测另一份源码树，设 `GLM_DFLASH2_TREE=<树根>`
   并把它放进 `PYTHONPATH`。
@@ -166,3 +166,12 @@ podman run --rm -it --device nvidia.com/gpu=5 --device nvidia.com/gpu=6 --securi
 - `bench_route_first_gpu.py`：`--orig` 默认是 0023 之前的 route v2（`fixtures/`），`--new` 默认是镜像内文件，
   `--mm` 可选。
 - `test_pp_draft_tail_gpu.py --no-private` 是负对照（thin GEMM 开启时允许失败）。
+
+0003 / 0032 / 0033 的测试：
+
+- `test_sched_mamba_checkpoint_cpu.py <scheduler.py>`：CPU，取补丁后源码中的真实
+  `_mamba_block_aligned_split`，检查检查点按 target 状态页对齐（`check-dflash2-series.sh` 会跑）；
+- `test_kv_draft_pages.py`：CPU，镜像内运行，drafter 1024 token 块的页布局与 stride（镜像构建时跑）；
+- `test_think_boundaries.py`：CPU，镜像内运行，0033 的思考/正文切分（镜像构建时跑）；
+- `test_pp_prefill_large_rows_gpu.py`：sm80 GPU，2312/5120/8192/10240 行 sparse MLA 与 KDA prefill
+  与分块调用逐位比较。

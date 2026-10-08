@@ -1,0 +1,66 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: PP prefill kernels for steps above 2312 rows
+
+The PP sparse-MLA (0012) and KDA (0014) prefill paths were only taken for
+up to 2312 query rows, the chunk size they were validated with, not a kernel
+limit. PD with LMCache prefills 5184-row steps, which fell back to the
+generic kernels. Sparse MLA is one independent CTA per query row (row count
+only changes grid.x; the int32 offset guard stays the real bound), so allow
+up to 32768 rows; KDA already sizes its chunk workspaces dynamically under a
+32768-token ceiling, so raise its default limit to 16384. 2312, 5120, 8192
+and 10240 rows match chunked calls bitwise, outputs and final KDA state.
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -66,7 +66,7 @@
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL: bool = False
+     VLLM_GLM5_PP_SPARSE_MLA_PREFILL_MIN_TOKENS: int = 384
+     VLLM_GLM5_PP_KDA_PREFILL: bool = False
+-    VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS: int = 2312
++    VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS: int = 16384
+     VLLM_GLM5_THIN_GEMM: bool = False
+     VLLM_GLM5_PP_FOLD_DRAFT_FC: bool = False
+     VLLM_GLM5_PROLOGUE_FUSE: bool = False
+@@ -1035,7 +1035,7 @@
+     # ported from Morrowmake (glm5next/nvidia/ops/sparse_prefill_mla_pp.py) that
+     # gathers each selected cache row once for all heads and skips invalid
+     # index slots. Taken only on sm_80, 64 heads, bf16, 512-wide NoPE latent,
+-    # 2176 index slots and MIN_TOKENS..2312 query rows; everything else keeps
++    # 2176 index slots and MIN_TOKENS..32768 query rows; everything else keeps
+     # the Triton kernel. Default off. Not bitwise equal to the Triton kernel.
+     "VLLM_GLM5_PP_SPARSE_MLA_PREFILL": lambda: bool(
+         int(os.getenv("VLLM_GLM5_PP_SPARSE_MLA_PREFILL", "0"))
+@@ -1064,7 +1064,7 @@
+         "VLLM_GLM5_SPARSE_MLA_DEVICE_REQ_IDS", "0"
+     ).strip().lower() in ("1", "true", "yes", "on"),
+     "VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS": lambda: int(
+-        os.getenv("VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS", "2312")
++        os.getenv("VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS", "16384")
+     ),
+     # sm_80 thin-M BF16 GEMM (vllm/models/glm5next/nvidia/ops/thin_gemm.py,
+     # ported from Morrowmake/vllm-cmp170hx). Routes the unquantized BF16
+diff --git a/vllm/models/glm5next/nvidia/ops/sparse_prefill_mla_pp.py b/vllm/models/glm5next/nvidia/ops/sparse_prefill_mla_pp.py
+--- a/vllm/models/glm5next/nvidia/ops/sparse_prefill_mla_pp.py
++++ b/vllm/models/glm5next/nvidia/ops/sparse_prefill_mla_pp.py
+@@ -97,7 +97,10 @@
+ HEADS = 64
+ DIM = 512
+ INDEX_WIDTH = 2176      # 2048 top-k + a 128-slot local section
+-MAX_TOKENS = 2312       # the largest prefill chunk under pipeline parallel
++# One independent CTA per query row: row count changes only grid.x, not
++# shared memory, reductions or tile geometry. The offset gate below is the
++# real bound; 2312 was the original validation workload, not a kernel limit.
++MAX_TOKENS = 32768
+ _I32 = 2**31
+ 
+ 
+@@ -322,7 +325,7 @@
+     Open exactly on the configuration it was validated on: sm_80, all 64
+     query heads on the card, one latent kv head, bf16 q/kv/out, the 512-wide
+     NoPE layout with V read from the same row (block_dpe 0), int32 indices
+-    of width 2176, 1..2312 query rows, unit stride on the last dim of every
++    of width 2176, 1..32768 query rows, unit stride on the last dim of every
+     tensor and 32-bit row offsets."""
+     if not q.is_cuda or not _is_sm80(q.device):
+         return "not sm_80"

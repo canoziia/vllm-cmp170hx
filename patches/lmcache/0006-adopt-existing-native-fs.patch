@@ -32,226 +32,6 @@ index 00ad729..1bd7249 100644
      def set_backend_identity(self, name: str, shared: bool = False) -> None:
          """Set the identity used to tag this adapter's cache events.
  
-diff --git a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
-index 2d70349..ece1235 100644
---- a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
-+++ b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
-@@ -11,6 +11,7 @@ from __future__ import annotations
- 
- # Standard
- from typing import TYPE_CHECKING, Optional
-+import os
- 
- if TYPE_CHECKING:
-     from lmcache.v1.distributed.internal_api import (
-@@ -19,6 +20,7 @@ if TYPE_CHECKING:
- 
- # First Party
- from lmcache.logging import init_logger
-+from lmcache.v1.distributed.api import ObjectKey
- from lmcache.v1.distributed.l2_adapters.base import (
-     L2AdapterInterface,
- )
-@@ -29,6 +31,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
- from lmcache.v1.distributed.l2_adapters.factory import (
-     register_l2_adapter_factory,
- )
-+from lmcache.v1.distributed.l2_adapters.fs_key_codec import (
-+    filename_to_object_key,
-+)
- 
- logger = init_logger(__name__)
- 
-@@ -45,6 +50,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-     - use_odirect: bypass page cache via O_DIRECT.
-     - read_ahead_size: trigger filesystem readahead by
-       reading this many bytes first (optional).
-+    - adopt_existing: on startup, scan ``base_path`` and seed byte
-+      accounting / eviction with files persisted by a previous run
-+      (default true).
-     """
- 
-     def __init__(
-@@ -55,6 +63,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-         use_odirect: bool = False,
-         read_ahead_size: Optional[int] = None,
-         max_capacity_gb: float = 0,
-+        adopt_existing: bool = True,
-     ):
-         self.base_path = base_path
-         self.num_workers = num_workers
-@@ -62,6 +71,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-         self.use_odirect = use_odirect
-         self.read_ahead_size = read_ahead_size
-         self.max_capacity_gb = max_capacity_gb
-+        self.adopt_existing = adopt_existing
- 
-     @classmethod
-     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
-@@ -90,6 +100,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
-             raise ValueError("max_capacity_gb must be a non-negative number")
- 
-+        adopt_existing = d.get("adopt_existing", True)
-+        if not isinstance(adopt_existing, bool):
-+            raise ValueError("adopt_existing must be a boolean")
-+
-         return cls(
-             base_path=base_path,
-             num_workers=num_workers,
-@@ -97,6 +111,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-             use_odirect=use_odirect,
-             read_ahead_size=read_ahead_size,
-             max_capacity_gb=float(max_capacity_gb),
-+            adopt_existing=adopt_existing,
-         )
- 
-     @classmethod
-@@ -116,10 +131,98 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
-             "first (optional)\n"
-             "- max_capacity_gb (float): max L2 capacity "
-             "in GB for usage tracking / eviction "
--            "(default 0 = disabled)"
-+            "(default 0 = disabled)\n"
-+            "- adopt_existing (bool): on startup, seed "
-+            "accounting/eviction from files persisted by "
-+            "a previous run (default true)"
-         )
- 
- 
-+def scan_adoptable_files(
-+    base_path: str,
-+    relative_tmp_dir: str,
-+) -> list[tuple["ObjectKey", int, float]]:
-+    """Scan ``base_path`` for adoptable object files from a previous run.
-+
-+    Only completed objects are considered: the FS connectors write through a
-+    temp file and atomically rename to the final name, so any file that both
-+    carries the ``.data`` extension and decodes back to an ``ObjectKey`` is a
-+    fully written object. Temp files (under ``relative_tmp_dir`` or with a
-+    non-``.data`` extension) and foreign files are skipped.
-+
-+    Args:
-+        base_path: The adapter's object directory.
-+        relative_tmp_dir: The adapter's temp sub-directory name (empty when
-+            temp files live next to the objects under a different extension).
-+
-+    Returns:
-+        One ``(key, size_bytes, mtime)`` tuple per adoptable file, sorted by
-+        ``mtime`` ascending so callers can seed LRU order oldest-first.
-+    """
-+    found: list[tuple[ObjectKey, int, float]] = []
-+    try:
-+        entries = list(os.scandir(base_path))
-+    except FileNotFoundError:
-+        return []
-+    for entry in entries:
-+        if not entry.is_file(follow_symlinks=False):
-+            continue
-+        key = filename_to_object_key(entry.name)
-+        if key is None:
-+            continue
-+        stat = entry.stat(follow_symlinks=False)
-+        found.append((key, stat.st_size, stat.st_mtime))
-+    found.sort(key=lambda item: item[2])
-+    return found
-+
-+
-+_ADOPT_NOTIFY_BATCH = 4096
-+
-+
-+def _make_adapter_class(native_cls):
-+    """Build the FS-native adapter class on top of the lazily imported
-+    ``NativeConnectorL2Adapter`` (imported lazily to avoid the circular
-+    dependency documented in ``_create_fs_native_l2_adapter``)."""
-+
-+    class _FSNativeConnectorL2Adapter(native_cls):
-+        """``NativeConnectorL2Adapter`` plus filesystem startup adoption."""
-+
-+        def __init__(
-+            self,
-+            *args,
-+            base_path="",
-+            relative_tmp_dir="",
-+            adopt_existing=True,
-+            **kwargs,
-+        ):
-+            super().__init__(*args, **kwargs)
-+            self._base_path = base_path
-+            self._relative_tmp_dir = relative_tmp_dir
-+            self._adopt_existing = adopt_existing
-+
-+        def adopt_existing_keys(self) -> int:
-+            if not self._adopt_existing:
-+                return 0
-+            adoptable = scan_adoptable_files(self._base_path, self._relative_tmp_dir)
-+            for start in range(0, len(adoptable), _ADOPT_NOTIFY_BATCH):
-+                batch = adoptable[start : start + _ADOPT_NOTIFY_BATCH]
-+                self._notify_keys_stored(
-+                    [key for key, _size, _mtime in batch],
-+                    [size for _key, size, _mtime in batch],
-+                )
-+            if adoptable:
-+                total = sum(size for _key, size, _mtime in adoptable)
-+                logger.info(
-+                    "FS native adapter adopted %d existing objects (%.2f GiB) from %s",
-+                    len(adoptable),
-+                    total / (1 << 30),
-+                    self._base_path,
-+                )
-+            return len(adoptable)
-+
-+    return _FSNativeConnectorL2Adapter
-+
-+
- def _create_fs_native_l2_adapter(
-     config: L2AdapterConfigBase,
-     l1_memory_desc: "Optional[L1MemoryDesc]" = None,
-@@ -158,7 +261,8 @@ def _create_fs_native_l2_adapter(
-         config.use_odirect,
-         config.read_ahead_size,
-     )
--    return NativeConnectorL2Adapter(
-+    adapter_cls = _make_adapter_class(NativeConnectorL2Adapter)
-+    return adapter_cls(
-         native_client,
-         max_capacity_gb=config.max_capacity_gb,
-         type_name="FSNativeL2Adapter",
-@@ -168,6 +272,9 @@ def _create_fs_native_l2_adapter(
-             "num_workers": config.num_workers,
-             "read_ahead_size": config.read_ahead_size,
-         },
-+        base_path=config.base_path,
-+        relative_tmp_dir=config.relative_tmp_dir,
-+        adopt_existing=config.adopt_existing,
-     )
- 
- 
-diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
-index 1bd2602..f7ef849 100644
---- a/lmcache/v1/distributed/storage_manager.py
-+++ b/lmcache/v1/distributed/storage_manager.py
-@@ -144,6 +144,20 @@ class StorageManager:
-         )
-         self._l2_eviction_controller.start()
- 
-+        # Startup adoption AFTER the eviction controller has registered its
-+        # listeners: objects persisted by a previous server lifetime are
-+        # re-seeded into byte accounting and eviction (LRU oldest-first), so
-+        # restarts reuse the on-disk cache instead of accumulating
-+        # unaccounted data on top of it until the disk fills.
-+        for adapter_id, adapter in self._l2_adapters.items():
-+            adopted = adapter.adopt_existing_keys()
-+            if adopted:
-+                logger.info(
-+                    "L2 adapter %d adopted %d objects from a previous run",
-+                    adapter_id,
-+                    adopted,
-+                )
-+
-         # Controllers receive the initial set as ordered lists; they key
-         # their own copies by ``descriptor.index`` (== adapter_id) and learn
-         # of later changes via add_adapter/request_remove_adapter.
 diff --git a/lmcache/v1/distributed/l2_adapters/fs_key_codec.py b/lmcache/v1/distributed/l2_adapters/fs_key_codec.py
 new file mode 100644
 index 0000000..b81cb28
@@ -349,3 +129,227 @@ index 0000000..b81cb28
 +        )
 +    except ValueError:
 +        return None
+diff --git a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+index 2d70349..513b7d7 100644
+--- a/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/fs_native_l2_adapter.py
+@@ -11,6 +11,7 @@ from __future__ import annotations
+ 
+ # Standard
+ from typing import TYPE_CHECKING, Optional
++import os
+ 
+ if TYPE_CHECKING:
+     from lmcache.v1.distributed.internal_api import (
+@@ -19,6 +20,7 @@ if TYPE_CHECKING:
+ 
+ # First Party
+ from lmcache.logging import init_logger
++from lmcache.v1.distributed.api import ObjectKey
+ from lmcache.v1.distributed.l2_adapters.base import (
+     L2AdapterInterface,
+ )
+@@ -29,6 +31,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
+ from lmcache.v1.distributed.l2_adapters.factory import (
+     register_l2_adapter_factory,
+ )
++from lmcache.v1.distributed.l2_adapters.fs_key_codec import (
++    filename_to_object_key,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -45,6 +50,9 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+     - use_odirect: bypass page cache via O_DIRECT.
+     - read_ahead_size: trigger filesystem readahead by
+       reading this many bytes first (optional).
++    - adopt_existing: on startup, scan ``base_path`` and seed byte
++      accounting / eviction with files persisted by a previous run
++      (default true).
+     """
+ 
+     def __init__(
+@@ -55,6 +63,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         use_odirect: bool = False,
+         read_ahead_size: Optional[int] = None,
+         max_capacity_gb: float = 0,
++        adopt_existing: bool = True,
+     ):
+         self.base_path = base_path
+         self.num_workers = num_workers
+@@ -62,6 +71,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         self.use_odirect = use_odirect
+         self.read_ahead_size = read_ahead_size
+         self.max_capacity_gb = max_capacity_gb
++        self.adopt_existing = adopt_existing
+ 
+     @classmethod
+     def from_dict(cls, d: dict) -> "FSNativeL2AdapterConfig":
+@@ -90,6 +100,10 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
+             raise ValueError("max_capacity_gb must be a non-negative number")
+ 
++        adopt_existing = d.get("adopt_existing", True)
++        if not isinstance(adopt_existing, bool):
++            raise ValueError("adopt_existing must be a boolean")
++
+         return cls(
+             base_path=base_path,
+             num_workers=num_workers,
+@@ -97,6 +111,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+             use_odirect=use_odirect,
+             read_ahead_size=read_ahead_size,
+             max_capacity_gb=float(max_capacity_gb),
++            adopt_existing=adopt_existing,
+         )
+ 
+     @classmethod
+@@ -116,10 +131,102 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
+             "first (optional)\n"
+             "- max_capacity_gb (float): max L2 capacity "
+             "in GB for usage tracking / eviction "
+-            "(default 0 = disabled)"
++            "(default 0 = disabled)\n"
++            "- adopt_existing (bool): on startup, seed "
++            "accounting/eviction from files persisted by "
++            "a previous run (default true)"
+         )
+ 
+ 
++def scan_adoptable_files(
++    base_path: str,
++    relative_tmp_dir: str,
++) -> list[tuple["ObjectKey", int, float]]:
++    """Scan ``base_path`` for adoptable object files from a previous run.
++
++    Only completed objects are considered: the FS connectors write through a
++    temp file and atomically rename to the final name, so any file that both
++    carries the ``.data`` extension and decodes back to an ``ObjectKey`` is a
++    fully written object. Temp files (under ``relative_tmp_dir`` or with a
++    non-``.data`` extension) and foreign files are skipped.
++
++    Args:
++        base_path: The adapter's object directory.
++        relative_tmp_dir: The adapter's temp sub-directory name (empty when
++            temp files live next to the objects under a different extension).
++
++    Returns:
++        One ``(key, size_bytes, mtime)`` tuple per adoptable file, sorted by
++        ``mtime`` ascending so callers can seed LRU order oldest-first.
++    """
++    found: list[tuple[ObjectKey, int, float]] = []
++    try:
++        entries = list(os.scandir(base_path))
++    except FileNotFoundError:
++        return []
++    for entry in entries:
++        if not entry.is_file(follow_symlinks=False):
++            continue
++        key = filename_to_object_key(entry.name)
++        if key is None:
++            continue
++        stat = entry.stat(follow_symlinks=False)
++        found.append((key, stat.st_size, stat.st_mtime))
++    found.sort(key=lambda item: item[2])
++    return found
++
++
++_ADOPT_NOTIFY_BATCH = 4096
++
++
++def _make_adapter_class(native_cls):
++    """Build the FS-native adapter class on top of the lazily imported
++    ``NativeConnectorL2Adapter`` (imported lazily to avoid the circular
++    dependency documented in ``_create_fs_native_l2_adapter``)."""
++
++    class _FSNativeConnectorL2Adapter(native_cls):
++        """``NativeConnectorL2Adapter`` plus filesystem startup adoption."""
++
++        def __init__(
++            self,
++            *args,
++            base_path="",
++            relative_tmp_dir="",
++            adopt_existing=True,
++            **kwargs,
++        ):
++            super().__init__(*args, **kwargs)
++            self._base_path = base_path
++            self._relative_tmp_dir = relative_tmp_dir
++            self._adopt_existing = adopt_existing
++
++        def adopt_existing_keys(self) -> int:
++            if not self._adopt_existing:
++                return 0
++            adoptable = scan_adoptable_files(self._base_path, self._relative_tmp_dir)
++            for start in range(0, len(adoptable), _ADOPT_NOTIFY_BATCH):
++                batch = adoptable[start : start + _ADOPT_NOTIFY_BATCH]
++                # Native delete completions consult this table before notifying
++                # accounting/LRU. Adopted files must be known there too.
++                with self._lock:
++                    self._key_sizes.update({key: size for key, size, _ in batch})
++                self._notify_keys_stored(
++                    [key for key, _size, _mtime in batch],
++                    [size for _key, size, _mtime in batch],
++                )
++            if adoptable:
++                total = sum(size for _key, size, _mtime in adoptable)
++                logger.info(
++                    "FS native adapter adopted %d existing objects (%.2f GiB) from %s",
++                    len(adoptable),
++                    total / (1 << 30),
++                    self._base_path,
++                )
++            return len(adoptable)
++
++    return _FSNativeConnectorL2Adapter
++
++
+ def _create_fs_native_l2_adapter(
+     config: L2AdapterConfigBase,
+     l1_memory_desc: "Optional[L1MemoryDesc]" = None,
+@@ -158,7 +265,8 @@ def _create_fs_native_l2_adapter(
+         config.use_odirect,
+         config.read_ahead_size,
+     )
+-    return NativeConnectorL2Adapter(
++    adapter_cls = _make_adapter_class(NativeConnectorL2Adapter)
++    return adapter_cls(
+         native_client,
+         max_capacity_gb=config.max_capacity_gb,
+         type_name="FSNativeL2Adapter",
+@@ -168,6 +276,9 @@ def _create_fs_native_l2_adapter(
+             "num_workers": config.num_workers,
+             "read_ahead_size": config.read_ahead_size,
+         },
++        base_path=config.base_path,
++        relative_tmp_dir=config.relative_tmp_dir,
++        adopt_existing=config.adopt_existing,
+     )
+ 
+ 
+diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
+index 1bd2602..f7ef849 100644
+--- a/lmcache/v1/distributed/storage_manager.py
++++ b/lmcache/v1/distributed/storage_manager.py
+@@ -144,6 +144,20 @@ class StorageManager:
+         )
+         self._l2_eviction_controller.start()
+ 
++        # Startup adoption AFTER the eviction controller has registered its
++        # listeners: objects persisted by a previous server lifetime are
++        # re-seeded into byte accounting and eviction (LRU oldest-first), so
++        # restarts reuse the on-disk cache instead of accumulating
++        # unaccounted data on top of it until the disk fills.
++        for adapter_id, adapter in self._l2_adapters.items():
++            adopted = adapter.adopt_existing_keys()
++            if adopted:
++                logger.info(
++                    "L2 adapter %d adopted %d objects from a previous run",
++                    adapter_id,
++                    adopted,
++                )
++
+         # Controllers receive the initial set as ordered lists; they key
+         # their own copies by ``descriptor.index`` (== adapter_id) and learn
+         # of later changes via add_adapter/request_remove_adapter.

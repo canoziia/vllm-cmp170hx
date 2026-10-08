@@ -1,7 +1,7 @@
 From: canoziia <canoziia@users.noreply.github.com>
 Subject: [PATCH] PP: cache the per-hop tensor-dict metadata
 
-VLLM_PP_METADATA_CACHE_0025 (default 0; read once when the "pp"
+VLLM_PP_METADATA_CACHE (default 0; read once when the "pp"
 GroupCoordinator is built; every PP rank must set the same value -- a mixed
 setting is not negotiated and ends in an error or a timeout). Only the PP
 group's isend_tensor_dict/irecv_tensor_dict change. Each direction keeps the
@@ -28,7 +28,7 @@ index 92deff1..0337a6c 100644
 +        import os
 +        self._pp_metadata_cache = None
 +        if (group_name == "pp"
-+                and os.environ.get("VLLM_PP_METADATA_CACHE_0025", "0") == "1"):
++                and os.environ.get("VLLM_PP_METADATA_CACHE", "0") == "1"):
 +            from vllm.distributed.pp_metadata_cache import PPMetadataCache
 +            self._pp_metadata_cache = PPMetadataCache(self, _RetainedHandle)
          _register_group(self)
