@@ -56,7 +56,7 @@ services:
       VLLM_PP_DECODE_COHORT_BALANCE: "1"
       # 128 MiB indexer logits budget (KV pool +25% with dflash2/0011)
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
-      # Every DFlash2 series switch at its deployed value (dflash2/0034); the
+      # Every DFlash2 series switch at its deployed value (dflash2/0033); the
       # list is in README.md. Set a single switch here to override it.
       VLLM_GLM53_OPT_PROFILE: "default"
     command:
@@ -85,6 +85,8 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser=glm47
       - --reasoning-parser=glm47
+      # model template + empty <think></think> when thinking is off (chat_template.jinja)
+      - --chat-template=/opt/glm-5.3-flash/chat_template.jinja
       - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:

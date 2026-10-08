@@ -18,7 +18,7 @@ exception: `VLLM_GLM5_ROUTE_V2_FIRST` (0023) defaulted to 1 under route v2 in
 development and defaults to 0 here (whole-machine runs were slower with 1).
 Only `VLLM_GLM5_INDEXER_JIT_WARMUP` (0015) defaults to on, and it is
 compile-only.
-`VLLM_GLM53_OPT_PROFILE=default` (0034) turns the rest on (0010 in `tc` mode,
+`VLLM_GLM53_OPT_PROFILE=default` (0033) turns the rest on (0010 in `tc` mode,
 see below); both W4A16 composes set it. With no GLM env set the image behaves
 as the DeepSeek image for every other model.
 
@@ -56,8 +56,7 @@ as the DeepSeek image for every other model.
 | 0030 | PP hop metadata cache (32-byte header; payload only when the pickled bytes change) | `VLLM_PP_METADATA_CACHE` (0; **on in the profile**; same on every PP rank) | 0025 (`patches-pp/`) |
 | 0031 | PP hop tensors packed into one NCCL P2P | `VLLM_PP_PACK_TENSORS` (0; **on in the profile**; checked equal on every PP rank) | 0029 (`patches-pp/`) |
 | 0032 | PP sparse-MLA / KDA prefill above 2312 rows (the old limit was the validation chunk, not a kernel limit) | with 0012/0014; `VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` (16384) | - |
-| 0033 | parser splits on `</think>` with the GLM-5.3 template even when thinking is "off" | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` (0) | - |
-| 0034 | one profile switch for the series | `VLLM_GLM53_OPT_PROFILE` (unset) | - |
+| 0033 | one profile switch for the series | `VLLM_GLM53_OPT_PROFILE` (unset) | - |
 
 0003: each drafter block holds 1024 tokens in one MLA page (4 of 5 MiB at
 target block 5120); padded pages are never split into kernel blocks. With
@@ -76,7 +75,7 @@ KDA sizes its chunk workspaces dynamically under a 32768-token ceiling; the
 default dispatch limit is 16384. 2312/5120/8192/10240-row calls match chunked
 calls bitwise (output and final KDA state). Marlin MoE never had a row limit.
 
-0034: `VLLM_GLM53_OPT_PROFILE=default` sets each switch to its deployed value
+0033: `VLLM_GLM53_OPT_PROFILE=default` sets each switch to its deployed value
 unless that variable is already set; the table is in the model README.
 
 Left out of the development series:
