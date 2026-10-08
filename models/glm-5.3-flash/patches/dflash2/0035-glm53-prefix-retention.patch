@@ -1,0 +1,52 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] glm5: retain the local partial prefix drafter window on first prefill
+
+Keep existing checkpoint and EAGLE validity rules; make sparse retention
+include the real hash-aligned replay boundary before a sibling discovers it.
+Default off, enabled by the GLM profile. No LMCache changes.
+
+diff --git a/vllm/glm53_opt_profile.py b/vllm/glm53_opt_profile.py
+index a8e4729..014d419 100644
+--- a/vllm/glm53_opt_profile.py
++++ b/vllm/glm53_opt_profile.py
+@@ -71,6 +71,8 @@ PROFILES: dict[str, dict[str, str]] = {
+         "VLLM_PP_PACK_TENSORS": "1",
+         # 0034 prompt tail state from prefill to decode (LMCache PD only)
+         "VLLM_GLM53_PD_TAIL": "1",
++        # Retain the existing local 1024-aligned KDA tail's drafter window.
++        "VLLM_GLM53_PREFIX_RETENTION": "1",
+     },
+ }
+ 
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index a495f99..9903235 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+ from collections.abc import Sequence
++import os
+ from typing import NamedTuple
+ 
+ from vllm.logger import init_logger
+@@ -324,6 +325,19 @@ class KVCacheCoordinator(ABC):
+         if not self.eagle_group_ids:
+             return (request.num_prompt_tokens - 1,)
+         block = self.scheduler_block_size
++        # GLM align mode materializes a real partial KDA tail at the hash
++        # boundary minus one hash unit. Retain the drafter's peek window
++        # there on the FIRST request, rather than waiting for a sibling to
++        # rediscover it as a shared-prefix junction. Do not change EAGLE flags,
++        # checkpoint positions, or lookup validity rules here.
++        if (
++            os.environ.get("VLLM_GLM53_PREFIX_RETENTION", "0") == "1"
++            and getattr(self, "enable_partial_hash_hits", False)
++            and self.hash_block_size == 1024
++            and self.scheduler_block_size == 5120
++            and any(isinstance(m, MambaManager) for m in self.single_type_managers)
++        ):
++            block = self.hash_block_size
+         resend = (request.num_prompt_tokens - 1) // block * block
+         extension = request.num_prompt_tokens // block * block
+         return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))

@@ -95,6 +95,13 @@ DFlash2。测试：`tests/dflash2/test_pd_tail_gpu.py`（真实状态与首步�
 | 0029 | `VLLM_GLM5_IDX_DUAL_GEMM` | 1 |
 | 0030 / 0031 | `VLLM_PP_METADATA_CACHE` / `VLLM_PP_PACK_TENSORS` | 1 |
 | 0034 | `VLLM_GLM53_PD_TAIL` | 1 |
+| 0035 | `VLLM_GLM53_PREFIX_RETENTION` | 1 |
+
+`VLLM_GLM53_PREFIX_RETENTION` 补丁默认关闭，profile 打开：在现有
+hash1024/target5120/draft1024 几何下，为实际 KDA partial checkpoint
+保留 drafter 连续尾窗，使首次 extension 不必先全量重算来补 shared junction。
+不修改 EAGLE 标记或状态有效性规则，不新增 KDA checkpoint，不修改 LMCache；
+4487-token 首轮后的正常可复用位置仍为3072，而不是4096。
 
 0030/0031 改变 PP 段之间的传输格式，所有段必须一致（profile 在每个进程里
 相同）。不在 profile 里、默认值即部署值的：`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS`
@@ -315,6 +322,7 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0032 | PP sparse MLA / KDA prefill 放开到 2312 行以上（原限制只是验证时的 chunk 大小） | 随 0012/0014；`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` 默认 16384 | 2312/5120/8192/10240 行与分块调用逐位一致（输出与 KDA 末状态） |
 | 0033 | 一个 profile 开关设置系列部署值 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
 | 0034 | prefill 把提示尾段状态交给 decode，decode 首步只采样（PD） | `VLLM_GLM53_PD_TAIL`（profile 打开） | 四段状态与首步 logits/候选逐位一致；107k 两跳 23.55 → 20.17 s |
+| 0035 | 首轮保留本地 partial prefix 的 drafter 尾窗 | `VLLM_GLM53_PREFIX_RETENTION`（默认关，profile 打开） | 不改 checkpoint/lookup 语义；短多轮脚本 `tests/dflash2/test_prefix_retention.py` |
 
 **route v2 用 tc 模式（profile 中 `VLLM_GLM5_ROUTE_V2_GEMV=tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
 **不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：
