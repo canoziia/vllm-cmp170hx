@@ -68,7 +68,7 @@ GPU tests in `/opt/qwen-cache-tests/` before deployment.
 ## Runtime geometry
 
 ```text
-GPU devices: 6,7
+GPU devices: 6,7 (`QWEN_GPU_0`, `QWEN_GPU_1` in `.env`)
 TP1 x PP2, partition 26,22
 max_model_len=1,000,000
 max_num_batched_tokens=4,096
