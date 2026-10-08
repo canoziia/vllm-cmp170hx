@@ -1,4 +1,4 @@
-03bfd1beae421890941d173e5ddfa2f36b2dd6300917ca49660bf1ff2c0653af  models/glm-5.3-flash/patches/dflash2/series
+daed2b6e6db1b7be470031537735b4216387175bcedd850d0844c0179a72ed1f  models/glm-5.3-flash/patches/dflash2/series
 bdcc76eaf40505fdac9b7c682941f6a44724d170ad5f842225fe3c35a7d3378c  models/glm-5.3-flash/patches/dflash2/0001-glm5next-aux-hidden-states-pp.patch
 c60b635099acf40f5e3ce3996ed104ba194898f1636e7dac38be528dc281011e  models/glm-5.3-flash/patches/dflash2/0002-glm5next-kpool-tail-ring-spec-decode.patch
 73fda6363a59fc26895d0d5f33296692b03f52632e44603f8b96c5b32c02aab9  models/glm-5.3-flash/patches/dflash2/0003-glm5next-kv-layout-dflash-drafter-groups.patch
@@ -31,8 +31,7 @@ bcdffc25acbd475c90490bbd386b3715cb14da9c473cff54ab3027f95b29bff5  models/glm-5.3
 7157d1efcae1fc815580ff942f6c0baa930c25a383ad72e47ad19f13c387cdf6  models/glm-5.3-flash/patches/dflash2/0030-pp-metadata-cache.patch
 dc3d31827604090d78c5109facf7ddcdf12dcecf692dc45ccfb3b84b6b5444ac  models/glm-5.3-flash/patches/dflash2/0031-pp-pack-hop-tensors.patch
 2c71baec6193faa8e24a1cbd8e31f87d6792d3c61612c6b94cb181636048f05f  models/glm-5.3-flash/patches/dflash2/0032-glm5-pp-prefill-large-rows.patch
-6a50e205b19ca956f504f7bb8ed326359339f650da53bcafece5624097539f1b  models/glm-5.3-flash/patches/dflash2/0033-glm53-think-boundaries.patch
-b4f0bdadea3a1230182944986aa1b5223891e4f8564c399f98ce3f9a9630f34c  models/glm-5.3-flash/patches/dflash2/0034-glm53-opt-profile.patch
+d8b8320699286026600fe68c6fe086cd6d92531730431e6ed3a465cd8604279e  models/glm-5.3-flash/patches/dflash2/0033-glm53-opt-profile.patch
 c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4  models/glm-5.3-flash/native/ampere_marlin/LICENSE
 52a38ff8e31ed87788e11994da981f6db404be2948d80ee398ebff2fa592190d  models/glm-5.3-flash/native/ampere_marlin/README.md
 2be2d50ac7c11c91e572d334c397529351770e4725fbd53708314949fd856701  models/glm-5.3-flash/native/ampere_marlin/build.py
@@ -43,6 +42,7 @@ cac8a5efe26de6d354d2c1d41340fbf87adf9eebdd78aaf5d4ca05126bb5e1f8  models/glm-5.3
 a1c676bd305156bedac32bf719a3fc66b4eb3e294770026e091cddf85891699e  models/glm-5.3-flash/native/ampere-marlin-selfcheck.py
 81add119856a3d5d14d830a7e1945d7cdfc63a96fc3eb01c99c2522677d53fcf  models/glm-5.3-flash/manifests/source.env
 23b9789ae61609dff92a4efb43a1e39c5b8dae391452f6acac37dc789931d33c  scripts/apply-glm53-dflash2-patches.sh
-48feeb708dfa2b0a03130036141fe538e20536ed89ceaf53d45b3de215ee4996  scripts/build-glm53-dflash2-image.sh
-f9a9e7ab4aa623daee585485e8d3439162a4931e05a84aa8a034020c5f8a7e3a  scripts/test-glm53-dflash2-patches.py
+23f4db81071ab496e778d0b821d1b9d11ede11a687203a02f14d4d12b55fb872  scripts/build-glm53-dflash2-image.sh
+c5af523df73b0bf57582bcdf9154f079e1b780d49544e17b19e4132d4972770d  scripts/test-glm53-dflash2-patches.py
 7dff204fc3f9699ddcc7dd8143467c573b62aa340b98e63f44b2d9c1270706b9  models/glm-5.3-flash/tests/check-dflash2-series.sh
+ac2a2b81d063cf92fea258e8adc9e6560b09ff8d6e147d2df6850dae12dcfe23  models/glm-5.3-flash/chat_template.jinja

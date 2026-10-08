@@ -27,7 +27,7 @@ new file mode 100644
 index 0000000..bf9dcaf
 --- /dev/null
 +++ b/vllm/glm53_opt_profile.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,85 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""One switch for the GLM-5.3-Flash W4A16 + DFlash2 patch series.
 +
@@ -99,8 +99,6 @@ index 0000000..bf9dcaf
 +        # 0030 PP metadata cache, 0031 packed PP hop tensors
 +        "VLLM_PP_METADATA_CACHE": "1",
 +        "VLLM_PP_PACK_TENSORS": "1",
-+        # 0033 split reasoning on </think> with the GLM-5.3 template
-+        "VLLM_GLM53_FORCE_THINK_BOUNDARIES": "1",
 +    },
 +}
 +

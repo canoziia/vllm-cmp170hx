@@ -41,7 +41,7 @@ def env_default(text: str, name: str, default: str) -> bool:
 
 series = [line.strip() for line in (PATCH_DIR / "series").read_text().splitlines()
           if line.strip() and not line.startswith("#")]
-check("series has 34 patches", len(series) == 34, str(len(series)))
+check("series has 33 patches", len(series) == 33, str(len(series)))
 
 touched: set[str] = set()
 for name in series:
@@ -123,9 +123,8 @@ markers = [
     ("0030 hook", "vllm/distributed/parallel_state.py", "_pp_metadata_cache"),
     ("0031 PP pack module", "vllm/distributed/pp_pack.py", 'ENV = "VLLM_PP_PACK_TENSORS"'),
     ("0031 hook", "vllm/distributed/parallel_state.py", "_pp_pack"),
-    ("0033 think boundaries", "vllm/parser/glm47_moe.py", "VLLM_GLM53_FORCE_THINK_BOUNDARIES"),
-    ("0034 profile", "vllm/glm53_opt_profile.py", "VLLM_GLM53_OPT_PROFILE"),
-    ("0034 hook", "vllm/env_override.py", "_glm53_apply_opt_profile()"),
+    ("0033 profile", "vllm/glm53_opt_profile.py", "VLLM_GLM53_OPT_PROFILE"),
+    ("0033 hook", "vllm/env_override.py", "_glm53_apply_opt_profile()"),
 ]
 for label, rel, needle in markers:
     text = src(rel)

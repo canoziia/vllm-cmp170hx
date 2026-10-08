@@ -45,7 +45,7 @@ key；`adopt_existing=true` 时重启前的文件也计入容量并能被回收
 
 ### 优化开关
 
-`VLLM_GLM53_OPT_PROFILE=default`（dflash2/0034）在每个进程启动时把下表开关设为
+`VLLM_GLM53_OPT_PROFILE=default`（dflash2/0033）在每个进程启动时把下表开关设为
 部署值，**已设置的变量不覆盖**，所以单独关某一项只需在 compose 里写
 `VLLM_XXX: "0"`。不设 profile 时所有补丁回到各自默认（关）。
 
@@ -73,19 +73,21 @@ key；`adopt_existing=true` 时重启前的文件也计入容量并能被回收
 | 0027 | `VLLM_GLM5_SHARED_EXPERT_REORDER` | 1 |
 | 0029 | `VLLM_GLM5_IDX_DUAL_GEMM` | 1 |
 | 0030 / 0031 | `VLLM_PP_METADATA_CACHE` / `VLLM_PP_PACK_TENSORS` | 1 |
-| 0033 | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` | 1 |
 
 0030/0031 改变 PP 段之间的传输格式，所有段必须一致（profile 在每个进程里
 相同）。不在 profile 里、默认值即部署值的：`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS`
 （16384，0032）、`VLLM_GLM5_PRENORM_BF16X3_MIN_TOKENS`（384，0028）。
 
-### 思考与正文
+### 思考开关
 
-GLM-5.3 的模板每次都以未闭合的 `<think>` 结尾，`enable_thinking=false` 和
-`reasoning_effort=none` 也一样，模型照常思考；glm45/glm47 parser（同一个类）
-原先信任这个标志，把思考连同正文都放进 `content`。0033 让 parser 始终以
-`</think>` 切分：`content` 不再混入思考，但模型并不会因此不思考。思考在
-`message.reasoning` 字段。
+模型自带的模板在生成提示末尾总是放一个未闭合的 `<think>`，`enable_thinking=false`
+也一样，模型照常思考，parser 却按请求标志把思考当成正文。compose 改用
+`chat_template.jinja`（镜像内 `/opt/glm-5.3-flash/chat_template.jinja`，
+`--chat-template`）：它与模型模板只差一处，`enable_thinking=false` 时生成提示以空的
+`<think></think>` 结尾（模板对历史中没有思考的 assistant 轮次本来就用这个形式），
+模型直接作答，正文在 `content`。vLLM 会把 `reasoning_effort=none` 转成
+`enable_thinking=false`。其他请求（默认、`low`/`high`、`enable_thinking=true`）渲染结果
+与原模板逐字相同，思考在 `message.reasoning`。
 
 ### 实测（node2，出厂设置）
 
@@ -250,9 +252,9 @@ the server to log `Reaped GPU instance` before starting the replacement.
 
 ### 补丁系列（`patches/dflash2/`）
 
-34 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
+33 个补丁，按 `series` 顺序依次叠加在 DeepSeek 镜像源码之上。每个补丁都是相对前一个补丁结果的
 git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何默认行为；compose 用
-`VLLM_GLM53_OPT_PROFILE=default`（0034）一次打开，开关表见上文“优化开关”。
+`VLLM_GLM53_OPT_PROFILE=default`（0033）一次打开，开关表见上文“优化开关”。
 详细说明（英文）以及与开发编号的对照见 `patches/dflash2/README.md`。
 
 | # | 作用 | 开关 | GPU 实测结论 |
@@ -289,8 +291,7 @@ git diff。除 0015 外，所有开关默认关闭，镜像本身不改变任何
 | 0030 | PP 段间跳的元数据缓存：每跳先发 32 字节 CPU header，元数据 pickle 字节与上一跳相同时不再发送 payload；张量与顺序不变 | `VLLM_PP_METADATA_CACHE`（默认 0；**profile 打开**；所有 PP rank 必须一致） | 与 0031 一起见“本轮实测”；CPU 逻辑 5 项 + 真实 Gloo 160 步通过 |
 | 0031 | PP 段间跳的多个张量打包为一次 NCCL P2P（mHC hidden_states + fc 折叠部分和，每跳 2 次 → 1 次；字节与 padded 行数不变） | `VLLM_PP_PACK_TENSORS`（默认 0；**profile 打开**；启动时校验所有 PP rank 一致，不一致即报错） | 两卡 NCCL 120 步 packed=False/True 逐位一致；与 0030 一起 c1 counting 29.32→29.44 步/秒，c8 739.5→752.4 |
 | 0032 | PP sparse MLA / KDA prefill 放开到 2312 行以上（原限制只是验证时的 chunk 大小） | 随 0012/0014；`VLLM_GLM5_PP_KDA_PREFILL_MAX_TOKENS` 默认 16384 | 2312/5120/8192/10240 行与分块调用逐位一致（输出与 KDA 末状态） |
-| 0033 | GLM-5.3 模板下 parser 始终按 `</think>` 切分思考与正文 | `VLLM_GLM53_FORCE_THINK_BOUNDARIES` | `enable_thinking=false` / `reasoning_effort=none` 时 content 不再混入思考 |
-| 0034 | 一个 profile 开关打开整个系列 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
+| 0033 | 一个 profile 开关打开整个系列 | `VLLM_GLM53_OPT_PROFILE=default` | 已设置的单项开关优先 |
 
 **route v2 用 tc 模式（profile 中 `VLLM_GLM5_ROUTE_V2_GEMV=tc`）**：tc 的 router logits 与我们旧的 gate 路径（`_bf16_gemv_kernel`）
 **不逐位一致**（归约顺序不同，第 8、9 名专家近似并列时可能翻转），但与对方的 `_moe_route_kernel` **逐位一致**。选它有两个原因：
