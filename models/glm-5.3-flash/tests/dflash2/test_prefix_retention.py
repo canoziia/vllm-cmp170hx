@@ -18,8 +18,8 @@ def main():
     args = p.parse_args()
     key = os.environ['VLLM_API_KEY']
 
-    def request(length, salt, endpoint=args.prefill):
-        body = dict(model=args.model, prompt=[1234] * length, cache_salt=salt,
+    def request(length, salt, endpoint=args.prefill, tokens=None):
+        body = dict(model=args.model, prompt=tokens or [1234] * length, cache_salt=salt,
                     max_tokens=8, temperature=0, return_token_ids=True,
                     logprobs=1)
         req = urllib.request.Request(endpoint + '/v1/completions',
@@ -44,7 +44,7 @@ def main():
         results.append(result)
     assert results[0]['cached'] == 0
     if not args.baseline:
-        assert all(r['cached'] == 3072 for r in results[1:]), results
+        assert all(r['cached'] == 4096 for r in results[1:]), results
     # Same final prompt with a fresh salt: compare fixed greedy outputs and
     # chosen-token scores, not only HTTP status or usage accounting.
     fresh = request(5084, 'prefix-fresh-' + uuid.uuid4().hex)
@@ -56,19 +56,39 @@ def main():
     print(json.dumps(dict(case='score-check', max_abs_logprob_delta=delta)), flush=True)
     # Check the two sides of a hash boundary; don't claim the last incomplete
     # drafter page or an unmaterialized KDA state as a hit.
-    for length in (4096, 4097):
+    for length in (4095, 4096, 4097):
         salt = 'prefix-remainder-' + uuid.uuid4().hex
         show('remainder-first', request(length, salt))
         hit = request(length + 17, salt)
         show('remainder-second', hit)
         if not args.baseline:
-            assert hit['cached'] == 3072, hit
+            assert hit['cached'] == (3072 if length == 4095 else 4096), hit
     if not args.baseline:
+        # Siblings share the complete context pages, but diverge immediately
+        # after 4096. Interleave them to expose cross-group / suffix pollution.
+        salt = 'prefix-branches-' + uuid.uuid4().hex
+        request(4487, salt)
+        for suffix in (42, 314):
+            tokens = [1234] * 4096 + [suffix] * 465
+            hit = request(len(tokens), salt, tokens=tokens)
+            # Independently materialize the same prefix and chunk history.
+            # A one-shot cold 4561 prefill has different KDA chunk numerics
+            # (also on the old 3072 deployment). The forced-cold same-shape
+            # comparison is recorded separately during diagnostic validation.
+            reference_salt = uuid.uuid4().hex
+            assert request(4487, reference_salt)['cached'] == 0
+            fresh = request(len(tokens), reference_salt, tokens=tokens)
+            show('branch', hit)
+            assert hit['cached'] == 4096 and fresh['cached'] == 4096
+            assert hit['ids'] == fresh['ids']
+            delta = max(abs(a-b) for a, b in zip(hit['scores'], fresh['scores']))
+            assert delta < 0.1, delta
+            print(json.dumps(dict(case='branch-score', max_abs_logprob_delta=delta)), flush=True)
         def concurrent_case(i):
             salt = 'prefix-c8-' + uuid.uuid4().hex
             first = request(4487 + i, salt)
             second = request(4561 + i, salt)
-            assert first['cached'] == 0 and second['cached'] == 3072
+            assert first['cached'] == 0 and second['cached'] == 4096
             assert len(second['ids']) == 8
             return second
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
