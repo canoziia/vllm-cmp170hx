@@ -96,6 +96,21 @@ build that uses that runtime.
      the scheduler still validates the grammar and fails closed on missing IDs;
    - a focused regression tests interleaved A/B batches and a removed request.
 
+8. `0008-pp-global-eagle-group-semantics.patch`
+   - keeps global drafter identity even on a PP worker with no local layers in
+     that group; scheduler configuration merges owner flags across workers;
+   - separates Mamba's common drafter replay checkpoint from its own group
+     identity using the existing `drop_eagle_checkpoint_block` contract. Target
+     recurrent groups are not drafter groups, but still need a real checkpoint
+     at the shortest legal common hit;
+   - follows Qwen's existing real-MTP-only annotation rather than adding a GLM
+     model-name exception. Qwen's extra probe-cap fix remains model-local: it
+     does not create the missing complete SWA marker page in GLM;
+   - correctness fix, always applied, no performance switch. GLM's opt-in 0035
+     retention remains necessary. No LMCache change; no fabricated partial
+     SWA page or recurrent checkpoint. Existing no-annotation legacy fallback
+     remains for models without explicit drafter metadata.
+
 The first four patches were validated in the DeepSeek default/debug series and
 in the Qwen PP2/MTP3 series. Patch 0005 alone was measured on Qwen PP2 and did
 not restore acceptance; 0006 requires a new-image runtime acceptance A/B before

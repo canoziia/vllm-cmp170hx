@@ -1,0 +1,52 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] Preserve global PP drafter identity and recurrent replay stops
+
+Worker-local layer ownership must not erase global group semantics. Recurrent
+checkpoints still stop at the common drafter replay boundary, independently
+of whether the recurrent group itself is a drafter. This reuses the existing
+drop_eagle_checkpoint_block contract rather than marking target state EAGLE.
+
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 4e6109e..82df948 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -2468,7 +2468,16 @@ def generate_scheduler_kv_cache_config(
+     # All workers have the same kv_cache_config except layer names, so use
+     # an arbitrary one to initialize the scheduler.
+     cfg = copy.deepcopy(kv_cache_configs[0])
+-    for group in cfg.kv_cache_groups:
++    for worker_cfg in kv_cache_configs:
++        if len(worker_cfg.kv_cache_groups) != len(cfg.kv_cache_groups):
++            raise ValueError("PP workers disagree on global KV cache group count")
++    for index, group in enumerate(cfg.kv_cache_groups):
++        # Group identity is global, including groups empty on PP0. Also accept
++        # older worker projections which retained the flag only on the owner.
++        group.is_eagle_group = any(
++            worker_cfg.kv_cache_groups[index].is_eagle_group
++            for worker_cfg in kv_cache_configs
++        )
+         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+             # All layers in the UniformTypeKVCacheSpecs have the same type,
+             # so use an arbitrary one to initialize the scheduler.
+@@ -2713,7 +2722,7 @@ def _project_kv_cache_groups_to_worker(
+             KVCacheGroupSpec(
+                 worker_layer_names,
+                 group_spec,
+-                is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
++                is_eagle_group=group.is_eagle_group,
+             )
+         )
+     return projected_groups
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index ac48420..1eaf298 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -2016,7 +2016,7 @@ class MambaManager(SingleTypeKVCacheManager):
+         latest_prompt_hash_boundary = (
+             request.num_prompt_tokens // hash_block_size
+         ) * hash_block_size
+-        if self.use_eagle:
++        if self.drop_eagle_checkpoint_block:
+             # Eagle groups match one hash unit past the candidate and drop it,
+             # so register the tail one unit lower.
+             latest_prompt_hash_boundary = max(
