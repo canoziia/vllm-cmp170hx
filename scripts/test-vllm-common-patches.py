@@ -230,5 +230,32 @@ check(
     and fp4_fn_src.rstrip().endswith("return 1.0"),
 )
 
+# Execute the real scheduler-config merger without importing GPU dependencies.
+from types import SimpleNamespace
+import copy
+utils_src = (root / "vllm/v1/core/kv_cache_utils.py").read_text()
+utils_ast = ast.parse(utils_src)
+merge = next(n for n in utils_ast.body if isinstance(n, ast.FunctionDef)
+             and n.name == "generate_scheduler_kv_cache_config")
+ns = dict(copy=copy, KVCacheConfig=SimpleNamespace,
+          UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}))
+exec(compile(ast.Module(body=[merge], type_ignores=[]), "<PP merger>", "exec"), ns)
+def config(flags):
+    return SimpleNamespace(num_blocks=32, kv_cache_groups=[
+        SimpleNamespace(is_eagle_group=flag, kv_cache_spec=object()) for flag in flags])
+a, b = config([False, False]), config([False, True])
+merged = ns[merge.name]([a, b])
+check("PP merger preserves owner-only draft flag", [g.is_eagle_group for g in merged.kv_cache_groups] == [False, True])
+check("PP merger does not mutate workers", not a.kv_cache_groups[1].is_eagle_group)
+check("empty PP group retains global identity", "is_eagle_group=group.is_eagle_group and bool(worker_layer_names)" not in utils_src)
+manager_src = (root / "vllm/v1/core/single_type_kv_cache_manager.py").read_text()
+check("Mamba partial gate uses common replay stop", "if self.drop_eagle_checkpoint_block:" in manager_src)
+try:
+    ns[merge.name]([a, config([True])])
+except ValueError:
+    check("PP count mismatch rejected", True)
+else:
+    check("PP count mismatch rejected", False)
+
 print("VLLM_COMMON_PATCHES", "FAIL: " + ", ".join(failures) if failures else "PASS")
 sys.exit(1 if failures else 0)
