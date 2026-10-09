@@ -93,6 +93,8 @@ if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
   # default would silently change ordinary production runs.
   grep -q 'enable_adaptive_verification: bool = False' \
     "$SOURCE_TREE/vllm/config/speculative.py"
+  python3 "$MODEL_DIR/tests/test_adaptive_switch_routing.py" "$SOURCE_TREE"
+  python3 "$MODEL_DIR/tests/test_verification_profile.py" "$SOURCE_TREE"
   # the budget published by the last rank can never exceed the drafts that exist
   grep -q 'pp_verification_budget = min(pp_verification_budget, scheduled_drafts)' \
     "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"

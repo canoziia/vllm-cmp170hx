@@ -24,5 +24,6 @@ assert pol.cost(32,[2,5,2,5,2,5])>0
 src=(p.parent/'scheduler.py').read_text();ast.parse(src)
 assert src.index('self.dsv41_history_policy.observe(')<src.index('new_token_ids = generated_token_ids')
 assert 'history_limits.get(request.request_id)' in src
-assert 'spec.enable_adaptive_verification' in src
+assert 'spec.uses_history_verification()' in src
+assert 'VLLM_DSV41_HISTORY_POLICY' not in src
 print('PASS at-risk censoring; high acceptance k5; manual k0/2; cleanup; ragged cost; integration gates')
