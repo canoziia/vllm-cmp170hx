@@ -8,8 +8,30 @@ CONTROL=$DEBUG_DIR/control.json
 mkdir -p "$DEBUG_DIR"
 
 signal_workers() {
-  podman exec "$CONTAINER" sh -c \
-    "pkill -USR2 -f '[V]LLM::Worker_PP'"
+  podman exec "$CONTAINER" python3 -c '
+import os, signal
+from pathlib import Path
+processes = {}
+for p in Path("/proc").iterdir():
+    if not p.name.isdigit():
+        continue
+    try:
+        cmd = (p / "cmdline").read_bytes()
+        parent = int((p / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        processes[int(p.name)] = (parent, cmd, (p / "comm").read_text().strip())
+    except (OSError, ValueError):
+        pass
+workers = [pid for pid, (parent, cmd, comm) in processes.items()
+           if comm.startswith("VLLM::Worker") or (
+               b"spawn_main" in cmd and parent in processes
+               and b"spawn_main" in processes[parent][1]
+               and processes[parent][0] == 1)]
+if not workers:
+    raise SystemExit("No PP worker children found; no signal sent")
+for pid in workers:
+    os.kill(pid, signal.SIGUSR2)
+print("Signaled", len(workers), "PP workers")
+'
 }
 
 case "${1:-}" in

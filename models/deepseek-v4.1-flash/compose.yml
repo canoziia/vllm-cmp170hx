@@ -58,7 +58,8 @@ services:
       # One switch for all optimisation patches 0003-0013 (patch 0014); the
       # individual switches are listed in README.md and can still be set here
       # to override a single one (e.g. VLLM_DSV41_INDEXER_PREFILL_FAST: "0").
-      VLLM_DSV41_OPT_PROFILE: "default"
+      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-default}"
+      VLLM_DSV41_DECODE_TRACE: "${VLLM_DSV41_DECODE_TRACE:-0}"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
@@ -68,6 +69,9 @@ services:
 
     command:
       - /models/DeepSeek-V4.1-Flash
+      - --profiler-config.profiler=${VLLM_PROFILER:-null}
+      - --profiler-config.torch_profiler_dir=${VLLM_TORCH_PROFILE_DIR:-}
+      - --profiler-config.torch_profiler_with_stack=false
       - --host=0.0.0.0
       - --port=8000
       - --served-model-name=deepseek-ai/DeepSeek-V4.1-Flash

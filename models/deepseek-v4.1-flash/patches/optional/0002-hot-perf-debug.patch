@@ -461,13 +461,14 @@ new file mode 100644
          self.dynamic_sd_lookup: list[int] | None = None
          if speculative_config is not None:
              if speculative_config.num_speculative_tokens_per_batch_size:
-@@ -1063,7 +1078,8 @@
+@@ -1063,8 +1078,9 @@
                      # preserve full cudagraph for this step.
                      # Not for diffusion where draft tokens can't be padded.
                      if (
 -                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
 +                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
 +                         and not self._dspark_control)
+                         and getattr(request, "verification_draft_limit", None) is None
                          and self.num_sampled_tokens_per_step > 0
                          and num_new_tokens == 1
                          and not prefill_scheduled
@@ -499,14 +500,6 @@ new file mode 100644
              self.log_stats
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -2,6 +2,7 @@
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- import gc
- import itertools
-+import os
- from collections import defaultdict
- from collections.abc import Callable, Iterable
- from dataclasses import dataclass
 @@ -258,6 +259,11 @@
          else:
              decode_query_lens = [self.decode_query_len]
@@ -521,11 +514,11 @@ new file mode 100644
          )
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -19,8 +19,10 @@
+@@ -19,9 +19,10 @@
  
  import functools
+ import os
  import gc
-+import os
  import time
 -from contextlib import AbstractContextManager
 +from collections import defaultdict
@@ -699,23 +692,23 @@ new file mode 100644
              assert block_tables is not None
              attn_groups = self.attn_groups
              if dummy_run and is_profile:
-@@ -1817,6 +1902,7 @@
-                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+@@ -1840,6 +1925,7 @@
                      for groups in attn_groups
                  ]
 +            fine_stamp = tracer.cpu_start() if timing else 0
-             attn_metadata = self.model_state.prepare_attn(
-                 input_batch,
-                 batch_desc.cg_mode,
-@@ -1829,6 +1915,8 @@
-                 # indices from the previous real batch.
-                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             metadata_graph = (
+                 self.cudagraph_manager.metadata_graphs.get(batch_desc)
+                 if self.cudagraph_manager is not None else None
              )
+@@ -1868,6 +1954,8 @@
+                     for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+                 )
 +            if timing:
 +                tracer.cpu_end("model_state_prepare_attn", fine_stamp)
  
          input_ids = input_batch.input_ids
          inputs_embeds = None
+         ec_connector_output = None
 @@ -1861,6 +1949,10 @@
              if inputs_embeds is not None and not requires_raw_input_tokens(self.model):
                  input_ids = None

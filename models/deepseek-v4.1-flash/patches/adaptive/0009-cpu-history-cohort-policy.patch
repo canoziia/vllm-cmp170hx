@@ -1,0 +1,380 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek: CPU at-risk history and cohort verification policy
+
+No dev RPC or GPU confidence allocator. Opt-in via verification profile;
+explicit VLLM_DSV41_HISTORY_POLICY=0 preserves fixed KS.
+
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -52,6 +52,8 @@
+     "VLLM_DSV41_BALANCED_COHORTS": "1",
+     "VLLM_DSV41_FAST_METADATA": "1",
+     "VLLM_DSV41_METADATA_GRAPHS": "1",
++    # CPU history/cohort policy; explicit =0 keeps fixed-width KS behaviour.
++    "VLLM_DSV41_HISTORY_POLICY": "1",
+ }
+ 
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -323,6 +323,18 @@
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        self.dsv41_history_policy = None
++        import os
++        if os.environ.get("VLLM_DSV41_HISTORY_POLICY", "0") == "1":
++            spec = vllm_config.speculative_config
++            if (spec is None or spec.method != "dspark"
++                    or spec.enable_adaptive_verification
++                    or not self.use_v2_model_runner
++                    or os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"):
++                raise ValueError("history policy requires KS DSpark verification; "
++                                 "GPU adaptive verification must be disabled")
++            from .dsv41_history_policy import HistoryPolicy
++            self.dsv41_history_policy = HistoryPolicy(logger)
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
+@@ -617,6 +629,25 @@
+             throttle_prefills and not self.prefill_capacity_bound
+         ) and any(not r.is_prefill_chunk for r in self.running)
+ 
++        # CPU-known next prefixes; no GPU relay or in-flight mutation. Preserve
++        # full proposals until NEXT eligible scheduling so k can grow again.
++        history_limits = {}
++        if self.dsv41_history_policy is not None:
++            eligible = [r for r in self.running
++                        if not r.is_prefill_chunk
++                        and self.current_step >= r.next_decode_eligible_step
++                        and r.num_stale_output_tokens == 0
++                        and not self.structured_output_manager.should_advance(r)
++                        and (r.spec_token_ids or r.num_output_placeholders > 0)]
++            if eligible:
++                eligible = eligible[:getattr(
++                    self, "_get_max_num_scheduled_decodes",
++                    lambda: self.max_num_running_reqs)()]
++                history_limits = self.dsv41_history_policy.choose(
++                    eligible, min(self.max_num_running_reqs,
++                                  len(self.running) + len(self.waiting)
++                                  + len(self.skipped_waiting)), self.running)
++
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
+@@ -664,6 +695,8 @@
+                 continue
+ 
+             limit = getattr(request, "verification_draft_limit", None)
++            if limit is None:
++                limit = history_limits.get(request.request_id)
+             if limit is not None and len(request.spec_token_ids) > limit:
+                 request.spec_token_ids = request.spec_token_ids[:limit]
+             num_new_tokens = (
+@@ -840,6 +873,8 @@
+                     - request.num_output_placeholders
+                 )
+                 limit = getattr(request, "verification_draft_limit", None)
++                if limit is None:
++                    limit = history_limits.get(request.request_id)
+                 if limit is not None:
+                     num_scheduled_spec_tokens = min(num_scheduled_spec_tokens, limit)
+                 if num_scheduled_spec_tokens > 0:
+@@ -1071,6 +1106,7 @@
+                     if (
+                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                         and getattr(request, "verification_draft_limit", None) is None
++                        and self.dsv41_history_policy is None
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -2041,6 +2077,12 @@
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if (self.dsv41_history_policy is not None and not output_is_stale
++                        and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
++                        and not self.structured_output_manager.should_advance(request)):
++                    if getattr(request, "verification_draft_limit", None) is None:
++                        self.dsv41_history_policy.observe(
++                            req_id, num_draft_tokens, num_accepted)
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+@@ -2559,6 +2601,8 @@
+             if type(limit) is not int or not 0 <= limit <= self.num_spec_tokens:
+                 raise ValueError("spec_k must be an integer in the configured draft range")
+             request.verification_draft_limit = limit
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.forget(request.request_id)
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+@@ -2681,6 +2725,8 @@
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+         self._free_request_blocks(request)
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.forget(request.request_id)
+         del self.requests[request.request_id]
+ 
+     @property
+diff --git a/vllm/v1/core/sched/dsv41_history_policy.py b/vllm/v1/core/sched/dsv41_history_policy.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_history_policy.py
+@@ -0,0 +1,252 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU-only DSpark prefix policy. No confidence relay, device sync or RPC.
++
++Uniform periods: KS4378200 reviewed rounds3/4 upper envelope, median across
++fixtures (labels are not policy inputs). Ragged penalty: node1 matched-row
++rounds1/2, c8/c32. All numbers ms, drafting remains full width.
++"""
++from __future__ import annotations
++
++import math
++import random
++import time
++from collections import Counter
++from dataclasses import dataclass, field
++
++# C -> k1..5 request recurrence periods, not independent forward timings.
++UNIFORM_MS = {
++    1: (23.3363, 25.1028, 26.8228, 29.0576, 30.0880),
++    2: (24.3722, 26.0088, 27.7099, 29.8630, 30.9034),
++    4: (27.7395, 29.2079, 30.3102, 32.4898, 33.6713),
++    8: (31.1514, 34.9460, 39.0532, 41.8467, 44.5077),
++    16: (50.8700, 54.9209, 58.4146, 61.6853, 64.1886),
++    32: (64.8606, 69.6108, 74.2044, 80.4401, 83.9715),
++}
++
++
++def interpolate(xs, values, x):
++    if x <= xs[0]:
++        return values[0]
++    for i in range(1, len(xs)):
++        if x <= xs[i]:
++            w = (x-xs[i-1])/(xs[i]-xs[i-1])
++            return values[i-1]*(1-w)+values[i]*w
++    return values[-1]
++
++
++@dataclass
++class History:
++    risk: list[float] = field(default_factory=lambda: [0.0]*5)
++    success: list[float] = field(default_factory=lambda: [0.0]*5)
++    blocks: int = 0
++    k: int = 5
++
++    def observe(self, drafted: int, accepted: int):
++        if not 0 <= accepted <= drafted <= 5:
++            return
++        self.blocks += 1
++        # Long-history window, not accepted/step feedback. Unobserved tails
++        # decay but do not become failures; exploration refreshes them.
++        for j in range(5):
++            self.risk[j] *= 0.995
++            self.success[j] *= 0.995
++            if drafted > j and accepted >= j:
++                self.risk[j] += 1
++                self.success[j] += accepted > j
++
++    def estimate(self):
++        # Weak optimistic cold-start prior. Keep full width until 8 blocks.
++        q = [(s+1.6)/(n+2.0) for s,n in zip(self.success,self.risk)]
++        e, var, survival = [1.0], [0.0], 1.0
++        for j,p in enumerate(q):
++            survival *= p
++            e.append(e[-1]+survival)
++            # Delta-method accumulated probability error, effective samples
++            # discounted by 4 for within-request correlation. This is a
++            # conservative engineering band, NOT a formal coverage guarantee.
++            v = sum(q[l]*(1-q[l])/(self.risk[l]/4+3) /
++                    max(q[l]*q[l], 1e-6) for l in range(j+1))
++            var.append(var[-1]+survival*math.sqrt(v))
++        return e, var, q
++
++
++class HistoryPolicy:
++    def __init__(self, logger):
++        self.logger = logger
++        self.history: dict[str, History] = {}
++        self.rng = random.Random(4378200)
++        self.hist = Counter()
++        self.decisions = 0
++        self.cpu_ns = 0
++        self.last_plan = {}
++        logger.info("DSV41 history policy enabled: at-risk CPU cohort, "
++                    "warm_blocks=8 exploration=0.02 hysteresis=0.01 cost_error=0.02; "
++                    "GPU confidence policy must remain disabled")
++
++    def forget(self, request_id):
++        self.history.pop(request_id, None)
++        self.last_plan.pop(request_id, None)
++
++    def observe(self, request_id, drafted, accepted):
++        self.history.setdefault(request_id, History()).observe(drafted, accepted)
++
++    def cost(self, concurrency, widths, heterogeneity=0.0):
++        """Recurrence proxy keyed by live load, cohort n/R and graph path.
++
++        n correction captures fixed-per-cohort overhead at a changed capacity.
++        Ragged cost includes PIECEWISE + metadata and padding, not just rows.
++        Never extrapolate outside the measured concurrency domain.
++        """
++        n = len(widths)
++        mean_k = sum(widths)/n
++        cs = sorted(UNIFORM_MS)
++        curve = [interpolate(cs, [UNIFORM_MS[c][j] for c in cs], concurrency)
++                 for j in range(5)]
++        period = interpolate([1,2,3,4,5], curve, max(1,mean_k))
++        # Acceptance heterogeneity is observable, not a fixture/mode label.
++        # 50/50 high/low measured anchors; smoothly shrink to homogeneous
++        # history outside a genuinely heterogeneous cohort.
++        weight = min(1.0, heterogeneity / 3.0)
++        if weight and concurrency >= 8 and mean_k >= 3:
++            t3 = interpolate([8,32], [41.186,75.471], concurrency)
++            t5 = interpolate([8,32], [47.238,87.528], concurrency)
++            mixed_reference = t3 + (t5-t3)*(mean_k-3)/2
++            period = period*(1-weight)+mixed_reference*weight
++        nominal_n = 1 if concurrency <= 4 else math.ceil(concurrency/6)
++        # Calibrated reference cohort size; avoid pretending a single n2
++        # forward costs the whole c32 cycle. Bounded shape correction only.
++        period *= min(1.25, max(0.8, (n/nominal_n)**0.12))
++        if len(set(widths)) > 1:
++            penalty = interpolate([8,32], [4.694,4.452], concurrency)
++            rows = sum(k+1 for k in widths)
++            padded = rows if rows <= 4 else 8*math.ceil(rows/8)
++            period += penalty + 0.08*max(0,padded-rows)
++        return period
++
++    def choose(self, requests, concurrency, residents=None):
++        start = time.perf_counter_ns()
++        live = {r.request_id for r in requests}
++        if not live:
++            return {}
++        # Only these eligible requests are priced jointly. Existing scheduler
++        # owns phase/capacity; policy never opens/reassigns a cohort.
++        if all(getattr(r, 'verification_draft_limit', None) is not None
++               for r in requests):
++            for r in requests:
++                self.last_plan[r.request_id] = r.verification_draft_limit
++            return {}
++        states = [self.history.setdefault(r.request_id, History()) for r in requests]
++        estimates = [h.estimate() for h in states]
++        manual = [getattr(r, 'verification_draft_limit', None) for r in requests]
++        warm = [h.blocks < 8 for h in states]
++        current = [m if m is not None else h.k for m,h in zip(manual,states)]
++        candidates = [current]
++        for k in range(1,6):
++            candidates.append([m if m is not None else (5 if w else k)
++                               for m,w in zip(manual,warm)])
++        # Marginal-position allocation with common shadow price, not each
++        # request's independent E/step maximum. Enumerate modest thresholds.
++        for threshold in (0.03,0.06,0.10,0.16,0.24):
++            widths = []
++            for m,w,(e,err,q) in zip(manual,warm,estimates):
++                if m is not None:
++                    widths.append(m)
++                elif w:
++                    widths.append(5)
++                else:
++                    valid = [k for k in range(1,6)
++                             if all((e[j]-e[j-1])/e[j-1] >= threshold
++                                    for j in range(2,k+1))]
++                    widths.append(max(valid,default=1))
++            candidates.append(widths)
++        candidates = list(dict.fromkeys(tuple(v) for v in candidates))
++        # Other in-flight phases consume the SAME pipeline resources. Price
++        # candidate changes against their fixed output/load, never optimize
++        # this cohort's independent ratio in isolation. Grouping stays owned
++        # by AsyncScheduler; no phase migration or feedback ordering changes.
++        peers = [r for r in (residents or requests)
++                 if r.request_id not in live and not r.is_prefill_chunk]
++        peer_groups = {}
++        global_e5 = [e[5] for e,_,_ in estimates]
++        peer_tokens = 0.0
++        for r in peers:
++            h = self.history.setdefault(r.request_id, History())
++            e,_,_ = h.estimate()
++            k = getattr(r, 'verification_draft_limit', None)
++            if k is None:
++                k = h.k
++            peer_tokens += e[k]
++            global_e5.append(e[5])
++            phase = getattr(r, 'decode_cohort_phase', r.request_id)
++            peer_groups.setdefault(phase, []).append(k)
++        heterogeneity = max(global_e5)-min(global_e5)
++        # Sparse low-occupancy heterogeneous phases: matched-row experiments
++        # showed the ragged/phase penalty exceeds the trimming budget at C8.
++        # Cohort-local homogeneous plans can still create global ragged cadence.
++        # No measured support for that transition: retain full width until the
++        # saturated region, not a mode/prompt gate. Remember the condition for
++        # the request lifetime so tail drain cannot reopen an unsafe decision.
++        if concurrency <= 8 and heterogeneity > 1.0:
++            for r in (residents or requests):
++                self.history.setdefault(r.request_id, History()).mixed_guard = True
++        if any(getattr(h, 'mixed_guard', False) for h in states):
++            result = {}
++            for r,h,m in zip(requests,states,manual):
++                if m is None:
++                    h.k = 5
++                    result[r.request_id] = 5
++                self.last_plan[r.request_id] = m if m is not None else 5
++            self.hist['mixed_guard5'] += len(result)
++            self.decisions += 1
++            self.cpu_ns += time.perf_counter_ns()-start
++            if self.decisions % 64 == 0:
++                self.logger.info("DSV41 history mixed_guard=full C=%d cohort=%d "
++                                 "heterogeneity=%.3f cpu_us_mean=%.1f",
++                                 concurrency,len(requests),heterogeneity,
++                                 self.cpu_ns/self.decisions/1000)
++            return result
++        total_n = len(requests)+len(peers)
++        fixed_load = sum(len(widths)/total_n *
++                         self.cost(concurrency,widths,heterogeneity)
++                         for widths in peer_groups.values())
++        def score(plan):
++            tokens = peer_tokens + sum(e[k] for k,(e,_,_) in zip(plan,estimates))
++            period = fixed_load + len(requests)/total_n * self.cost(
++                concurrency,plan,heterogeneity)
++            return tokens/period
++        reference = tuple(current)
++        chosen = max(candidates,key=score)
++        gain = score(chosen)/score(reference)-1
++        # Only uncertainty of positions changed contributes; shared prefix
++        # cancels. Sum correlated errors rather than treating positions iid.
++        change_error = sum(abs(err[k]-err[old]) for k,old,(_,err,_) in
++                           zip(chosen,reference,estimates))
++        ref_tokens = peer_tokens + sum(e[k] for k,(e,_,_) in zip(reference,estimates))
++        band = 1.64*change_error/max(ref_tokens,1) + 0.02
++        if gain <= band + 0.01:
++            chosen = reference
++        # Full-width exploration jointly per cohort, never changes manual k.
++        explored = self.rng.random() < 0.02
++        if explored:
++            chosen = tuple(m if m is not None else 5 for m in manual)
++        result = {}
++        for r,h,m,k in zip(requests,states,manual,chosen):
++            if m is None:
++                # Exploration does not reset baseline hysteresis state.
++                if not explored:
++                    h.k = k
++                result[r.request_id] = k
++            self.hist['manual' if m is not None else str(k)] += 1
++            self.last_plan[r.request_id] = k
++        self.decisions += 1
++        self.cpu_ns += time.perf_counter_ns()-start
++        if self.decisions % 64 == 0:
++            qs = [sum(v[2][j] for v in estimates)/len(estimates) for j in range(5)]
++            self.logger.info("DSV41 history decisions=%d C=%d cohort=%d "
++                             "k_hist=%s q=%s candidate_gain=%.4f band=%.4f "
++                             "cpu_us_mean=%.1f",
++                             self.decisions,concurrency,len(requests),dict(self.hist),
++                             [round(q,4) for q in qs],gain,band,
++                             self.cpu_ns/self.decisions/1000)
++            self.hist.clear()
++        return result

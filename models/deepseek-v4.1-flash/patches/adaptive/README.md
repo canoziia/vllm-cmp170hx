@@ -1,9 +1,11 @@
 # Adaptive verification series (compiled into the default build, off at runtime)
 
 `patches/adaptive/series` is applied by `scripts/build-deepseek-v41-image.sh` by
-default. It stays inert because `enable_adaptive_verification` defaults to `false`
-in the speculative config and every hook the series installs is behind an adaptive
-check, which the build now asserts. Opt out with `ENABLE_ADAPTIVE_VERIFICATION=0`.
+default. The PP adaptive hooks stay inert because `enable_adaptive_verification`
+defaults to `false`. Verification-width and metadata optimisations added by 0008
+have separate default-off switches (`VLLM_DSV41_OPT_PROFILE=verification` opts in)
+and do not require the adaptive scoring policy. Opt out of the complete series
+with `ENABLE_ADAPTIVE_VERIFICATION=0`.
 
 Enable per deployment:
 
@@ -89,8 +91,9 @@ That distinction also assigns the two defects found so far:
   and pipeline wait - is about 70% of a c1 step (42.6 ms period against 12-15 ms of
   priced work) and still about a third at c32. Moving the algorithm outside the
   regime its cost model assumed, without extending that model, is what produces the
-  systematic under-verification at low concurrency. 0008 (price the fixed per-step
-  cost) is the completion of our port.
+  systematic under-verification at low concurrency. A historical fixed-cost
+  experiment numbered 0008 was removed after a negative result; it is not the
+  current 0008 and is not shipped.
 
 ### 0007: uniform decode graphs alongside varlen (why "on but trimmed nothing" was slow)
 
@@ -111,6 +114,22 @@ range-partitioning, because inserting them there would let a uniform graph claim
 the counts under its bucket and starve ragged steps of their varlen graph,
 dropping those steps to eager. `_is_compatible()` still refuses a uniform graph
 unless the step is uniform at that width, so ragged steps are unchanged.
+
+### 0008: verification widths, live-load cohorts and metadata replay
+
+The current 0008 corrects 0007's list-alias/range-partition and early candidate
+priority defects, captures common narrow uniform graphs, and adds an independently
+opt-in execution path for CPU-known per-request draft prefixes (`spec_k`). Target
+acceptance/rejection and the PP feedback collective shape/order are unchanged.
+Adaptive confidence scoring remains separate; an adaptive batch is never treated
+as uniform merely because its total budget divides by its request count.
+
+The verification profile also uses a live-load established-decode cap, packs
+partial PP phases only after their feedback's earliest eligible step, shares the
+device token-owner map across KV groups, and replays metadata preparation for
+exact uniform SM80 batches. Padding/ragged/prefill/dummy and unsupported paths
+keep the builder. See the model README for switches, the request contract and
+CPU/GPU tests. These switches are all off under the deployed `default` profile.
 
 ### Measured cost of shipping it (runtime flag off)
 
