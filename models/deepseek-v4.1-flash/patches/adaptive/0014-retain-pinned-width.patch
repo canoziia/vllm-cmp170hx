@@ -1,0 +1,51 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -629,6 +629,8 @@
+         # full proposals until NEXT eligible scheduling so k can grow again.
+         history_limits = {}
+         if self.dsv41_history_policy is not None:
++            history_limits.update(
++                self.dsv41_history_policy.retained_limits(self.running))
+             eligible = [r for r in self.running
+                         if not r.is_prefill_chunk
+                         and self.current_step >= r.next_decode_eligible_step
+@@ -639,10 +641,10 @@
+                 eligible = eligible[:getattr(
+                     self, "_get_max_num_scheduled_decodes",
+                     lambda: self.max_num_running_reqs)()]
+-                history_limits = self.dsv41_history_policy.choose(
++                history_limits.update(self.dsv41_history_policy.choose(
+                     eligible, min(self.max_num_running_reqs,
+                                   len(self.running) + len(self.waiting)
+-                                  + len(self.skipped_waiting)), self.running)
++                                  + len(self.skipped_waiting)), self.running))
+ 
+         # First, schedule the RUNNING requests.
+         req_index = 0
+diff --git a/vllm/v1/core/sched/dsv41_hot_policy.py b/vllm/v1/core/sched/dsv41_hot_policy.py
+--- a/vllm/v1/core/sched/dsv41_hot_policy.py
++++ b/vllm/v1/core/sched/dsv41_hot_policy.py
+@@ -96,6 +96,22 @@
+                         error=type(exc).__name__))
+         self.logger.warning('DSV41 hot version %.12s disabled; baseline retained', entry.version)
+ 
++    def retained_limits(self, requests):
++        """Keep authenticated pinned widths when new decisions are ineligible.
++
++        In-flight/stale-output and cohort-capacity gates may omit a resident
++        from choose(). Absence must not mean full5 for an active experiment.
++        Failed revisions and manual requests retain the ordinary fallback path.
++        """
++        result = {}
++        for request in requests:
++            entry = self.active.get(request.request_id)
++            if (entry is not None and not entry.failed
++                    and entry.version not in self.disabled
++                    and getattr(request, 'verification_draft_limit', None) is None):
++                result[request.request_id] = entry.k
++        return result
++
+     def choose(self, requests, concurrency, residents=None):
+         result = super().choose(requests, concurrency, residents)
+         for r in requests:
