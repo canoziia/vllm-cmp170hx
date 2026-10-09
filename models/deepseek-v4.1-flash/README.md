@@ -80,8 +80,8 @@ CPU scheduler history/cohort policy: conditional at-risk acceptance estimates,
 warmup, uncertainty/hysteresis, 2% full-width exploration, and a joint
 output/cost comparison. `false` keeps fixed width. Manual `spec_k` always wins.
 History recency is configured in the same JSON, e.g.
-`"adaptive_verification_decay":0.9` (Compose `.env`:
-`VLLM_ADAPTIVE_VERIFICATION_DECAY=0.9`). Each observed verification block
+`"adaptive_verification_decay":0.95` (the default; Compose `.env`:
+`VLLM_ADAPTIVE_VERIFICATION_DECAY=0.95`). Each observed verification block
 multiplies previous per-position risk/success weights by this value. Valid
 finite numbers are `[0,1)`; 0 keeps only the newest block. Values near 1 react
 more slowly. Decay is a per-block retention factor, not an acceptance-rate

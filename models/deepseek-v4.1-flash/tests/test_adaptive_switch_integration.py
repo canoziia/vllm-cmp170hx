@@ -36,6 +36,7 @@ def make(enabled):
  if enabled:assert s.dsv41_history_policy.decay==.95
  return s
 # Real config parsing accepts only finite numeric decay in [0,1).
+assert SpeculativeConfig(model='ngram',num_speculative_tokens=5).adaptive_verification_decay==.95
 for value in (0.,.9,.95,.999):
  parsed=SpeculativeConfig(model='ngram',num_speculative_tokens=5,
                           adaptive_verification_decay=value)
