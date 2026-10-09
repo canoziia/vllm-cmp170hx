@@ -8,9 +8,9 @@ diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
 +    """
 +
 +    adaptive_verification_decay: float = Field(
-+        default=0.9, ge=0.0, lt=1.0, allow_inf_nan=False, strict=True)
++        default=0.95, ge=0.0, lt=1.0, allow_inf_nan=False, strict=True)
 +    """History weight retained per verification feedback block for DeepSeek's
-+    CPU adaptive policy. 0.9 gives an approximate ten-block weight horizon;
++    CPU adaptive policy. 0.95 gives an approximate twenty-block weight horizon;
 +    0 discards all but the newest block. Ignored when adaptive verification is off.
      """
  
@@ -38,7 +38,7 @@ diff --git a/vllm/v1/core/sched/dsv41_history_policy.py b/vllm/v1/core/sched/dsv
 +    risk_weight_sq: list[float] = field(default_factory=lambda: [0.0]*5)
      blocks: int = 0
      k: int = 5
-+    decay: float = 0.9
++    decay: float = 0.95
 +    pending_k: int = 5
 +    pending_blocks: int = 0
 +    last_choice_block: int = -1
@@ -114,7 +114,7 @@ diff --git a/vllm/v1/core/sched/dsv41_history_policy.py b/vllm/v1/core/sched/dsv
  
  class HistoryPolicy:
 -    def __init__(self, logger):
-+    def __init__(self, logger, decay=0.9):
++    def __init__(self, logger, decay=0.95):
 +        if isinstance(decay,bool) or not math.isfinite(decay) or not 0<=decay<1:
 +            raise ValueError("adaptive_verification_decay must be finite in [0,1)")
 +        self.decay = decay

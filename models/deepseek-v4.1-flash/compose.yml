@@ -95,7 +95,7 @@ services:
       # Public algorithm switch: true enables CPU history-based automatic k;
       # false keeps fixed depth. The optimisation profile does not enable it.
       # Manual request spec_k overrides automatic selection.
-      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true,"enable_adaptive_verification":${VLLM_ADAPTIVE_VERIFICATION:-false},"adaptive_verification_decay":${VLLM_ADAPTIVE_VERIFICATION_DECAY:-0.9}}'
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true,"enable_adaptive_verification":${VLLM_ADAPTIVE_VERIFICATION:-false},"adaptive_verification_decay":${VLLM_ADAPTIVE_VERIFICATION_DECAY:-0.95}}'
       - --per-request-spec-decode-metrics=detailed
       - --tokenizer-mode=deepseek_v41
       - --enable-auto-tool-choice

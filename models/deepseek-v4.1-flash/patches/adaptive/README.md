@@ -29,7 +29,7 @@ additional user switches. Existing default-OFF configuration stays OFF.
 
 ### History retention configuration (0011, candidate)
 
-`adaptive_verification_decay` is read from `--speculative-config` (default0.9,
+`adaptive_verification_decay` is read from `--speculative-config` (default0.95,
 finite numeric `[0,1)`). It multiplies old at-risk success/risk weights on each
 feedback block. The estimator also retains squared weights for effective sample
 size; changing decay must not leave the old raw-risk/4 uncertainty gate intact.

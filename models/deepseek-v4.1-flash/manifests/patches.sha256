@@ -7,7 +7,7 @@ b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepsee
 0fe44111c6a723311c0597c6514b135c884e5961901aa53a3014dc439e7f99e7  models/deepseek-v4.1-flash/patches/adaptive/0004-v2-budget-relay-integration.patch
 6e10c44cf3fd73ed5e8951993c281830523351bbab6fa2c7585e1d726872d6e2  models/deepseek-v4.1-flash/patches/adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
 4c56ae883f0c10f750fc64d4a66b9c78b67d6de3b1502bc562a9f940026846ec  models/deepseek-v4.1-flash/patches/adaptive/series
-1bc2b516038514ce0e52fd53d2fff250bafb3f88794d154c3472d4989939cb4b  models/deepseek-v4.1-flash/patches/adaptive/0011-configurable-history-decay.patch
+c0c79d8f2beb2ca782657acff2efd8c36e5b6cda5cafef6fafbcce92cec8b4b5  models/deepseek-v4.1-flash/patches/adaptive/0011-configurable-history-decay.patch
 6b04c181f00d3816afa11cd8e92cdb3622b8afdbd7155afcc71ffac0d99bf347  models/deepseek-v4.1-flash/patches/adaptive/0010-unify-adaptive-verification-switch.patch
 0f2eb0c72cbe4e38aead7ba32209e0d2141f5a15feb7bf6cad690cf1f874a0ed  models/deepseek-v4.1-flash/patches/adaptive/0008-verification-widths-and-live-cohorts.patch
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v4.1-flash/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
