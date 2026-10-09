@@ -10,3 +10,4 @@ adaptive/0009-cpu-history-cohort-policy.patch
 adaptive/0010-unify-adaptive-verification-switch.patch
 adaptive/0011-configurable-history-decay.patch
 adaptive/0012-target-only-history-draft-config.patch
+adaptive/0013-hot-request-policy.patch
