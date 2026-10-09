@@ -1,0 +1,326 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,7 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
+-import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -271,20 +270,6 @@
+         # manager's re-prefillable window (this minus 1), and how many tokens to
+         # reserve between a chunk boundary and the prefill end.
+         self.num_prefill_lookahead = 0
+-        self._dspark_control = os.environ.get("VLLM_DSPARK_CONTROL_FILE", "")
+-        self._dspark_poll_at = 0.0
+-        self._dspark_enabled = True
+-        if self._dspark_control:
+-            # Adaptive verification is allowed alongside the hot toggle: a K=0
+-            # step clamps the PP verification budget to the drafts the scheduler
+-            # actually scheduled, so the toggle stays the single source of truth.
+-            if not (
+-                speculative_config
+-                and speculative_config.use_dspark()
+-                and vllm_config.use_v2_model_runner
+-                and self.parallel_config.data_parallel_size == 1
+-            ):
+-                raise ValueError("Hot DSpark requires MRV2 DSpark with DP=1")
+         self.dynamic_sd_lookup: list[int] | None = None
+         if speculative_config is not None:
+             if speculative_config.num_speculative_tokens_per_batch_size:
+@@ -343,8 +328,8 @@
+         if spec is not None and spec.uses_history_verification():
+             if not self.use_v2_model_runner:
+                 raise ValueError("Adaptive DeepSeek verification requires Model Runner V2")
+-            from .dsv41_history_policy import HistoryPolicy
+-            self.dsv41_history_policy = HistoryPolicy(
++            from .dsv41_hot_policy import HotHistoryPolicy
++            self.dsv41_history_policy = HotHistoryPolicy(
+                 logger, decay=spec.adaptive_verification_decay)
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+@@ -1115,8 +1100,7 @@
+                     # preserve full cudagraph for this step.
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
+-                         and not self._dspark_control)
++                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                         and getattr(request, "verification_draft_limit", None) is None
+                         and self.dsv41_history_policy is None
+                         and self.num_sampled_tokens_per_step > 0
+@@ -1489,25 +1473,6 @@
+                 len(num_scheduled_tokens)
+             ]
+ 
+-        if self._dspark_control:
+-            now = time.monotonic()
+-            if now >= self._dspark_poll_at:
+-                self._dspark_poll_at = now + 1.0
+-                try:
+-                    with open(self._dspark_control) as f:
+-                        value = f.read(16).strip()
+-                    if value in ("0", "1"):
+-                        enabled = value == "1"
+-                        if enabled != self._dspark_enabled:
+-                            logger.info("Hot DSpark: requested K=%d",
+-                                        self.num_spec_tokens if enabled else 0)
+-                        self._dspark_enabled = enabled
+-                except OSError:
+-                    pass
+-            num_spec_tokens_to_schedule = (
+-                self.num_spec_tokens if self._dspark_enabled else 0
+-            )
+-
+         scheduled_encoder_input_stats = None
+         if (
+             self.log_stats
+@@ -1566,6 +1531,11 @@
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.scheduled(
++                scheduler_output, self.running,
++                min(self.max_num_running_reqs, len(self.running)+len(self.waiting)
++                    +len(self.skipped_waiting)))
+         return scheduler_output
+ 
+     def _get_max_num_scheduled_decodes(self) -> int:
+@@ -2006,6 +1976,8 @@
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.begin_feedback()
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+@@ -2108,6 +2080,16 @@
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if self.dsv41_history_policy is not None:
++                    self.dsv41_history_policy.feedback(
++                        scheduler_output, request, num_draft_tokens, num_accepted,
++                        len(generated_token_ids),
++                        valid=(not output_is_stale
++                               and 0 <= num_accepted <= num_draft_tokens
++                               and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
++                               and not self.structured_output_manager.should_advance(request)
++                               and request.num_output_tokens + len(generated_token_ids)
++                                   < request.max_tokens))
+                 if (self.dsv41_history_policy is not None and not output_is_stale
+                         and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
+                         and not self.structured_output_manager.should_advance(request)):
+@@ -2635,6 +2617,7 @@
+             request.verification_draft_limit = limit
+         if self.dsv41_history_policy is not None:
+             self.dsv41_history_policy.forget(request.request_id)
++            self.dsv41_history_policy.admit(request)
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+diff --git a/vllm/v1/core/sched/dsv41_hot_policy.py b/vllm/v1/core/sched/dsv41_hot_policy.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_hot_policy.py
+@@ -0,0 +1,196 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Trusted host-only request-pinned CPU policy experiments. Not a Python sandbox.
++No GPU sync/RPC/signals. Public clients cannot supply module paths or source.
++Control is read only at request admission; active requests retain their version.
++"""
++import hashlib
++import hmac
++import json
++import math
++import os
++import re
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++from .dsv41_history_policy import HistoryPolicy
++
++
++class HotHistoryPolicy(HistoryPolicy):
++    def __init__(self, logger, decay=.95):
++        super().__init__(logger, decay)
++        self.root = Path(os.environ.get('VLLM_DSV41_POLICY_DIR', '/root/.cache/dsv41-policy'))
++        self.active = {}
++        self.generation = 0
++        self.modules = {}
++        self.disabled = set()
++        self.feedback_time = None
++        self.trace_path = self.root / 'trace.jsonl'
++        self.trace_bytes = 0
++
++    def trace(self, event):
++        # Only opt-in experiments. Bounded bytes per engine lifetime; no prompt,
++        # output IDs, credential or user-supplied code in this file.
++        if self.trace_bytes > 64*1024*1024:
++            return
++        try:
++            data = json.dumps(event, allow_nan=False, separators=(',', ':'))+'\n'
++            fd = os.open(self.trace_path, os.O_WRONLY|os.O_CREAT|os.O_APPEND, 0o600)
++            try:
++                os.write(fd, data.encode())
++            finally:
++                os.close(fd)
++            self.trace_bytes += len(data)
++        except Exception:
++            self.logger.warning('DSV41 hot policy trace unavailable')
++
++    def admit(self, request):
++        extra = getattr(request.sampling_params, 'extra_args', None) or {}
++        supplied = extra.get('spec_policy_token')
++        if not isinstance(supplied, str) or getattr(request, 'verification_draft_limit', None) is not None:
++            return
++        try:
++            control = json.loads((self.root/'control.json').read_text())
++            secret = control.get('token', '')
++            if not control.get('enabled') or not isinstance(secret, str) or len(secret)<32:
++                return
++            if not hmac.compare_digest(supplied, secret):
++                return
++            digest = control['sha256']
++            if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{64}', digest):
++                raise ValueError('bad digest')
++            if digest in self.disabled:
++                return
++            if digest not in self.modules:
++                if len(self.modules)>=32:
++                    raise ValueError('version limit reached')
++                path = self.root/'versions'/(digest+'.py')
++                if path.is_symlink() or path.stat().st_size>131072:
++                    raise ValueError('bad source')
++                source = path.read_bytes()
++                if hashlib.sha256(source).hexdigest()!=digest:
++                    raise ValueError('digest mismatch')
++                ns = {'__name__':'dsv41_plugin_'+digest}
++                exec(compile(source, str(path), 'exec'), ns)
++                if ns.get('API_VERSION') != 1 or not callable(ns.get('Policy')):
++                    raise ValueError('bad plugin API')
++                # Factories must be lightweight, CPU-only, side-effect free.
++                ns['self_test']()
++                self.modules[digest] = ns['Policy']
++            config = control.get('config', {})
++            # JSON copy prevents plugin mutation of the control object.
++            config = json.loads(json.dumps(config))
++            plugin = self.modules[digest](config)
++            rid = request.request_id
++            self.generation += 1
++            self.active[rid] = SimpleNamespace(plugin=plugin, version=digest, k=5,
++                generation=self.generation, previous=None, fresh=False, feedback=None, seq=0, failed=False)
++            self.trace(dict(event='admit', request=rid, version=digest, config=config))
++        except Exception as exc:
++            self.logger.warning('DSV41 hot admission failed (%s); baseline retained', type(exc).__name__)
++
++    def fail(self, rid, entry, exc):
++        self.disabled.add(entry.version)
++        entry.failed = True
++        self.trace(dict(event='fallback', request=rid, version=entry.version,
++                        error=type(exc).__name__))
++        self.logger.warning('DSV41 hot version %.12s disabled; baseline retained', entry.version)
++
++    def choose(self, requests, concurrency, residents=None):
++        result = super().choose(requests, concurrency, residents)
++        for r in requests:
++            entry = self.active.get(r.request_id)
++            if not entry or entry.failed or entry.version in self.disabled:
++                continue
++            try:
++                if entry.fresh:
++                    started = time.perf_counter()
++                    decision = entry.plugin.choose(dict(concurrency=concurrency,
++                        cohort_size=len(requests), current_k=entry.k))
++                    if type(decision) is not int or not 1<=decision<=5:
++                        raise ValueError('plugin k outside 1..5')
++                    if time.perf_counter()-started>.02:
++                        raise TimeoutError('slow plugin')
++                    diagnostics = getattr(entry.plugin, 'diagnostics', {})
++                    if len(json.dumps(diagnostics, allow_nan=False))>16384:
++                        raise ValueError('oversized diagnostics')
++                    self.trace(dict(event='choose',request=r.request_id,version=entry.version,
++                        seq=entry.seq,old=entry.k,next=decision,concurrency=concurrency,
++                        diagnostics=diagnostics))
++                    entry.k = decision
++                    entry.fresh = False
++                result[r.request_id] = entry.k
++            except Exception as exc:
++                self.fail(r.request_id, entry, exc)
++        return result
++
++    def scheduled(self, output, residents, concurrency):
++        if not self.active:
++            return
++        now = time.perf_counter()
++        # Identity of the live cohort/load invalidates cross-load speed records.
++        load_key = tuple(sorted(r.request_id for r in residents))
++        prefilling = any(r.is_prefill_chunk for r in residents)
++        stamps = {}
++        for rid, drafts in output.scheduled_spec_decode_tokens.items():
++            entry = self.active.get(rid)
++            if entry and not entry.failed and entry.version not in self.disabled:
++                entry.seq += 1
++                stamps[rid] = (entry, now, load_key, prefilling, concurrency,
++                               len(drafts), entry.seq)
++        # Stored on the exact SchedulerOutput, not a single latest-request slot.
++        # It is CPU-only timing metadata; do not attach plugin objects to workers.
++        output._dsv41_hot_stamps = {rid:(e.generation,*rest) for rid,(e,*rest) in stamps.items()}
++
++    def begin_feedback(self):
++        self.feedback_time = time.perf_counter()
++
++    def feedback(self, output, request, drafted, accepted, output_tokens, valid):
++        rid = request.request_id
++        stamp = getattr(output, '_dsv41_hot_stamps', {}).get(rid)
++        entry = self.active.get(rid)
++        if not entry or not stamp or stamp[0]!=entry.generation or entry.failed or entry.version in self.disabled:
++            return
++        _, sent, load_key, prefilling, concurrency, actual_k, seq = stamp
++        now = self.feedback_time if self.feedback_time is not None else time.perf_counter()
++        latency = now-sent
++        previous = entry.previous
++        entry.previous = (now, load_key, prefilling, actual_k)
++        # Feedback-to-feedback recurrence includes pipeline cadence, queueing,
++        # scheduler overhead. NOT CUDA kernel time. On a k transition use
++        # dispatch-to-feedback latency; no previous-width period attribution.
++        seconds = latency
++        kind = 'dispatch_to_feedback'
++        timing_valid = valid and not prefilling and previous is not None and previous[1]==load_key and not previous[2]
++        if timing_valid and previous[3]==actual_k:
++            seconds = now-previous[0]
++            kind = 'feedback_recurrence'
++        else:
++            # Dispatch latency is logged, but is not comparable to steady
++            # recurrence. Exclude the transition period from reward training.
++            timing_valid = False
++        if not valid:
++            entry.previous = None
++        if not 0<seconds<60 or actual_k!=drafted:
++            timing_valid = False
++        event = dict(request=rid,version=entry.version,seq=seq,k=drafted,accepted=accepted,
++                     output_tokens=output_tokens,seconds=seconds,latency_s=latency,
++                     timing_kind=kind,timing_valid=timing_valid,valid=valid,
++                     concurrency=concurrency,load_epoch=hash(load_key))
++        self.trace(dict(event='feedback',**event))
++        if not valid:
++            return
++        try:
++            started=time.perf_counter()
++            entry.plugin.observe(event.copy())
++            if time.perf_counter()-started>.02:
++                raise TimeoutError('slow plugin')
++            entry.fresh=True
++        except Exception as exc:
++            self.fail(rid,entry,exc)
++
++    def forget(self, request_id):
++        super().forget(request_id)
++        entry=self.active.pop(request_id,None)
++        if entry:
++            self.trace(dict(event='forget',request=request_id,version=entry.version))
