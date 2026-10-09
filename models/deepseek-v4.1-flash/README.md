@@ -69,20 +69,20 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 - `VLLM_DSV41_FAST_METADATA=1`: compute a persistent device token-owner map once
   per small decode batch and share it across KV groups (not enabled with DBO);
 - `VLLM_DSV41_METADATA_GRAPHS=1`: on SM80, replay metadata preparation for exact
-  CPU-known uniform batches. Prefill, ragged, padded, dummy and adaptive batches
-  keep the original builder. No new PP messages or communicators are introduced.
+  CPU-known uniform batches, including CPU-selected adaptive widths. Prefill,
+  ragged, padded, dummy and GPU-allocated adaptive batches keep the original builder. No new PP messages or communicators are introduced.
 
-- `VLLM_DSV41_HISTORY_POLICY=1`: CPU scheduler history-based cohort policy,
-  enabled by this same `verification` profile (no extra deployment profile).
-  Estimates conditional acceptance at each actually verified position, with
-  smoothing, warmup, uncertainty/hysteresis and 2% cohort-wide full-width
-  exploration. Compares joint uniform k1–5 and mixed marginal-depth plans by
-  expected total output / measured recurrence cost, including ragged graph
-  penalties and live concurrency/cohort shape. Manual `spec_k` always wins.
-  Set this component to `0` for fixed-width KS comparisons. The old GPU
-  confidence allocator must remain disabled; enabling both fails startup.
+Automatic depth is controlled only by
+`--speculative-config '{"method":"dspark", "num_speculative_tokens":5,
+"enable_adaptive_verification":true}'` (in Compose set
+`VLLM_ADAPTIVE_VERIFICATION=true` in `.env`). On DeepSeek V4.1 this selects the
+CPU scheduler history/cohort policy: conditional at-risk acceptance estimates,
+warmup, uncertainty/hysteresis, 2% full-width exploration, and a joint
+output/cost comparison. `false` keeps fixed width. Manual `spec_k` always wins.
+There is no separate `VLLM_DSV41_HISTORY_POLICY` user switch; the `verification`
+profile only enables the four execution optimisations above, never auto-k.
 
-All five switches default off independently; explicit environment values override
+All four optimisation switches default off independently; explicit environment values override
 profile defaults. Configure the profile in `.env`, then use the regular build and
 Compose deployment. Do not enable a new performance profile without checking the
 workload's k5 regression gate.
@@ -94,10 +94,9 @@ draft is still accepted/rejected by the target. The configured DSpark drafter
 still proposes its full block; this is not a drafter-compute shortcut. Requests
 can have different limits; nonuniform mixtures fall back to a compatible graph
 or eager execution rather than being falsely labelled uniform. Omission uses
-history policy when enabled, otherwise retains configured full width. With the
-CPU history policy, manual `spec_k` is fixed (not an adaptive upper bound).
-Without that CPU policy, the older GPU adaptive verification, if separately
-enabled, may trim below this upper bound. The field is validated before numeric coercion and
+the CPU history policy when `enable_adaptive_verification=true`, otherwise
+retains configured full width. Manual `spec_k` is fixed, not an adaptive upper
+bound. The field is validated before numeric coercion and
 rejected on unsupported models or when the feature is disabled. It is a
 request-creation setting, not a hot update of a running request.
 

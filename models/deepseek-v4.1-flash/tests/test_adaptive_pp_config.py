@@ -6,9 +6,11 @@ from vllm.config import VllmConfig,CUDAGraphMode
 
 
 def config():
+    spec = NS(enable_adaptive_verification=True,method='dspark',draft_sample_method='greedy',num_speculative_tokens=5)
+    spec.uses_history_verification = lambda: spec.enable_adaptive_verification
     return NS(lora_config=None,compilation_config=NS(cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE),
         model_config=NS(architectures=['DeepseekV41ForCausalLM']),
-        speculative_config=NS(enable_adaptive_verification=True,method='dspark',draft_sample_method='greedy'),
+        speculative_config=spec,
         parallel_config=NS(pipeline_parallel_size=6,tensor_parallel_size=1,data_parallel_size=1,
             prefill_context_parallel_size=1,decode_context_parallel_size=1,use_ubatching=False))
 

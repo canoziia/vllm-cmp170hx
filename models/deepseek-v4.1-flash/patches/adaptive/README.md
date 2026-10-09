@@ -12,6 +12,21 @@ Enable per deployment:
     --speculative-config={"method":"dspark","num_speculative_tokens":5,\
       "use_local_argmax_reduction":true,"enable_adaptive_verification":true}
 
+### Public adaptive switch (0010)
+
+`enable_adaptive_verification=true` now selects the CPU at-risk history/cohort
+policy for DeepSeek V4.1. `false` disables automatic k. The `verification`
+optimisation profile no longer enables the algorithm, and the separate
+`VLLM_DSV41_HISTORY_POLICY` environment switch is removed. Compose forwards
+`VLLM_ADAPTIVE_VERIFICATION` (default false) to this public configuration field.
+Manual request `spec_k` overrides the automatic decision.
+
+Internally, device-layout consumers use `uses_gpu_adaptive_verification()`;
+DeepSeek's CPU-known widths must not accidentally enable GPU compaction,
+confidence relay, or device-only sampling boundaries. Other DSpark models retain
+their prior confidence allocator. These internal capability methods are not
+additional user switches. Existing default-OFF configuration stays OFF.
+
 ### Why shipping it by default is inert (asserted at build time)
 
 * `AttentionBackend.supports_device_cpu_query_lens_mismatch()` answers `True` on
