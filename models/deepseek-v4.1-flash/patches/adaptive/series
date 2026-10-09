@@ -8,3 +8,4 @@ adaptive/0007-uniform-decode-alongside-varlen.patch
 adaptive/0008-verification-widths-and-live-cohorts.patch
 adaptive/0009-cpu-history-cohort-policy.patch
 adaptive/0010-unify-adaptive-verification-switch.patch
+adaptive/0011-configurable-history-decay.patch

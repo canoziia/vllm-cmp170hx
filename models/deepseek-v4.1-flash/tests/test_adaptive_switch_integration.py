@@ -26,13 +26,26 @@ def make(enabled):
  cfg=seed.vllm_config;spec=cfg.speculative_config
  cfg.model_config.model_arch_config.architectures=['DeepseekV41ForCausalLM']
  spec.method='dspark';spec.target_model_config=cfg.model_config;spec.enable_adaptive_verification=enabled
+ spec.adaptive_verification_decay=.95
  os.environ['VLLM_USE_V2_MODEL_RUNNER']='1'
  import vllm.envs as envs
  envs.VLLM_USE_V2_MODEL_RUNNER=True
  s=AsyncScheduler(vllm_config=cfg,kv_cache_config=seed.kv_cache_manager.kv_cache_config,block_size=16,log_stats=True,structured_output_manager=StructuredOutputManager(cfg))
  s.pp_size=6;s.use_pp=True
  assert bool(s.dsv41_history_policy)==enabled
+ if enabled:assert s.dsv41_history_policy.decay==.95
  return s
+# Real config parsing accepts only finite numeric decay in [0,1).
+for value in (0.,.9,.95,.999):
+ parsed=SpeculativeConfig(model='ngram',num_speculative_tokens=5,
+                          adaptive_verification_decay=value)
+ assert parsed.adaptive_verification_decay==value
+for value in (-.1,1.,float('inf'),float('nan'),True,'0.9'):
+ try:SpeculativeConfig(model='ngram',num_speculative_tokens=5,
+                       adaptive_verification_decay=value)
+ except (ValueError,TypeError):pass
+ else:raise AssertionError(('invalid decay accepted',value))
+print('PASS real speculative config decay parsing/range/type validation')
 # Probe config validator's explicit supported-scope checks, with no CUDA init.
 vllm.platforms._current_platform.is_device_capability_family=lambda family:family==80
 spec=object.__new__(SpeculativeConfig);spec.enable_adaptive_verification=True;spec.method='dspark';spec.target_model_config=NS(architectures=['DeepseekV41ForCausalLM']);spec.num_speculative_tokens=5;spec.draft_sample_method='greedy'

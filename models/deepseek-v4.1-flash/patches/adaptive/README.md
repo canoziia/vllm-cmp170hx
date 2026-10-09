@@ -27,6 +27,19 @@ confidence relay, or device-only sampling boundaries. Other DSpark models retain
 their prior confidence allocator. These internal capability methods are not
 additional user switches. Existing default-OFF configuration stays OFF.
 
+### History retention configuration (0011, candidate)
+
+`adaptive_verification_decay` is read from `--speculative-config` (default0.9,
+finite numeric `[0,1)`). It multiplies old at-risk success/risk weights on each
+feedback block. The estimator also retains squared weights for effective sample
+size; changing decay must not leave the old raw-risk/4 uncertainty gate intact.
+Candidate switching compares paired score differences, preserving shared-prefix
+covariance, requires two fresh supporting feedback blocks, and periodically
+refreshes censored tails with full-width probes. Heterogeneous fallback is
+re-evaluated from recent evidence rather than permanently locking the request.
+These decision changes require online validation before deployment; offline
+full-feedback replay does not predict counterfactual token streams or throughput.
+
 ### Why shipping it by default is inert (asserted at build time)
 
 * `AttentionBackend.supports_device_cpu_query_lens_mismatch()` answers `True` on
