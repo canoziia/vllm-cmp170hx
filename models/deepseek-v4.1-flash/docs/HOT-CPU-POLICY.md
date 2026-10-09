@@ -54,3 +54,32 @@ speed. Source code storage is writable only by trusted host admin.
 Candidate measured_v1 discounts per-k N/Y/T at.95, mixes one current predicted
 pseudoblock, compares strict score>, max+1 upward and arbitrary downward jumps.
 It is experimental, not an asserted optimum; no cohort coupling or fixed warmup.
+
+## Later stability research (not a new production default)
+
+`measured_v15.py` retains per-arm measured evidence and calibrated predictions,
+adds measured-ratio uncertainty and paired-prefix gain uncertainty, and uses an
+explicit3% improvement tolerance (cold choice retains2% wider near-tie rule).
+All real evidence decays.95; old speeds themselves do not shrink. Up max+1,
+down may jump; stale-width/invalid-timing feedback cannot immediately switch.
+The uncertainty gate is a heuristic, not an iid confidence guarantee. No task
+names/labels or cohort-coupled decision is used. CPU tests include six
+concurrencies/all starting widths and high-low-high recovery. Candidate is still
+experimental: mixed-load execution exposed a fixed-interface issue below.
+
+## Retained width fix: adaptive/0014 (requires deploying scheduler code)
+
+Before0014, only residents eligible for a fresh `choose()` got history limits.
+A stale-output or capacity-excluded experiment could consequently executefull5
+although its pinned selected width was2/3, causing spurious one-step5 jumps.
+0014 seeds limits from `HotHistoryPolicy.retained_limits()` before refreshing
+eligible choices. Only active authenticated experimental entries participate;
+manual overrides, failed revisions and ordinary traffic keep their prior path.
+No GPU/PP protocol or new feedback advances are introduced.
+
+This is NOT fixable by publishing a CPU policy alone. Source/CPU integration
+checks pass; do not claim online fix until a separately approved scheduler
+maintenance deployment and repeat mixed-load GPU validation. Existing image
+8fc270533891 does NOT contain0014. Keep experimental admissions disabled until
+that validation; historical single-load results do not certify mixed-load
+stability.
