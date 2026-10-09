@@ -56,6 +56,66 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 `NVIDIA_VISIBLE_DEVICES` variable is intentionally absent;
 `CUDA_DEVICE_ORDER=PCI_BUS_ID` makes CUDA's selected-device ordering stable.
 
+## Opt-in verification widths and load-aware PP cohorts
+
+`VLLM_DSV41_OPT_PROFILE=verification` extends the deployed `default` profile;
+`default` itself is unchanged. The extension enables:
+
+- `VLLM_DSV41_VERIFICATION=1`: exact small-cohort uniform graphs for query widths
+  1–6, least-padding dispatch, and DSpark request-local verification depth;
+- `VLLM_DSV41_BALANCED_COHORTS=1`: the established-decode cap uses live load
+  rather than the configured capacity. Prefill is uncapped and the PP feedback
+  ring retains its original `pp_size` cadence and collective order;
+- `VLLM_DSV41_FAST_METADATA=1`: compute a persistent device token-owner map once
+  per small decode batch and share it across KV groups (not enabled with DBO);
+- `VLLM_DSV41_METADATA_GRAPHS=1`: on SM80, replay metadata preparation for exact
+  CPU-known uniform batches. Prefill, ragged, padded, dummy and adaptive batches
+  keep the original builder. No new PP messages or communicators are introduced.
+
+- `VLLM_DSV41_HISTORY_POLICY=1`: CPU scheduler history-based cohort policy,
+  enabled by this same `verification` profile (no extra deployment profile).
+  Estimates conditional acceptance at each actually verified position, with
+  smoothing, warmup, uncertainty/hysteresis and 2% cohort-wide full-width
+  exploration. Compares joint uniform k1–5 and mixed marginal-depth plans by
+  expected total output / measured recurrence cost, including ragged graph
+  penalties and live concurrency/cohort shape. Manual `spec_k` always wins.
+  Set this component to `0` for fixed-width KS comparisons. The old GPU
+  confidence allocator must remain disabled; enabling both fails startup.
+
+All five switches default off independently; explicit environment values override
+profile defaults. Configure the profile in `.env`, then use the regular build and
+Compose deployment. Do not enable a new performance profile without checking the
+workload's k5 regression gate.
+
+With the verification profile enabled, OpenAI completions/chat requests may set
+`"vllm_xargs": {"spec_k": 2}`. `spec_k` is an integer in `[0, 5]` and limits the
+**target-verified draft prefix**, not the target's sampling policy. Every emitted
+draft is still accepted/rejected by the target. The configured DSpark drafter
+still proposes its full block; this is not a drafter-compute shortcut. Requests
+can have different limits; nonuniform mixtures fall back to a compatible graph
+or eager execution rather than being falsely labelled uniform. Omission uses
+history policy when enabled, otherwise retains configured full width. With the
+CPU history policy, manual `spec_k` is fixed (not an adaptive upper bound).
+Without that CPU policy, the older GPU adaptive verification, if separately
+enabled, may trim below this upper bound. The field is validated before numeric coercion and
+rejected on unsupported models or when the feature is disabled. It is a
+request-creation setting, not a hot update of a running request.
+
+The cost table is a local PP6/CMP170HX approximation from KS4378200 history
+and small c8/c32 mixed measurements, not a general hardware model or oracle.
+No mode/prompt labels select k. Short requests may finish before enough feedback;
+near ties keep the current width. Structured-output and stale/preempted blocks
+are excluded from history updates. **Follow-up:** mixed widths can fall back to
+PIECEWISE rather than FULL and lose static metadata replay even at equal rows;
+this policy prices that cost but does not fix mixed FULL graph capture. Prior
+18/18 revised historical replay was not an independent blind validation.
+
+Diagnostics: `VLLM_DSV41_DECODE_TRACE=1` logs sampled shape histograms. For a torch
+profile, set `VLLM_PROFILER=torch` and
+`VLLM_TORCH_PROFILE_DIR=/root/.cache/profile`, restart, and call `/start_profile`
+then `/stop_profile` once. Restart before a second CUPTI session. These options
+are off by default and no measurement RPC is shipped.
+
 ## Build
 
 ```bash

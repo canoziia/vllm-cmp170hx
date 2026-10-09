@@ -1,0 +1,807 @@
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 5609526..30f1e56 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -45,6 +45,15 @@ PROFILES: dict[str, dict[str, str]] = {
+     },
+ }
+ 
++# Opt-in extension; the deployed default profile remains unchanged.
++PROFILES["verification"] = {
++    **PROFILES["default"],
++    "VLLM_DSV41_VERIFICATION": "1",
++    "VLLM_DSV41_BALANCED_COHORTS": "1",
++    "VLLM_DSV41_FAST_METADATA": "1",
++    "VLLM_DSV41_METADATA_GRAPHS": "1",
++}
++
+ 
+ def apply() -> None:
+     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
+diff --git a/vllm/entrypoints/serve/engine/protocol.py b/vllm/entrypoints/serve/engine/protocol.py
+index 704d6b2..11db39d 100644
+--- a/vllm/entrypoints/serve/engine/protocol.py
++++ b/vllm/entrypoints/serve/engine/protocol.py
+@@ -44,6 +44,13 @@ class OpenAIBaseModel(BaseModel):
+     @model_validator(mode="wrap")
+     @classmethod
+     def __log_extra_fields__(cls, data, handler):
++        # Validate request-local verification width BEFORE the numeric union
++        # in vllm_xargs coerces bool True into integer 1.
++        if isinstance(data, dict):
++            extra = data.get("vllm_xargs")
++            if isinstance(extra, dict) and "spec_k" in extra:
++                if type(extra["spec_k"]) is not int or extra["spec_k"] < 0:
++                    raise ValueError("vllm_xargs.spec_k must be a nonnegative integer")
+         result = handler(data)
+         if not isinstance(data, dict):
+             return result
+diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
+index e81ac29..d316a2b 100644
+--- a/vllm/sampling_params.py
++++ b/vllm/sampling_params.py
+@@ -823,6 +823,22 @@ class SamplingParams(
+         structured_outputs_config: StructuredOutputsConfig | None,
+         tokenizer: TokenizerLike | None,
+     ) -> None:
++        if self.extra_args and "spec_k" in self.extra_args:
++            import os
++            value = self.extra_args["spec_k"]
++            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
++                    or speculative_config is None
++                    or speculative_config.method != "dspark"
++                    or "DeepseekV41ForCausalLM" not in model_config.architectures):
++                raise VLLMValidationError(
++                    "spec_k requires VLLM_DSV41_VERIFICATION=1 and DSpark",
++                    parameter="vllm_xargs.spec_k",
++                )
++            if type(value) is not int or not 0 <= value <= speculative_config.num_speculative_tokens:
++                raise VLLMValidationError(
++                    "spec_k must be an integer between 0 and configured draft count",
++                    parameter="vllm_xargs.spec_k",
++                )
+         self._validate_logprobs(model_config)
+         self._validate_logit_bias(model_config)
+         self._validate_trace_replay(model_config, speculative_config)
+diff --git a/vllm/v1/attention/backends/mla/decode_metadata.py b/vllm/v1/attention/backends/mla/decode_metadata.py
+new file mode 100644
+index 0000000..d15ed49
+--- /dev/null
++++ b/vllm/v1/attention/backends/mla/decode_metadata.py
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Device-driven flattened indexer metadata; no host read of query lengths."""
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _flatten_decode(seq, bt, starts, out_seq, out_bt, out_lens,
++                    N: tl.constexpr, ROWS: tl.constexpr,
++                    IN_STRIDE: tl.constexpr, OUT_STRIDE: tl.constexpr,
++                    REQS: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    reqs = tl.arange(0, REQS)
++    ends = tl.load(starts + reqs + 1, reqs < N, other=0)
++    # Zero-length padding requests do not own a row. Actual device lengths,
++    # not the CPU's evenly-distributed adaptive placeholders, define ownership.
++    owner = tl.sum(((row >= ends) & (reqs < N)).to(tl.int32), 0)
++    valid = owner < N
++    owner = tl.minimum(owner, N - 1)
++    begin = tl.load(starts + owner)
++    end = tl.load(starts + owner + 1)
++    length = tl.load(seq + owner)
++    value = length - (end - begin) + row - begin + 1
++    tl.store(out_seq + row, tl.where(valid, value, 0))
++    tl.store(out_lens + row, 1)
++    for base in range(tl.cdiv(OUT_STRIDE, BLOCK)):
++        col = base * BLOCK + tl.arange(0, BLOCK)
++        v = tl.load(bt + owner * IN_STRIDE + col,
++                    valid & (col < OUT_STRIDE), other=0)
++        tl.store(out_bt + row * OUT_STRIDE + col, v, col < OUT_STRIDE)
++
++
++@triton.jit
++def _token_owners(starts, out, N: tl.constexpr, TOKENS: tl.constexpr,
++                  REQS: tl.constexpr, BLOCK: tl.constexpr):
++    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    reqs = tl.arange(0, REQS)
++    ends = tl.load(starts + reqs + 1, reqs < N, other=0)
++    owner = tl.sum(((rows[:, None] >= ends[None, :])
++                    & (reqs[None, :] < N)).to(tl.int32), axis=1)
++    # CommonAttentionMetadata's incumbent pads unmapped rows with request 0.
++    tl.store(out + rows, tl.where(owner < N, owner, 0), rows < TOKENS)
++
++
++def prepare_token_owners(starts, out, num_tokens):
++    n = starts.numel() - 1
++    if num_tokens:
++        _token_owners[(triton.cdiv(num_tokens, 128),)](
++            starts, out, n, num_tokens, triton.next_power_of_2(n), 128)
++    return out[:num_tokens]
++
++
++def prepare_flattened_decode(seq, block_table, query_start_loc,
++                             out_seq, out_bt, out_lens, num_rows):
++    """Write persistent buffers, including safe zeros for graph-padding rows.
++
++    out_lens may alias the builder's per-request decode_lens: the kernel never
++    reads that tensor. All ownership is derived from immutable query_start_loc.
++    """
++    n = seq.shape[0]
++    _flatten_decode[(num_rows,)](
++        seq, block_table, query_start_loc, out_seq, out_bt, out_lens,
++        n, num_rows, block_table.stride(0), out_bt.stride(0),
++        triton.next_power_of_2(n), 256)
++    out_seq[num_rows:] = 0
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 7662948..7f82bba 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from dataclasses import dataclass
+ from typing import Any, NamedTuple
+ 
+@@ -979,6 +980,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         self.decode_threshold = next_n
+         self.reorder_batch_threshold = None
+         self.use_flattening = _use_flattening(self.vllm_config)
++        self.fast_decode_metadata = (
++            os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++            and _sm80_v41_adaptive(self.vllm_config)
++        )
+         self.supports_varlen = _supports_varlen_paged_mqa_logits()
+         logger.info_once(
+             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
+@@ -1111,6 +1116,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         """Prepare native or per-token flattened decode tensors."""
+         spec_config = self.vllm_config.speculative_config
+         adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
++        if self.fast_decode_metadata and not use_native and not self.supports_varlen:
++            from .decode_metadata import prepare_flattened_decode
++
++            prepare_flattened_decode(
++                seq_lens, block_table, query_start_loc,
++                self.decode_seq_lens_buffer, self.expanded_block_table_buffer,
++                self.decode_lens_buffer, num_decode_tokens,
++            )
++            return (
++                self.decode_seq_lens_buffer[:num_decode_tokens],
++                self.expanded_block_table_buffer[:num_decode_tokens],
++                self.decode_lens_buffer[:num_decode_tokens],
++                num_decode_tokens, False,
++            )
++        query_start_loc = query_start_loc[:num_decodes]
+         min_decode_len = int(decode_lens_cpu.min().item())
+         if not use_native:
+             assert self.decode_seq_lens_buffer.dim() == 1
+@@ -1532,7 +1552,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                     block_table=block_table,
+                     decode_lens=decode_lens,
+                     decode_lens_cpu=decode_lens_cpu,
+-                    query_start_loc=common_attn_metadata.query_start_loc[:num_decodes],
++                    query_start_loc=common_attn_metadata.query_start_loc[:num_decodes + 1],
+                     num_decodes=num_decodes,
+                     num_decode_tokens=num_decode_tokens,
+                     use_native=use_native,
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 34f7460..9ad8c7c 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ from vllm import envs
+ from vllm.logger import init_logger
+ from vllm.v1.core.sched.output import SchedulerOutput
+@@ -24,6 +26,17 @@ class AsyncScheduler(Scheduler):
+             or not self.use_pp
+         ):
+             return self.max_num_running_reqs
++        if (os.environ.get("VLLM_DSV41_BALANCED_COHORTS", "0") == "1"
++                and "DeepseekV41ForCausalLM"
++                in self.vllm_config.model_config.architectures):
++            # The capacity-based limit is inert at low load: four requests
++            # completing prefill together remain locked in a four-request
++            # cadence forever. Bound established decodes by the LIVE load.
++            # Do not change the pp_size feedback-ring cadence or cap prefill.
++            live = min(self.max_num_running_reqs,
++                       len(self.running) + len(self.waiting)
++                       + len(self.skipped_waiting))
++            return max(1, (live + self.pp_size - 1) // self.pp_size)
+         # ceil(max_num_seqs / pp_size)
+         return (self.max_num_running_reqs + self.pp_size - 1) // self.pp_size
+ 
+@@ -62,12 +75,56 @@ class AsyncScheduler(Scheduler):
+             )
+             # Add placeholders for the new draft/spec tokens.
+             # We will update the actual spec token ids in the worker process.
+-            request.spec_token_ids = self._spec_token_placeholders
++            limit = getattr(request, "verification_draft_limit", None)
++            request.spec_token_ids = (
++                self._spec_token_placeholders if limit is None
++                else self._spec_token_placeholders[:limit]
++            )
+ 
+             if self.use_v2_model_runner:
+                 # Set the next step index in which this request is eligible to be
+                 # scheduled for decode (for PP microbatching).
+-                request.next_decode_eligible_step = self.current_step + self.pp_size
++                earliest = self.current_step + self.pp_size
++                if (self.use_pp
++                        and os.environ.get("VLLM_DSV41_BALANCED_COHORTS", "0") == "1"
++                        and "DeepseekV41ForCausalLM"
++                        in self.vllm_config.model_config.architectures):
++                    phase = getattr(request, "decode_cohort_phase", None)
++                    loads = [0] * self.pp_size
++                    for live in self.running:
++                        assigned = getattr(live, "decode_cohort_phase", None)
++                        if assigned is not None:
++                            loads[assigned] += 1
++                    capacity = self._get_max_num_scheduled_decodes()
++                    fragmented = (
++                        sum(n > 0 for n in loads)
++                        > (sum(loads) + capacity - 1) // capacity
++                    )
++                    if phase is None or (fragmented and loads[phase] < capacity):
++                        if phase is not None:
++                            loads[phase] -= 1
++                        # Fill an existing non-full cohort before opening an
++                        # empty phase. Uniformly spreading C8 over six phases
++                        # adds two metadata/draft/PP trips versus four cohorts
++                        # of two. Repack partial phases after load growth too;
++                        # delay the NEXT decode, never consume a feedback
++                        # result before its original T+PP boundary.
++                        def phase_cost(delay):
++                            load = loads[(earliest + delay) % self.pp_size]
++                            return (load >= capacity, -load if load < capacity else load, delay)
++                        earliest += min(range(self.pp_size), key=phase_cost)
++                    request.decode_cohort_phase = earliest % self.pp_size
++                request.next_decode_eligible_step = earliest
++        if os.environ.get("VLLM_DSV41_DECODE_TRACE", "0") == "1":
++            histogram = getattr(self, "_decode_histogram", {})
++            requests = list(scheduler_output.num_scheduled_tokens)
++            key = (len(self.running), len(requests),
++                   scheduler_output.total_num_scheduled_tokens)
++            histogram[str(key)] = histogram.get(str(key), 0) + 1
++            self._decode_histogram = histogram
++            if self.current_step % 256 == 0:
++                logger.info("PP live/cohort/rows histogram %s", histogram)
++                self._decode_histogram = {}
+ 
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 2880a1b..5fa7e92 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -663,6 +663,9 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            limit = getattr(request, "verification_draft_limit", None)
++            if limit is not None and len(request.spec_token_ids) > limit:
++                request.spec_token_ids = request.spec_token_ids[:limit]
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -836,6 +839,9 @@ class Scheduler(SchedulerInterface):
+                     - request.num_tokens
+                     - request.num_output_placeholders
+                 )
++                limit = getattr(request, "verification_draft_limit", None)
++                if limit is not None:
++                    num_scheduled_spec_tokens = min(num_scheduled_spec_tokens, limit)
+                 if num_scheduled_spec_tokens > 0:
+                     spec_token_ids = request.spec_token_ids
+                     if len(spec_token_ids) > num_scheduled_spec_tokens:
+@@ -1064,6 +1070,7 @@ class Scheduler(SchedulerInterface):
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        and getattr(request, "verification_draft_limit", None) is None
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -1542,6 +1549,8 @@ class Scheduler(SchedulerInterface):
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        if hasattr(request, "decode_cohort_phase"):
++            request.decode_cohort_phase = None
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+@@ -2485,7 +2494,10 @@ class Scheduler(SchedulerInterface):
+                 metadata = request.structured_output_request
+                 spec_token_ids = strip_speculative_padding(spec_token_ids)
+                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+-            request.spec_token_ids = spec_token_ids
++            limit = getattr(request, "verification_draft_limit", None)
++            request.spec_token_ids = (
++                spec_token_ids if limit is None else spec_token_ids[:limit]
++            )
+ 
+     def update_draft_token_ids_in_output(
+         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
+@@ -2534,6 +2546,19 @@ class Scheduler(SchedulerInterface):
+         return self.kv_cache_manager.usage
+ 
+     def add_request(self, request: Request) -> None:
++        params = request.sampling_params
++        extra = params.extra_args if params is not None else None
++        limit = extra.get("spec_k") if extra else None
++        if limit is not None:
++            import os
++            spec = self.vllm_config.speculative_config
++            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
++                    or spec is None or spec.method != "dspark"
++                    or not self.use_v2_model_runner):
++                raise ValueError("spec_k requires enabled DSpark verification widths")
++            if type(limit) is not int or not 0 <= limit <= self.num_spec_tokens:
++                raise ValueError("spec_k must be an integer in the configured draft range")
++            request.verification_draft_limit = limit
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index 05949c2..9be0adc 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -278,6 +278,7 @@ def build_attn_metadata(
+     causal: bool | torch.Tensor | Mapping[int, bool] = True,
+     rswa_prefix_lens: torch.Tensor | None = None,
+     ubatch_idx: int = 0,
++    token_to_req_indices_cache: torch.Tensor | None = None,
+ ) -> dict[str, Any]:
+     seq_lens = seq_lens[:num_reqs]
+     if dcp_local_seq_lens is not None:
+@@ -325,6 +326,7 @@ def build_attn_metadata(
+             **common_attn_metadata_extra_kwargs,
+         )
+ 
++        common_attn_metadata._token_to_req_indices_cache = token_to_req_indices_cache
+         for attn_group in attn_groups[i]:
+             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+             if for_cudagraph_capture:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index c8d79c4..f493d60 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
+ import itertools
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+@@ -343,7 +344,14 @@ class CudaGraphManager:
+ 
+         for mode, descs in descs_by_mode.items():
+             descs.sort(key=lambda d: d.num_tokens, reverse=True)
+-            self._capture_descs[mode] = descs
++            # uniform_decode_descs must not leak into the range partition:
++            # capture and candidate lists used to alias, so extend() below
++            # starved varlen rows 5..6, 9..12, etc. of their FULL graph.
++            self._capture_descs[mode] = (
++                list(descs)
++                if os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++                else descs
++            )
+ 
+         if uniform_decode_descs:
+             # Capture them, but keep them out of the range partitioning that
+@@ -399,6 +407,113 @@ class CudaGraphManager:
+                         self._candidates.setdefault(key, []).extend(matching)
+                     current_range_start = num_tokens + 1
+ 
++        # Small adaptive verification batches otherwise jump 5->8, 9->16,
++        # etc. Keep the legacy candidate construction untouched, then add exact
++        # varlen shapes. These graphs support device-side ragged allocations;
++        # CPU divisibility alone must NEVER be treated as proof of uniformity.
++        if (capture_varlen_decode
++                and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++                and "DeepseekV41ForCausalLM"
++                in self.vllm_config.model_config.architectures):
++            limit = min(48, max_cg_capture_size, max_decode_tokens)
++            for rows, loras in product(range(1, limit + 1), self.lora_capture_cases):
++                key = (rows, loras)
++                existing = self._candidates.get(key, [])
++                if any(d.cg_mode == decode_mode and d.num_tokens == rows
++                       and d.uniform_token_count is None for d in existing):
++                    continue
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode, num_tokens=rows,
++                    num_reqs=min(rows, self.max_num_reqs),
++                    max_query_len=self.decode_query_len,
++                    num_active_loras=loras,
++                )
++                self._capture_descs[decode_mode].append(desc)
++                # Uniform full-width exact graphs retain first priority.
++                pos = next((i for i, d in enumerate(existing)
++                            if d.num_tokens > rows), len(existing))
++                existing.insert(pos, desc)
++                self._candidates[key] = existing
++            # Keep both token AND request padding tight. A 2-request/10-row
++            # step otherwise selects a 10-request descriptor; per-request
++            # metadata is prepared outside the graph on every PP stage.
++            # max_query_len remains the full device-side bound: these are
++            # genuinely ragged graphs, not assumed uniform CPU placeholders.
++            for reqs, width, loras in product(
++                range(1, min(8, self.max_num_reqs) + 1),
++                range(1, self.decode_query_len + 1), self.lora_capture_cases,
++            ):
++                rows = reqs * width
++                if rows > max_cg_capture_size:
++                    continue
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode, num_tokens=rows, num_reqs=reqs,
++                    max_query_len=self.decode_query_len,
++                    num_active_loras=loras,
++                )
++                if desc not in self._capture_descs[decode_mode]:
++                    self._capture_descs[decode_mode].append(desc)
++                if desc not in self._candidates.setdefault((rows, loras), []):
++                    self._candidates[rows, loras].append(desc)
++            # The one-request allocation is CPU-known even with adaptive
++            # verification. Capture its exact narrow uniform shapes so padded
++            # request slots do not inflate attention/compressor metadata.
++            for width, loras in product(range(1, self.decode_query_len),
++                                        self.lora_capture_cases):
++                if width > max_cg_capture_size:
++                    continue
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode, num_tokens=width, num_reqs=1,
++                    uniform_token_count=width, num_active_loras=loras,
++                )
++                if desc not in self._capture_descs[decode_mode]:
++                    self._capture_descs[decode_mode].append(desc)
++                self._candidates.setdefault((width, loras), []).insert(0, desc)
++            self._capture_descs[decode_mode].sort(
++                key=lambda d: d.num_tokens, reverse=True)
++            # Legacy prepending occurs before varlen ranges are populated:
++            # its covered_by check therefore misses exact varlen buckets
++            # (e.g. 4x6 rows wrongly selects uniform36 rather than varlen24).
++            # Stable ties preserve incumbent uniform preference; never prefer
++            # PIECEWISE to FULL merely for fewer padded tokens.
++            for candidates in self._candidates.values():
++                candidates.sort(key=lambda d: (
++                    d.cg_mode != CUDAGraphMode.FULL, d.num_tokens,
++                    d.num_reqs if d.num_reqs is not None else self.max_num_reqs))
++
++        if (separate_decode_routine and decode_mode
++                and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++                and "DeepseekV41ForCausalLM"
++                in self.vllm_config.model_config.architectures):
++            # CPU-known scheduled verification widths do not need adaptive
++            # allocation or its PP length-vector dependency. Capture the small
++            # cohorts used by PP6, and powers of two for larger bursts.
++            req_counts = sorted(set(range(1, min(8, self.max_num_reqs) + 1))
++                                | {n for n in (16, 32) if n <= self.max_num_reqs})
++            for reqs, width, loras in product(
++                req_counts, range(1, self.decode_query_len + 1),
++                self.lora_capture_cases,
++            ):
++                rows = reqs * width
++                if rows > max_cg_capture_size:
++                    continue
++                desc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode, num_tokens=rows, num_reqs=reqs,
++                    uniform_token_count=width, num_active_loras=loras,
++                )
++                if desc not in self._capture_descs[decode_mode]:
++                    self._capture_descs[decode_mode].append(desc)
++                for actual_reqs in range(1, reqs + 1):
++                    key = (actual_reqs * width, loras)
++                    if desc not in self._candidates.setdefault(key, []):
++                        self._candidates[key].append(desc)
++            self._capture_descs[decode_mode].sort(
++                key=lambda d: d.num_tokens, reverse=True)
++            for candidates in self._candidates.values():
++                candidates.sort(key=lambda d: (
++                    d.cg_mode != CUDAGraphMode.FULL, d.num_tokens,
++                    d.num_reqs if d.num_reqs is not None else self.max_num_reqs))
++
+     def needs_capture(self) -> bool:
+         return len(self._capture_descs) > 0
+ 
+@@ -453,6 +568,13 @@ class CudaGraphManager:
+                     ):
+                         forward_fn(CUDAGraphMode.PIECEWISE)
+                     else:
++                        # Include optional metadata-graph allocation in the
++                        # startup estimate, not just the subsequent model graph.
++                        metadata_free_before = None
++                        if (self._capture_mem_samples is not None
++                                and os.environ.get("VLLM_DSV41_METADATA_GRAPHS", "0") == "1"):
++                            torch.accelerator.synchronize()
++                            metadata_free_before = torch.accelerator.get_memory_info()[0]
+                         # Capture with fresh attention state.
+                         forward_fn = create_forward_fn(desc, warmup=False)
+                         if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+@@ -471,7 +593,10 @@ class CudaGraphManager:
+                             set_graph_pool_id(current_platform.graph_pool_handle())
+                         if self._capture_mem_samples is not None:
+                             torch.accelerator.synchronize()
+-                            free_before = torch.accelerator.get_memory_info()[0]
++                            free_before = (
++                                metadata_free_before if metadata_free_before is not None
++                                else torch.accelerator.get_memory_info()[0]
++                            )
+                         with torch.cuda.graph(
+                             graph,
+                             self.pool,
+@@ -522,6 +647,25 @@ class CudaGraphManager:
+                     max_query_len,
+                     num_ubatches,
+                 ):
++                    if os.environ.get("VLLM_DSV41_DECODE_TRACE", "0") == "1":
++                        histogram = getattr(self, "_decode_histogram", {})
++                        bucket = f"{num_reqs}/{num_tokens}/{desc.num_tokens}/{desc.uniform_token_count}"
++                        histogram[bucket] = histogram.get(bucket, 0) + 1
++                        self._decode_histogram = histogram
++                        count = getattr(self, "_decode_trace_count", 0) + 1
++                        self._decode_trace_count = count
++                        if count % 256 == 0:
++                            logger.info("Decode shape histogram pp=%d %s",
++                                        get_pp_group().rank_in_group, histogram)
++                            self._decode_histogram = {}
++                        seen = getattr(self, "_decode_seen", set())
++                        signature = (num_reqs, num_tokens, uniform_token_count, desc)
++                        if signature not in seen:
++                            logger.info("Decode dispatch pp=%d real_reqs=%d rows=%d uniform=%s -> %s",
++                                        get_pp_group().rank_in_group, num_reqs,
++                                        num_tokens, uniform_token_count, desc)
++                            seen.add(signature)
++                            self._decode_seen = seen
+                     return desc
+         if num_ubatches == 1:
+             num_tokens = self._bucket_pad_num_tokens(num_tokens)
+@@ -609,6 +753,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+             lora_capture_cases=lora_capture_cases,
+             varlen_decode=varlen_decode,
+         )
++        self.metadata_graphs: dict[BatchExecutionDescriptor, tuple[torch.cuda.CUDAGraph, dict[str, Any]]] = {}
+         self.hidden_states: torch.Tensor | None = None
+         self.aux_hidden_states: list[torch.Tensor] = []
+         self.use_aux_hidden_state_outputs = False
+@@ -678,6 +823,14 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 assert intermediate_tensors is not None
+                 model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+ 
++            capture_metadata = (
++                not warmup and desc.cg_mode == CUDAGraphMode.FULL
++                and desc.uniform_token_count is not None
++                and os.environ.get("VLLM_DSV41_METADATA_GRAPHS", "0") == "1"
++                and current_platform.is_device_capability_family(80)
++                and "DeepseekV41ForCausalLM"
++                in self.vllm_config.model_config.architectures
++            )
+             attn_metadata, slot_mappings = prepare_inputs_to_capture(
+                 num_reqs,
+                 num_tokens,
+@@ -689,6 +842,11 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
+                 max_query_len=desc.max_query_len,
+                 pcp_manager=pcp_manager,
++                metadata_graph_callback=(
++                    (lambda graph, metadata: self.metadata_graphs.__setitem__(
++                        desc, (graph, metadata))) if capture_metadata else None
++                ),
++                metadata_graph_pool=self.pool,
+             )
+ 
+             # Capture with dummy rows marked as padding.
+@@ -782,6 +940,8 @@ def prepare_inputs_to_capture(
+     full_cudagraph: bool,
+     max_query_len: int | None = None,
+     pcp_manager: "PCPManager | None" = None,
++    metadata_graph_callback: Callable[[torch.cuda.CUDAGraph, dict[str, Any]], None] | None = None,
++    metadata_graph_pool: Any = None,
+ ) -> AttentionState:
+     input_batch = InputBatch.make_dummy(
+         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
+@@ -828,15 +988,24 @@ def prepare_inputs_to_capture(
+     # In summary: We always generate attention metadata for both FULL and PIECEWISE
+     # CUDA graphs, setting for_capture=True for FULL graphs, and for_capture=False
+     # for PIECEWISE graphs, to ensure correct execution and capture.
+-    attn_metadata = model_state.prepare_attn(
+-        input_batch,
+-        CUDAGraphMode.NONE,
+-        input_block_tables,
+-        slot_mappings,
+-        attn_groups,
+-        kv_cache_config,
+-        for_capture=full_cudagraph,
+-    )
++    def prepare_metadata():
++        return model_state.prepare_attn(
++            input_batch,
++            CUDAGraphMode.NONE,
++            input_block_tables,
++            slot_mappings,
++            attn_groups,
++            kv_cache_config,
++            for_capture=full_cudagraph,
++        )
++
++    attn_metadata = prepare_metadata()
++    if metadata_graph_callback is not None:
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph, pool=metadata_graph_pool,
++                              stream=current_stream(), capture_error_mode="thread_local"):
++            attn_metadata = prepare_metadata()
++        metadata_graph_callback(graph, attn_metadata)
+     return AttentionState(attn_metadata, slot_mappings_by_layer)
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6a515e7..779c991 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
+ """
+ 
+ import functools
++import os
+ import gc
+ import time
+ from contextlib import AbstractContextManager
+@@ -1257,6 +1258,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             is_prefilling_np=is_prefilling_np,
+             has_prefill=bool(is_prefilling_np.any()),
+         )
++        if (num_reqs == 1 and not batch_state.has_prefill
++                and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"):
++            # Only a single request proves uniformity without reading device
++            # allocations. Divisibility of an adaptive multi-request budget
++            # does NOT prove equal widths.
++            max_query_len = num_toks
+         return batch_state, get_uniform_decode_token_count(
+             num_reqs, num_toks, max_query_len, batch_state.has_prefill
+         )
+@@ -1673,6 +1680,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # not exist. Clamp so a zero-draft step verifies zero rows.
+             pp_verification_budget = min(pp_verification_budget, scheduled_drafts)
+             partial = pp_verification_budget not in (0, scheduled_drafts)
++            if num_reqs == 1 and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1":
++                partial = False  # allocation equals authoritative CPU total
+             if not self.is_first_pp_rank and partial != (pp_verification_lengths is not None):
+                 raise RuntimeError("PP verification lengths/schema mismatch")
+         if batch_req_state is not None:
+@@ -1824,18 +1833,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+                     for groups in attn_groups
+                 ]
+-            attn_metadata = self.model_state.prepare_attn(
+-                input_batch,
+-                batch_desc.cg_mode,
+-                block_tables,
+-                slot_mappings,
+-                attn_groups,
+-                self.kv_cache_config,
+-                # FULL replay reads capture-time metadata buffers. Re-stage them
+-                # from the zeroed dummy block tables instead of retaining state
+-                # indices from the previous real batch.
+-                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
++            metadata_graph = (
++                self.cudagraph_manager.metadata_graphs.get(batch_desc)
++                if self.cudagraph_manager is not None else None
+             )
++            if (metadata_graph is not None and not dummy_run
++                    and self.adaptive_verification is None
++                    and not input_batch.has_prefill
++                    and input_batch.num_reqs == batch_desc.num_reqs
++                    and input_batch.num_tokens == batch_desc.num_tokens
++                    and uniform_tok_count == batch_desc.uniform_token_count):
++                # Only exact CPU-known uniform batches: a metadata graph with
++                # static output_size must never consume padded/ragged lengths.
++                graph, attn_metadata = metadata_graph
++                graph.replay()
++                if os.environ.get("VLLM_DSV41_DECODE_TRACE", "0") == "1":
++                    seen = getattr(self, "_metadata_replay_seen", set())
++                    if batch_desc not in seen:
++                        logger.info("Decode metadata graph replay: %s", batch_desc)
++                        seen.add(batch_desc)
++                        self._metadata_replay_seen = seen
++            else:
++                attn_metadata = self.model_state.prepare_attn(
++                    input_batch,
++                    batch_desc.cg_mode,
++                    block_tables,
++                    slot_mappings,
++                    attn_groups,
++                    self.kv_cache_config,
++                    # FULL replay reads capture-time metadata buffers. Re-stage
++                    # them from zeroed dummy tables rather than stale slots.
++                    for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
++                )
+ 
+         input_ids = input_batch.input_ids
+         inputs_embeds = None
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 7d42745..31b8ea7 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any
+ 
+ import torch
+@@ -35,6 +36,14 @@ class DefaultModelState(ModelState):
+     ):
+         super().__init__(vllm_config, model, encoder_cache, device)
+ 
++        self.decode_token_owners = None
++        if (os.environ.get("VLLM_DSV41_FAST_METADATA", "0") == "1"
++                and not vllm_config.parallel_config.use_ubatching
++                and "DeepseekV41ForCausalLM" in self.model_config.architectures):
++            # One stable address across all KV groups and capture/replay. This
++            # map depends only on query boundaries, never group-specific KV.
++            self.decode_token_owners = torch.empty(
++                self.max_num_tokens, dtype=torch.int32, device=device)
+         self.prompt_embeds_state: PromptEmbedsState | None = None
+         if self.model_config.enable_prompt_embeds:
+             self.prompt_embeds_state = PromptEmbedsState(
+@@ -206,6 +215,12 @@ class DefaultModelState(ModelState):
+                 mm_features=self.encoder_cache.mm_features,
+                 sliding_window=self.model_config.get_sliding_window(),
+             )
++        token_owners = None
++        if self.decode_token_owners is not None and max_query_len <= 6:
++            from vllm.v1.attention.backends.mla.decode_metadata import prepare_token_owners
++
++            token_owners = prepare_token_owners(
++                query_start_loc_gpu, self.decode_token_owners, num_tokens)
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+@@ -226,5 +241,6 @@ class DefaultModelState(ModelState):
+             for_cudagraph_capture=for_capture,
+             rswa_prefix_lens=input_batch.prompt_lens,
+             ubatch_idx=ubatch_idx,
++            token_to_req_indices_cache=token_owners,
+         )
+         return attn_metadata
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index b8c87e5..536cd70 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Adaptive verification for DSpark speculative decoding."""
+ 
++import os
+ from collections import defaultdict
+ from collections.abc import Iterable, Iterator
+ from typing import TYPE_CHECKING
+@@ -373,7 +374,9 @@ class AdaptiveVerificationManager:
+         Zero/full budgets are determined entirely by CPU scheduler metadata.
+         The snapshot survives subsequent use of the persistent allocator buffer.
+         """
+-        if budget in (0, scheduled_drafts):
++        if budget in (0, scheduled_drafts) or (
++            num_reqs == 1 and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++        ):
+             return None
+         return self._batch_draft_capacity[:num_reqs].clone()
+ 
+@@ -450,6 +453,10 @@ class AdaptiveVerificationManager:
+                     or authoritative_capacities.device != capacities.device):
+                 raise ValueError("Invalid authoritative draft-capacity tensor")
+             capacities.copy_(authoritative_capacities)
++        elif num_reqs == 1 and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1":
++            # With one request the total IS its allocation. Sorting confidences
++            # and sending the result across five PP links cannot add information.
++            capacities.fill_(draft_budget)
+         elif draft_budget == 0:
+             capacities.zero_()
+         else:
