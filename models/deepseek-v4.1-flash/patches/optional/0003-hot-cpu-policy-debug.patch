@@ -1,0 +1,114 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -328,8 +328,8 @@
+         if spec is not None and spec.uses_history_verification():
+             if not self.use_v2_model_runner:
+                 raise ValueError("Adaptive DeepSeek verification requires Model Runner V2")
+-            from .dsv41_fixed_policy import FixedHistoryPolicy
+-            self.dsv41_history_policy = FixedHistoryPolicy(
++            from .dsv41_hot_policy_debug import HotHistoryPolicy
++            self.dsv41_history_policy = HotHistoryPolicy(
+                 logger, decay=spec.adaptive_verification_decay)
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+diff --git a/vllm/v1/core/sched/dsv41_hot_policy_debug.py b/vllm/v1/core/sched/dsv41_hot_policy_debug.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_hot_policy_debug.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DEBUG BUILD ONLY. Trusted host Python plugins, NOT a sandbox.
++Ordinary requests use the compiled fixed measured policy. Requests pin SHA/config at admission.
++No CUDA access, publicly supplied code paths, or GPU synchronization.
++"""
++import hashlib,hmac,json,os,re,time
++from pathlib import Path
++from .dsv41_fixed_policy import FixedHistoryPolicy
++
++class GuardedPlugin:
++    def __init__(self, plugin):self.plugin=plugin
++    def observe(self,event):
++        t=time.perf_counter();self.plugin.observe(event)
++        if time.perf_counter()-t>.02:raise TimeoutError('slow plugin')
++    def choose(self,context):
++        t=time.perf_counter();result=self.plugin.choose(context)
++        if time.perf_counter()-t>.02:raise TimeoutError('slow plugin')
++        diag=getattr(self.plugin,'diagnostics',{})
++        if len(json.dumps(diag,allow_nan=False))>16384:raise ValueError('oversized diagnostics')
++        self.diagnostics=diag
++        return result
++
++class HotHistoryPolicy(FixedHistoryPolicy):
++    def __init__(self,logger,decay=.95):
++        super().__init__(logger,decay)
++        self.root=Path(os.environ.get('VLLM_DSV41_POLICY_DIR','/root/.cache/dsv41-policy'))
++        self.modules={};self.disabled=set();self.trace_bytes=0
++
++    def make_entry(self,request):
++        supplied=(getattr(request.sampling_params,'extra_args',None) or {}).get('spec_policy_token')
++        if not isinstance(supplied,str):return super().make_entry(request)
++        try:
++            control=json.loads((self.root/'control.json').read_text())
++            secret=control.get('token','')
++            if (not control.get('enabled') or not isinstance(secret,str) or len(secret)<32
++                    or not hmac.compare_digest(supplied,secret)):return super().make_entry(request)
++            digest=control['sha256']
++            if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{64}',digest):raise ValueError('bad digest')
++            if digest in self.disabled:return super().make_entry(request)
++            if digest not in self.modules:
++                if len(self.modules)>=32:raise ValueError('version limit')
++                p=self.root/'versions'/(digest+'.py')
++                if p.is_symlink() or p.stat().st_size>131072:raise ValueError('bad source')
++                src=p.read_bytes()
++                if hashlib.sha256(src).hexdigest()!=digest:raise ValueError('digest mismatch')
++                ns={'__name__':'dsv41_plugin_'+digest}
++                exec(compile(src,str(p),'exec'),ns)
++                if ns.get('API_VERSION')!=1 or not callable(ns.get('Policy')):raise ValueError('plugin API')
++                ns['self_test']();self.modules[digest]=ns['Policy']
++            config=json.loads(json.dumps(control.get('config',{})))
++            entry=self.new_entry(GuardedPlugin(self.modules[digest](config)))
++            entry.version=digest
++            self.active[request.request_id]=entry
++            self.trace(dict(event='admit',request=request.request_id,version=digest,config=config))
++            return entry
++        except Exception as exc:
++            self.logger.warning('DSV41 debug admission failed (%s); fixed measured policy retained',type(exc).__name__)
++            return super().make_entry(request)
++
++    def is_disabled(self,entry):
++        return entry.failed or getattr(entry,'version',None) in self.disabled
++
++    def fail(self,rid,entry,exc):
++        version=getattr(entry,'version',None)
++        if version is None:return super().fail(rid,entry,exc)
++        self.disabled.add(version)
++        self.trace(dict(event='fallback',request=rid,error=type(exc).__name__))
++        # Replace ALL entries of failed revision by fresh fixed policy state.
++        # Increment generation so old in-flight feedback cannot train fallback.
++        from .dsv41_measured_policy import Policy
++        for key,old in list(self.active.items()):
++            if getattr(old,'version',None)==version:
++                self.active[key]=self.new_entry(Policy({'decay':self.decay}))
++        entry.failed=True;entry.k=5;entry.fresh=False
++        self.logger.warning('DSV41 debug revision %.12s disabled; fixed measured policy retained',version)
++
++    def trace(self,event):
++        entry=self.active.get(event.get('request'))
++        version=getattr(entry,'version',None)
++        if version is None:return
++        if self.trace_bytes>=64*1024*1024:return
++        try:
++            event={**event,'version':version}
++            text=json.dumps(event,allow_nan=False,separators=(',',':'))+'\n'
++            if self.trace_bytes+len(text.encode())>64*1024*1024:return
++            fd=os.open(self.root/'trace.jsonl',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
++            try:os.write(fd,text.encode())
++            finally:os.close(fd)
++            self.trace_bytes+=len(text.encode())
++        except Exception:
++            self.logger.warning('DSV41 debug trace unavailable')
++
++    def forget(self,rid):
++        self.trace(dict(event='forget',request=rid))
++        super().forget(rid)

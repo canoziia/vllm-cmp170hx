@@ -110,6 +110,9 @@ if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
     "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
   compile_files+=(
     "$SOURCE_TREE/vllm/v1/core/sched/dsv41_history_policy.py"
+    "$SOURCE_TREE/vllm/v1/core/sched/dsv41_fixed_policy.py"
+    "$SOURCE_TREE/vllm/v1/core/sched/dsv41_measured_policy.py"
+    "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
     "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
     "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
   )
@@ -122,12 +125,15 @@ if [[ ${ENABLE_PERF_DEBUG:-0} == 1 ]]; then
     "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
   compile_files+=(
     "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
+    "$SOURCE_TREE/vllm/v1/core/sched/dsv41_hot_policy_debug.py"
     "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
     "$SOURCE_TREE/vllm/v1/worker/gpu/pp_utils.py"
   )
 else
   [[ ! -e "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py" ]]
   ! grep -q 'perf_debug' "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+  [[ ! -e "$SOURCE_TREE/vllm/v1/core/sched/dsv41_hot_policy_debug.py" ]]
+  ! grep -q 'dsv41_hot_policy' "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
 fi
 
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
