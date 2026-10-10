@@ -3,6 +3,9 @@
 Reproducible minimal patches and a Podman Compose deployment for
 `deepseek-ai/DeepSeek-V4.1-Flash` on six SM80 CMP 170HX GPUs.
 
+Remaining investigation candidates and delivery rules:
+[optimisation backlog](docs/OPTIMIZATION-BACKLOG.md). These are not measured gains.
+
 ## Source and image
 
 - Author source: `https://github.com/344303947/dsv41-flash-pp5-170hx.git`
