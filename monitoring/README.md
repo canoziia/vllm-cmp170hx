@@ -22,8 +22,12 @@ monitoring/
 
 ## Run
 
+Run from the repository checkout, like the model compose files (on host-b:
+`/path/to/vllm-cmp170hx/monitoring`, `.env` there with mode 0600). Data lives
+outside the checkout in `MONITORING_DATA_DIR` (default `/srv/monitoring-data`).
+
 ```bash
-cd monitoring
+cd /path/to/vllm-cmp170hx/monitoring
 cp .env.example .env && chmod 600 .env   # set GRAFANA_ADMIN_PASSWORD and targets
 podman compose up -d                     # add `--profile gpu` for GPU metrics
 ```
