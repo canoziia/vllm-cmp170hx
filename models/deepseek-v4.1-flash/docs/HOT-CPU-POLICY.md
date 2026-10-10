@@ -1,94 +1,70 @@
-# Request-pinned CPU policy experiments
+# Fixed measured policy and debug-only hot experiments
 
-Default traffic remains on the existing history policy. Requires public
-`enable_adaptive_verification=true` and DeepSeek MRV2 history routing. Manual
-`vllm_xargs.spec_k` wins. This is not a second public adaptive mode switch.
+With `enable_adaptive_verification=true`, DeepSeek uses the compiled request-local
+measured policy. Other DSpark models keep the GPU confidence allocator; manual
+`vllm_xargs.spec_k` takes priority. Disabling the public switch retains the fixed
+full-width path. The verification execution profile does not select the algorithm.
 
-Trusted host root writes `/root/app/deepseek-v41/cache/dsv41-policy` (already
-mounted as `/root/.cache/dsv41-policy`). No restart is required after the initial
-scheduler hook deployment. Keep directory0700, control/source0600. Run:
+## Production build
+
+`ENABLE_PERF_DEBUG=0` (default) applies `adaptive/0013-fixed-measured-policy.patch`.
+The scheduler constructs `FixedHistoryPolicy`. There is no external Python
+loader, capability admission, file polling or per-step trace IO. Selected widths
+are retained even when a request is ineligible for a fresh decision.
+
+Statistics discount evidence at the configured decay (default0.95); empirical
+speeds do not decay. Candidate predictions share current output/time calibration.
+Per-width measured evidence blends with one predicted pseudoblock. Measured-ratio
+and paired-prefix uncertainty gates plus a3% improvement tolerance reduce marginal
+reversals. Cold selection prefers the widest candidate within2% of the maximum,
+provided it beats full width by3%. Upward changes are at most one width; downward
+changes may jump. These tolerances and uncertainty estimates are engineering
+heuristics, not formal confidence guarantees. No prompt labels or new cohort
+coordination are used.
+
+Feedback carries the actual scheduled width and request generation. First,
+transition, prefill, load-change, invalid and terminal periods do not train
+measured timing. CPU-visible recurrence includes pipeline cadence and queueing,
+NOT GPU kernel time. Invalid policy decisions fail closed to full5 for that
+request. Finishing/aborting removes its state.
+
+## Debug build
+
+`ENABLE_PERF_DEBUG=1` additionally applies `optional/0002-hot-perf-debug.patch` and
+`optional/0003-hot-cpu-policy-debug.patch`. The latter adds `HotHistoryPolicy`
+in `dsv41_hot_policy_debug.py`, extending the same fixed adapter. Ordinary
+requests still use the compiled measured policy.
+
+Only trusted host administrators publish source under
+`/root/app/deepseek-v41/cache/dsv41-policy` (container cache mount). Keep root
+0700 and source/control0600. Publisher:
 
 ```
-python3 scripts/publish-policy.py /root/app/deepseek-v41/cache/dsv41-policy scripts/policies/measured_v1.py
+python3 scripts/publish-policy.py /root/app/deepseek-v41/cache/dsv41-policy trusted-policy.py
 python3 scripts/publish-policy.py /root/app/deepseek-v41/cache/dsv41-policy --disable
 ```
 
-The root-only control file contains a capability token. Local test clients read
-it and submit `vllm_xargs.spec_policy_token`; never print it, put it on command
-lines, commit it or expose it to ordinary clients. Unauthenticated requests do
-not read/load source and retain baseline. Control has enabled, token, sha256,
-config; modules live in versions/<sha256>.py. Publisher atomically replaces
-control. Wrong hash, bad syntax/API/self-test/factory retains baseline.
+Debug admission requires enabled control and the matching private capability in
+`vllm_xargs.spec_policy_token`; manual widths never admit. Never print, commit or
+expose the token. API_VERSION=1, self_test(), Policy(config), observe(event),
+choose(context)->integer1..5. Requests pin hash/config at admission; new publishes
+affect only new requests. Upward decisions must still obey max+1. Disable stops
+new admission, not existing requests.
 
-API_VERSION=1; self_test(); Policy(config); observe(event); choose(context)->int
-1..5. Optional JSON diagnostics, max16KB. observe receives actual scheduled k,
-accepted drafts, output tokens, timestamps/seconds, validity, live-load epoch.
-Choose runs only after fresh feedback, before NEXT eligible scheduling. Multiple
-choose calls with no fresh feedback do not accumulate persistence or change k.
-Requests are pinned to a source hash and copied config at admission, up to32
-loaded versions per process. Active requests never migrate state. Disable only
-stops NEW experiment admissions; request cancellation is separate.
+Source SHA is verified, symlinks/oversized source rejected, code version count
+bounded32. Plugins are trusted executable Python, NOT sandboxed: the20ms completed
+call guard cannot interrupt infinite loops, native faults or blocking imports.
+Test CPU-only plugins independently before publication. No torch/CUDA imports,
+GPU objects or IO in policy calls. Bad plugins disable their revision and use
+fresh compiled fixed state with a new generation, avoiding old-feedback reuse.
 
-Fallback: exceptions, illegal results or a completed call taking >20ms disable
-that revision, falling back to warmed baseline state. Python is NOT sandboxed;
-an infinite loop, native crash, memory exhaustion or blocking import cannot be
-interrupted by the post-call time guard. Only vetted trusted CPU-only code may
-be published. Do not import torch/CUDA, do IO or hold model/GPU references.
+Debug-only private JSONL records attributed feedback and decisions, bounded64MiB
+per process. It excludes prompt/output IDs and credentials. Synchronous trace
+IO can affect performance; do not call traced results uninstrumented throughput.
+Production has no trace writer or external-source execution.
 
-Timing is CPU-visible request feedback recurrence. It includes pipeline cadence,
-queueing and scheduler/host overhead, NOT CUDA-only kernel execution. Exact
-SchedulerOutput stores request generation ID and dispatched width, so in-flight
-results cannot be credited to a newly selected k or a recycled request. First
-feedback, width transition, load membership change, prefill, stale/invalid or
-max-token terminal samples are excluded from measured reward. Dispatch latency
-is logged separately for diagnosis, not mixed with recurrence. No synchronization
-or PP protocol changes. Candidate resets measured N/Y/T on load epoch change.
-
-Trace is private append-only JSONL at policy root, capped64MiB per process
-lifetime; no prompt/output token IDs. Trace includes versions, actual widths,
-proposed widths, timing semantics, N, real/predicted/blended scores. Trace IO is
-synchronous CPU work for experiments and can affect their speed; baseline has no
-per-step trace IO. Never call traced performance an uninstrumented production
-speed. Source code storage is writable only by trusted host admin.
-
-Candidate measured_v1 discounts per-k N/Y/T at.95, mixes one current predicted
-pseudoblock, compares strict score>, max+1 upward and arbitrary downward jumps.
-It is experimental, not an asserted optimum; no cohort coupling or fixed warmup.
-
-## Later stability research (not a new production default)
-
-`measured_v15.py` retains per-arm measured evidence and calibrated predictions,
-adds measured-ratio uncertainty and paired-prefix gain uncertainty, and uses an
-explicit3% improvement tolerance (cold choice retains2% wider near-tie rule).
-All real evidence decays.95; old speeds themselves do not shrink. Up max+1,
-down may jump; stale-width/invalid-timing feedback cannot immediately switch.
-The uncertainty gate is a heuristic, not an iid confidence guarantee. No task
-names/labels or cohort-coupled decision is used. CPU tests include six
-concurrencies/all starting widths and high-low-high recovery. Candidate is still
-experimental: mixed-load execution exposed a fixed-interface issue below.
-
-## Retained width fix: adaptive/0014 (requires deploying scheduler code)
-
-Before0014, only residents eligible for a fresh `choose()` got history limits.
-A stale-output or capacity-excluded experiment could consequently executefull5
-although its pinned selected width was2/3, causing spurious one-step5 jumps.
-0014 seeds limits from `HotHistoryPolicy.retained_limits()` before refreshing
-eligible choices. Only active authenticated experimental entries participate;
-manual overrides, failed revisions and ordinary traffic keep their prior path.
-No GPU/PP protocol or new feedback advances are introduced.
-
-Adaptive series reproducibility: 0013 was originally generated against a
-one-off snapshot that also carried the DISABLED hot-perf-debug scheduler code,
-so the series did not replay from the pinned source commit (0013 failed at
-`@@ -1,7 +1,6 @@`). It was regenerated from the real 0001..0012 output; the
-replay now completes and reproduces the deployed container bytes exactly at
-0013 and the fixed bytes at 0014. Any new patch must be validated by replaying
-the WHOLE series from SOURCE_COMMIT, not by apply-check against whichever
-snapshot happened to generate it.
-
-This is NOT fixable by publishing a CPU policy alone. Source/CPU integration
-checks pass; do not claim online fix until a separately approved scheduler
-maintenance deployment and repeat mixed-load GPU validation. Existing image
-8fc270533891 does NOT contain0014. Keep experimental admissions disabled until
-that validation; historical single-load results do not certify mixed-load
-stability.
+All source changes must replay from SOURCE_COMMIT through the COMPLETE main,
+common, adaptive and (when requested) optional series. Self-generated snapshot
+apply-check alone is insufficient. Production and debug configurations are both
+validated before deployment. Legacy experiments remain local research artifacts,
+not numbered algorithm variants in production source.
