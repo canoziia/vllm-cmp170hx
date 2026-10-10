@@ -37,7 +37,7 @@ services:
     volumes:
       - ./prometheus/entrypoint.sh:/etc/prometheus/entrypoint.sh:ro
       - ${VLLM_METRICS_TOKEN_FILE:-/dev/null}:/run/secrets/vllm_metrics_token:ro
-      - ${MONITORING_DATA_DIR:-/root/app/monitoring/data}/prometheus:/prometheus:U
+      - ${MONITORING_DATA_DIR:-/root/app/monitoring-data}/prometheus:/prometheus:U
 
   grafana:
     image: docker.io/grafana/grafana:12.1.1
@@ -63,7 +63,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards/vllm:ro
-      - ${MONITORING_DATA_DIR:-/root/app/monitoring/data}/grafana:/var/lib/grafana:U
+      - ${MONITORING_DATA_DIR:-/root/app/monitoring-data}/grafana:/var/lib/grafana:U
 
   # Optional (profile gpu): nvidia-smi based exporter. dcgm-exporter is not
   # used because DCGM profiling metrics are not available on CMP 170HX.
