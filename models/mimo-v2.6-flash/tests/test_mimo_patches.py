@@ -48,6 +48,17 @@ assert 'def enabled(switch: str = "VLLM_MIMO26_DRAFT_HEAD_FP8") -> bool:' in (
 assert 'getattr(self.model, "after_target_sharing", None)' in (
     root / "vllm/v1/worker/gpu/spec_decode/speculator.py").read_text()
 
+# 0006: DFlash drafter under PP (aux hidden states, value scale).
+src2 = mimo.read_text()
+assert "supports_aux_hidden_states_over_pp = True" in src2
+assert "**self.pack_local_aux_hidden_states(aux_hidden_states)," in src2
+assert "SupportsEagle3" in omni.read_text()
+dfl = (root / "vllm/model_executor/models/qwen3_dflash.py").read_text()
+assert 'value_scale=dflash_config.get("attention_value_scale")' in dfl
+assert "all_v.mul_(value_scale)" in dfl
+assert '"VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8"' in dfl
+assert "or spec_decode_needs_target_embed(vllm_config)" in src2
+
 # Upstream pieces the deployment relies on (fail loudly if a rebase drops them).
 assert '"MiMoV2ForCausalLM": ("mimo_v2", "MiMoV2ForCausalLM")' in (
     root / "vllm/model_executor/models/registry.py"
@@ -64,4 +75,4 @@ assert 'store_dtype == "mxfp4"' in (
 for f in (mimo, omni, root / "vllm/model_executor/models/mimo_v2_mtp.py",
           root / "vllm/mimo26_opt_profile.py"):
     py_compile.compile(str(f), doraise=True)
-print("PASS 0001-0005 present; mimo_v2 / mimo_v2_omni / MTP / fp8+mxfp4 upstream hooks intact")
+print("PASS 0001-0006 present; mimo_v2 / mimo_v2_omni / MTP / fp8+mxfp4 upstream hooks intact")

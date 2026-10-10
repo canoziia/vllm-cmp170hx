@@ -1,6 +1,7 @@
-cf81b6af920eb3a5dc4f7bf0791a6806478d235bdc74d06ef08eea5820c28698  models/mimo-v2.6-flash/patches/series
+5aad955ccdd062d1f0b2b902f954c9551e5838869a0d6b632bd8543d52538c6a  models/mimo-v2.6-flash/patches/series
 e8a1308f4843c6b43c5ad348d21d3ee7a3c3f2abd7481800afada41c55f0ac2f  models/mimo-v2.6-flash/patches/0001-mimo-v2-fp8-qkv-checkpoint-shards.patch
 776112223f39aa0110fb1020df3cdecbf555c23e223556d79f82e528063e0355  models/mimo-v2.6-flash/patches/0002-mimo-v2-multi-layer-mtp.patch
 39b0dbc15632b9ac7971bcb5ca011e9ee6f8bdae351f7b1cd151078a9b95ebbf  models/mimo-v2.6-flash/patches/0003-mimo26-opt-profile.patch
 8e2eddf7be74fc845880b3b5e91f0bc9087699ebd5dd855d8883e5cf5dd47b74  models/mimo-v2.6-flash/patches/0004-moe-align-bitonic-sort.patch
 444591269a3082ac6a048fd01279894015bb881081ee5eae8be0c8e16c6e76ae  models/mimo-v2.6-flash/patches/0005-mimo-v2-fp8-draft-head.patch
+20ed9ce702a350844cda098bf2befd4131a411eb11bdcad5dd6e2da0a5f09d6f  models/mimo-v2.6-flash/patches/0006-mimo-v2-dflash-drafter.patch
