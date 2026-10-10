@@ -107,7 +107,7 @@ EOF
 	job vllm "${PROM_SCRAPE_INTERVAL:-10s}" 8s "$AUTH"
 	job vllm-router "${PROM_SCRAPE_INTERVAL:-10s}" 8s
 	job lmcache "${PROM_SCRAPE_INTERVAL:-10s}" 8s
-	job gpu "${PROM_SCRAPE_INTERVAL:-10s}" 8s
+	job gpu "${GPU_SCRAPE_INTERVAL:-30s}" 20s
 } >"$OUT/prometheus.yml"
 
 promtool check config "$OUT/prometheus.yml" >&2

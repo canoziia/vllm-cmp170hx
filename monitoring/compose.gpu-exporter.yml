@@ -1,0 +1,23 @@
+# nvidia-smi based GPU exporter only (no Prometheus/Grafana), for nodes that
+# are scraped by the stack on another node. dcgm-exporter is not used: DCGM
+# profiling metrics are not available on CMP 170HX.
+#
+# .env (optional, 0600): GPU_EXPORTER_LISTEN / GPU_EXPORTER_PORT / GPU_QUERY_FIELDS
+# Start: podman compose -f compose.gpu-exporter.yml up -d
+#
+# Every scrape runs one `nvidia-smi --query-gpu`. The default field list costs
+# ~0.35 s of driver time for 10 GPUs (all fields: ~1.8 s); keep the gpu job
+# scrape interval at 30s (GPU_SCRAPE_INTERVAL on the Prometheus side).
+services:
+  gpu-exporter:
+    image: docker.io/utkuozdemir/nvidia_gpu_exporter:1.3.2
+    container_name: vllm-monitoring-gpu-exporter
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --web.listen-address=${GPU_EXPORTER_LISTEN:-127.0.0.1}:${GPU_EXPORTER_PORT:-19835}
+      - --query-field-names=${GPU_QUERY_FIELDS:-uuid,name,index,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw,power.limit,clocks.current.sm,clocks.current.memory,pstate,fan.speed,pcie.link.gen.current,pcie.link.width.current,clocks_throttle_reasons.active}
+    devices:
+      - nvidia.com/gpu=all
+    security_opt: ["label=disable"]
+    mem_limit: 128m
