@@ -76,9 +76,13 @@ Automatic depth is controlled only by
 `--speculative-config '{"method":"dspark", "num_speculative_tokens":5,
 "enable_adaptive_verification":true}'` (in Compose set
 `VLLM_ADAPTIVE_VERIFICATION=true` in `.env`). On DeepSeek V4.1 this selects the
-CPU scheduler history/cohort policy: conditional at-risk acceptance estimates,
-warmup, uncertainty/hysteresis, 2% full-width exploration, and a joint
-output/cost comparison. `false` keeps fixed width. Manual `spec_k` always wins.
+fixed request-local measured policy: discounted prefix-acceptance estimates,
+calibrated output/cost predictions blended with attributed real feedback, and
+uncertainty-aware gain comparisons. It adds no cohort-coupled decisions or
+fixed observation window. `false` keeps fixed width. Manual `spec_k` always wins.
+Production has no external algorithm loader. `ENABLE_PERF_DEBUG=1` builds the
+trusted hot-policy experiment interface separately; see
+[fixed and debug CPU policies](docs/HOT-CPU-POLICY.md).
 History recency is configured in the same JSON, e.g.
 `"adaptive_verification_decay":0.95` (the default; Compose `.env`:
 `VLLM_ADAPTIVE_VERIFICATION_DECAY=0.95`). Each observed verification block
@@ -107,14 +111,15 @@ bound. The field is validated before numeric coercion and
 rejected on unsupported models or when the feature is disabled. It is a
 request-creation setting, not a hot update of a running request.
 
-The cost table is a local PP6/CMP170HX approximation from KS4378200 history
-and small c8/c32 mixed measurements, not a general hardware model or oracle.
+The cost table is a local PP6/CMP170HX approximation from uniform-width
+measurements, not a general hardware model or oracle.
 No mode/prompt labels select k. Short requests may finish before enough feedback;
 near ties keep the current width. Structured-output and stale/preempted blocks
 are excluded from history updates. **Follow-up:** mixed widths can fall back to
 PIECEWISE rather than FULL and lose static metadata replay even at equal rows;
-this policy prices that cost but does not fix mixed FULL graph capture. Prior
-18/18 revised historical replay was not an independent blind validation.
+the policy observes real recurrence but does not fix mixed FULL graph capture.
+Workload-level measurements can follow different output trajectories across k;
+historical replay is not independent throughput or correctness validation.
 
 Diagnostics: `VLLM_DSV41_DECODE_TRACE=1` logs sampled shape histograms. For a torch
 profile, set `VLLM_PROFILER=torch` and
