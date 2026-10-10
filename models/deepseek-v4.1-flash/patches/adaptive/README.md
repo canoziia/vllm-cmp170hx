@@ -137,7 +137,8 @@ unless the step is uniform at that width, so ragged steps are unchanged.
 
 The current 0008 corrects 0007's list-alias/range-partition and early candidate
 priority defects, captures common narrow uniform graphs, and adds an independently
-opt-in execution path for CPU-known per-request draft prefixes (`spec_k`). Target
+opt-in execution path for CPU-known per-request draft prefixes (`spec_k`,
+DeepSeek V4.1 only; other models ignore the key). Target
 acceptance/rejection and the PP feedback collective shape/order are unchanged.
 Adaptive confidence scoring remains separate; an adaptive batch is never treated
 as uniform merely because its total budget divides by its request count.

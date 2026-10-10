@@ -18,51 +18,6 @@ index 5c0735c..2fb5da7 100644
  
  def apply() -> None:
      name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
-diff --git a/vllm/entrypoints/serve/engine/protocol.py b/vllm/entrypoints/serve/engine/protocol.py
-index 704d6b2..11db39d 100644
---- a/vllm/entrypoints/serve/engine/protocol.py
-+++ b/vllm/entrypoints/serve/engine/protocol.py
-@@ -44,6 +44,13 @@ class OpenAIBaseModel(BaseModel):
-     @model_validator(mode="wrap")
-     @classmethod
-     def __log_extra_fields__(cls, data, handler):
-+        # Validate request-local verification width BEFORE the numeric union
-+        # in vllm_xargs coerces bool True into integer 1.
-+        if isinstance(data, dict):
-+            extra = data.get("vllm_xargs")
-+            if isinstance(extra, dict) and "spec_k" in extra:
-+                if type(extra["spec_k"]) is not int or extra["spec_k"] < 0:
-+                    raise ValueError("vllm_xargs.spec_k must be a nonnegative integer")
-         result = handler(data)
-         if not isinstance(data, dict):
-             return result
-diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
-index e81ac29..d316a2b 100644
---- a/vllm/sampling_params.py
-+++ b/vllm/sampling_params.py
-@@ -823,6 +823,22 @@ class SamplingParams(
-         structured_outputs_config: StructuredOutputsConfig | None,
-         tokenizer: TokenizerLike | None,
-     ) -> None:
-+        if self.extra_args and "spec_k" in self.extra_args:
-+            import os
-+            value = self.extra_args["spec_k"]
-+            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
-+                    or speculative_config is None
-+                    or speculative_config.method != "dspark"
-+                    or "DeepseekV41ForCausalLM" not in model_config.architectures):
-+                raise VLLMValidationError(
-+                    "spec_k requires VLLM_DSV41_VERIFICATION=1 and DSpark",
-+                    parameter="vllm_xargs.spec_k",
-+                )
-+            if type(value) is not int or not 0 <= value <= speculative_config.num_speculative_tokens:
-+                raise VLLMValidationError(
-+                    "spec_k must be an integer between 0 and configured draft count",
-+                    parameter="vllm_xargs.spec_k",
-+                )
-         self._validate_logprobs(model_config)
-         self._validate_logit_bias(model_config)
-         self._validate_trace_replay(model_config, speculative_config)
 diff --git a/vllm/v1/attention/backends/mla/decode_metadata.py b/vllm/v1/attention/backends/mla/decode_metadata.py
 new file mode 100644
 index 0000000..d15ed49
@@ -220,8 +175,70 @@ index dbbd32f..b5e863b 100644
  
      def _update_request_with_output(
          self, request: Request, new_token_ids: list[int], is_stale: bool = False
+diff --git a/vllm/v1/core/sched/dsv41_spec_k.py b/vllm/v1/core/sched/dsv41_spec_k.py
+new file mode 100644
+index 0000000..504f5e8
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_spec_k.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DeepSeek V4.1 request-local verification width (``vllm_xargs.spec_k``).
++
++``vllm_xargs`` already reaches ``SamplingParams.extra_args`` unchanged for every
++model. Only ``DeepseekV41ForCausalLM`` consults this module (two
++architecture-gated call sites: input validation and scheduler admission);
++every other model ignores the key exactly like the unpatched engine.
++"""
++import os
++
++from vllm.exceptions import VLLMValidationError
++
++
++def _widths_enabled(spec) -> bool:
++    return os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++
++
++def validate_request(extra_args, speculative_config) -> None:
++    """Front-end validation; failures surface as HTTP 400."""
++    if not extra_args or "spec_k" not in extra_args:
++        return
++    value = extra_args["spec_k"]
++    if type(value) is not int or value < 0:
++        raise VLLMValidationError(
++            "vllm_xargs.spec_k must be a nonnegative integer",
++            parameter="vllm_xargs.spec_k",
++        )
++    if (speculative_config is None
++            or speculative_config.method != "dspark"
++            or not _widths_enabled(speculative_config)):
++        raise VLLMValidationError(
++            "spec_k requires VLLM_DSV41_VERIFICATION=1 and DSpark",
++            parameter="vllm_xargs.spec_k",
++        )
++    if not 0 <= value <= speculative_config.num_speculative_tokens:
++        raise VLLMValidationError(
++            "spec_k must be an integer between 0 and configured draft count",
++            parameter="vllm_xargs.spec_k",
++        )
++
++
++def draft_limit(request, spec, num_spec_tokens: int,
++                use_v2_model_runner: bool) -> int | None:
++    """Scheduler admission: the request's verified-draft limit, or None."""
++    params = request.sampling_params
++    extra = params.extra_args if params is not None else None
++    limit = extra.get("spec_k") if extra else None
++    if limit is None:
++        return None
++    if (spec is None or spec.method != "dspark"
++            or not use_v2_model_runner
++            or not _widths_enabled(spec)):
++        raise ValueError("spec_k requires enabled DSpark verification widths")
++    if type(limit) is not int or not 0 <= limit <= num_spec_tokens:
++        raise ValueError("spec_k must be an integer in the configured draft range")
++    return limit
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 149d7f4..5fa7e92 100644
+index 149d7f4..d40f6fa 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -663,6 +663,9 @@ class Scheduler(SchedulerInterface):
@@ -264,26 +281,36 @@ index 149d7f4..5fa7e92 100644
  
      def update_draft_token_ids_in_output(
          self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
-@@ -2536,6 +2546,19 @@ class Scheduler(SchedulerInterface):
+@@ -2536,6 +2546,13 @@ class Scheduler(SchedulerInterface):
          return self.kv_cache_manager.usage
  
      def add_request(self, request: Request) -> None:
-+        params = request.sampling_params
-+        extra = params.extra_args if params is not None else None
-+        limit = extra.get("spec_k") if extra else None
-+        if limit is not None:
-+            import os
-+            spec = self.vllm_config.speculative_config
-+            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
-+                    or spec is None or spec.method != "dspark"
-+                    or not self.use_v2_model_runner):
-+                raise ValueError("spec_k requires enabled DSpark verification widths")
-+            if type(limit) is not int or not 0 <= limit <= self.num_spec_tokens:
-+                raise ValueError("spec_k must be an integer in the configured draft range")
-+            request.verification_draft_limit = limit
++        if "DeepseekV41ForCausalLM" in self.vllm_config.model_config.architectures:
++            from vllm.v1.core.sched.dsv41_spec_k import draft_limit
++
++            limit = draft_limit(request, self.vllm_config.speculative_config,
++                                self.num_spec_tokens, self.use_v2_model_runner)
++            if limit is not None:
++                request.verification_draft_limit = limit
          existing = self.requests.get(request.request_id)
          if existing is not None:
              update = StreamingUpdate.from_request(request)
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 4cc433c..d1617c6 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -100,6 +100,11 @@ class InputProcessor:
+                 self.structured_outputs_config,
+                 self.tokenizer,
+             )
++            if "DeepseekV41ForCausalLM" in self.model_config.architectures:
++                # DeepSeek V4.1 request-local verification width (vllm_xargs.spec_k).
++                from vllm.v1.core.sched.dsv41_spec_k import validate_request
++
++                validate_request(params.extra_args, self.speculative_config)
+ 
+             if self.model_config.return_sampling_mask:
+                 if params.temperature <= 0:
 diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
 index 05949c2..9be0adc 100644
 --- a/vllm/v1/worker/gpu/attn_utils.py

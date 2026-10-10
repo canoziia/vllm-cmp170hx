@@ -106,25 +106,6 @@ index cf062b1..4f1524c 100644
              # Existing builders stage device-driven request owners, compressed
              # slots and ragged SWA indices into persistent buffers. Restrict
              # this opt-in to the physical SM80 path covered by replay tests.
-diff --git a/vllm/sampling_params.py b/vllm/sampling_params.py
-index d316a2b..c585a3b 100644
---- a/vllm/sampling_params.py
-+++ b/vllm/sampling_params.py
-@@ -826,10 +826,11 @@ class SamplingParams(
-         if self.extra_args and "spec_k" in self.extra_args:
-             import os
-             value = self.extra_args["spec_k"]
--            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
--                    or speculative_config is None
-+            if (speculative_config is None
-                     or speculative_config.method != "dspark"
--                    or "DeepseekV41ForCausalLM" not in model_config.architectures):
-+                    or "DeepseekV41ForCausalLM" not in model_config.architectures
-+                    or (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
-+                        and not speculative_config.uses_history_verification())):
-                 raise VLLMValidationError(
-                     "spec_k requires VLLM_DSV41_VERIFICATION=1 and DSpark",
-                     parameter="vllm_xargs.spec_k",
 diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
 index 4b79135..474d2a0 100755
 --- a/vllm/v1/attention/backends/flashinfer.py
@@ -633,8 +614,24 @@ index 0000000..f05d6e4
 +        )
 +    assert abs(p.y[1] / p.t[1] - 80) < 1e-8
 +    assert abs(p.n[1] - 0.95**10) < 1e-8
+diff --git a/vllm/v1/core/sched/dsv41_spec_k.py b/vllm/v1/core/sched/dsv41_spec_k.py
+index 504f5e8..0b20714 100644
+--- a/vllm/v1/core/sched/dsv41_spec_k.py
++++ b/vllm/v1/core/sched/dsv41_spec_k.py
+@@ -12,7 +12,10 @@ from vllm.exceptions import VLLMValidationError
+ 
+ 
+ def _widths_enabled(spec) -> bool:
+-    return os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++    # Explicit verification widths, or the public adaptive switch selecting
++    # DeepSeek's CPU history policy (which honours manual spec_k first).
++    return (os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++            or spec.uses_history_verification())
+ 
+ 
+ def validate_request(extra_args, speculative_config) -> None:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 5fa7e92..b9b85b1 100644
+index d40f6fa..a0758c2 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -323,6 +323,14 @@ class Scheduler(SchedulerInterface):
@@ -749,28 +746,17 @@ index 5fa7e92..b9b85b1 100644
                  # Rejections roll back num_computed_tokens (and, under async
                  # scheduling, num_output_placeholders, which covers the spec
                  # tokens). A stale rejection count predates the preemption
-@@ -2552,13 +2608,17 @@ class Scheduler(SchedulerInterface):
-         if limit is not None:
-             import os
-             spec = self.vllm_config.speculative_config
--            if (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
--                    or spec is None or spec.method != "dspark"
--                    or not self.use_v2_model_runner):
-+            if (spec is None or spec.method != "dspark"
-+                    or not self.use_v2_model_runner
-+                    or (os.environ.get("VLLM_DSV41_VERIFICATION", "0") != "1"
-+                        and not spec.uses_history_verification())):
-                 raise ValueError("spec_k requires enabled DSpark verification widths")
-             if type(limit) is not int or not 0 <= limit <= self.num_spec_tokens:
-                 raise ValueError("spec_k must be an integer in the configured draft range")
-             request.verification_draft_limit = limit
+@@ -2553,6 +2609,9 @@ class Scheduler(SchedulerInterface):
+                                 self.num_spec_tokens, self.use_v2_model_runner)
+             if limit is not None:
+                 request.verification_draft_limit = limit
 +        if self.dsv41_history_policy is not None:
 +            self.dsv41_history_policy.forget(request.request_id)
 +            self.dsv41_history_policy.admit(request)
          existing = self.requests.get(request.request_id)
          if existing is not None:
              update = StreamingUpdate.from_request(request)
-@@ -2681,6 +2741,8 @@ class Scheduler(SchedulerInterface):
+@@ -2675,6 +2734,8 @@ class Scheduler(SchedulerInterface):
      def _free_blocks(self, request: Request):
          assert request.is_finished()
          self._free_request_blocks(request)
