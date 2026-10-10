@@ -1,0 +1,122 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo-v2: fp8 copy of the shared lm_head for draft logits
+
+VLLM_MIMO26_DRAFT_HEAD_FP8=1 (default 0 = unchanged). MiMo's drafters (the
+MTP heads here, the DFlash drafter in 0006) share the target's bf16 lm_head
+(152576 x 4096, 1.25 GB). With MTP3 it is read three times per decode step on
+the last PP rank. With the switch the draft logits come from a per-row FP8
+copy through Marlin W8A16 (DeepSeek's Fp8DraftHead, deepseek-v4.1-flash patch
+0009), via the shared helper vllm/model_executor/layers/fp8_draft_head.py.
+Target verification keeps the bf16 head, so outputs are unchanged; only draft
+acceptance can move. +0.62 GiB on the last PP rank. Built by a new optional
+after_target_sharing() hook that Speculator.load_model calls once the
+loaders have shared the target's lm_head/embedding, i.e. before KV sizing and CUDA-graph capture.
+
+diff --git a/vllm/model_executor/layers/fp8_draft_head.py b/vllm/model_executor/layers/fp8_draft_head.py
+new file mode 100644
+index 0000000..a2d81e3
+--- /dev/null
++++ b/vllm/model_executor/layers/fp8_draft_head.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++"""fp8 copy of a shared bf16 lm_head for speculative *draft* logits.
++
++Drafters that share the target's bf16 lm_head compute their draft logits from a
++per-row fp8 copy through Marlin W8A16 instead, each behind its own switch
++(default 0 = unchanged): VLLM_MIMO26_DRAFT_HEAD_FP8 for the MiMo MTP heads,
++VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8 for the MiMo DFlash drafter (measured: it
++lowers DFlash's deep-position acceptance, so it is not in the profile)
++(DeepSeek's Fp8DraftHead, models/deepseek-v4.1-flash patch 0009). The target's
++verification logits keep the bf16 head, so outputs are unchanged; only draft
++acceptance can move. Built once the target modules are shared (before KV
++sizing and CUDA-graph capture); +N*K bytes on the drafter's PP rank.
++"""
++import os
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++
++def enabled(switch: str = "VLLM_MIMO26_DRAFT_HEAD_FP8") -> bool:
++    return os.environ.get(switch, "0") == "1"
++
++
++def build(lm_head, owner: str, switch: str = "VLLM_MIMO26_DRAFT_HEAD_FP8"):
++    """Fp8DraftHead for ``lm_head`` when ``switch`` is on, else None."""
++    if not enabled(switch):
++        return None
++    from vllm.models.deepseek_v4_1.nvidia.dspark_fp8_head import Fp8DraftHead
++
++    head = Fp8DraftHead(lm_head.weight.data)
++    logger.info("%s: fp8 draft lm_head built (%.2f GiB)", owner, head.nbytes() / 2**30)
++    return head
++
++
++def logits(head, lm_head, logits_processor, hidden_states: torch.Tensor) -> torch.Tensor:
++    """LogitsProcessor semantics (soft cap, scale, vocab padding, TP gather,
++    org-vocab truncation) with the projection swapped for the fp8 copy."""
++    lp = logits_processor
++    out = head(hidden_states)
++    if lp.soft_cap is not None:
++        out = torch.tanh(out / lp.soft_cap) * lp.soft_cap
++    if lp.scale != 1.0:
++        out = out * lp.scale
++    num_pad = lm_head.shard_indices.num_org_vocab_padding
++    if num_pad > 0:
++        out[..., -num_pad:] = -float("inf")
++    out = lp._gather_logits(out)
++    return out[..., : lp.org_vocab_size]
+diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
+index 13f0a81..1e2fcd7 100644
+--- a/vllm/model_executor/models/mimo_v2_mtp.py
++++ b/vllm/model_executor/models/mimo_v2_mtp.py
+@@ -260,12 +260,28 @@ class MiMoV2MTP(nn.Module):
+             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
+         )
+ 
++    def after_target_sharing(self) -> None:
++        """VLLM_MIMO26_DRAFT_HEAD_FP8: fp8 copy of the shared lm_head for the
++        draft logits (vllm/model_executor/layers/fp8_draft_head.py)."""
++        from vllm.model_executor.layers import fp8_draft_head
++
++        self._fp8_draft_head = fp8_draft_head.build(self.lm_head, "MiMo MTP")
++
+     def compute_logits(
+         self,
+         hidden_states: torch.Tensor,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor | None:
+-        return self.model.compute_logits(hidden_states, self.lm_head, spec_step_idx)
++        head = getattr(self, "_fp8_draft_head", None)
++        if head is None:
++            return self.model.compute_logits(
++                hidden_states, self.lm_head, spec_step_idx
++            )
++        from vllm.model_executor.layers import fp8_draft_head
++
++        return fp8_draft_head.logits(
++            head, self.lm_head, self.model.logits_processor, hidden_states
++        )
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         tp_rank = get_tensor_model_parallel_rank()
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 16bb105..98c3363 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -184,6 +184,12 @@ class DraftModelSpeculator(BaseSpeculator):
+         )
+ 
+         self.model = self.load_draft_model(target_model, target_attn_layer_names)
++        # Optional draft-side setup that needs the shared target modules (e.g.
++        # a derived copy of the shared lm_head, fp8_draft_head.py). Runs after
++        # the loaders share lm_head/embedding, before KV sizing and capture.
++        after_sharing = getattr(self.model, "after_target_sharing", None)
++        if after_sharing is not None:
++            after_sharing()
+         self._validate_local_argmax_reduction()
+ 
+         all_attn_layers = set[str](

@@ -1,0 +1,109 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] fused_moe: single-sort deterministic MoE align up to 4096 entries
+
+VLLM_MIMO26_SORT_MOE_ALIGN=1 (default 0 = unchanged; needs
+VLLM_DSV4_FAST_DET_MOE_ALIGN=1 and the deterministic align, both on in the
+MiMo profile). One Triton program sorts (expert << 13 | flat index) keys
+with tl.sort, takes per-expert counts from tl.histogram and scatters, giving
+exactly the sorted_ids / expert_ids / num_tokens_post_pad of
+_moe_align_block_size_deterministic. CUDA graph on sm_80, 256 experts:
+4-8 us for 8-512 entries (DeepSeek 0003 chunked kernel 11-59 us) and
+12 / 26 us for 1024 / 2048 entries, which previously used the ~25-kernel
+torch path (MiMo MTP3 at c32: 128 tokens x top-8 = 1024 entries).
+
+diff --git a/vllm/model_executor/layers/fused_moe/fast_det_align.py b/vllm/model_executor/layers/fused_moe/fast_det_align.py
+index fe5e960..3a296cd 100644
+--- a/vllm/model_executor/layers/fused_moe/fast_det_align.py
++++ b/vllm/model_executor/layers/fused_moe/fast_det_align.py
+@@ -67,10 +67,64 @@ def _det_align_kernel(ids, sorted_ids, expert_ids, ntpp, S, E, BS, CAP, NB,
+     tl.store(ntpp, total)
+ 
+ 
++# VLLM_MIMO26_SORT_MOE_ALIGN=1 (default 0): for up to SORT_MAX_ENTRIES routed
++# entries use one bitonic sort of (expert << 13 | index) keys plus a histogram
++# (same output bit for bit). Under CUDA graphs on sm_80 it takes 4-8 us for
++# 8-512 entries (the chunked kernel above: 11-59 us) and 12/26 us for
++# 1024/2048 entries, which previously fell back to the ~25-kernel torch path
++# (e.g. 32 requests x 4 MTP tokens x top-8 = 1024).
++SORT_MAX_ENTRIES = 4096
++_SORT_KEY_SHIFT = 13  # 2**13 = 8192 > SORT_MAX_ENTRIES
++
++
++@triton.jit
++def _sort_align_kernel(ids, sorted_ids, expert_ids, ntpp, offs, S, E, BS, CAP, NB,
++                       P: tl.constexpr, EP: tl.constexpr, FILL: tl.constexpr,
++                       SHIFT: tl.constexpr):
++    i = tl.arange(0, P)
++    e = tl.load(ids + i, mask=i < S, other=-1).to(tl.int32)
++    valid = (i < S) & (e >= 0) & (e < E)
++    big: tl.constexpr = 2147483647
++    key = tl.where(valid, (e << SHIFT) | i, big)
++    counts = tl.histogram(tl.where(valid, e, 0), EP, mask=valid)
++    padded = ((counts + BS - 1) // BS) * BS
++    start = tl.cumsum(padded, 0) - padded
++    cu = tl.cumsum(counts, 0) - counts
++    total = tl.sum(padded, 0)
++    es = tl.arange(0, EP)
++    tl.store(offs + es, start)
++    tl.store(offs + EP + es, cu)
++    for p0 in range(0, CAP, FILL):
++        p = p0 + tl.arange(0, FILL)
++        tl.store(sorted_ids + p, S, mask=p < CAP)
++    for b0 in range(0, NB, FILL):
++        b = b0 + tl.arange(0, FILL)
++        tl.store(expert_ids + b, -1, mask=(b < NB) & (b * BS >= total))
++    tl.debug_barrier()
++    sk = tl.sort(key)
++    ok = sk != big
++    se = tl.where(ok, sk >> SHIFT, 0)
++    si = sk & ((1 << SHIFT) - 1)
++    base = tl.load(offs + se, mask=ok, other=0)
++    cue = tl.load(offs + EP + se, mask=ok, other=0)
++    tl.store(sorted_ids + base + (i - cue), si, mask=ok)
++    nblk = padded // BS
++    maxblk = tl.max(nblk, 0)
++    sblk = start // BS
++    live = es < E
++    for k in range(0, maxblk):
++        tl.store(expert_ids + sblk + k, es, mask=live & (k < nblk))
++    tl.store(ntpp, total)
++
++
+ def enabled() -> bool:
+     return os.environ.get("VLLM_DSV4_FAST_DET_MOE_ALIGN", "0") == "1"
+ 
+ 
++def sort_enabled() -> bool:
++    return os.environ.get("VLLM_MIMO26_SORT_MOE_ALIGN", "0") == "1"
++
++
+ def try_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids,
+               num_tokens_post_pad, expert_map) -> bool:
+     """Fill the outputs and return True, or return False to keep torch."""
+@@ -80,13 +134,25 @@ def try_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids,
+                                                               torch.int64):
+         return False
+     s = topk_ids.numel()
+-    if s == 0 or s > MAX_ENTRIES or not 0 < num_experts <= MAX_EXPERTS:
++    use_sort = sort_enabled() and s <= SORT_MAX_ENTRIES
++    if (s == 0 or not 0 < num_experts <= MAX_EXPERTS
++            or (s > MAX_ENTRIES and not use_sort)):
+         return False
+     if not (sorted_ids.is_contiguous() and expert_ids.is_contiguous()
+             and sorted_ids.dtype == expert_ids.dtype == torch.int32
+             and num_tokens_post_pad.dtype == torch.int32):
+         return False
+     ep = triton.next_power_of_2(num_experts)
++    if use_sort:
++        p = max(16, triton.next_power_of_2(s))
++        offs = torch.empty(2 * ep, dtype=torch.int32, device=topk_ids.device)
++        with torch.cuda.device(topk_ids.device):
++            _sort_align_kernel[(1,)](
++                topk_ids, sorted_ids, expert_ids, num_tokens_post_pad, offs, s,
++                num_experts, block_size, sorted_ids.numel(), expert_ids.numel(),
++                P=p, EP=ep, FILL=1024, SHIFT=_SORT_KEY_SHIFT,
++                num_warps=8 if p <= 1024 else 16)
++        return True
+     with torch.cuda.device(topk_ids.device):
+         _det_align_kernel[(1,)](
+             topk_ids, sorted_ids, expert_ids, num_tokens_post_pad, s,

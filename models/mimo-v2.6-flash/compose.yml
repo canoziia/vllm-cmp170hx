@@ -47,6 +47,9 @@ services:
       NCCL_PROTO: Simple
       NCCL_IB_DISABLE: "1"
       VLLM_PP_LAYER_PARTITION: "${MIMO_PP_LAYER_PARTITION:?set MIMO_PP_LAYER_PARTITION}"
+      # One switch for the MiMo series (patch 0003); individual switches set
+      # here or in .env still win. Switch table in README.md.
+      VLLM_MIMO26_OPT_PROFILE: "${VLLM_MIMO26_OPT_PROFILE}"
       VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
     command:
       - /models/MiMo-V2.6-Flash-MOPD

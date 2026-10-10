@@ -1,0 +1,96 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo-v2: use the checkpoint's MTP layers as parallel heads
+
+VLLM_MIMO26_MTP_LAYERS=N (default unset = upstream: one MTP layer reused for
+every draft step). Loads the first N of the checkpoint's
+num_nextn_predict_layers MTP layers (V2.6-Flash has 3) and reports N as the
+draft config's num_nextn_predict_layers, so that with
+num_speculative_tokens > 1 vLLM selects its multi-module MTP speculator and
+draft step k runs MTP layer k.
+
+MiMo's MTP layers are parallel heads: layer k predicts token t+k+2 from the
+target model's hidden state at t and token t+k+1. The predictor therefore
+returns its input hidden state as the speculator's feedback instead of its
+own output. Per-position acceptance, c1 greedy, 300 tokens:
+
+  counting  chained output 1.00/0.00/0.00   target hidden 1.00/1.00/1.00
+  code      layer-0 reuse  0.96/0.61/0.18   target hidden 0.90/0.78/0.63
+  prose     layer-0 reuse  0.67/0.20/0.03   target hidden 0.69/0.35/0.15
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 331db79..c68e953 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -371,6 +371,21 @@ def _validate_qwen3_omni_dspark(
+         )
+ 
+ 
++def _mimo_v2_num_mtp_layers(hf_config, default: int) -> int:
++    """MiMo-V2 MTP layers to load: VLLM_MIMO26_MTP_LAYERS, capped by the
++    checkpoint's num_nextn_predict_layers; ``default`` when unset."""
++    import os
++
++    raw = os.environ.get("VLLM_MIMO26_MTP_LAYERS", "")
++    if not raw:
++        return default
++    requested = int(raw)
++    available = getattr(hf_config, "num_nextn_predict_layers", None) or 1
++    if requested < 1:
++        raise ValueError(f"VLLM_MIMO26_MTP_LAYERS must be >= 1, got {raw!r}")
++    return min(requested, available)
++
++
+ @config
+ class SpeculativeConfig:
+     """Configuration for speculative decoding."""
+@@ -744,8 +759,13 @@ class SpeculativeConfig:
+             }
+ 
+             hf_config.model_type = "mimo_v2_mtp"
+-            # vLLM currently supports only the first MiMo-V2 MTP layer.
+-            n_predict = _MIMO_V2_PRO_NUM_MTP_LAYERS
++            # Upstream uses only the first MiMo-V2 MTP layer (reused for every
++            # draft step). VLLM_MIMO26_MTP_LAYERS=N (default 1) loads the first
++            # N checkpoint MTP layers, one per draft step, which selects the
++            # multi-module MTP speculator when num_speculative_tokens > 1.
++            n_predict = _mimo_v2_num_mtp_layers(
++                hf_config, _MIMO_V2_PRO_NUM_MTP_LAYERS
++            )
+             hf_config.update(
+                 {
+                     "num_hidden_layers": 0,
+diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
+index 552f7e4..13f0a81 100644
+--- a/vllm/model_executor/models/mimo_v2_mtp.py
++++ b/vllm/model_executor/models/mimo_v2_mtp.py
+@@ -175,7 +175,9 @@ class MiMoV2MultiTokenPredictor(nn.Module):
+         config = vllm_config.model_config.hf_config
+         spec_cfg = vllm_config.speculative_config
+         assert spec_cfg is not None
+-        num_mtp_layers = 1
++        # SpeculativeConfig sets num_nextn_predict_layers to the number of MTP
++        # layers to load (1 unless VLLM_MIMO26_MTP_LAYERS asks for more).
++        num_mtp_layers = getattr(config, "num_nextn_predict_layers", None) or 1
+ 
+         self.num_mtp_layers = num_mtp_layers
+ 
+@@ -207,9 +209,18 @@ class MiMoV2MultiTokenPredictor(nn.Module):
+         if inputs_embeds is None:
+             inputs_embeds = self.embed_input_ids(input_ids)
+         current_step_idx = spec_step_idx % self.num_mtp_layers
+-        return self.mtp.layers[str(current_step_idx)](
++        out = self.mtp.layers[str(current_step_idx)](
+             inputs_embeds, positions, previous_hidden_states
+         )
++        if self.num_mtp_layers > 1:
++            # MiMo's MTP layers are parallel heads: layer k predicts token
++            # t+k+2 from the *target model's* hidden state at t and token
++            # t+k+1, not from layer k-1's output. Hand the input hidden state
++            # through as the multi-module speculator's feedback (it shifts the
++            # tokens, the hidden rows stay the target's). Chaining the normed
++            # or pre-norm output instead leaves layers 1-2 at ~0% acceptance.
++            return out, previous_hidden_states
++        return out
+ 
+     def compute_logits(
+         self,

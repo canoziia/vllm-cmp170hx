@@ -2,3 +2,7 @@
 # series. The pinned tree already loads MiMo-V2.6 as MiMoV2OmniForCausalLM
 # (text + vision + audio) with the MiMo MTP head.
 0001-mimo-v2-fp8-qkv-checkpoint-shards.patch
+0002-mimo-v2-multi-layer-mtp.patch
+0003-mimo26-opt-profile.patch
+0004-moe-align-bitonic-sort.patch
+0005-mimo-v2-fp8-draft-head.patch

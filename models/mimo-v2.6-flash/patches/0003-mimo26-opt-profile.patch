@@ -1,0 +1,63 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo26: one profile switch for the MiMo series
+
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index 9c3046d..c157f42 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -9,6 +9,11 @@ from vllm.dsv41_opt_profile import apply as _dsv41_apply_opt_profile
+ 
+ _dsv41_apply_opt_profile()
+ 
++# MiMo-V2.6-Flash on CMP 170HX: one switch for the MiMo series switches.
++from vllm.mimo26_opt_profile import apply as _mimo26_apply_opt_profile
++
++_mimo26_apply_opt_profile()
++
+ 
+ def _get_torch_cuda_version():
+     """Peripheral function to _maybe_set_cuda_compatibility_path().
+diff --git a/vllm/mimo26_opt_profile.py b/vllm/mimo26_opt_profile.py
+new file mode 100644
+index 0000000..3716bc8
+--- /dev/null
++++ b/vllm/mimo26_opt_profile.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One switch for the MiMo-V2.6-Flash patch series (models/mimo-v2.6-flash).
++
++VLLM_MIMO26_OPT_PROFILE=default sets every switch below to its deployed value
++*unless that variable is already set*, so a single switch can still be
++overridden (e.g. VLLM_MIMO26_MTP_LAYERS=1). Unset / "0" / "off": nothing is
++changed and every patch keeps its own default (off). Applied from
++vllm.env_override, before any other vLLM module is imported, in the API
++server and in every spawned worker. The switch table is in
++models/mimo-v2.6-flash/README.md.
++"""
++import os
++
++PROFILES: dict[str, dict[str, str]] = {
++    "default": {
++        # 0002 MTP layers as parallel heads (multi-module MTP)
++        "VLLM_MIMO26_MTP_LAYERS": "3",
++        # DeepSeek 0003 single-kernel deterministic MoE align (bitwise equal,
++        # <= 512 routed entries; generic, already in the image)
++        "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
++        # 0004 single-sort align for every size up to 4096 entries
++        "VLLM_MIMO26_SORT_MOE_ALIGN": "1",
++        # 0005 fp8 copy of lm_head for MTP draft logits
++        "VLLM_MIMO26_DRAFT_HEAD_FP8": "1",
++    },
++}
++
++
++def apply() -> None:
++    name = os.environ.get("VLLM_MIMO26_OPT_PROFILE", "").strip().lower()
++    if name in ("", "0", "off", "none"):
++        return
++    if name not in PROFILES:
++        raise ValueError(
++            f"VLLM_MIMO26_OPT_PROFILE={name!r}: unknown profile "
++            f"(known: {', '.join(sorted(PROFILES))})")
++    for key, value in PROFILES[name].items():
++        os.environ.setdefault(key, value)
