@@ -33,6 +33,7 @@ shared and adaptive series applied exactly as for that image, then
 | 0003-mimo26-opt-profile | `VLLM_MIMO26_OPT_PROFILE`: one switch for the series |
 | 0004-moe-align-bitonic-sort | single-sort deterministic MoE align up to 4096 entries |
 | 0005-mimo-v2-fp8-draft-head | fp8 copy of the shared lm_head for draft logits |
+| 0006-mimo-v2-dflash-drafter | the bundled DFlash drafter under PP (experimental, below) |
 
 The pinned tree already has everything else: `MiMoV2OmniForCausalLM` (the
 checkpoint has `vision_config`, so vLLM loads text + vision + audio), the
@@ -135,10 +136,26 @@ Not in the profile but set in `.env` (measured on top of the profile):
 | `MIMO_PP_LAYER_PARTITION` | 13,13,13,9 | the last rank also drafts; c32 counting +5 %, frees 14 GiB there |
 | `VLLM_PP_DECODE_COHORT_BALANCE` | 1 | spreads decodes over the PP in-flight batches; c32 counting/code/prose +57 / +63 / +36 %, c1 bit-identical |
 
+## DFlash drafter (0006, experimental)
+
+`--speculative-config={"method":"dflash","model":"/models/MiMo-V2.6-Flash-MOPD/dflash","num_speculative_tokens":7}`
+runs the bundled 5-layer drafter (block 8, attention sinks, SWA 1024, value
+scale 0.612, separate mask embedding). It reads aux hidden states of target
+layers 0/11/23/35/47 across all PP ranks and needs the target embedding on the
+last rank (+1.25 GiB). Against MTP3 (c1/c8/c32 per-request tok/s):
+counting +54 / +12 / +15 %, code +26 / +12 / 0 %, prose -43 / -46 / -50 %
+(prose acceptance 10.5 %). At k=3 its first three positions are below the MTP
+heads' (code 0.84/0.73/0.58 vs 0.90/0.80/0.67). Not deployed:
+
+- KV: with the drafter's SWA layers (page size differs from the target's) the
+  hybrid KV manager splits into 11 groups and the KV pool drops to 294k tokens
+  (1M needs 29.45 GiB/rank), so it currently needs max-model-len <= 262144.
+- `VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8` (fp8 draft head for DFlash, default 0,
+  not in the profile) lowers DFlash's deep-position acceptance (code 4.68 ->
+  4.21 tok/step).
+
 ## Not enabled yet
 
-- The bundled `dflash/` drafter (5-layer DFlash, block 8) is not used. Only
-  the MTP heads are.
 - LMCache: not connected. The hybrid SWA/global grouping with sinks has not
   been validated against the shared LMCache series.
 - Multimodal inputs are loaded but have not been smoke-tested.

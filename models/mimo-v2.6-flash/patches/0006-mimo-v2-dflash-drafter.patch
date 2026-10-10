@@ -1,0 +1,209 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo-v2: run the bundled DFlash drafter under PP
+
+The checkpoint ships a 5-layer DFlash drafter (dflash/, block 8, target
+layers 0/11/23/35/47, separate mask_embedding.pt, attention sinks, SWA
+1024). vLLM's qwen3_dflash already handles the sinks, sliding window and
+mask embedding; this adds what MiMo needs on top:
+
+- MiMoV2Model: auxiliary hidden states over pipeline parallelism, as in
+  llama (absolute layer indices, embedding output only on the first rank,
+  local states packed into the intermediate tensors, the last rank returns
+  upstream + local ones); supports_aux_hidden_states_over_pp.
+- MiMoV2OmniForCausalLM: SupportsEagle3, so the aux layers can be set.
+- qwen3_dflash: dflash_config.attention_value_scale (0.612 for MiMo) scales
+  V before attention, for the query block and for the precomputed target
+  context K/V. Only drafters whose config carries the key are affected.
+- MiMoV2Model: builds embed_tokens on the last PP rank too when the
+  speculator needs the target embedding (spec_decode_needs_target_embed, as
+  DeepSeek V4.1); the drafter has no embedding of its own. +1.25 GiB there.
+- qwen3_dflash: after_target_sharing() / compute_logits can use the 0005 fp8
+  draft head for the draft logits of every block position, behind its own
+  switch VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8 (default 0, not in the profile:
+  on MiMo it lowers deep-position acceptance, code 4.68 -> 4.21 tok/step).
+
+Selected only by --speculative-config method "dflash" with the dflash/
+directory; MTP deployments are unchanged.
+
+diff --git a/vllm/model_executor/models/mimo_v2.py b/vllm/model_executor/models/mimo_v2.py
+index d65d6ea..f6cf95d 100644
+--- a/vllm/model_executor/models/mimo_v2.py
++++ b/vllm/model_executor/models/mimo_v2.py
+@@ -67,6 +67,7 @@ from .utils import (
+     make_empty_intermediate_tensors_factory,
+     make_layers,
+     maybe_prefix,
++    spec_decode_needs_target_embed,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -542,6 +543,7 @@ def _shard_fp8_qkv_proj(
+ 
+ 
+ class MiMoV2Model(nn.Module, EagleModelMixin):
++    supports_aux_hidden_states_over_pp = True
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -554,8 +556,12 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
+         self.vocab_size = config.vocab_size
+         self.num_redundant_experts = eplb_config.num_redundant_experts
+ 
+-        if get_pp_group().is_first_rank or (
+-            config.tie_word_embeddings and get_pp_group().is_last_rank
++        # The last rank also needs the input embedding when its drafter
++        # (DFlash) embeds tokens with the target's table.
++        if (
++            get_pp_group().is_first_rank
++            or (config.tie_word_embeddings and get_pp_group().is_last_rank)
++            or spec_decode_needs_target_embed(vllm_config)
+         ):
+             self.embed_tokens = VocabParallelEmbedding(
+                 config.vocab_size,
+@@ -604,11 +610,19 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        aux_hidden_states = self._maybe_add_hidden_state(
+-            [], self.start_layer, hidden_states, residual
+-        )
++        # Aux hidden states (EAGLE-3 / DFlash targets) over PP, as in llama:
++        # absolute layer indices, the embedding output only on the first rank,
++        # local states packed into the intermediate tensors, the last rank
++        # returns upstream + local ones.
++        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++        aux_hidden_states: list[torch.Tensor] = []
++        if get_pp_group().is_first_rank:
++            self._maybe_add_hidden_state(
++                aux_hidden_states, self.start_layer, hidden_states, residual
++            )
+         for idx, layer in enumerate(
+-            islice(self.layers, self.start_layer, self.end_layer)
++            islice(self.layers, self.start_layer, self.end_layer),
++            start=self.start_layer,
+         ):
+             hidden_states, residual = layer(positions, hidden_states, residual)
+             self._maybe_add_hidden_state(
+@@ -617,11 +631,16 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
++                {
++                    "hidden_states": hidden_states,
++                    "residual": residual,
++                    **self.pack_local_aux_hidden_states(aux_hidden_states),
++                }
+             )
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
+ 
++        aux_hidden_states = remote_aux + aux_hidden_states
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/model_executor/models/mimo_v2_omni.py b/vllm/model_executor/models/mimo_v2_omni.py
+index 93bd6a4..6853c62 100644
+--- a/vllm/model_executor/models/mimo_v2_omni.py
++++ b/vllm/model_executor/models/mimo_v2_omni.py
+@@ -55,6 +55,7 @@ from vllm.transformers_utils.processors.mimo_v2_omni import (
+ 
+ from .interfaces import (
+     MultiModalEmbeddings,
++    SupportsEagle3,
+     SupportsMultiModal,
+     SupportsPP,
+     SupportsQuant,
+@@ -1238,7 +1239,9 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
+     info=MiMoV2OmniProcessingInfo,
+     dummy_inputs=MiMoV2OmniDummyInputsBuilder,
+ )
+-class MiMoV2OmniForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant):
++class MiMoV2OmniForCausalLM(
++    nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
++):
+     # To ensure correct weight loading and mapping.
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_prefix={
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index ce3884a..89b998f 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -168,6 +168,7 @@ class DFlashQwen3Attention(nn.Module):
+         attention_bias: bool = False,
+         add_swa_attention_sink_bias: bool = False,
+         sliding_window: int | None = None,
++        value_scale: float | None = None,
+         causal: bool = False,
+         is_neox_style: bool = True,
+         cache_config: CacheConfig | None = None,
+@@ -224,6 +225,10 @@ class DFlashQwen3Attention(nn.Module):
+         )
+ 
+         self.sliding_window = sliding_window
++        # dflash_config.attention_value_scale (MiMo-V2 drafters): V is scaled
++        # before attention, for the query block here and for the target
++        # context K/V in precompute_and_store_context_kv.
++        self.value_scale = value_scale
+         self.attn = Attention(
+             self.num_heads,
+             self.head_dim,
+@@ -262,6 +267,8 @@ class DFlashQwen3Attention(nn.Module):
+         ).view(k_shape)
+ 
+         q, k = self.rotary_emb(positions, q, k)
++        if self.value_scale is not None:
++            v = v * self.value_scale
+ 
+         attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+@@ -312,6 +319,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
+             attention_bias=getattr(config, "attention_bias", False),
+             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+             sliding_window=sliding_window,
++            value_scale=dflash_config.get("attention_value_scale"),
+             causal=causal,
+             is_neox_style=is_neox_style,
+             head_dim=getattr(config, "head_dim", None),
+@@ -602,6 +610,9 @@ class DFlashQwen3Model(nn.Module):
+ 
+         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
+         all_k_normed = self._normalize_context_k(all_k)
++        value_scale = self.layers[0].self_attn.value_scale
++        if value_scale is not None:
++            all_v.mul_(value_scale)
+ 
+         # --- Fused RoPE across all layers ---
+         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
+@@ -743,10 +754,31 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         get_draft_kv_cache_layer_names."""
+         return [layer.self_attn.causal for layer in self.model.layers]
+ 
++    def after_target_sharing(self) -> None:
++        """VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8: fp8 copy of the shared lm_head
++        for the draft logits of every block position (fp8_draft_head.py). Only
++        with a full-vocabulary draft head that is shared with the target."""
++        from vllm.model_executor.layers import fp8_draft_head
++
++        self._fp8_draft_head = (
++            fp8_draft_head.build(
++                self.lm_head, "DFlash", "VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8"
++            )
++            if self.draft_id_to_target_id is None
++            else None
++        )
++
+     def compute_logits(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
++        head = getattr(self, "_fp8_draft_head", None)
++        if head is not None:
++            from vllm.model_executor.layers import fp8_draft_head
++
++            return fp8_draft_head.logits(
++                head, self.lm_head, self.logits_processor, hidden_states
++            )
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         if self.draft_id_to_target_id is None:
+             return logits
