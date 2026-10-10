@@ -12,33 +12,23 @@ Enable per deployment:
     --speculative-config={"method":"dspark","num_speculative_tokens":5,\
       "use_local_argmax_reduction":true,"enable_adaptive_verification":true}
 
-### Public adaptive switch (0010)
+### Measured verification policy (0009)
 
-`enable_adaptive_verification=true` now selects the CPU at-risk history/cohort
-policy for DeepSeek V4.1. `false` disables automatic k. The `verification`
-optimisation profile no longer enables the algorithm, and the separate
-`VLLM_DSV41_HISTORY_POLICY` environment switch is removed. Compose forwards
-`VLLM_ADAPTIVE_VERIFICATION` (default false) to this public configuration field.
-Manual request `spec_k` overrides the automatic decision.
+`enable_adaptive_verification=true` selects the request-local measured policy
+on DeepSeek V4.1; other models retain their GPU confidence allocator. Manual
+`spec_k` overrides automatic choice. The verification profile controls execution
+optimisations, not automatic selection. `adaptive_verification_decay` (default
+0.95, finite [0,1)) discounts evidence, not measured speeds.
 
-Internally, device-layout consumers use `uses_gpu_adaptive_verification()`;
-DeepSeek's CPU-known widths must not accidentally enable GPU compaction,
-confidence relay, or device-only sampling boundaries. Other DSpark models retain
-their prior confidence allocator. These internal capability methods are not
-additional user switches. Existing default-OFF configuration stays OFF.
+Per-width measured output/time blends with one calibrated predicted block.
+Gain and uncertainty gates reduce marginal reversals; upward changes are at
+most one width. Retained limits preserve the chosen width between decisions.
+Feedback is attributed to actual scheduled width and request generation;
+CPU-visible timing includes PP cadence and queueing, not just GPU computation.
+Failures retain full5. No external source loader is included in production.
 
-### History retention configuration (0011, candidate)
-
-`adaptive_verification_decay` is read from `--speculative-config` (default0.95,
-finite numeric `[0,1)`). It multiplies old at-risk success/risk weights on each
-feedback block. The estimator also retains squared weights for effective sample
-size; changing decay must not leave the old raw-risk/4 uncertainty gate intact.
-Candidate switching compares paired score differences, preserving shared-prefix
-covariance, requires two fresh supporting feedback blocks, and periodically
-refreshes censored tails with full-width probes. Heterogeneous fallback is
-re-evaluated from recent evidence rather than permanently locking the request.
-These decision changes require online validation before deployment; offline
-full-feedback replay does not predict counterfactual token streams or throughput.
+The optional hot-policy interface is compiled only with ENABLE_PERF_DEBUG=1.
+See [CPU policy contract](../../docs/HOT-CPU-POLICY.md).
 
 ### Why shipping it by default is inert (asserted at build time)
 

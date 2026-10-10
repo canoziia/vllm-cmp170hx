@@ -6,10 +6,7 @@ d4bf27af0f982594c1108ecff09c9ab4916d1a9c25b10b23f672dbcaa019ccd7  models/deepsee
 b57013baff059273ac879c30bc4434db727b1f989c5bf5221ddd45dcb0ef4c65  models/deepseek-v4.1-flash/patches/adaptive/0003-pack-confidence-with-draft-feedback.patch
 0fe44111c6a723311c0597c6514b135c884e5961901aa53a3014dc439e7f99e7  models/deepseek-v4.1-flash/patches/adaptive/0004-v2-budget-relay-integration.patch
 6e10c44cf3fd73ed5e8951993c281830523351bbab6fa2c7585e1d726872d6e2  models/deepseek-v4.1-flash/patches/adaptive/0005-pair-pp-confidence-relay-with-fixed-warmup.patch
-1b85f4807fca22fa332c45ae63b43bb29badcd3ba688062ba934c11ec85d0f27  models/deepseek-v4.1-flash/patches/adaptive/series
-67625ebbec97aecff63ac389c36d503fa26b7af98ffc68d7d0f1ce785e392abf  models/deepseek-v4.1-flash/patches/adaptive/0012-target-only-history-draft-config.patch
-c0c79d8f2beb2ca782657acff2efd8c36e5b6cda5cafef6fafbcce92cec8b4b5  models/deepseek-v4.1-flash/patches/adaptive/0011-configurable-history-decay.patch
-6b04c181f00d3816afa11cd8e92cdb3622b8afdbd7155afcc71ffac0d99bf347  models/deepseek-v4.1-flash/patches/adaptive/0010-unify-adaptive-verification-switch.patch
+538e54db76672299dbae2aa097e94156de112296c7e25aee376818335e600b8e  models/deepseek-v4.1-flash/patches/adaptive/series
 0f2eb0c72cbe4e38aead7ba32209e0d2141f5a15feb7bf6cad690cf1f874a0ed  models/deepseek-v4.1-flash/patches/adaptive/0008-verification-widths-and-live-cohorts.patch
 79e00af26f469145c511b520683c64cfb40174c85e3c40e02f2925fb08526fb0  models/deepseek-v4.1-flash/patches/adaptive/0006-clamp-pp-budget-to-scheduled-drafts.patch
 3f7f6cfbecfa7aeb79e61f78bf85c1e43d0cf006a3bc863a57e8d248d6bbb01b  models/deepseek-v4.1-flash/patches/adaptive/0007-uniform-decode-alongside-varlen.patch
@@ -25,7 +22,6 @@ a74e0a191cec239f92189b414889051461d92c340af97919c720f378478b25c0  models/deepsee
 ebe791970e10f9f97bbb0d7a50358b8adea2344ab6b49c7ece78cdd014280c75  models/deepseek-v4.1-flash/patches/0010-dsv41-thin-woa.patch
 dfb48539cc85ed52242378a165a2eff7743533b8b960d3ea2d8d101021e0479d  models/deepseek-v4.1-flash/patches/0013-dsv4-o2-dense-mxfp8-decode.patch
 b164f36096f78d35a0cfe7d066a3b8e0d4d07024950bcfc6ec2c14c9100657bb  models/deepseek-v4.1-flash/patches/0014-dsv41-opt-profile.patch
-80138259a60257185794cf0d4df95d20daa59f27cb2982f7b5bdcb675c78ec36  models/deepseek-v4.1-flash/patches/adaptive/0009-cpu-history-cohort-policy.patch
-f41b17ebaffb927d7ef01154cbdc1819f276bfd960a43e82ea24b956a88ffc69  models/deepseek-v4.1-flash/patches/adaptive/0013-fixed-measured-policy.patch
 481395fecc96d05f99488ce6b702680abc1d14ea1e07a95d4350413f949aec05  models/deepseek-v4.1-flash/patches/optional/0003-hot-cpu-policy-debug.patch
 9b78cfd43e3edb778164f9d81f9f752b41de353c9833adcd916e908faaf79cf8  models/deepseek-v4.1-flash/patches/optional/series.perf-debug
+9c894581250605806a0459c4acd3ad394d8db42e51f13eae7573aa0579312d44  models/deepseek-v4.1-flash/patches/adaptive/0009-measured-verification-policy.patch

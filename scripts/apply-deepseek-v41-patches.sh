@@ -109,7 +109,6 @@ if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
   grep -q 'supports_aux_hidden_states_over_pp' \
     "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
   compile_files+=(
-    "$SOURCE_TREE/vllm/v1/core/sched/dsv41_history_policy.py"
     "$SOURCE_TREE/vllm/v1/core/sched/dsv41_fixed_policy.py"
     "$SOURCE_TREE/vllm/v1/core/sched/dsv41_measured_policy.py"
     "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
