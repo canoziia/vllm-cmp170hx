@@ -1,36 +1,7 @@
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -1,7 +1,6 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- import itertools
--import os
- import time
- from collections import defaultdict, deque
- from collections.abc import Iterable
-@@ -271,20 +270,6 @@
-         # manager's re-prefillable window (this minus 1), and how many tokens to
-         # reserve between a chunk boundary and the prefill end.
-         self.num_prefill_lookahead = 0
--        self._dspark_control = os.environ.get("VLLM_DSPARK_CONTROL_FILE", "")
--        self._dspark_poll_at = 0.0
--        self._dspark_enabled = True
--        if self._dspark_control:
--            # Adaptive verification is allowed alongside the hot toggle: a K=0
--            # step clamps the PP verification budget to the drafts the scheduler
--            # actually scheduled, so the toggle stays the single source of truth.
--            if not (
--                speculative_config
--                and speculative_config.use_dspark()
--                and vllm_config.use_v2_model_runner
--                and self.parallel_config.data_parallel_size == 1
--            ):
--                raise ValueError("Hot DSpark requires MRV2 DSpark with DP=1")
-         self.dynamic_sd_lookup: list[int] | None = None
-         if speculative_config is not None:
-             if speculative_config.num_speculative_tokens_per_batch_size:
-@@ -343,8 +328,8 @@
+@@ -328,8 +328,8 @@
          if spec is not None and spec.uses_history_verification():
              if not self.use_v2_model_runner:
                  raise ValueError("Adaptive DeepSeek verification requires Model Runner V2")
@@ -41,43 +12,7 @@ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
                  logger, decay=spec.adaptive_verification_decay)
          # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
          # cadence (`next_decode_eligible_step`).
-@@ -1115,8 +1100,7 @@
-                     # preserve full cudagraph for this step.
-                     # Not for diffusion where draft tokens can't be padded.
-                     if (
--                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None
--                         and not self._dspark_control)
-+                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
-                         and getattr(request, "verification_draft_limit", None) is None
-                         and self.dsv41_history_policy is None
-                         and self.num_sampled_tokens_per_step > 0
-@@ -1489,25 +1473,6 @@
-                 len(num_scheduled_tokens)
-             ]
- 
--        if self._dspark_control:
--            now = time.monotonic()
--            if now >= self._dspark_poll_at:
--                self._dspark_poll_at = now + 1.0
--                try:
--                    with open(self._dspark_control) as f:
--                        value = f.read(16).strip()
--                    if value in ("0", "1"):
--                        enabled = value == "1"
--                        if enabled != self._dspark_enabled:
--                            logger.info("Hot DSpark: requested K=%d",
--                                        self.num_spec_tokens if enabled else 0)
--                        self._dspark_enabled = enabled
--                except OSError:
--                    pass
--            num_spec_tokens_to_schedule = (
--                self.num_spec_tokens if self._dspark_enabled else 0
--            )
--
-         scheduled_encoder_input_stats = None
-         if (
-             self.log_stats
-@@ -1566,6 +1531,11 @@
+@@ -1531,6 +1531,11 @@
  
          with record_function_or_nullcontext("schedule: update_after_schedule"):
              self._update_after_schedule(scheduler_output)
@@ -89,7 +24,7 @@ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
          return scheduler_output
  
      def _get_max_num_scheduled_decodes(self) -> int:
-@@ -2006,6 +1976,8 @@
+@@ -1971,6 +1976,8 @@
          scheduler_output: SchedulerOutput,
          model_runner_output: ModelRunnerOutput,
      ) -> dict[int, EngineCoreOutputs]:
@@ -98,7 +33,7 @@ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
          sampled_token_ids = model_runner_output.sampled_token_ids
          logprobs = model_runner_output.logprobs
          prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-@@ -2108,6 +2080,16 @@
+@@ -2073,6 +2080,16 @@
                  num_sampled = self.num_sampled_tokens_per_step
                  num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                  num_rejected = num_draft_tokens - num_accepted
@@ -115,7 +50,7 @@ diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
                  if (self.dsv41_history_policy is not None and not output_is_stale
                          and not (scheduler_output.num_invalid_spec_tokens or {}).get(req_id)
                          and not self.structured_output_manager.should_advance(request)):
-@@ -2635,6 +2617,7 @@
+@@ -2600,6 +2617,7 @@
              request.verification_draft_limit = limit
          if self.dsv41_history_policy is not None:
              self.dsv41_history_policy.forget(request.request_id)

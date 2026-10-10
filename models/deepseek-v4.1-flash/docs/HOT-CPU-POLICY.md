@@ -77,6 +77,15 @@ eligible choices. Only active authenticated experimental entries participate;
 manual overrides, failed revisions and ordinary traffic keep their prior path.
 No GPU/PP protocol or new feedback advances are introduced.
 
+Adaptive series reproducibility: 0013 was originally generated against a
+one-off snapshot that also carried the DISABLED hot-perf-debug scheduler code,
+so the series did not replay from the pinned source commit (0013 failed at
+`@@ -1,7 +1,6 @@`). It was regenerated from the real 0001..0012 output; the
+replay now completes and reproduces the deployed container bytes exactly at
+0013 and the fixed bytes at 0014. Any new patch must be validated by replaying
+the WHOLE series from SOURCE_COMMIT, not by apply-check against whichever
+snapshot happened to generate it.
+
 This is NOT fixable by publishing a CPU policy alone. Source/CPU integration
 checks pass; do not claim online fix until a separately approved scheduler
 maintenance deployment and repeat mixed-load GPU validation. Existing image
