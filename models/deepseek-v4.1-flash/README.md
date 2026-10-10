@@ -112,9 +112,18 @@ can have different limits; nonuniform mixtures fall back to a compatible graph
 or eager execution rather than being falsely labelled uniform. Omission uses
 the CPU history policy when `enable_adaptive_verification=true`, otherwise
 retains configured full width. Manual `spec_k` is fixed, not an adaptive upper
-bound. The field is validated before numeric coercion and
-rejected on unsupported models or when the feature is disabled. It is a
-request-creation setting, not a hot update of a running request.
+bound. `spec_k` is supported only on DeepSeek V4.1 (DSpark). It travels in
+the generic `vllm_xargs` -> `SamplingParams.extra_args` passthrough; parsing,
+validation and the per-request limit live in the DeepSeek-only module
+`vllm/v1/core/sched/dsv41_spec_k.py`, called from two
+`DeepseekV41ForCausalLM`-gated hooks (input validation -> HTTP 400, scheduler
+admission). Negative or non-integer values and requests while the feature is
+disabled or DSpark is not configured are rejected with 400. Note that the
+generic request model coerces JSON booleans to 0/1 before any model code runs,
+so `true`/`false` are read as 1/0. Every other
+model served from this image (GLM, ...) silently ignores the key, exactly as
+the unpatched engine does. It is a request-creation setting, not a hot update
+of a running request.
 
 The cost table is a local PP6/CMP170HX approximation from uniform-width
 measurements, not a general hardware model or oracle.
