@@ -1,10 +1,10 @@
-"""Final end-to-end validation through dsv4_o2_dense (O2/O4/O5 dispatch + Marlin fallback).
+"""Final end-to-end validation through dsv41_dense_mxfp8 (stream-K/split-K/wide split-K dispatch + Marlin fallback).
 --acc: fp64 accuracy + determinism over many M;  --safety: graph capture;  --seq: 8-layer sequence."""
 import argparse, os, statistics, time
-os.environ["VLLM_DSV4_O2_DENSE"] = "1"; os.environ["VLLM_DSV4_O2_LIB"] = "out/_o2.so"
+os.environ["VLLM_DSV41_DENSE_MXFP8_DECODE"] = "1"; os.environ["VLLM_DSV41_DENSE_MXFP8_LIB"] = "out/_dsv41_dense_mxfp8.so"
 import torch
-import dsv4_o2_dense as D
-from o2_common import SHAPES, clone, emit, graph_of, make, marlin, nbytes, time_graph
+import dsv41_dense_mxfp8 as D
+from dense_mxfp8_common import SHAPES, clone, emit, graph_of, make, marlin, nbytes, time_graph
 ap = argparse.ArgumentParser(); ap.add_argument("--out", default="data/final_all.jsonl")
 for k in ("acc", "safety", "seq"): ap.add_argument("--" + k, action="store_true")
 a = ap.parse_args(); f = open(a.out, "a"); fails = []
@@ -13,7 +13,7 @@ a = ap.parse_args(); f = open(a.out, "a"); fails = []
 def mk(K, N, seed, ref=False, lo=115, hi=123):
     L, r = make(K, N, seed, ref=ref, exp_lo=lo, exp_hi=hi)
     L.input_size_per_partition, L.output_size_per_partition = K, N
-    D.prepare(L); assert L._o2_ok
+    D.prepare(L); assert L._dense_mxfp8_ok
     return L, r
 
 

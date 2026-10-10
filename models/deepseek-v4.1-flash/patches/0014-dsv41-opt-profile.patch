@@ -54,8 +54,8 @@ index 0000000..5609526
 +        # 0012 fast prefill indexer
 +        "VLLM_DSV41_INDEXER_PREFILL_FAST": "1",
 +        # 0013 dense MXFP8 decode GEMM
-+        "VLLM_DSV4_O2_DENSE": "1",
-+        "VLLM_DSV4_O2_LIB": os.path.join(os.path.dirname(os.path.abspath(__file__)), "_o2.so"),
++        "VLLM_DSV41_DENSE_MXFP8_DECODE": "1",
++        "VLLM_DSV41_DENSE_MXFP8_LIB": os.path.join(os.path.dirname(os.path.abspath(__file__)), "_dsv41_dense_mxfp8.so"),
 +    },
 +}
 +

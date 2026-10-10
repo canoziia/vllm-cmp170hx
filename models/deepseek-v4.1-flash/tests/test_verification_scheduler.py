@@ -10,7 +10,7 @@ from tests.v1.core.utils import create_scheduler,create_requests
 from vllm.v1.outputs import ModelRunnerOutput
 import vllm.envs as envs
 os.environ['VLLM_DSV41_VERIFICATION']='1'
-os.environ['VLLM_DSV41_BALANCED_COHORTS']='1'
+os.environ['VLLM_PP_DECODE_COHORT_LIVE_LOAD']='1'
 # A local HF config avoids downloading OPT; no weights are loaded.
 p=Path(tempfile.mkdtemp());(p/'config.json').write_text(json.dumps({'model_type':'opt','architectures':['OPTForCausalLM'],'hidden_size':64,'ffn_dim':256,'num_hidden_layers':2,'num_attention_heads':4,'vocab_size':1024,'max_position_embeddings':4096,'word_embed_proj_dim':64}))
 def output(s):

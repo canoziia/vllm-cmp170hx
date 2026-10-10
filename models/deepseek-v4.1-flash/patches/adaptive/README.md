@@ -133,7 +133,7 @@ the counts under its bucket and starve ragged steps of their varlen graph,
 dropping those steps to eager. `_is_compatible()` still refuses a uniform graph
 unless the step is uniform at that width, so ragged steps are unchanged.
 
-### 0008: verification widths, live-load cohorts and metadata replay
+### 0008: verification widths and decode metadata
 
 The current 0008 corrects 0007's list-alias/range-partition and early candidate
 priority defects, captures common narrow uniform graphs, and adds an independently
@@ -142,12 +142,19 @@ acceptance/rejection and the PP feedback collective shape/order are unchanged.
 Adaptive confidence scoring remains separate; an adaptive batch is never treated
 as uniform merely because its total budget divides by its request count.
 
-The verification profile also uses a live-load established-decode cap, packs
-partial PP phases only after their feedback's earliest eligible step, shares the
-device token-owner map across KV groups, and replays metadata preparation for
-exact uniform SM80 batches. Padding/ragged/prefill/dummy and unsupported paths
-keep the builder. See the model README for switches, the request contract and
-CPU/GPU tests. These switches are all off under the deployed `default` profile.
+The verification profile also shares the device token-owner map across KV
+groups and replays metadata preparation for exact uniform SM80 batches.
+Padding/ragged/prefill/dummy and unsupported paths keep the builder. These stay
+in 0008 rather than a separate patch because they only act on the narrow
+uniform/one-request shapes that the verification-width branch creates (the
+flattened indexer path and the single-request shortcuts are gated by
+`VLLM_DSV41_VERIFICATION` itself, and metadata graphs are captured only for the
+`uniform_token_count` descriptors that branch adds). The profile additionally
+turns on the generic live-load PP decode cohorts
+(`VLLM_PP_DECODE_COHORT_LIVE_LOAD`), which live in the shared
+`patches/vllm/0003-balance-async-pp-decode-batches.patch`, not here. See the
+model README for switches, the request contract and CPU/GPU tests. These
+switches are all off under the deployed `default` profile.
 
 ### Measured cost of shipping it (runtime flag off)
 

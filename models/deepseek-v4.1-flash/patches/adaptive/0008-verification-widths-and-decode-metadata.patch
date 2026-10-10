@@ -1,5 +1,5 @@
 diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
-index 5609526..30f1e56 100644
+index 5c0735c..2fb5da7 100644
 --- a/vllm/dsv41_opt_profile.py
 +++ b/vllm/dsv41_opt_profile.py
 @@ -45,6 +45,15 @@ PROFILES: dict[str, dict[str, str]] = {
@@ -10,7 +10,7 @@ index 5609526..30f1e56 100644
 +PROFILES["verification"] = {
 +    **PROFILES["default"],
 +    "VLLM_DSV41_VERIFICATION": "1",
-+    "VLLM_DSV41_BALANCED_COHORTS": "1",
++    "VLLM_PP_DECODE_COHORT_LIVE_LOAD": "1",
 +    "VLLM_DSV41_FAST_METADATA": "1",
 +    "VLLM_DSV41_METADATA_GRAPHS": "1",
 +}
@@ -187,37 +187,10 @@ index 7662948..7f82bba 100644
                      num_decode_tokens=num_decode_tokens,
                      use_native=use_native,
 diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
-index 34f7460..9ad8c7c 100644
+index dbbd32f..b5e863b 100644
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
-@@ -1,6 +1,8 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- 
-+import os
-+
- from vllm import envs
- from vllm.logger import init_logger
- from vllm.v1.core.sched.output import SchedulerOutput
-@@ -24,6 +26,17 @@ class AsyncScheduler(Scheduler):
-             or not self.use_pp
-         ):
-             return self.max_num_running_reqs
-+        if (os.environ.get("VLLM_DSV41_BALANCED_COHORTS", "0") == "1"
-+                and "DeepseekV41ForCausalLM"
-+                in self.vllm_config.model_config.architectures):
-+            # The capacity-based limit is inert at low load: four requests
-+            # completing prefill together remain locked in a four-request
-+            # cadence forever. Bound established decodes by the LIVE load.
-+            # Do not change the pp_size feedback-ring cadence or cap prefill.
-+            live = min(self.max_num_running_reqs,
-+                       len(self.running) + len(self.waiting)
-+                       + len(self.skipped_waiting))
-+            return max(1, (live + self.pp_size - 1) // self.pp_size)
-         # ceil(max_num_seqs / pp_size)
-         return (self.max_num_running_reqs + self.pp_size - 1) // self.pp_size
- 
-@@ -62,12 +75,56 @@ class AsyncScheduler(Scheduler):
+@@ -73,7 +73,11 @@ class AsyncScheduler(Scheduler):
              )
              # Add placeholders for the new draft/spec tokens.
              # We will update the actual spec token ids in the worker process.
@@ -230,39 +203,10 @@ index 34f7460..9ad8c7c 100644
  
              if self.use_v2_model_runner:
                  # Set the next step index in which this request is eligible to be
-                 # scheduled for decode (for PP microbatching).
--                request.next_decode_eligible_step = self.current_step + self.pp_size
-+                earliest = self.current_step + self.pp_size
-+                if (self.use_pp
-+                        and os.environ.get("VLLM_DSV41_BALANCED_COHORTS", "0") == "1"
-+                        and "DeepseekV41ForCausalLM"
-+                        in self.vllm_config.model_config.architectures):
-+                    phase = getattr(request, "decode_cohort_phase", None)
-+                    loads = [0] * self.pp_size
-+                    for live in self.running:
-+                        assigned = getattr(live, "decode_cohort_phase", None)
-+                        if assigned is not None:
-+                            loads[assigned] += 1
-+                    capacity = self._get_max_num_scheduled_decodes()
-+                    fragmented = (
-+                        sum(n > 0 for n in loads)
-+                        > (sum(loads) + capacity - 1) // capacity
-+                    )
-+                    if phase is None or (fragmented and loads[phase] < capacity):
-+                        if phase is not None:
-+                            loads[phase] -= 1
-+                        # Fill an existing non-full cohort before opening an
-+                        # empty phase. Uniformly spreading C8 over six phases
-+                        # adds two metadata/draft/PP trips versus four cohorts
-+                        # of two. Repack partial phases after load growth too;
-+                        # delay the NEXT decode, never consume a feedback
-+                        # result before its original T+PP boundary.
-+                        def phase_cost(delay):
-+                            load = loads[(earliest + delay) % self.pp_size]
-+                            return (load >= capacity, -load if load < capacity else load, delay)
-+                        earliest += min(range(self.pp_size), key=phase_cost)
-+                    request.decode_cohort_phase = earliest % self.pp_size
-+                request.next_decode_eligible_step = earliest
+@@ -107,6 +111,16 @@ class AsyncScheduler(Scheduler):
+                         earliest += min(range(self.pp_size), key=phase_cost)
+                     request.decode_cohort_phase = earliest % self.pp_size
+                 request.next_decode_eligible_step = earliest
 +        if os.environ.get("VLLM_DSV41_DECODE_TRACE", "0") == "1":
 +            histogram = getattr(self, "_decode_histogram", {})
 +            requests = list(scheduler_output.num_scheduled_tokens)
@@ -277,7 +221,7 @@ index 34f7460..9ad8c7c 100644
      def _update_request_with_output(
          self, request: Request, new_token_ids: list[int], is_stale: bool = False
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 2880a1b..5fa7e92 100644
+index 149d7f4..5fa7e92 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -663,6 +663,9 @@ class Scheduler(SchedulerInterface):
@@ -308,16 +252,7 @@ index 2880a1b..5fa7e92 100644
                          and self.num_sampled_tokens_per_step > 0
                          and num_new_tokens == 1
                          and not prefill_scheduled
-@@ -1542,6 +1549,8 @@ class Scheduler(SchedulerInterface):
-         self._inflight_prefills.discard(request)
-         request.status = RequestStatus.PREEMPTED
-         request.num_computed_tokens = 0
-+        if hasattr(request, "decode_cohort_phase"):
-+            request.decode_cohort_phase = None
-         if request.spec_token_ids:
-             request.spec_token_ids = []
-         # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -2485,7 +2494,10 @@ class Scheduler(SchedulerInterface):
+@@ -2487,7 +2494,10 @@ class Scheduler(SchedulerInterface):
                  metadata = request.structured_output_request
                  spec_token_ids = strip_speculative_padding(spec_token_ids)
                  spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
@@ -329,7 +264,7 @@ index 2880a1b..5fa7e92 100644
  
      def update_draft_token_ids_in_output(
          self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
-@@ -2534,6 +2546,19 @@ class Scheduler(SchedulerInterface):
+@@ -2536,6 +2546,19 @@ class Scheduler(SchedulerInterface):
          return self.kv_cache_manager.usage
  
      def add_request(self, request: Request) -> None:

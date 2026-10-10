@@ -44,10 +44,10 @@ means drafting more next time; no full-width proposal is generated or retained.
  create mode 100644 vllm/v1/core/sched/qwen38_verification_policy.py
 
 diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
-index d18c868..4106507 100644
+index 91c72d3..1c78e96 100644
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
-@@ -62,7 +62,12 @@ class AsyncScheduler(Scheduler):
+@@ -73,7 +73,12 @@ class AsyncScheduler(Scheduler):
              )
              # Add placeholders for the new draft/spec tokens.
              # We will update the actual spec token ids in the worker process.
@@ -520,7 +520,7 @@ index 0000000..f75bff5
 +        except Exception as exc:  # noqa: BLE001 - fail closed
 +            self._fail(entry, exc)
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 487871f..a27952e 100644
+index 7adadbb..0333524 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -323,6 +323,27 @@ class Scheduler(SchedulerInterface):
@@ -648,16 +648,16 @@ index 487871f..a27952e 100644
      def _get_max_num_scheduled_decodes(self) -> int:
          return self.max_num_running_reqs
  
-@@ -1559,6 +1646,8 @@ class Scheduler(SchedulerInterface):
-         self._inflight_prefills.discard(request)
-         request.status = RequestStatus.PREEMPTED
+@@ -1561,6 +1648,8 @@ class Scheduler(SchedulerInterface):
          request.num_computed_tokens = 0
+         if hasattr(request, "decode_cohort_phase"):
+             request.decode_cohort_phase = None
 +        if hasattr(request, "qwen38_drafted"):
 +            request.qwen38_drafted = None
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1947,6 +2036,8 @@ class Scheduler(SchedulerInterface):
+@@ -1949,6 +2038,8 @@ class Scheduler(SchedulerInterface):
          scheduler_output: SchedulerOutput,
          model_runner_output: ModelRunnerOutput,
      ) -> dict[int, EngineCoreOutputs]:
@@ -666,7 +666,7 @@ index 487871f..a27952e 100644
          sampled_token_ids = model_runner_output.sampled_token_ids
          logprobs = model_runner_output.logprobs
          prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
-@@ -2049,6 +2140,26 @@ class Scheduler(SchedulerInterface):
+@@ -2051,6 +2142,26 @@ class Scheduler(SchedulerInterface):
                  num_sampled = self.num_sampled_tokens_per_step
                  num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                  num_rejected = num_draft_tokens - num_accepted
@@ -693,7 +693,7 @@ index 487871f..a27952e 100644
                  # Rejections roll back num_computed_tokens (and, under async
                  # scheduling, num_output_placeholders, which covers the spec
                  # tokens). A stale rejection count predates the preemption
-@@ -2502,7 +2613,10 @@ class Scheduler(SchedulerInterface):
+@@ -2504,7 +2615,10 @@ class Scheduler(SchedulerInterface):
                  metadata = request.structured_output_request
                  spec_token_ids = strip_speculative_padding(spec_token_ids)
                  spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
@@ -705,7 +705,7 @@ index 487871f..a27952e 100644
  
      def update_draft_token_ids_in_output(
          self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
-@@ -2551,6 +2665,20 @@ class Scheduler(SchedulerInterface):
+@@ -2553,6 +2667,20 @@ class Scheduler(SchedulerInterface):
          return self.kv_cache_manager.usage
  
      def add_request(self, request: Request) -> None:
@@ -726,7 +726,7 @@ index 487871f..a27952e 100644
          existing = self.requests.get(request.request_id)
          if existing is not None:
              update = StreamingUpdate.from_request(request)
-@@ -2673,6 +2801,8 @@ class Scheduler(SchedulerInterface):
+@@ -2675,6 +2803,8 @@ class Scheduler(SchedulerInterface):
      def _free_blocks(self, request: Request):
          assert request.is_finished()
          self._free_request_blocks(request)

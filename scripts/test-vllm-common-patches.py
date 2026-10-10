@@ -117,14 +117,14 @@ check(
 
 # ---- 0004 stop structured output from accepting drafts on permissive rows ----
 print("0004-grammar-fail-closed-draft-rows:")
-o4_out = (root / "vllm/v1/core/sched/output.py").read_text()
-o4_mr = (root / "vllm/v1/worker/gpu/model_runner.py").read_text()
-o4_rs = (root / "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py").read_text()
-o4_shard = (root / "vllm/v1/worker/gpu/sample/batch_shard.py").read_text()
-o4_test = (root / "tests/v1/worker/test_grammar_invalid_drafts.py").read_text()
+p0004_out = (root / "vllm/v1/core/sched/output.py").read_text()
+p0004_mr = (root / "vllm/v1/worker/gpu/model_runner.py").read_text()
+p0004_rs = (root / "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py").read_text()
+p0004_shard = (root / "vllm/v1/worker/gpu/sample/batch_shard.py").read_text()
+p0004_test = (root / "tests/v1/worker/test_grammar_invalid_drafts.py").read_text()
 check(
     "GrammarOutput carries the constrained draft prefix",
-    "num_acceptable_drafts: list[int] | None = None" in o4_out,
+    "num_acceptable_drafts: list[int] | None = None" in p0004_out,
 )
 check(
     "scheduler derives it from the scheduled draft window",
@@ -132,37 +132,37 @@ check(
 )
 check(
     "row limit is keyed on device local positions",
-    "input_batch.expanded_local_pos" in o4_mr
-    and "cu_num_logits[1:] - cu_num_logits[:-1]" in o4_mr
-    and "local_pos > row_limit" in o4_mr,
+    "input_batch.expanded_local_pos" in p0004_mr
+    and "cu_num_logits[1:] - cu_num_logits[:-1]" in p0004_mr
+    and "local_pos > row_limit" in p0004_mr,
 )
 check(
     "absent prefix invalidates the whole draft window",
-    "num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0" in o4_mr,
+    "num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0" in p0004_mr,
 )
 check(
     "row limit reaches the rejection sampler",
-    "invalid_drafts = grammar_invalid_drafts(" in o4_mr
-    and "self.speculator.draft_logits,\n                invalid_drafts,\n" in o4_mr,
+    "invalid_drafts = grammar_invalid_drafts(" in p0004_mr
+    and "self.speculator.draft_logits,\n                invalid_drafts,\n" in p0004_mr,
 )
 check(
     "sampler pins those drafts invalid before verification",
-    "verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)" in o4_rs
+    "verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)" in p0004_rs
     and "rejection_sample(\n            processed_logits,\n            draft_logits,\n            verify_draft_sampled,"
-    in o4_rs,
+    in p0004_rs,
 )
 check(
     "sharded TP batches keep the prefix aligned",
-    "num_acceptable_drafts=num_acceptable," in o4_shard,
+    "num_acceptable_drafts=num_acceptable," in p0004_shard,
 )
 check(
     "upstream unit test ported",
-    "def test_follow_the_device_layout_under_adaptive_verification" in o4_test,
+    "def test_follow_the_device_layout_under_adaptive_verification" in p0004_test,
 )
 
 # ---- 0005 backfill worker-side drafts before masking structured outputs ----
 print("0005-wait-for-structured-draft-backfill:")
-o5_test = (root / "tests/v1/core/test_async_structured_draft_handoff.py").read_text()
+p0005_test = (root / "tests/v1/core/test_async_structured_draft_handoff.py").read_text()
 check(
     "structured requests defer when scheduled drafts are worker-side placeholders",
     "scheduled_drafts = spec_decode_tokens.get(req_id, ())" in async_src
@@ -171,9 +171,9 @@ check(
 )
 check(
     "CPU regression covers zero outstanding outputs and non-structured control",
-    "def test_async_structured_draft_handoff_without_prior_output" in o5_test
-    and "(True, 0, [-1, -1, -1], True)" in o5_test
-    and "(False, 0, [-1, -1, -1], False)" in o5_test,
+    "def test_async_structured_draft_handoff_without_prior_output" in p0005_test
+    and "(True, 0, [-1, -1, -1], True)" in p0005_test
+    and "(False, 0, [-1, -1, -1], False)" in p0005_test,
 )
 engine_src = (root / "vllm/v1/engine/core.py").read_text()
 check(
@@ -185,8 +185,8 @@ check(
 )
 check(
     "CPU regression covers empty-queue backfill order",
-    "def test_async_structured_backfill_with_empty_batch_queue" in o5_test
-    and 'events == ["take_drafts", "backfill", "grammar", "sample"]' in o5_test,
+    "def test_async_structured_backfill_with_empty_batch_queue" in p0005_test
+    and 'events == ["take_drafts", "backfill", "grammar", "sample"]' in p0005_test,
 )
 
 # ---- 0006 retrieve draft IDs by request, not last batch ----
@@ -202,8 +202,8 @@ check(
 )
 check(
     "GPU regression covers unrelated batch and removed request",
-    "def test_request_keyed_drafts_survive_interleaved_batches" in o5_test
-    and 'runner.take_draft_token_ids(["B", "gone"])' in o5_test,
+    "def test_request_keyed_drafts_survive_interleaved_batches" in p0005_test
+    and 'runner.take_draft_token_ids(["B", "gone"])' in p0005_test,
 )
 
 # ---- 0007 NVFP4 Marlin scale factor without the boolean gather ----

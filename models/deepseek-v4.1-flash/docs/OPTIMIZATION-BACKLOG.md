@@ -2,8 +2,8 @@
 
 These are investigation candidates, **not demonstrated gains**. The historical
 profile in `/tmp/ds-src/CONTEXT.md` predates small-kernel fusion, mHC v2,
-MXFP4 activation/sum fusion, FP8 draft head, thin wo_a, prefill kernels, O2
-dense kernels and the verification/cohort/metadata optimisations. Do not use
+MXFP4 activation/sum fusion, FP8 draft head, thin wo_a, prefill kernels, dense
+MXFP8 decode kernels and the verification/cohort/metadata optimisations. Do not use
 its timings as the current bottleneck ranking.
 
 ## First: obtain a current profile
@@ -49,7 +49,8 @@ selection, shared metadata / metadata graphs, live-load cohorts, request `spec_k
 and the measured automatic width policy. See the patch series and model README
 for exact switches and scopes.
 
-Previous engine-level negative/risky experiments include O1 MoE, alternative
+Previous engine-level negative/risky experiments include an MXFP4 MoE decode-kernel
+rewrite, alternative
 MoE dequantisation paths, router fusion/reordering, drafter tail relocation,
 64-head sparse-prefill variants and alternate PP partitions. Revisit only with
 new evidence or a materially different design, not a repeated microbenchmark.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""DeepSeek V4.1 decode small-kernel fusions (/tmp/ds-work/C diff): bitwise
+"""DeepSeek V4.1 decode small-kernel fusions (patch 0006): bitwise
 tests + micro-benchmarks. Run inside the image on ONE sm80 GPU:
 
     python3 test_dsv41_small_kernels_gpu.py [--vllm-root DIR] [--bench]

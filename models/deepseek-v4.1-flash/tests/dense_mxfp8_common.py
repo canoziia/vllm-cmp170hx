@@ -1,4 +1,4 @@
-"""Shared helpers for O2 dense MXFP8 experiments (run inside the vLLM image)."""
+"""Shared helpers for dense MXFP8 decode experiments (run inside the vLLM image)."""
 import json
 import statistics
 import time
