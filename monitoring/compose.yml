@@ -34,6 +34,7 @@ services:
       PROM_RETENTION: ${PROM_RETENTION:-180d}
       PROM_RETENTION_SIZE: ${PROM_RETENTION_SIZE:-50GB}
       PROM_SCRAPE_INTERVAL: ${PROM_SCRAPE_INTERVAL:-10s}
+      GPU_SCRAPE_INTERVAL: ${GPU_SCRAPE_INTERVAL:-30s}
     volumes:
       - ./prometheus/entrypoint.sh:/etc/prometheus/entrypoint.sh:ro
       - ${VLLM_METRICS_TOKEN_FILE:-/dev/null}:/run/secrets/vllm_metrics_token:ro
@@ -65,16 +66,10 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards/vllm:ro
       - ${MONITORING_DATA_DIR:-/root/app/monitoring-data}/grafana:/var/lib/grafana:U
 
-  # Optional (profile gpu): nvidia-smi based exporter. dcgm-exporter is not
-  # used because DCGM profiling metrics are not available on CMP 170HX.
-  # Add this node to GPU_METRICS_TARGETS, e.g. node2=127.0.0.1:19835.
+  # Optional (profile gpu): nvidia-smi based exporter for this node. Other
+  # nodes run compose.gpu-exporter.yml. See README "GPU metrics" for cost.
   gpu-exporter:
-    image: docker.io/utkuozdemir/nvidia_gpu_exporter:1.3.2
-    container_name: vllm-monitoring-gpu-exporter
+    extends:
+      file: compose.gpu-exporter.yml
+      service: gpu-exporter
     profiles: [gpu]
-    restart: unless-stopped
-    network_mode: host
-    command: ["--web.listen-address=${GPU_EXPORTER_LISTEN:-127.0.0.1}:${GPU_EXPORTER_PORT:-19835}"]
-    devices:
-      - nvidia.com/gpu=all
-    security_opt: ["label=disable"]

@@ -99,6 +99,26 @@ The upstream dashboards filter by `model_name`, which merged instances of the
 same model; the generated copies add `server`, `role` and `instance` variables
 and group histograms `by (le, instance)`.
 
+## GPU metrics
+
+`--profile gpu` starts `utkuozdemir/nvidia_gpu_exporter` on the monitoring
+node; other nodes run only the exporter from their checkout:
+
+```bash
+cd monitoring   # .env: GPU_EXPORTER_LISTEN=<node IP reachable by Prometheus>
+podman compose -f compose.gpu-exporter.yml up -d
+```
+
+and are added to `GPU_METRICS_TARGETS` on the Prometheus node. The exporter
+has no auth; bind it to a LAN address and restrict the source (node1:
+nftables table `vllm_monitoring`, only 162.105.151.94 and loopback may reach
+19835).
+
+Cost: each scrape runs one `nvidia-smi --query-gpu` (NVML, persistence mode on,
+no CUDA context, no kernel launches on the GPUs). Measured on node1 (10 GPUs):
+all fields ~1.8 s of driver/sys time, the default `GPU_QUERY_FIELDS` ~0.35 s;
+with the 30 s `GPU_SCRAPE_INTERVAL` that is ~1% of one CPU core.
+
 ## Known limitations
 
 - Counters reset when an engine restarts; `rate`/`increase` handle that, but
