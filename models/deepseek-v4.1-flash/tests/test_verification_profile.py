@@ -4,7 +4,7 @@ import importlib.util,os,sys
 from pathlib import Path
 p=Path(sys.argv[1])/'vllm/dsv41_opt_profile.py'
 s=importlib.util.spec_from_file_location('profile_under_test',p);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
-keys=('VLLM_DSV41_VERIFICATION','VLLM_DSV41_BALANCED_COHORTS','VLLM_DSV41_FAST_METADATA','VLLM_DSV41_METADATA_GRAPHS')
+keys=('VLLM_DSV41_VERIFICATION','VLLM_PP_DECODE_COHORT_LIVE_LOAD','VLLM_DSV41_FAST_METADATA','VLLM_DSV41_METADATA_GRAPHS')
 for k in keys:assert k not in m.PROFILES['default']
 original=dict(os.environ)
 try:

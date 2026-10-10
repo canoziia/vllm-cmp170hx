@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
- * O2: dense MXFP8 (e4m3 + e8m0 group-32) decode GEMM for sm_80, reading the
+ * stream-K: dense MXFP8 (e4m3 + e8m0 group-32) decode GEMM for sm_80, reading the
  * vLLM Marlin 8-bit layout unchanged (prepare_mxfp8_layer_for_marlin).
  *
  * Layout (verified in v1): per k16 row the weights are 16N bytes; 64-column
@@ -39,7 +39,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace o2 {
+namespace dense_mxfp8 {
 
 __device__ __forceinline__ uint32_t lop3_or_and(uint32_t a, uint32_t m, uint32_t b) {
   uint32_t r;  // (a & m) | b
@@ -126,7 +126,7 @@ __device__ __forceinline__ int owner_of(int u, int U, int T) {
 // MODE 0: full GEMM.  MODE 1: cp.async only (roofline).  MODE 2: + smem
 // reads + dequant (xor checksum, no mma).  MODE 3: full compute, no output.
 template <int TB, int W, int ST, int MODE, int GPU, int HIV>
-__global__ void __launch_bounds__(W * 32) o2_gemm(const Params p) {
+__global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
   constexpr int TOK = TB * 8;
   constexpr int SW = GPU * (132 + 32 * TB);  // uint4 per warp per stage
   constexpr int OFF_S = 128 * GPU;           // scales (uint4 index within stage)
@@ -426,7 +426,7 @@ static void launch(const Params& p, int ctas, cudaStream_t stream) {
   constexpr int SMEM0 = W * ST * SW * 16;
   constexpr int SMEMR = W * 2 * 64 * TB * 8 * 4 + W * 2 * 4 + 16;
   constexpr int SMEM = SMEM0;
-  auto kern = o2_gemm<TB, W, ST, MODE, GPU, HIV>;
+  auto kern = streamk_gemm<TB, W, ST, MODE, GPU, HIV>;
   static int occ = [&] {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     int n = 0;
@@ -452,15 +452,15 @@ static void launch(const Params& p, int ctas, cudaStream_t stream) {
 }
 
 // ============================================================================
-// O3: M = 9..48 variant.  CTA = W warps on W ADJACENT 64-col tiles at the same
+// tiled stream-K: M = 9..48 variant.  CTA = W warps on W ADJACENT 64-col tiles at the same
 // k-range; the activation chunk of every stage is cp.async'ed ONCE into smem by
 // the whole CTA and read by all W warps with ldmatrix (x L2 traffic / W).
 // One __syncthreads per stage (x is loaded cooperatively).  Stream-K over
 // (tile-group, k-unit) at CTA granularity; per-warp fragments are reduced with
-// the same fence-free sentinel owner/contributor scheme as O2 (slot = cta*W+warp).
+// the same fence-free sentinel owner/contributor scheme as stream-K (slot = cta*W+warp).
 // ============================================================================
 template <int TB, int W, int ST, int MODE, int GPU>
-__global__ void __launch_bounds__(W * 32) o3_gemm(const Params p) {
+__global__ void __launch_bounds__(W * 32) streamk_tiled_gemm(const Params p) {
   constexpr int TOK = TB * 8;
   constexpr int WS = 128 * GPU;          // uint4 weights per warp per stage
   constexpr int SS = 4 * GPU;            // uint4 scales per warp per stage
@@ -735,37 +735,37 @@ template <int TB, int W, int ST, int MODE, int GPU>
 static void launch3(const Params& p, int ctas, cudaStream_t stream) {
   constexpr int STG = W * (128 * GPU + 4 * GPU) + GPU * TB * 32;
   constexpr int SMEM = ST * STG * 16;
-  auto kern = o3_gemm<TB, W, ST, MODE, GPU>;
+  auto kern = streamk_tiled_gemm<TB, W, ST, MODE, GPU>;
   static int occ = [&] {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     int n = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, W * 32, SMEM);
     return n;
   }();
-  TORCH_CHECK(occ > 0, "o3 config does not fit");
-  TORCH_CHECK((p.N / 64) % W == 0, "o3: N/64 must be a multiple of W");
+  TORCH_CHECK(occ > 0, "streamk_tiled config does not fit");
+  TORCH_CHECK((p.N / 64) % W == 0, "streamk_tiled: N/64 must be a multiple of W");
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int64_t U = (int64_t)(p.N / 64 / W) * (p.K / 32 / GPU);
   if (ctas == 0) ctas = occ * sms;
   else if (ctas < 0) ctas = (int)std::max<int64_t>(1, std::min<int64_t>((U + (-ctas) - 1) / (-ctas), (int64_t)occ * sms));
   if (ctas > U) ctas = (int)U;
-  TORCH_CHECK(ctas >= 1 && U * ctas < (1ll << 31), "o3: U*T overflow");
-  TORCH_CHECK(ctas <= occ * sms, "o3: grid must be co-resident (owners spin on contributors)");
-  TORCH_CHECK(p.part_n >= (int64_t)ctas * W * 32 * 16 * TB, "o3: scratch too small");
+  TORCH_CHECK(ctas >= 1 && U * ctas < (1ll << 31), "streamk_tiled: U*T overflow");
+  TORCH_CHECK(ctas <= occ * sms, "streamk_tiled: grid must be co-resident (owners spin on contributors)");
+  TORCH_CHECK(p.part_n >= (int64_t)ctas * W * 32 * 16 * TB, "streamk_tiled: scratch too small");
   kern<<<ctas, W * 32, SMEM, stream>>>(p);
 }
 
 // ============================================================================
-// O4: M = 9..64, static split-K with CTA-shared activations.
+// split-K: M = 9..64, static split-K with CTA-shared activations.
 // grid = (TG tile-groups) x S K-slices.  CTA (tg, s) = W warps on the W adjacent
 // 64-col tiles of tile-group tg over k-units [s*GU/S, (s+1)*GU/S).  The x chunk
 // of every stage is cp.async'ed once into smem and read by all warps with
 // ldmatrix.  S == 1: bf16 written directly.  S > 1: each warp stores its fp32
-// fragment (lane-native, plain stores), and o4_reduce sums the S slices in
+// fragment (lane-native, plain stores), and splitk_reduce sums the S slices in
 // slice order (deterministic, no atomics, no spinning, graph safe).
 // ============================================================================
 template <int TB, int W, int ST, int GPU, bool PART>
-__global__ void __launch_bounds__(W * 32) o4_gemm(const Params p, const int S, const int NCH) {
+__global__ void __launch_bounds__(W * 32) splitk_gemm(const Params p, const int S, const int NCH) {
   constexpr int TOK = TB * 8;
   constexpr int WS = 128 * GPU, SS = 4 * GPU, XS = GPU * TB * 32;
   constexpr int STG = W * (WS + SS) + XS;
@@ -940,7 +940,7 @@ __global__ void __launch_bounds__(W * 32) o4_gemm(const Params p, const int S, c
 }
 
 // out[m][n] = bf16( sum_{s=0..S-1} part[s][m][n] ), fixed slice order (deterministic).
-__global__ void __launch_bounds__(256) o4_reduce(const float4* __restrict__ part, __nv_bfloat16* __restrict__ out,
+__global__ void __launch_bounds__(256) splitk_reduce(const float4* __restrict__ part, __nv_bfloat16* __restrict__ out,
                                                  int64_t ldo, int M, int N, int S) {
   const int n4 = N >> 2;
   const int64_t per = (int64_t)M * n4;
@@ -962,33 +962,33 @@ static void launch4(const Params& p, int S, cudaStream_t stream) {
   constexpr int STG = W * (128 * GPU + 4 * GPU) + GPU * TB * 32;
   constexpr int SMEMP = ST * STG * 16, SMEMT = W * TB * 8 * 68 * 4;
   constexpr int SMEM = SMEMP > SMEMT ? SMEMP : SMEMT;
-  TORCH_CHECK((p.N / 64) % W == 0, "o4: N/64 must be a multiple of W");
+  TORCH_CHECK((p.N / 64) % W == 0, "splitk: N/64 must be a multiple of W");
   const int GU = p.K / 32 / GPU;
-  TORCH_CHECK(S >= 1 && S <= GU, "o4: bad split");
+  TORCH_CHECK(S >= 1 && S <= GU, "splitk: bad split");
   const int TG = p.N / 64 / W;
   const int NCH = (p.M + TB * 8 - 1) / (TB * 8);
   dim3 grid(S * NCH, TG);
-  TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "o4: out alignment");
+  TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk: out alignment");
   if (S == 1) {
-    auto kern = o4_gemm<TB, W, ST, GPU, false>;
+    auto kern = splitk_gemm<TB, W, ST, GPU, false>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, W * 32, SMEM, stream>>>(p, S, NCH);
   } else {
-    TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "o4: scratch too small");
-    TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "o4: out alignment");
-    auto kern = o4_gemm<TB, W, ST, GPU, true>;
+    TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "splitk: scratch too small");
+    TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk: out alignment");
+    auto kern = splitk_gemm<TB, W, ST, GPU, true>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, W * 32, SMEM, stream>>>(p, S, NCH);
     const int64_t per = (int64_t)p.M * (p.N / 4);
-    o4_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
+    splitk_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.M, p.N, S);
   }
 }
 
 // ============================================================================
-// O5: large M (65..192).  Like O4 (static split-K, CTA-shared activations) but
+// wide split-K: large M (65..192).  Like split-K (static split-K, CTA-shared activations) but
 // TWO warps share each 64-col tile: warp (tile = w>>1, h = w&1) owns the
 // 16-col subtiles jj = 2h, 2h+1 -> it dequantises only its half of the words
 // (one LDS.128 per row) and its accumulator is 2 x 4 x TB floats, so one pass
@@ -996,7 +996,7 @@ static void launch4(const Params& p, int S, cudaStream_t stream) {
 // NCH balanced chunks of <= TB*8 rows (chunk index fastest in the grid).
 // ============================================================================
 template <int TB, int TW, int ST, int GPU, bool PART>
-__global__ void __launch_bounds__(TW * 64) o5_gemm(const Params p, const int S, const int NCH, const int CR) {
+__global__ void __launch_bounds__(TW * 64) splitk_wide_gemm(const Params p, const int S, const int NCH, const int CR) {
   constexpr int W = 2 * TW;  // warps
   constexpr int TOK = TB * 8;
   constexpr int WS = 128 * GPU, SS = 4 * GPU, XS = GPU * TB * 32;
@@ -1162,41 +1162,41 @@ static void launch5(const Params& p, int S, cudaStream_t stream) {
   constexpr int STG = TW * (128 * GPU + 4 * GPU) + GPU * TB * 32;
   constexpr int SMEMP = ST * STG * 16, SMEMT = TW * 2 * 8 * 36 * 4;
   constexpr int SMEM = SMEMP > SMEMT ? SMEMP : SMEMT;
-  TORCH_CHECK((p.N / 64) % TW == 0, "o5: N/64 must be a multiple of TW");
+  TORCH_CHECK((p.N / 64) % TW == 0, "splitk_wide: N/64 must be a multiple of TW");
   const int GU = p.K / 32 / GPU;
-  TORCH_CHECK(S >= 1 && S <= GU, "o5: bad split");
-  TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "o5: out alignment");
+  TORCH_CHECK(S >= 1 && S <= GU, "splitk_wide: bad split");
+  TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk_wide: out alignment");
   const int NCH = (p.M + TB * 8 - 1) / (TB * 8);
   const int CR = (((p.M + NCH - 1) / NCH) + 7) / 8 * 8;  // balanced chunk rows (multiple of 8)
   dim3 grid(S * NCH, p.N / 64 / TW);
   if (S == 1) {
-    auto kern = o5_gemm<TB, TW, ST, GPU, false>;
+    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, false>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, TW * 64, SMEM, stream>>>(p, S, NCH, CR);
   } else {
-    TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "o5: scratch too small");
-    auto kern = o5_gemm<TB, TW, ST, GPU, true>;
+    TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "splitk_wide: scratch too small");
+    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, true>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, TW * 64, SMEM, stream>>>(p, S, NCH, CR);
     const int64_t per = (int64_t)p.M * (p.N / 4);
-    o4_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
+    splitk_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.M, p.N, S);
   }
 }
 
-}  // namespace o2
+}  // namespace dense_mxfp8
 
 static unsigned long long* g_dbg = nullptr;
 static int g_sync = 0;
-void o2_set_sync(int64_t v) { g_sync = (int)v; }
-void o2_set_dbg(at::Tensor const& d) { g_dbg = d.numel() ? (unsigned long long*)d.data_ptr() : nullptr; }
+void dense_mxfp8_set_sync(int64_t v) { g_sync = (int)v; }
+void dense_mxfp8_set_dbg(at::Tensor const& d) { g_dbg = d.numel() ? (unsigned long long*)d.data_ptr() : nullptr; }
 
 // cfg = mode*1000 + variant; variant selects (TB,W,ST,GPU,HIV)
-void o2_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
+void streamk_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
               at::Tensor& part, at::Tensor& cnt, int64_t cfg, int64_t ctas) {
-  using namespace o2;
+  using namespace dense_mxfp8;
   const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -1248,10 +1248,10 @@ void o2_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at:
 }
 
 
-// O3 (M <= 48): cfg = mode*1000 + variant (mode 0 full, 3 no-output ablation)
-void o3_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
+// tiled stream-K (M <= 48): cfg = mode*1000 + variant (mode 0 full, 3 no-output ablation)
+void streamk_tiled_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
               at::Tensor& part, int64_t cfg, int64_t ctas) {
-  using namespace o2;
+  using namespace dense_mxfp8;
   const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -1279,14 +1279,14 @@ void o3_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at:
     case 60: L3(6, 4, 4, 1);
   }
 #undef L3
-  TORCH_CHECK(false, "bad o3 cfg");
+  TORCH_CHECK(false, "bad streamk_tiled cfg");
 }
 
 
-// O4 (M <= 64, static split-K + shared activations): cfg = TB*10 + variant, S = K slices
-void o4_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
+// split-K (M <= 64, static split-K + shared activations): cfg = TB*10 + variant, S = K slices
+void splitk_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
               at::Tensor& part, int64_t cfg, int64_t S) {
-  using namespace o2;
+  using namespace dense_mxfp8;
   const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -1326,14 +1326,14 @@ void o4_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at:
     case 82: L4(8, 8, 3, 1);
   }
 #undef L4
-  TORCH_CHECK(false, "bad o4 cfg");
+  TORCH_CHECK(false, "bad splitk cfg");
 }
 
 
-// O5 (large M, two warps per tile): cfg = TB*10 + variant, S = K slices
-void o5_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
+// wide split-K (large M, two warps per tile): cfg = TB*10 + variant, S = K slices
+void splitk_wide_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at::Tensor& out,
               at::Tensor& part, int64_t cfg, int64_t S) {
-  using namespace o2;
+  using namespace dense_mxfp8;
   const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
                   reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
@@ -1370,21 +1370,21 @@ void o5_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s, at:
     case 125: L5(12, 1, 6, 1);
   }
 #undef L5
-  TORCH_CHECK(false, "bad o5 cfg");
+  TORCH_CHECK(false, "bad splitk_wide cfg");
 }
 
-TORCH_LIBRARY_FRAGMENT(_o2, m) {
+TORCH_LIBRARY_FRAGMENT(_dsv41_dense_mxfp8, m) {
   m.def("set_dbg(Tensor d) -> ()");
-  m.def("dense5(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
-  m.def("dense4(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
-  m.def("dense3(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int ctas) -> ()");
-  m.def("set_sync(int v) -> ()", &o2_set_sync);
-  m.def("dense(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, Tensor(c!) cnt, int cfg, int ctas) -> ()");
+  m.def("splitk_wide(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
+  m.def("splitk(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
+  m.def("streamk_tiled(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int ctas) -> ()");
+  m.def("set_sync(int v) -> ()", &dense_mxfp8_set_sync);
+  m.def("streamk(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, Tensor(c!) cnt, int cfg, int ctas) -> ()");
 }
-TORCH_LIBRARY_IMPL(_o2, CUDA, m) {
-  m.impl("dense", &o2_dense);
-  m.impl("dense3", &o3_dense);
-  m.impl("dense4", &o4_dense);
-  m.impl("dense5", &o5_dense);
-  m.impl("set_dbg", &o2_set_dbg);
+TORCH_LIBRARY_IMPL(_dsv41_dense_mxfp8, CUDA, m) {
+  m.impl("streamk", &streamk_dense);
+  m.impl("streamk_tiled", &streamk_tiled_dense);
+  m.impl("splitk", &splitk_dense);
+  m.impl("splitk_wide", &splitk_wide_dense);
+  m.impl("set_dbg", &dense_mxfp8_set_dbg);
 }

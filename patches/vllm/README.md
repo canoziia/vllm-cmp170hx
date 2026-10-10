@@ -35,6 +35,14 @@ build that uses that runtime.
      `models/deepseek-v4.1-flash/docs/PP-DECODE-COHORT-BALANCE.md`.
    - upstream behavioural test ported into `tests/v1/core/test_async_scheduler.py`
      (CPU only), plus one test for the opt-in deviation.
+   - optional live-load cohorts, `VLLM_PP_DECODE_COHORT_LIVE_LOAD` (**default
+     `0`**, not upstream): bound established decodes by the live load
+     (running + waiting) instead of `max_num_seqs`, assign each decode request a
+     PP cadence phase (fill non-full cohorts first, repack fragmented phases
+     after load growth by delaying only the next decode), and clear the phase on
+     preemption. Model-agnostic; only the DeepSeek V4.1 `verification` opt
+     profile enables it. With the switch unset the code path is skipped, so
+     every other model is unchanged.
 
 4. `0004-grammar-fail-closed-draft-rows.patch`
    - port of vllm-project/vllm#54442, the fail-closed half of #54437: a

@@ -66,9 +66,11 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 
 - `VLLM_DSV41_VERIFICATION=1`: exact small-cohort uniform graphs for query widths
   1–6, least-padding dispatch, and DSpark request-local verification depth;
-- `VLLM_DSV41_BALANCED_COHORTS=1`: the established-decode cap uses live load
-  rather than the configured capacity. Prefill is uncapped and the PP feedback
-  ring retains its original `pp_size` cadence and collective order;
+- `VLLM_PP_DECODE_COHORT_LIVE_LOAD=1` (shared patch
+  `patches/vllm/0003-balance-async-pp-decode-batches.patch`, default off for
+  every model): the established-decode cap uses live load rather than the
+  configured capacity, and partial PP phases are packed. Prefill is uncapped and
+  the PP feedback ring retains its original `pp_size` cadence and collective order;
 - `VLLM_DSV41_FAST_METADATA=1`: compute a persistent device token-owner map once
   per small decode batch and share it across KV groups (not enabled with DBO);
 - `VLLM_DSV41_METADATA_GRAPHS=1`: on SM80, replay metadata preparation for exact
@@ -392,8 +394,8 @@ Hardware facts that shape every kernel on this box (CMP 170HX, measured):
 
 Correction (later measurements): an earlier version of this table listed
 FP32/bf16 FMA-class instructions at ~42 / SM / clk and called them
-throttled, and the L2 as 40 MB. Clean microbenchmarks on node1/node2 (O2,
-P4 lab runs) measure ~64 / SM / clk for FP32, bf16 HFMA2 and integer ops
+throttled, and the L2 as 40 MB. Clean microbenchmarks on node1/node2 (dense MXFP8 decode
+and prefill-indexer lab runs) measure ~64 / SM / clk for FP32, bf16 HFMA2 and integer ops
 alike, i.e. no ALU throttling, and the device reports 32 MiB of L2. The real
 limit on sustained decode is the 180 W power cap: under load every card sits
 at 179-181 W with the SW power-cap throttle active and SM clocks of
@@ -569,9 +571,9 @@ requests on a fresh instance (one-time JIT/warm-up), not from steady state.
 
 ## Dense MXFP8 decode GEMM (patch 0013)
 
-`VLLM_DSV4_O2_DENSE` (patch default 0, `compose.yml` sets 1): the dense MXFP8
+`VLLM_DSV41_DENSE_MXFP8_DECODE` (patch default 0, `compose.yml` sets 1): the dense MXFP8
 projections (q_b, o, qkv_a, shared expert w13/w2) use our kernels from
-`native/dsv4_o2` (built into the image as `vllm/_o2.so`) where a measured
+`native/dsv41_dense_mxfp8` (built into the image as `vllm/_dsv41_dense_mxfp8.so`) where a measured
 per-shape dispatch table shows them faster than Marlin, Marlin elsewhere:
 
 - M <= 8: warp-level stream-K; M 9-64: CTA-shared activations (cp.async once
@@ -580,7 +582,7 @@ per-shape dispatch table shows them faster than Marlin, Marlin elsewhere:
 - 236 of 250 scanned (shape, M) points use our kernel, each >= 1.04x Marlin
   (median 1.11-1.54x per shape); layer sequence 1.08-1.29x for M 1-192;
 - fp64 error at Marlin's level (mean ratio 1.00000-1.00001, max <= 1.0024),
-  not bitwise; deterministic, CUDA-graph safe; `tests/test_o2_dense_gpu.py`.
+  not bitwise; deterministic, CUDA-graph safe; `tests/test_dense_mxfp8_decode_gpu.py`.
 
 Engine (node1 PP6, development tree): c1 steps/s +2.6 % on all three loads
 (32.18/29.56/32.13 -> 33.01/30.34/32.96 with the M <= 8 kernel), acceptance
@@ -619,8 +621,8 @@ switch defaults to off (original code path). The profile is applied from
 | 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` | 1 | MXFP4 MoE prefill split-list |
 | 0011 | `VLLM_DSV41_SPARSE_PREFILL_64H` | (off) | 64-head sparse prefill tile; no stable gain, not enabled |
 | 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | 1 | fast prefill indexer (logits bitwise, same top-512 set) |
-| 0013 | `VLLM_DSV4_O2_DENSE` | 1 | dense MXFP8 decode GEMM for M 1-192 (Marlin elsewhere) |
-| 0013 | `VLLM_DSV4_O2_LIB` | `vllm/_o2.so` | path of the 0013 kernel library (built into the image) |
+| 0013 | `VLLM_DSV41_DENSE_MXFP8_DECODE` | 1 | dense MXFP8 decode GEMM for M 1-192 (Marlin elsewhere) |
+| 0013 | `VLLM_DSV41_DENSE_MXFP8_LIB` | `vllm/_dsv41_dense_mxfp8.so` | path of the 0013 kernel library (built into the image) |
 
 Requirements: patch 0003/0008 align switches act only with
 `VLLM_DETERMINISTIC_MOE_ALIGN` (on by default in this tree).

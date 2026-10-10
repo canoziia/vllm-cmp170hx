@@ -11,7 +11,7 @@ a5cb766d1844fd6f22f39d9b2bac87e098ec85e0b3a695da74fa8cf19b974308  models/qwen3.8
 4b9857074936e4a10f576c0efdfa6372e4a3b7bd774bfe594e348960e8a0f233  models/qwen3.8-flash-next-nvfp4/patches/0006-mtp-draft-head-fp8.patch
 503c09da973defff1be156e5d8a26d8a7b9a222f59bf440e6646a6b302babc05  models/qwen3.8-flash-next-nvfp4/patches/0007-thin-m-bf16-gemm.patch
 886127537a443f13b7295d5fa55a92e8ca8f500ab2d6572d37aee0f58b100bf5  models/qwen3.8-flash-next-nvfp4/patches/0008-ple-native-ngram-hash.patch
-7dfd9ccbfb8ca1d72711b36ee17a61759437f30aa6a2d440f95da924f8dcdde8  models/qwen3.8-flash-next-nvfp4/patches/0009-mtp-draft-widths.patch
+73a3b1a95752a416559c665a172037a0b383f3b7735d968b5fa5ae1bdc9fb076  models/qwen3.8-flash-next-nvfp4/patches/0009-mtp-draft-widths.patch
 1eee786a6cd7a8bac1361364a0fd03c5d12e27b81b375608673d665ab42e2e54  models/qwen3.8-flash-next-nvfp4/patches/0010-ple-no-spec-blocks.patch
 ca7e299cb3e6eb9ede067ab90bba0b0f0d128c5801bf73b02e124b2d18fec09b  models/qwen3.8-flash-next-nvfp4/patches/0011-gdn-recoverssm.patch
 7f71ea94e00aac0aa20bff6ced7975c254bb7e26da5260b4cddbc3882cbc506e  models/qwen3.8-flash-next-nvfp4/patches/0012-fused-shared-gate.patch

@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 root=Path(sys.argv[1])/'vllm'
 t=ast.parse((root/'v1/core/sched/async_scheduler.py').read_text());c=next(x for x in t.body if isinstance(x,ast.ClassDef) and x.name=='AsyncScheduler');f=next(x for x in c.body if isinstance(x,ast.FunctionDef) and x.name=='_update_after_schedule');f.body=f.body[1:]
 ns=dict(os=os,SchedulerOutput=object);exec(compile(ast.Module([f],type_ignores=[]),'phase','exec'),ns)
-os.environ['VLLM_DSV41_BALANCED_COHORTS']='1';os.environ['VLLM_DSV41_DECODE_TRACE']='0'
+os.environ['VLLM_PP_DECODE_COHORT_LIVE_LOAD']='1';os.environ['VLLM_DSV41_DECODE_TRACE']='0'
 for n in range(1,33):
  capacity=(n+5)//6
  reqs={str(i):NS(is_prefill_chunk=False,num_output_placeholders=0,use_structured_output=False) for i in range(n)}

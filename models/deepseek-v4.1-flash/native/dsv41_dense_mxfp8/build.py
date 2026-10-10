@@ -6,7 +6,7 @@ from pathlib import Path
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", required=True)
-ap.add_argument("--name", default="_o2")
+ap.add_argument("--name", default="_dsv41_dense_mxfp8")
 ap.add_argument("srcs", nargs="+")
 a = ap.parse_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = ""

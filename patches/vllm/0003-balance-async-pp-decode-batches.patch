@@ -35,6 +35,19 @@ cap in #50410: per that thread the global cap measured -8.21% throughput and
 +11.31% mean TTFT against doing nothing, while the decode-only form measured
 +22.95%.
 
+Optional live-load cohorts (VLLM_PP_DECODE_COHORT_LIVE_LOAD, default OFF, not
+part of #57433). The capacity share above is inert at low load: four requests
+whose prefills complete together stay locked in one four-request cadence. With
+the switch on, the established-decode cap uses the live load (running + waiting,
+ceil-divided by pp_size) instead of max_num_seqs, and each decode request is
+assigned a cadence phase: fill a non-full cohort before opening an empty one,
+and repack fragmented partial phases after load growth by delaying the NEXT
+decode only (never consuming a feedback result before its T+pp_size boundary).
+Preemption clears the assigned phase. The live cap replaces the capacity share
+only where that share applies (VLLM_PP_DECODE_COHORT_BALANCE=1, MRV2 + async +
+PP); phase assignment runs on every MRV2 + async + PP decode step. The DeepSeek
+V4.1 `verification` opt profile turns it on; nothing else does.
+
 Signed-off-by: canoziia <canoziia@users.noreply.github.com>
 ---
 --- a/vllm/envs.py
@@ -64,15 +77,17 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
      # loaded pipeline stages can offload more than lighter ones.
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,9 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  
++import os
++
 +from vllm import envs
  from vllm.logger import init_logger
  from vllm.v1.core.sched.output import SchedulerOutput
  from vllm.v1.core.sched.scheduler import Scheduler
-@@ -16,6 +17,16 @@
+@@ -16,6 +19,25 @@
          self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
          self.pp_size = self.parallel_config.pipeline_parallel_size
  
@@ -83,12 +98,58 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
 +            or not self.use_pp
 +        ):
 +            return self.max_num_running_reqs
++        if os.environ.get("VLLM_PP_DECODE_COHORT_LIVE_LOAD", "0") == "1":
++            # The capacity-based limit is inert at low load: four requests
++            # completing prefill together remain locked in a four-request
++            # cadence forever. Bound established decodes by the LIVE load.
++            # Do not change the pp_size feedback-ring cadence or cap prefill.
++            live = min(self.max_num_running_reqs,
++                       len(self.running) + len(self.waiting)
++                       + len(self.skipped_waiting))
++            return max(1, (live + self.pp_size - 1) // self.pp_size)
 +        # ceil(max_num_seqs / pp_size)
 +        return (self.max_num_running_reqs + self.pp_size - 1) // self.pp_size
 +
      def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
          super()._update_after_schedule(scheduler_output)
          spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+@@ -46,7 +68,35 @@
+             if self.use_v2_model_runner:
+                 # Set the next step index in which this request is eligible to be
+                 # scheduled for decode (for PP microbatching).
+-                request.next_decode_eligible_step = self.current_step + self.pp_size
++                earliest = self.current_step + self.pp_size
++                if (self.use_pp
++                        and os.environ.get("VLLM_PP_DECODE_COHORT_LIVE_LOAD", "0") == "1"):
++                    phase = getattr(request, "decode_cohort_phase", None)
++                    loads = [0] * self.pp_size
++                    for live in self.running:
++                        assigned = getattr(live, "decode_cohort_phase", None)
++                        if assigned is not None:
++                            loads[assigned] += 1
++                    capacity = self._get_max_num_scheduled_decodes()
++                    fragmented = (
++                        sum(n > 0 for n in loads)
++                        > (sum(loads) + capacity - 1) // capacity
++                    )
++                    if phase is None or (fragmented and loads[phase] < capacity):
++                        if phase is not None:
++                            loads[phase] -= 1
++                        # Fill an existing non-full cohort before opening an
++                        # empty phase. Uniformly spreading C8 over six phases
++                        # adds two metadata/draft/PP trips versus four cohorts
++                        # of two. Repack partial phases after load growth too;
++                        # delay the NEXT decode, never consume a feedback
++                        # result before its original T+PP boundary.
++                        def phase_cost(delay):
++                            load = loads[(earliest + delay) % self.pp_size]
++                            return (load >= capacity, -load if load < capacity else load, delay)
++                        earliest += min(range(self.pp_size), key=phase_cost)
++                    request.decode_cohort_phase = earliest % self.pp_size
++                request.next_decode_eligible_step = earliest
+ 
+     def _update_request_with_output(
+         self, request: Request, new_token_ids: list[int], is_stale: bool = False
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -577,8 +577,15 @@
@@ -182,6 +243,15 @@ Signed-off-by: canoziia <canoziia@users.noreply.github.com>
      def _build_kv_connector_meta(
          self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
      ) -> KVConnectorMetadata:
+@@ -1509,6 +1542,8 @@
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        if hasattr(request, "decode_cohort_phase"):
++            request.decode_cohort_phase = None
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
 --- a/tests/v1/core/test_async_scheduler.py
 +++ b/tests/v1/core/test_async_scheduler.py
 @@ -109,6 +109,82 @@
