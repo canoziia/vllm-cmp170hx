@@ -1,0 +1,78 @@
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD on four CMP 170HX (PP4). vLLM resolves the checkpoint to
+# MiMoV2OmniForCausalLM (text + vision + audio towers).
+#
+# Start (ipc=host is required; podman-compose drops `ipc: host` without it):
+#   podman compose -f compose.yml --podman-run-args=--ipc=host up -d
+#
+# Checkpoint: MXFP4 routed experts (Marlin W4A16 on sm_80) + FP8 block-128
+# linears (Marlin W8A16 on sm_80) + BF16 o_proj. Attention: 39 SWA-128 layers
+# (8 KV heads, sinks) + 9 global GQA layers (4 KV heads); qk 192 / v 128, so
+# vLLM selects TRITON_ATTN_DIFFKV (FA-DiffKV needs FA3, not available on sm_80).
+x-podman:
+  in_pod: false
+
+services:
+  mimo-v2.6-flash:
+    image: ${MIMO_IMAGE:?set MIMO_IMAGE}
+    container_name: mimo-v2.6-flash
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${MIMO_GPU_0:?set MIMO_GPU_0}
+      - nvidia.com/gpu=${MIMO_GPU_1:?set MIMO_GPU_1}
+      - nvidia.com/gpu=${MIMO_GPU_2:?set MIMO_GPU_2}
+      - nvidia.com/gpu=${MIMO_GPU_3:?set MIMO_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${MIMO_MODEL_DIR:?set MIMO_MODEL_DIR}:/models/MiMo-V2.6-Flash-MOPD:ro
+      - ${MIMO_VLLM_CACHE:?set MIMO_VLLM_CACHE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      # mimo_v2 is not torch.compile-able here; piecewise CUDA graphs need the
+      # breakable capture path (same as models/deepseek-v4.1-flash).
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_PP_LAYER_PARTITION: "${MIMO_PP_LAYER_PARTITION:?set MIMO_PP_LAYER_PARTITION}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+    command:
+      - /models/MiMo-V2.6-Flash-MOPD
+      - --host=0.0.0.0
+      - --port=${MIMO_PORT:?set MIMO_PORT}
+      - --served-model-name=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --generation-config=vllm
+      - --max-model-len=${MIMO_MAX_MODEL_LEN:?set MIMO_MAX_MODEL_LEN}
+      - --max-num-seqs=${MIMO_MAX_NUM_SEQS:?set MIMO_MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${MIMO_MAX_NUM_BATCHED_TOKENS:?set MIMO_MAX_NUM_BATCHED_TOKENS}
+      - --kv-cache-memory=${MIMO_KV_CACHE_MEMORY:?set MIMO_KV_CACHE_MEMORY}
+      - --enable-prefix-caching
+      - --speculative-config=${MIMO_SPECULATIVE_CONFIG:?set MIMO_SPECULATIVE_CONFIG (null disables)}
+      - --disable-custom-all-reduce
+      - --enable-auto-tool-choice
+      - --tool-call-parser=mimo
+      - --reasoning-parser=mimo
+      - --enable-prompt-tokens-details
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_PORT}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40m
+      retries: 3

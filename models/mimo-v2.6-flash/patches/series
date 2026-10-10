@@ -1,0 +1,4 @@
+# MiMo-only vLLM patches, applied after the DeepSeek V4.1 + shared + adaptive
+# series. The pinned tree already loads MiMo-V2.6 as MiMoV2OmniForCausalLM
+# (text + vision + audio) with the MiMo MTP head.
+0001-mimo-v2-fp8-qkv-checkpoint-shards.patch
