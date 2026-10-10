@@ -54,6 +54,7 @@ const defaults = {
   mode: "decode",
   promptFile: null,
   reasoningEffort: "none",
+  chatTemplateKwargs: null,
   saveDir: null,
   baseUrl: process.env.VLLM_BASE_URL || "http://127.0.0.1:8000",
   model: process.env.VLLM_MODEL || "",
@@ -77,6 +78,9 @@ function help() {
                                 prose=600, code=1500)
   --reasoning-effort LEVEL      none|low|medium|high for chat modes (default none: without it
                                 the model spends the whole budget thinking)
+  --chat-template-kwargs JSON   Extra chat_template_kwargs for chat modes, e.g.
+                                '{"enable_thinking":false}' for templates that ignore
+                                reasoning_effort (MiMo)
   --save-dir DIR                Write each request's visible text to DIR/<mode>-c<N>-<i>.txt
   --prompt-file PATH            Use this prompt text instead of the mode's built-in one
   --timeout-ms N                Above 300 s, install the undici package next to this script
@@ -107,6 +111,7 @@ function parseArgs(argv) {
     else if (arg === "--seed") c.seed = Number(take());
     else if (arg === "--output") c.output = take();
     else if (arg === "--reasoning-effort") c.reasoningEffort = take();
+    else if (arg === "--chat-template-kwargs") c.chatTemplateKwargs = JSON.parse(take());
     else if (arg === "--save-dir") c.saveDir = take();
     else if (arg === "--prompt-file") c.promptFile = take();
     else if (arg === "--help" || arg === "-h") { help(); process.exit(0); }
@@ -208,7 +213,11 @@ async function oneRequest(c, model, concurrency, index) {
     stream: true,
     stream_options: { include_usage: true },
     ...(chat
-      ? { messages: [{ role: "user", content: prompt }], reasoning_effort: c.reasoningEffort }
+      ? {
+          messages: [{ role: "user", content: prompt }],
+          reasoning_effort: c.reasoningEffort,
+          ...(c.chatTemplateKwargs ? { chat_template_kwargs: c.chatTemplateKwargs } : {}),
+        }
       : { prompt }),
   };
   const startMs = nowMs();
