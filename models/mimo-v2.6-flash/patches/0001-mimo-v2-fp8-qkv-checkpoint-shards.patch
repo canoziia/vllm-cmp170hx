@@ -1,0 +1,248 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo-v2: load fused FP8 qkv_proj as export-TP row shards
+
+MiMo-V2 checkpoints store the fused FP8 qkv_proj pre-sharded for the TP they
+were exported with: n consecutive row shards, each [Q_s | K_s | V_s], each
+with its own 128x128 block-scale rows padded to whole blocks. n is the
+smallest KV-head count over the layer types (Pro: 8, V2.6-Flash: 4), so a
+V2.6-Flash global layer (13568 rows = 106 blocks) carries 108 scale rows.
+
+Upstream assumed one [Q_i|K_i|V_i] group per KV head with
+scale_rows // num_kv_heads scale rows each, which only holds when n equals
+the KV-head count (Pro). On V2.6-Flash SWA layers that fails at load, and a
+whole-matrix scale grid loads but produces unrelated tokens. The MTP loader
+used chunk(tp_size), correct only when tp_size == n.
+
+mimo_v2_qkv_checkpoint_shards() derives n from the config. _shard_fp8_qkv_proj
+returns checkpoint shard tp_rank unchanged when tp_size == n; otherwise it
+dequantizes every checkpoint shard with its own scale grid, reassembles Q/K/V
+in head order and re-quantizes this rank's [Q|K|V]. The MTP head uses the
+same helper. Verified against a streaming torch reference of the official
+modeling code (same top-5 next tokens, same order).
+
+diff --git a/vllm/model_executor/models/mimo_v2.py b/vllm/model_executor/models/mimo_v2.py
+index c7ba39b..d65d6ea 100644
+--- a/vllm/model_executor/models/mimo_v2.py
++++ b/vllm/model_executor/models/mimo_v2.py
+@@ -460,6 +460,22 @@ class MiMoV2FlashDecoderLayer(nn.Module):
+         return self.config.hybrid_layer_pattern[self.layer_id] == 1
+ 
+ 
++def mimo_v2_qkv_checkpoint_shards(config) -> int:
++    """Number of row shards the fused FP8 qkv_proj checkpoint is stored in.
++
++    MiMo-V2 checkpoints store qkv_proj pre-sharded for the TP size they were
++    exported with: ``n`` consecutive row shards, each ``[Q_s | K_s | V_s]``
++    and each with its own 128x128 block-scale grid padded to whole blocks.
++    The export TP equals the smallest KV-head count over the layer types
++    (Pro: 8 -> one KV head per shard; V2.6-Flash: global 4 / SWA 8 -> 4).
++    """
++    counts = [
++        getattr(config, attr, None)
++        for attr in ("num_key_value_heads", "swa_num_key_value_heads")
++    ]
++    return min(c for c in counts if c)
++
++
+ def _shard_fp8_qkv_proj(
+     w_full: torch.Tensor,
+     s_full: torch.Tensor,
+@@ -469,77 +485,62 @@ def _shard_fp8_qkv_proj(
+     v_head_dim: int,
+     tp_rank: int,
+     tp_size: int,
++    ckpt_shards: int | None = None,
+     block: int = 128,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Shard the fp8 qkv_proj weights for ``tp_rank``.
+ 
+-    The checkpoint stores the fused QKV as ``num_kv_heads`` contiguous groups
+-    (one per KV head; ``n`` below), each ordered ``[Q | K | V]``:
+-
+-        [Q_1 | K_1 | V_1 | Q_2 | K_2 | V_2 | ... | Q_n | K_n | V_n]
+-
+-    Per group, Q has ``(num_heads / num_kv_heads) * head_dim`` rows, K has
+-    ``head_dim`` rows, and V has ``v_head_dim`` rows.
+-
+-    Each TP rank owns ``g = num_kv_heads / tp_size`` of these groups, and the
+-    forward expects them de-interleaved into a single Q, K, and V block:
+-
+-        [Q_1 | Q_2 | ... | Q_g | K_1 | K_2 | ... | K_g | V_1 | V_2 | ... | V_g]
+-
+-    When ``g == 1`` the rank's slice is already ``[Q | K | V]``, so a plain
+-    chunk suffices. When ``g > 1`` we cannot reach the de-interleaved layout by
+-    re-permuting the fp8 block scales: each scale covers a 128-row block, and
+-    since K is 192 rows (1.5 blocks) a block straddles the K/V boundary, so no
+-    whole-block permutation produces it. Instead we dequantize this rank's
+-    groups to float (dropping the block constraint), reorder the rows into the
+-    layout above (Q, K, and V then each span a whole number of blocks), and
+-    re-quantize to fp8.
++    The checkpoint stores the fused QKV as ``n = ckpt_shards`` row shards
++    (see mimo_v2_qkv_checkpoint_shards), each ordered ``[Q | K | V]`` for its
++    ``num_heads / n`` query and ``num_kv_heads / n`` KV heads, and each with
++    its own block-scale rows (``ceil(shard_rows / 128)``, so a shard need not
++    end on a block boundary).
++
++    vLLM wants, per TP rank, ``[Q_rank | K_rank | V_rank]``. If ``tp_size ==
++    n`` that is exactly checkpoint shard ``tp_rank``. Otherwise dequantize each
++    checkpoint shard with its own scale grid, reassemble full Q, K and V in
++    head order, take this rank's heads and re-quantize to fp8 (Q, K and V
++    then each span whole blocks).
+     """
+-    assert tp_size <= num_kv_heads and num_kv_heads % tp_size == 0, (
++    n = ckpt_shards or num_kv_heads
++    assert num_kv_heads % n == 0 and num_heads % n == 0, (num_heads, num_kv_heads, n)
++    assert num_kv_heads % tp_size == 0, (
+         "TP size must evenly split the number of KV heads."
+     )
++    rows = w_full.shape[0]
++    shard_rows = rows // n
++    scale_rows = s_full.shape[0] // n
++    assert shard_rows * n == rows and scale_rows * n == s_full.shape[0]
++    assert scale_rows == -(-shard_rows // block), (rows, tuple(s_full.shape), n)
++
++    if tp_size == n:
++        return w_full.chunk(n, dim=0)[tp_rank], s_full.chunk(n, dim=0)[tp_rank]
+ 
+-    kv_heads_per_rank = num_kv_heads // tp_size
+-    if kv_heads_per_rank == 1:
+-        # One KV head per rank. The weights and scale can be trivially sharded
+-        # without re-quantization.
+-        w = w_full.chunk(tp_size, dim=0)[tp_rank]
+-        s = s_full.chunk(tp_size, dim=0)[tp_rank]
+-        return w, s
+-
+-    q_rows_per_group = (num_heads // num_kv_heads) * head_dim
+-    k_rows_per_group = head_dim
+-    v_rows_per_group = v_head_dim
+-    rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group
+-    scale_rows_per_group = s_full.shape[0] // num_kv_heads
++    q_rows = (num_heads // n) * head_dim
++    k_rows = (num_kv_heads // n) * head_dim
+     qs, ks, vs = [], [], []
+-    for g_idx in range(tp_rank * kv_heads_per_rank, (tp_rank + 1) * kv_heads_per_rank):
+-        row_start = g_idx * rows_per_group
+-        scale_row_start = g_idx * scale_rows_per_group
+-        # Dequantize this group's weights.
+-        w_g = w_full[row_start : row_start + rows_per_group].to(torch.float32)
+-        s_g = s_full[scale_row_start : scale_row_start + scale_rows_per_group].to(
+-            torch.float32
+-        )
+-        s_g_expanded = s_g.repeat_interleave(block, dim=0).repeat_interleave(
+-            block, dim=1
+-        )[:rows_per_group]
+-        w_g_dequant = w_g * s_g_expanded
+-        # Track the dequantized q, k, and v weights separately.
+-        qs.append(w_g_dequant[:q_rows_per_group])
+-        ks.append(w_g_dequant[q_rows_per_group : q_rows_per_group + k_rows_per_group])
+-        vs.append(w_g_dequant[q_rows_per_group + k_rows_per_group :])
+-
+-    # Combine the q, k, and v weights into the following layout:
+-    # [Q_1, Q_2, .., Q_g, K_1, K_2, ..., K_g, V_1, V_2, ..., V_g]
+-    grouped = torch.cat([torch.cat(qs), torch.cat(ks), torch.cat(vs)], dim=0)
+-    # Quantize back to fp8.
++    for i in range(n):
++        w = w_full[i * shard_rows : (i + 1) * shard_rows].to(torch.float32)
++        s = s_full[i * scale_rows : (i + 1) * scale_rows].to(torch.float32)
++        s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
++        d = w * s[:shard_rows, : w.shape[1]]
++        qs.append(d[:q_rows])
++        ks.append(d[q_rows : q_rows + k_rows])
++        vs.append(d[q_rows + k_rows :])
++    q, k, v = torch.cat(qs), torch.cat(ks), torch.cat(vs)
++
++    rq = (num_heads // tp_size) * head_dim
++    rk = (num_kv_heads // tp_size) * head_dim
++    rv = (num_kv_heads // tp_size) * v_head_dim
++    r = tp_rank
++    grouped = torch.cat(
++        [q[r * rq : (r + 1) * rq], k[r * rk : (r + 1) * rk], v[r * rv : (r + 1) * rv]]
++    )
+     return scaled_quantize(
+         grouped, GroupShape(block, block), w_full.dtype, compute_dtype=torch.float32
+     )
+ 
+ 
+-@support_torch_compile
+ class MiMoV2Model(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -819,6 +820,7 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
+             v_head_dim=attn.v_head_dim,
+             tp_rank=tp_rank,
+             tp_size=tp_size,
++            ckpt_shards=mimo_v2_qkv_checkpoint_shards(self.config),
+         )
+         sharded = {"weight": w_rank, "weight_scale_inv": s_rank}
+         for kind, tensor in sharded.items():
+diff --git a/vllm/model_executor/models/mimo_v2_mtp.py b/vllm/model_executor/models/mimo_v2_mtp.py
+index fa2cabe..552f7e4 100644
+--- a/vllm/model_executor/models/mimo_v2_mtp.py
++++ b/vllm/model_executor/models/mimo_v2_mtp.py
+@@ -45,7 +45,12 @@ from .interfaces import (
+     SupportsMultiModal,
+     _require_is_multimodal,
+ )
+-from .mimo_v2 import MiMoV2Attention, MiMoV2MLP
++from .mimo_v2 import (
++    MiMoV2Attention,
++    MiMoV2MLP,
++    _shard_fp8_qkv_proj,
++    mimo_v2_qkv_checkpoint_shards,
++)
+ from .utils import _merge_multimodal_embeddings, maybe_prefix
+ 
+ # MiMo-V2 checkpoints contain multiple MTP layers, but vLLM currently supports
+@@ -267,6 +272,7 @@ class MiMoV2MTP(nn.Module):
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+ 
++        pending_qkv: dict[str, dict[str, torch.Tensor]] = {}
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
+@@ -279,18 +285,33 @@ class MiMoV2MTP(nn.Module):
+             ):
+                 continue
+ 
+-            # Support fused qkv_proj checkpoint (Pro format).
+-            # The checkpoint is stored pre-sharded for TP=8 as
+-            # [Q_rank0, K_rank0, V_rank0, Q_rank1, ...], so splitting along
+-            # dim 0 with chunk(tp_size) gives each rank its Q+K+V slice for
+-            # both the FP8 weight and the block weight_scale_inv. This matches
+-            # how the main model loads the same layout.
++            # Fused FP8 qkv_proj checkpoint: stored pre-sharded for the export
++            # TP as [Q_s0, K_s0, V_s0, Q_s1, ...] with per-shard block scales
++            # (Pro: TP=8, V2.6-Flash: TP=4). Collect weight + scale and let the
++            # main model's helper reshard them for this TP rank.
+             if "qkv_proj" in name:
+-                if name in params_dict:
+-                    param = params_dict[name]
+-                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+-                    default_weight_loader(param, loaded_weight)
+-                    loaded_params.add(name)
++                if name in params_dict or name.endswith("weight_scale_inv"):
++                    prefix, kind = name.rsplit(".", 1)
++                    entry = pending_qkv.setdefault(prefix, {})
++                    entry[kind] = loaded_weight
++                    if "weight" in entry and "weight_scale_inv" in entry:
++                        del pending_qkv[prefix]
++                        cfg = self.config
++                        w_rank, s_rank = _shard_fp8_qkv_proj(
++                            entry["weight"],
++                            entry["weight_scale_inv"],
++                            num_heads=cfg.swa_num_attention_heads,
++                            num_kv_heads=cfg.swa_num_key_value_heads,
++                            head_dim=cfg.swa_head_dim,
++                            v_head_dim=getattr(cfg, "swa_v_head_dim", cfg.swa_head_dim),
++                            tp_rank=tp_rank,
++                            tp_size=tp_size,
++                            ckpt_shards=mimo_v2_qkv_checkpoint_shards(cfg),
++                        )
++                        for k2, t2 in (("weight", w_rank), ("weight_scale_inv", s_rank)):
++                            pname = f"{prefix}.{k2}"
++                            default_weight_loader(params_dict[pname], t2)
++                            loaded_params.add(pname)
+                 continue
+ 
+             # gate_proj/up_proj → gate_up_proj stacking (both formats);

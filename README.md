@@ -16,6 +16,7 @@ This `main` branch separates shared infrastructure from model-specific files:
 │   ├── apply-lmcache-patches.sh
 │   ├── build-deepseek-v41-image.sh
 │   ├── build-glm53-dflash2-image.sh          # GLM W4A16 + DFlash2 image
+│   ├── build-mimo-v26-image.sh               # MiMo-V2.6-Flash image
 │   ├── build-lmcache-server-image.sh         # shared LMCache server image
 │   ├── build-qwen38-image.sh
 │   ├── build-router-image.sh   # patched vllm-router image
@@ -37,6 +38,11 @@ This `main` branch separates shared infrastructure from model-specific files:
     │   ├── manifests/          # GLM pins + SHA256 of the dflash2 stack
     │   ├── patches/dflash2/    # GLM DFlash2 vLLM series (on top of DeepSeek's)
     │   ├── native/ampere_marlin/  # compiled sm_80 Marlin decode (Apache-2.0)
+    │   └── tests/
+    ├── mimo-v2.6-flash/        # PP4 engine on the DeepSeek V4.1 source stack
+    │   ├── compose.yml, .env.example
+    │   ├── manifests/          # model pin + SHA256 of the MiMo series
+    │   ├── patches/            # MiMo-only vLLM series (fused FP8 qkv loader)
     │   └── tests/
     └── qwen3.8-flash-next-nvfp4/
         ├── compose.yml
