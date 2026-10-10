@@ -7,6 +7,7 @@ This `main` branch separates shared infrastructure from model-specific files:
 ```text
 .
 ├── manifests/                  # pinned shared dependency/image metadata
+├── monitoring/                 # standalone Prometheus + Grafana for all nodes
 ├── patches/
 │   ├── lmcache/                # shared LMCache patch series
 │   ├── router/                 # vllm-router (production-stack) patch series
@@ -120,6 +121,15 @@ See [`models/glm-5.3-flash/README.md`](models/glm-5.3-flash/README.md).
 V4.1 image: the pinned author source already implements `glm5next`, and the
 image's shared vLLM series carries the NVFP4 load fix the model needs
 (`patches/vllm/0007-nvfp4-marlin-scale-factor-amax.patch`).
+
+## Monitoring
+
+See [`monitoring/README.md`](monitoring/README.md). One Prometheus + Grafana
+stack (podman compose, host network) scrapes the `/metrics` of every vLLM
+engine, vllm-router and LMCache server listed in `.env`
+(`VLLM_METRICS_TARGETS=name=host:port,...`) and provisions a throughput
+overview (per instance and PD-deduplicated totals) plus the upstream vLLM
+dashboards with `server`/`role`/`instance` variables.
 
 ## Benchmark client
 

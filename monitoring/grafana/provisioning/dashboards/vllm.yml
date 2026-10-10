@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: vllm
+    folder: vLLM
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 60
+    options:
+      path: /var/lib/grafana/dashboards/vllm
