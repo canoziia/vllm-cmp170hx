@@ -2,7 +2,7 @@ fd1aeee1d867b49727e48fa4d6186b5c391b4523a2dad9ffe8eb6b94ea88744e  models/glm-5.3
 bdcc76eaf40505fdac9b7c682941f6a44724d170ad5f842225fe3c35a7d3378c  models/glm-5.3-flash/patches/dflash2/0001-glm5next-aux-hidden-states-pp.patch
 c60b635099acf40f5e3ce3996ed104ba194898f1636e7dac38be528dc281011e  models/glm-5.3-flash/patches/dflash2/0002-glm5next-kpool-tail-ring-spec-decode.patch
 73fda6363a59fc26895d0d5f33296692b03f52632e44603f8b96c5b32c02aab9  models/glm-5.3-flash/patches/dflash2/0003-glm5next-kv-layout-dflash-drafter-groups.patch
-ed34cac533fa019267e9c519e4174b225c51770796dd66a78cfa427c0b7c12a4  models/glm-5.3-flash/patches/dflash2/0004-glm5-dflash-adaptive-depth.patch
+146bae434cbd9dff0ba105e464296f0d6e99c667655a2972f345bb1b9310cc55  models/glm-5.3-flash/patches/dflash2/0004-glm5-dflash-adaptive-depth.patch
 b6125a2111fff399ad83d24d0321733f12be2a15e5f6f19d07d95664b37ca8b2  models/glm-5.3-flash/patches/dflash2/0005-glm5-thin-m-bf16-gemm.patch
 61a9705aac8398ee899a16c30c1251f44476a827c297528c28061f10e60e8f63  models/glm-5.3-flash/patches/dflash2/0006-glm5-compiled-marlin-moe-decode.patch
 a542eb30f03b5d073e521479316ae96d718ad1c344a4bbee14f1f1fcf1c0950f  models/glm-5.3-flash/patches/dflash2/0007-dflash-fused-grouped-conv.patch

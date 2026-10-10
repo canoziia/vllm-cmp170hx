@@ -9,12 +9,12 @@ policy. Needs the V2 model runner and an explicit "method":"dflash".
 Performance only; the output stays lossless.
 
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index 0a22b51..f97bb51 100644
+index 331db79..c3ae21e 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
-@@ -540,6 +540,17 @@ class SpeculativeConfig:
-     """Whether to adaptively size the draft-verification budget from per-request
-     confidence. Currently only supported for method="dspark"."""
+@@ -549,6 +549,17 @@ class SpeculativeConfig:
+     0 discards all but the newest block. Ignored when adaptive verification is off.
+     """
  
 +    adaptive_k: dict[str, Any] | None = None
 +    """Load-/acceptance-adaptive verification depth (host-side), normally set
@@ -30,7 +30,7 @@ index 0a22b51..f97bb51 100644
      @staticmethod
      def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
          """Mean acceptance length to unconditional per-position rates, using
-@@ -1125,6 +1136,8 @@ class SpeculativeConfig:
+@@ -1134,6 +1145,8 @@ class SpeculativeConfig:
              )
              self.method = "mtp"
  
@@ -39,7 +39,7 @@ index 0a22b51..f97bb51 100644
          if self.model is None and self.num_speculative_tokens is not None:
              if self.method == "mtp":
                  if self.target_model_config is None:
-@@ -1820,10 +1833,135 @@ class SpeculativeConfig:
+@@ -1829,10 +1842,135 @@ class SpeculativeConfig:
                  "omit it."
              )
  
@@ -175,7 +175,7 @@ index 0a22b51..f97bb51 100644
      def verify_equal_vocab_size_if_draft_model(self):
          if (
              self.method == "draft_model"
-@@ -1917,6 +2055,13 @@ class SpeculativeConfig:
+@@ -1939,6 +2077,13 @@ class SpeculativeConfig:
      def uses_dynamic_speculative_decoding(self) -> bool:
          return self.num_speculative_tokens_per_batch_size is not None
  
@@ -190,7 +190,7 @@ index 0a22b51..f97bb51 100644
          return self.method == "draft_model"
  
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index badc723..2b0edab 100644
+index 95da879..d999ef6 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -993,6 +993,29 @@ class VllmConfig:
@@ -258,7 +258,7 @@ index badc723..2b0edab 100644
                      uniform_decode_sizes = sorted(
                          {
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 5494590..517d36e 100755
+index 1acf0cd..a8858db 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -49,6 +49,14 @@ if TYPE_CHECKING:
@@ -276,7 +276,7 @@ index 5494590..517d36e 100755
      VLLM_CPU_OFFLOAD_GB_PER_RANK: str | None = None
      VLLM_ENGRAM_EXACT_PIN: bool = True
      VLLM_CPU_KVCACHE_SPACE: int | None = 0
-@@ -914,6 +922,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -917,6 +925,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
          int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1"))
      ),
@@ -320,7 +320,7 @@ index 5494590..517d36e 100755
      # rank). Overrides --cpu-offload-gb for the matching rank so heavily
      # loaded pipeline stages can offload more than lighter ones.
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 2880a1b..26c2494 100644
+index 8572f57..13cfaaa 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -68,6 +68,7 @@ from vllm.v1.metrics.stats import (
@@ -365,7 +365,7 @@ index 2880a1b..26c2494 100644
          if speculative_config is not None:
              if speculative_config.num_speculative_tokens_per_batch_size:
                  self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
-@@ -561,6 +589,49 @@ class Scheduler(SchedulerInterface):
+@@ -575,6 +603,49 @@ class Scheduler(SchedulerInterface):
              num_new_tokens -= self.num_prefill_lookahead - remaining
          return max(num_new_tokens, 0)
  
@@ -415,7 +415,7 @@ index 2880a1b..26c2494 100644
      def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
          self.current_step += 1
          # NOTE(woosuk) on the scheduling algorithm:
-@@ -611,6 +682,14 @@ class Scheduler(SchedulerInterface):
+@@ -625,6 +696,14 @@ class Scheduler(SchedulerInterface):
  
          self.kv_cache_manager.new_step_starts()
  
@@ -430,7 +430,7 @@ index 2880a1b..26c2494 100644
          # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
          # all prefill compute unless saturated.
          defer_prefills = (
-@@ -1069,7 +1148,7 @@ class Scheduler(SchedulerInterface):
+@@ -1115,7 +1194,7 @@ class Scheduler(SchedulerInterface):
                          and not prefill_scheduled
                          and (scheduled_running_reqs or num_computed_tokens > 0)
                      ):
@@ -439,7 +439,7 @@ index 2880a1b..26c2494 100644
                          # Pad only when there is room for the sampled token(s).
                          if (
                              num_computed_tokens
-@@ -1112,7 +1191,7 @@ class Scheduler(SchedulerInterface):
+@@ -1158,7 +1237,7 @@ class Scheduler(SchedulerInterface):
                              break
                          if (
                              pad_spec_decode
@@ -448,7 +448,7 @@ index 2880a1b..26c2494 100644
                          ):
                              # Alignment clipped the placeholder rows. The split
                              # aligns prefill chunks, but the padded tail rows are
-@@ -1302,10 +1381,14 @@ class Scheduler(SchedulerInterface):
+@@ -1348,10 +1427,14 @@ class Scheduler(SchedulerInterface):
                  request.status = RequestStatus.RUNNING
                  request.num_computed_tokens = num_computed_tokens
                  if pad_spec_decode:
@@ -465,7 +465,7 @@ index 2880a1b..26c2494 100644
                  # Only track requests that will still be prefilling after this chunk.
                  if num_computed_tokens + num_new_tokens < request.num_tokens:
                      self._inflight_prefills.add(request)
-@@ -2041,6 +2124,16 @@ class Scheduler(SchedulerInterface):
+@@ -2112,6 +2195,16 @@ class Scheduler(SchedulerInterface):
                          request.num_computed_tokens -= num_rejected
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
@@ -482,7 +482,7 @@ index 2880a1b..26c2494 100644
                  spec_decoding_stats = self.make_spec_decoding_stats(
                      spec_decoding_stats,
                      num_draft_tokens=num_draft_tokens,
-@@ -2643,6 +2736,8 @@ class Scheduler(SchedulerInterface):
+@@ -2734,6 +2827,8 @@ class Scheduler(SchedulerInterface):
  
          self.encoder_cache_manager.free(request)
          request_id = request.request_id
@@ -839,10 +839,10 @@ index 0000000..5dacb79
 +        self._k_counts.clear()
 +        self._steps_since_log = 0
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index c8d79c4..5114f34 100644
+index f493d60..b9d100d 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -145,6 +145,7 @@ class CudaGraphManager:
+@@ -146,6 +146,7 @@ class CudaGraphManager:
          decode_query_len: int,
          lora_capture_cases: list[int] | None = None,
          varlen_decode: bool = False,
@@ -850,7 +850,7 @@ index c8d79c4..5114f34 100644
      ):
          self.vllm_config = vllm_config
          self.device = device
-@@ -154,6 +155,9 @@ class CudaGraphManager:
+@@ -155,6 +156,9 @@ class CudaGraphManager:
          self.cudagraph_mode = cudagraph_mode
          self.decode_query_len = decode_query_len
          self.varlen_decode = varlen_decode
@@ -860,7 +860,7 @@ index c8d79c4..5114f34 100644
  
          self.dp_size = vllm_config.parallel_config.data_parallel_size
          self.tp_size = vllm_config.parallel_config.tensor_parallel_size
-@@ -187,6 +191,15 @@ class CudaGraphManager:
+@@ -188,6 +192,15 @@ class CudaGraphManager:
  
          self._init_candidates()
  
@@ -876,7 +876,7 @@ index c8d79c4..5114f34 100644
      def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
          """Precompute actual num_active_loras -> effective captured case.
  
-@@ -234,6 +247,9 @@ class CudaGraphManager:
+@@ -235,6 +248,9 @@ class CudaGraphManager:
          # draft tokens. The scheduler might use a smaller number so we need
          # to capture graphs for all possible values during decode.
          speculative_config = self.vllm_config.speculative_config
@@ -886,7 +886,7 @@ index c8d79c4..5114f34 100644
          if (
              speculative_config
              and speculative_config.uses_dynamic_speculative_decoding()
-@@ -255,6 +271,21 @@ class CudaGraphManager:
+@@ -256,6 +272,21 @@ class CudaGraphManager:
                      for num_spec in dense_schedule[1:]
                  }
              )
@@ -908,7 +908,7 @@ index c8d79c4..5114f34 100644
          else:
              decode_query_lens = [self.decode_query_len]
  
-@@ -295,6 +326,8 @@ class CudaGraphManager:
+@@ -296,6 +327,8 @@ class CudaGraphManager:
                          rounded_num_tokens > max_decode_tokens
                          or rounded_num_tokens > max_cg_capture_size
                          or rounded_num_reqs > self.max_num_reqs
@@ -917,7 +917,7 @@ index c8d79c4..5114f34 100644
                      ):
                          continue
  
-@@ -600,6 +633,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+@@ -744,6 +777,7 @@ class ModelCudaGraphManager(CudaGraphManager):
          decode_query_len: int,
          lora_capture_cases: list[int] | None = None,
          varlen_decode: bool = False,
@@ -925,19 +925,19 @@ index c8d79c4..5114f34 100644
      ):
          super().__init__(
              vllm_config,
-@@ -608,6 +642,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+@@ -752,6 +786,7 @@ class ModelCudaGraphManager(CudaGraphManager):
              decode_query_len,
              lora_capture_cases=lora_capture_cases,
              varlen_decode=varlen_decode,
 +            adaptive_k_capture=adaptive_k_capture,
          )
+         self.metadata_graphs: dict[BatchExecutionDescriptor, tuple[torch.cuda.CUDAGraph, dict[str, Any]]] = {}
          self.hidden_states: torch.Tensor | None = None
-         self.aux_hidden_states: list[torch.Tensor] = []
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 6a515e7..f813934 100644
+index bbf4625..3920ed5 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -703,6 +703,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -704,6 +704,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              decode_query_len=self.decode_query_len,
              lora_capture_cases=self.lora_capture_cases,
              varlen_decode=self.adaptive_verification is not None,
