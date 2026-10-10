@@ -7,7 +7,7 @@ full-width path. The verification execution profile does not select the algorith
 
 ## Production build
 
-`ENABLE_PERF_DEBUG=0` (default) applies `adaptive/0013-fixed-measured-policy.patch`.
+`ENABLE_PERF_DEBUG=0` (default) applies `adaptive/0009-measured-verification-policy.patch`.
 The scheduler constructs `FixedHistoryPolicy`. There is no external Python
 loader, capability admission, file polling or per-step trace IO. Selected widths
 are retained even when a request is ineligible for a fresh decision.
