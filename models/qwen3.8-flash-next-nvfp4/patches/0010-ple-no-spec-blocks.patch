@@ -1,0 +1,170 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: no speculative state blocks for the PLE short conv
+
+VLLM_QWEN38_PLE_NO_SPEC_BLOCKS (default 0 = unchanged; align mode). The PLE
+short conv keeps its speculative window inside the running state block (its
+spec kernels read block column 0 only and the short-conv copy shifts that
+window), yet the generic Mamba spec reserved num_speculative_tokens extra
+state blocks per request for it, each a full shared page. The PLE spec now
+reserves none; the shared align machinery accepts conv-only groups with fewer
+speculative blocks and Mamba block-table rows keep one stride. With MTP5 a
+request holds 21 instead of 26 blocks (712-block pool: 33 instead of 27
+concurrent requests). Greedy outputs are byte-identical to the baseline.
+---
+ vllm/models/qwen4_exp/nvidia/ple_layer.py     | 19 +++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 18 +++++++++
+ .../worker/gpu/model_states/mamba_hybrid.py   | 10 ++---
+ vllm/v1/worker/mamba_utils.py                 | 39 ++++++++++++-------
+ 4 files changed, 65 insertions(+), 21 deletions(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index 43d951f..e89af40 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -190,6 +190,25 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+     def get_attn_backend(self) -> type[PleShortConvAttentionBackend]:
+         return PleShortConvAttentionBackend
+ 
++    def get_kv_cache_spec(self, vllm_config):
++        spec = super().get_kv_cache_spec(vllm_config)
++        import os
++
++        if (
++            spec is not None
++            and os.environ.get("VLLM_QWEN38_PLE_NO_SPEC_BLOCKS", "0") == "1"
++            and vllm_config.cache_config.mamba_cache_mode == "align"
++        ):
++            # The PLE short conv keeps its speculative window inside the
++            # running block (spec kernels read block column 0 only, the
++            # short-conv copy shifts that window), so the num_speculative_tokens
++            # extra state blocks the generic Mamba spec reserves are never
++            # touched. Do not allocate them.
++            import dataclasses
++
++            spec = dataclasses.replace(spec, num_speculative_blocks=0)
++        return spec
++
+     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+         return MambaStateDtypeCalculator.short_conv_state_dtype(
+             self.model_config.dtype, self.cache_config.mamba_cache_dtype
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 549375e..10afd1d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -712,6 +712,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size)
+             max_num_blocks_per_group.append(max_num_blocks)
+ 
++        # Mamba groups with fewer speculative blocks (conv-only PLE without
++        # speculative state blocks) still share the align machinery's single
++        # block-table row stride: pad their rows to the widest Mamba row.
++        mamba_rows = [
++            i
++            for i, group in enumerate(kv_cache_config.kv_cache_groups)
++            if isinstance(
++                group.kv_cache_spec.first_spec
++                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
++                else group.kv_cache_spec,
++                MambaSpec,
++            )
++        ]
++        if mamba_rows:
++            widest = max(max_num_blocks_per_group[i] for i in mamba_rows)
++            for i in mamba_rows:
++                max_num_blocks_per_group[i] = widest
++
+         target_attn_layer_names = None
+         if isinstance(self.speculator, DraftModelSpeculator):
+             # Adaptive verification validates target attention separately.
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index b44b22a..666fb14 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -116,13 +116,9 @@ class MambaHybridModelState(DefaultModelState):
+         if not self._align_mode:
+             return
+         mamba_groups = get_mamba_groups(kv_cache_config)
+-        mamba_spec = next(iter(mamba_groups))
+-        assert all(
+-            spec.block_size == mamba_spec.block_size
+-            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
+-            and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
+-            for spec in mamba_groups
+-        ), "all mamba groups must share cache scheduling parameters"
++        from vllm.v1.worker.mamba_utils import _shared_mamba_spec
++
++        mamba_spec = _shared_mamba_spec(mamba_groups)
+         self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
+         self._mamba_spec = mamba_spec
+ 
+diff --git a/vllm/v1/worker/mamba_utils.py b/vllm/v1/worker/mamba_utils.py
+index 9a6fa15..6f39ca0 100644
+--- a/vllm/v1/worker/mamba_utils.py
++++ b/vllm/v1/worker/mamba_utils.py
+@@ -18,6 +18,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.math_utils import cdiv
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+@@ -730,6 +731,28 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> dict[MambaSpec, list[int
+     return {spec: sorted(ids) for spec, ids in mamba_groups.items()}
+ 
+ 
++
++def _shared_mamba_spec(mamba_groups) -> "MambaSpec":
++    """The Mamba spec whose scheduling parameters the shared align machinery
++    uses: every group must agree on block size and cache mode. Speculative
++    block counts may differ only for conv-only (short conv) groups, which
++    never index speculative columns; the widest count is used."""
++    specs = list(mamba_groups)
++    widest = max(specs, key=lambda spec: spec.num_speculative_blocks)
++    assert all(
++        spec.block_size == widest.block_size
++        and spec.mamba_cache_mode == widest.mamba_cache_mode
++        and (
++            spec.num_speculative_blocks == widest.num_speculative_blocks
++            or (
++                spec.num_speculative_blocks == 0
++                and spec.mamba_type == MambaAttentionBackendEnum.SHORT_CONV
++            )
++        )
++        for spec in specs
++    ), "all mamba groups must share cache scheduling parameters"
++    return widest
++
+ def validate_mamba_state_copy_funcs(
+     mamba_groups: dict[MambaSpec, list[int]],
+     copy_funcs: MambaStateCopyFuncsByType,
+@@ -764,13 +787,7 @@ class MambaCopyBuffers:
+         make_buffer: Callable[..., CpuGpuBuffer],
+     ) -> "MambaCopyBuffers":
+         mamba_groups = get_mamba_groups(kv_cache_config)
+-        mamba_spec = next(iter(mamba_groups))
+-        assert all(
+-            spec.block_size == mamba_spec.block_size
+-            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
+-            and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
+-            for spec in mamba_groups
+-        ), "all mamba groups must share cache scheduling parameters"
++        mamba_spec = _shared_mamba_spec(mamba_groups)
+         mamba_group_ids = get_mamba_group_ids(mamba_groups)
+         entries_per_req = sum(
+             len(
+@@ -869,13 +886,7 @@ class MambaSpecDecodeGPUContext:
+         """Create context with allocated buffers (metadata populated later)."""
+         mamba_groups = get_mamba_groups(kv_cache_config)
+         mamba_group_ids = get_mamba_group_ids(mamba_groups)
+-        mamba_spec = next(iter(mamba_groups))
+-        assert all(
+-            spec.block_size == mamba_spec.block_size
+-            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
+-            and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
+-            for spec in mamba_groups
+-        ), "all mamba groups must share cache scheduling parameters"
++        mamba_spec = _shared_mamba_spec(mamba_groups)
+         copy_funcs_by_spec = {
+             spec: copy_funcs[spec.mamba_type] for spec in mamba_groups
+         }

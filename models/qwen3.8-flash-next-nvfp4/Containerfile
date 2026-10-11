@@ -7,6 +7,7 @@ ARG LMCACHE_SERVER_IMAGE=unknown
 USER root
 COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY ple_pread.c /tmp/ple_pread.c
+COPY gdn_mtp_record/ /tmp/gdn_mtp_record/
 COPY lmcache-cli /usr/local/bin/lmcache
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 COPY qwen-cache-tests/ /opt/qwen-cache-tests/
@@ -17,6 +18,9 @@ ENV PYTHONPATH=/opt/lmcache-patched
 RUN gcc -O3 -fopenmp -shared -fPIC \
       -o /usr/local/lib/libvllm_ple_pread.so /tmp/ple_pread.c \
     && rm /tmp/ple_pread.c \
+    && bash /tmp/gdn_mtp_record/build.sh /usr/local/lib/python3.12/dist-packages/vllm \
+         --build-dir /tmp/gdn_mtp_record/build \
+    && rm -rf /tmp/gdn_mtp_record \
     && chmod 0755 /usr/local/bin/lmcache \
     && python3 -m compileall -q \
       /usr/local/lib/python3.12/dist-packages/vllm \
@@ -28,6 +32,7 @@ RUN gcc -O3 -fopenmp -shared -fPIC \
     && python3 /opt/qwen-cache-tests/test_qsa_mtp_block_alignment.py /usr/local/lib/python3.12/dist-packages \
     && python3 /opt/qwen-cache-tests/test_qwen_mtp_group_annotation.py /usr/local/lib/python3.12/dist-packages \
     && python3 /opt/qwen-cache-tests/test_qsa_logits_workspace.py /usr/local/lib/python3.12/dist-packages \
+    && python3 /opt/qwen-cache-tests/test_qwen38_spec_k.py /usr/local/lib/python3.12/dist-packages \
     && rm /tmp/test-lmcache-patches.py
 
 LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \

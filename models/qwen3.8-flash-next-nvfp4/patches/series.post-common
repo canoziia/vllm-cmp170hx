@@ -6,3 +6,5 @@
 0007-thin-m-bf16-gemm.patch
 0008-ple-native-ngram-hash.patch
 0009-mtp-draft-widths.patch
+0010-ple-no-spec-blocks.patch
+0011-gdn-recoverssm.patch
