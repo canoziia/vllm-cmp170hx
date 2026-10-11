@@ -1,0 +1,146 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: one profile switch for the optimisation patches
+
+VLLM_QWEN38_OPT_PROFILE=default sets VLLM_QWEN38_FAST_MOE_ALIGN,
+VLLM_QWEN38_DRAFT_HEAD_FP8, VLLM_QWEN38_THIN_GEMM,
+VLLM_QWEN38_PLE_NATIVE_HASH, VLLM_QWEN38_VERIFICATION_WIDTHS,
+VLLM_QWEN38_ADAPTIVE_WIDTH, VLLM_QWEN38_PLE_NO_SPEC_BLOCKS,
+VLLM_QWEN38_GDN_RECOVER and VLLM_QWEN38_FUSED_SHARED_GATE to 1 unless the
+variable is already set (each
+switch stays individually overridable). Unset/0/off changes nothing. Applied
+from vllm.env_override, before any other vLLM import, in every process. The
+switches are registered in vllm.envs so they are not reported as unknown.
+---
+ vllm/env_override.py       |  5 ++++
+ vllm/envs.py               | 38 +++++++++++++++++++++++++++++
+ vllm/qwen38_opt_profile.py | 49 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 92 insertions(+)
+ create mode 100644 vllm/qwen38_opt_profile.py
+
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index a931b23..8930f4c 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -4,6 +4,11 @@
+ import importlib.util
+ import os
+ 
++# Qwen3.8 Flash Next on CMP 170HX: one switch for the per-patch switches.
++from vllm.qwen38_opt_profile import apply as _qwen38_apply_opt_profile
++
++_qwen38_apply_opt_profile()
++
+ 
+ def _get_torch_cuda_version():
+     """Peripheral function to _maybe_set_cuda_compatibility_path().
+diff --git a/vllm/envs.py b/vllm/envs.py
+index a2088bc..4fdf4d0 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -320,6 +320,16 @@ if TYPE_CHECKING:
+     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
+     VLLM_DETERMINISTIC_MOE_ALIGN: bool = True
++    VLLM_QWEN38_OPT_PROFILE: str = ""
++    VLLM_QWEN38_FAST_MOE_ALIGN: bool = False
++    VLLM_QWEN38_DRAFT_HEAD_FP8: bool = False
++    VLLM_QWEN38_THIN_GEMM: bool = False
++    VLLM_QWEN38_PLE_NATIVE_HASH: bool = False
++    VLLM_QWEN38_VERIFICATION_WIDTHS: bool = False
++    VLLM_QWEN38_ADAPTIVE_WIDTH: bool = False
++    VLLM_QWEN38_PLE_NO_SPEC_BLOCKS: bool = False
++    VLLM_QWEN38_GDN_RECOVER: bool = False
++    VLLM_QWEN38_FUSED_SHARED_GATE: bool = False
+     VLLM_DISABLE_MULTI_STREAM_PARALLEL: bool = False
+     VLLM_MHC_POST_FUSE_SQRSUM: bool = False
+     VLLM_MHC_PRENORM_SHARD: bool = False
+@@ -2251,6 +2261,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DETERMINISTIC_MOE_ALIGN": lambda: bool(
+         int(os.getenv("VLLM_DETERMINISTIC_MOE_ALIGN", "1"))
+     ),
++    # Qwen3.8 Flash Next on CMP 170HX optimisation switches (default off; the
++    # profile VLLM_QWEN38_OPT_PROFILE=default sets the deployed values, see
++    # vllm/qwen38_opt_profile.py). Read with os.environ at their call sites.
++    "VLLM_QWEN38_OPT_PROFILE": lambda: os.getenv("VLLM_QWEN38_OPT_PROFILE", ""),
++    "VLLM_QWEN38_FAST_MOE_ALIGN": lambda: os.getenv("VLLM_QWEN38_FAST_MOE_ALIGN", "0")
++    == "1",
++    "VLLM_QWEN38_DRAFT_HEAD_FP8": lambda: os.getenv("VLLM_QWEN38_DRAFT_HEAD_FP8", "0")
++    == "1",
++    "VLLM_QWEN38_THIN_GEMM": lambda: os.getenv("VLLM_QWEN38_THIN_GEMM", "0") == "1",
++    "VLLM_QWEN38_PLE_NATIVE_HASH": lambda: os.getenv(
++        "VLLM_QWEN38_PLE_NATIVE_HASH", "0"
++    )
++    == "1",
++    "VLLM_QWEN38_VERIFICATION_WIDTHS": lambda: os.getenv(
++        "VLLM_QWEN38_VERIFICATION_WIDTHS", "0"
++    )
++    == "1",
++    "VLLM_QWEN38_ADAPTIVE_WIDTH": lambda: os.getenv("VLLM_QWEN38_ADAPTIVE_WIDTH", "0")
++    == "1",
++    "VLLM_QWEN38_PLE_NO_SPEC_BLOCKS": lambda: os.getenv(
++        "VLLM_QWEN38_PLE_NO_SPEC_BLOCKS", "0"
++    )
++    == "1",
++    "VLLM_QWEN38_GDN_RECOVER": lambda: os.getenv("VLLM_QWEN38_GDN_RECOVER", "0") == "1",
++    "VLLM_QWEN38_FUSED_SHARED_GATE": lambda: os.getenv(
++        "VLLM_QWEN38_FUSED_SHARED_GATE", "0"
++    )
++    == "1",
+     # Debug kill-switch: force execute_in_parallel/maybe_execute_in_parallel
+     # to run serially on the default stream (no aux-stream overlap).
+     "VLLM_DISABLE_MULTI_STREAM_PARALLEL": lambda: bool(
+diff --git a/vllm/qwen38_opt_profile.py b/vllm/qwen38_opt_profile.py
+new file mode 100644
+index 0000000..a5cf1da
+--- /dev/null
++++ b/vllm/qwen38_opt_profile.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++"""One switch for the Qwen3.8 Flash Next NVFP4 CMP 170HX optimisation patches.
++
++VLLM_QWEN38_OPT_PROFILE=default sets every per-patch switch to its deployed
++value *unless that variable is already set*, so a single switch can still be
++overridden (e.g. VLLM_QWEN38_FAST_MOE_ALIGN=0). Unset / "0" / "off": nothing
++is changed (every patch stays at its own default, which is off). Applied from
++vllm.env_override, i.e. before any other vLLM module is imported, in the API
++server and in every spawned worker. The switch list is documented in
++models/qwen3.8-flash-next-nvfp4/README.md.
++"""
++import os
++
++PROFILES: dict[str, dict[str, str]] = {
++    "default": {
++        # single-kernel deterministic MoE block alignment
++        "VLLM_QWEN38_FAST_MOE_ALIGN": "1",
++        # fp8 copy of lm_head for MTP draft logits
++        "VLLM_QWEN38_DRAFT_HEAD_FP8": "1",
++        # sm80 thin-M BF16 GEMM for measured unquantized shapes
++        "VLLM_QWEN38_THIN_GEMM": "1",
++        # native n-gram hashing in the PLE offload worker
++        "VLLM_QWEN38_PLE_NATIVE_HASH": "1",
++        # MTP draft widths: draft k, verify exactly those k (per-batch k,
++        # per-step-count drafter graphs, manual vllm_xargs.spec_k)
++        "VLLM_QWEN38_VERIFICATION_WIDTHS": "1",
++        # measured per-request choice of k (DeepSeek measured policy)
++        "VLLM_QWEN38_ADAPTIVE_WIDTH": "1",
++        # PLE short conv without speculative state blocks (align mode)
++        "VLLM_QWEN38_PLE_NO_SPEC_BLOCKS": "1",
++        # GDN RecoverSSM: no speculative state blocks (native recording MTP
++        # kernel; falls back to the Triton recording path without it)
++        "VLLM_QWEN38_GDN_RECOVER": "1",
++        # shared-expert gate sigmoid*mul in one launch (bit-identical)
++        "VLLM_QWEN38_FUSED_SHARED_GATE": "1",
++    },
++}
++
++
++def apply() -> None:
++    name = os.environ.get("VLLM_QWEN38_OPT_PROFILE", "").strip().lower()
++    if name in ("", "0", "off", "none"):
++        return
++    if name not in PROFILES:
++        raise ValueError(
++            f"VLLM_QWEN38_OPT_PROFILE={name!r}: unknown profile "
++            f"(known: {', '.join(sorted(PROFILES))})")
++    for key, value in PROFILES[name].items():
++        os.environ.setdefault(key, value)
