@@ -1,0 +1,986 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: MTP draft widths - draft k, verify exactly those k
+
+VLLM_QWEN38_VERIFICATION_WIDTHS (default 0 = unchanged): when the scheduler
+schedules a batch it decides how many drafts k the last PP rank generates for
+it (SchedulerOutput.qwen38_next_draft_k). Every scheduled request records
+qwen38_drafted = k, async placeholders are exactly k, and the request's next
+verification consumes exactly the drafts that were generated (a manual
+vllm_xargs.spec_k caps it; preemption resets it). spec_k is parsed, validated
+and turned into the limit in vllm/v1/core/sched/qwen38_spec_k.py, reached only
+from two Qwen3.8-architecture-gated call sites: InputProcessor._validate_params
+(HTTP 400) and Scheduler.add_request. The generic request model and
+SamplingParams are untouched; other models ignore the key as before (JSON
+booleans arrive as 0/1 after the generic coercion).
+The MTP drafter runs its position-0 routine plus k-1 fused decode
+steps; one fused draft-decode CUDA graph is captured per step count, and exact
+uniform target decode graphs are captured for every verification width 1+k.
+One count per scheduled batch keeps both PP stages on the same exact graph; the
+draft feedback broadcast keeps its [reqs, K] shape (positions >= k are never
+consumed). Without the policy every batch drafts K (manual spec_k aside).
+
+VLLM_QWEN38_ADAPTIVE_WIDTH (default 0; needs the above): the DeepSeek V4.1
+measured verification policy (adaptive/0009) ported to MTP k<=K chooses k per
+request: per-position at-risk acceptance, 0.95 decay, measured output/time
+blended with one calibrated predicted block from Qwen's measured cost of
+drafting and verifying k, 98 %-of-peak cold choice with +3 %, then +3 % plus a
+ratio/paired-prefix uncertainty gate, at most one width of growth per decision,
+manual spec_k first, failure keeps K. One count per batch: between the
+smallest and largest member choice, the width with the highest summed relative
+policy score (a single request gets exactly its choice). Growing the width
+means drafting more next time; no full-width proposal is generated or retained.
+---
+ vllm/v1/core/sched/async_scheduler.py         |   7 +-
+ vllm/v1/core/sched/output.py                  |   4 +
+ vllm/v1/core/sched/qwen38_spec_k.py           |  59 +++
+ .../core/sched/qwen38_verification_policy.py  | 372 ++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               | 132 ++++++-
+ vllm/v1/engine/input_processor.py             |   7 +
+ vllm/v1/worker/gpu/cudagraph_utils.py         |  19 +
+ vllm/v1/worker/gpu/model_runner.py            |   5 +
+ .../spec_decode/autoregressive/speculator.py  |  90 ++++-
+ 9 files changed, 681 insertions(+), 14 deletions(-)
+ create mode 100644 vllm/v1/core/sched/qwen38_spec_k.py
+ create mode 100644 vllm/v1/core/sched/qwen38_verification_policy.py
+
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index d18c868..4106507 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -62,7 +62,12 @@ class AsyncScheduler(Scheduler):
+             )
+             # Add placeholders for the new draft/spec tokens.
+             # We will update the actual spec token ids in the worker process.
+-            request.spec_token_ids = self._spec_token_placeholders
++            drafted = getattr(request, "qwen38_drafted", None)
++            if drafted is not None:
++                # Placeholders for exactly the drafts this step will generate.
++                request.spec_token_ids = [-1] * drafted
++            else:
++                request.spec_token_ids = self._spec_token_placeholders
+ 
+             if self.use_v2_model_runner:
+                 # Set the next step index in which this request is eligible to be
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index b299167..3a7df7e 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -303,6 +303,10 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    # Qwen3.8 MTP draft widths: number of drafts the last PP rank generates in
++    # this step (None = all num_speculative_tokens).
++    qwen38_next_draft_k: int | None = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/qwen38_spec_k.py b/vllm/v1/core/sched/qwen38_spec_k.py
+new file mode 100644
+index 0000000..d7c3caa
+--- /dev/null
++++ b/vllm/v1/core/sched/qwen38_spec_k.py
+@@ -0,0 +1,59 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Qwen3.8 request-local verification width (``vllm_xargs.spec_k``).
++
++``vllm_xargs`` already reaches ``SamplingParams.extra_args`` unchanged for every
++model. Only Qwen3.8 architectures consult this module (two architecture-gated
++call sites: input validation and scheduler admission); every other model
++ignores the key exactly like the unpatched engine.
++"""
++import os
++
++from vllm.exceptions import VLLMValidationError
++
++
++def is_qwen38(architectures) -> bool:
++    return any(a.startswith(("Qwen4Exp", "Qwen3_8FlashNext")) for a in architectures or ())
++
++
++def _widths_enabled() -> bool:
++    return os.environ.get("VLLM_QWEN38_VERIFICATION_WIDTHS", "0") == "1"
++
++
++def validate_request(extra_args, speculative_config) -> None:
++    """Front-end validation; failures surface as HTTP 400."""
++    if not extra_args or "spec_k" not in extra_args:
++        return
++    value = extra_args["spec_k"]
++    if type(value) is not int or value < 0:
++        raise VLLMValidationError(
++            "vllm_xargs.spec_k must be a nonnegative integer",
++            parameter="vllm_xargs.spec_k",
++        )
++    if (
++        speculative_config is None
++        or speculative_config.method != "mtp"
++        or not _widths_enabled()
++    ):
++        raise VLLMValidationError(
++            "spec_k requires VLLM_QWEN38_VERIFICATION_WIDTHS=1 and Qwen3.8 MTP",
++            parameter="vllm_xargs.spec_k",
++        )
++    if not 0 <= value <= speculative_config.num_speculative_tokens:
++        raise VLLMValidationError(
++            "spec_k must be an integer between 0 and configured draft count",
++            parameter="vllm_xargs.spec_k",
++        )
++
++
++def draft_limit(request, spec, num_spec_tokens: int, use_v2_model_runner: bool) -> int | None:
++    """Scheduler admission: the request's verified-draft limit, or None."""
++    params = request.sampling_params
++    extra = params.extra_args if params is not None else None
++    limit = extra.get("spec_k") if extra else None
++    if limit is None:
++        return None
++    if spec is None or spec.method != "mtp" or not use_v2_model_runner or not _widths_enabled():
++        raise ValueError("spec_k requires Qwen3.8 MTP verification widths")
++    if type(limit) is not int or not 0 <= limit <= num_spec_tokens:
++        raise ValueError("spec_k must be an integer in the configured draft range")
++    return limit
+diff --git a/vllm/v1/core/sched/qwen38_verification_policy.py b/vllm/v1/core/sched/qwen38_verification_policy.py
+new file mode 100644
+index 0000000..f75bff5
+--- /dev/null
++++ b/vllm/v1/core/sched/qwen38_verification_policy.py
+@@ -0,0 +1,372 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Request-local measured MTP verification width for Qwen3.8 (CPU only).
++
++VLLM_QWEN38_ADAPTIVE_WIDTH=1 (default 0 = unchanged; requires
++VLLM_QWEN38_VERIFICATION_WIDTHS=1). Port of the DeepSeek V4.1 measured
++verification policy (models/deepseek-v4.1-flash adaptive/0009) generalised from
++DSpark k<=5 to MTP k<=K:
++
++* per request, per verified width: discounted (decay 0.95) at-risk acceptance
++  per draft position, output tokens and CPU-visible feedback recurrence time;
++* each width's measured output/time is blended with one predicted pseudo-block
++  (prefix-acceptance expectation x Qwen's measured step cost at the current
++  concurrency), calibrated to the current width's observed level;
++* a cold first trim needs +3 % over the incumbent (choosing the widest width
++  within 98 % of the peak); afterwards a change needs +3 % plus a ratio and
++  paired-prefix uncertainty gate; growth is at most one width per decision;
++* manual vllm_xargs.spec_k always wins; any policy failure keeps full K.
++
++The choice is a draft count: when the scheduler schedules a batch it decides
++how many drafts the MTP drafter generates for it, and the next step verifies
++exactly those drafts (growing the width means drafting more next time). Qwen's
++decode graphs are exact only for uniform batches, so the choices of the
++requests in one scheduled batch are combined into one count: the width
++(between the smallest and largest member choice) with the highest summed
++relative policy score.
++No task labels, external IO, CUDA objects or fixed observation windows.
++"""
++
++import math
++import time
++from types import SimpleNamespace
++
++# Measured full-batch step time (ms) on 2x CMP 170HX, PP2, MTP5 build, by
++# concurrency and drafts generated = verified k = 1..5 (index k-1); drafting
++# k steps, verifying k (mean over counting/code/prose). c32 from the MTP3
++# build (k1..k3) extrapolated, because MTP5 does not fit 32 requests in the
++# fixed KV budget.
++COST_MS = {
++    1: (17.2, 19.4, 20.9, 22.5, 24.0),
++    8: (26.2, 28.5, 33.7, 38.9, 39.9),
++    32: (41.2, 51.3, 58.5, 65.7, 72.9),
++}
++
++
++def costs(c, k_max):
++    cs = sorted(COST_MS)
++
++    def row(v):
++        v = list(v)[:k_max]
++        while len(v) < k_max:  # extrapolate linearly in k if K > table width
++            v.append(v[-1] + (v[-1] - v[-2] if len(v) > 1 else 0.0))
++        return [x / 1000 for x in v]
++
++    if c <= cs[0]:
++        return row(COST_MS[cs[0]])
++    for lo, hi in zip(cs, cs[1:]):
++        if c <= hi:
++            w = (c - lo) / (hi - lo)
++            return row(a * (1 - w) + b * w for a, b in zip(COST_MS[lo], COST_MS[hi]))
++    return row(COST_MS[cs[-1]])
++
++
++class Policy:
++    def __init__(self, k_max, decay=0.95, prediction_weight=1.0):
++        if not 0 <= decay < 1 or not 0 < prediction_weight <= 100 or k_max < 1:
++            raise ValueError("invalid config")
++        K = self.K = int(k_max)
++        self.decay = float(decay)
++        self.w = float(prediction_weight)
++        self.k = K
++        self.n = [0.0] * K
++        self.y = [0.0] * K
++        self.t = [0.0] * K
++        self.risk = [0.0] * K
++        self.success = [0.0] * K
++        self.prior = 1.0
++        self.epoch = None
++        self.diagnostics = {}
++        self.latest = None
++        self.trimmed = False
++        self.history = [[0.0] * (K + 1) for _ in range(K)]
++        self.q = [0.0] * K
++        self.y2 = [0.0] * K
++        self.t2 = [0.0] * K
++        self.yt = [0.0] * K
++
++    def observe(self, e):
++        K = self.K
++        k = e["k"]
++        a = e["accepted"]
++        dt = e["seconds"]
++        if not 1 <= k <= K or not 0 <= a <= k:
++            raise ValueError("invalid feedback")
++        self.latest = e.copy()
++        self.history = [[v * self.decay for v in row] for row in self.history]
++        self.history[k - 1][a] += 1
++        self.prior *= self.decay
++        if self.epoch != e["load_epoch"]:
++            self.n = [0.0] * K
++            self.y = [0.0] * K
++            self.t = [0.0] * K
++            self.epoch = e["load_epoch"]
++            self.q = [0.0] * K
++            self.y2 = [0.0] * K
++            self.t2 = [0.0] * K
++            self.yt = [0.0] * K
++        for j in range(K):
++            self.n[j] *= self.decay
++            self.y[j] *= self.decay
++            self.t[j] *= self.decay
++            self.q[j] *= self.decay**2
++            self.y2[j] *= self.decay
++            self.t2[j] *= self.decay
++            self.yt[j] *= self.decay
++            self.risk[j] *= self.decay
++            self.success[j] *= self.decay
++            if j < k:
++                self.risk[j] += 1
++                self.success[j] += a > j
++        if e["timing_valid"]:
++            j = k - 1
++            y = e["output_tokens"]
++            self.n[j] += 1
++            self.y[j] += y
++            self.t[j] += dt
++            self.q[j] += 1
++            self.y2[j] += y * y
++            self.t2[j] += dt * dt
++            self.yt[j] += y * dt
++
++    def choose(self, context):
++        K = self.K
++        self.k = context["current_k"]
++        p = []
++        previous = 1.0
++        for n, s in zip(self.risk, self.success):
++            previous = min(
++                previous, (s + self.prior + 0.5 * previous) / (n + self.prior + 1)
++            )
++            p.append(previous)
++        E = [1 + sum(p[:k]) for k in range(1, K + 1)]
++        C = costs(context["concurrency"], K)
++        # Calibrate predictions to the current observed level; keep ratios.
++        i = self.k - 1
++        scale = self.y[i] / self.n[i] / E[i] if self.n[i] else 1.0
++        time_scale = self.t[i] / self.n[i] / C[i] if self.n[i] else 1.0
++        predicted_y = [e * scale for e in E]
++        predicted_t = [c * time_scale for c in C]
++        scores = [
++            (y + self.w * e) / (t + self.w * c)
++            for y, t, e, c in zip(self.y, self.t, predicted_y, predicted_t)
++        ]
++        se = []
++        for j in range(K):
++            n = self.n[j]
++            if n <= 0:
++                se.append(0.0)
++                continue
++            rate = self.y[j] / self.t[j]
++            variance = max(
++                0.0, (self.y2[j] - 2 * rate * self.yt[j] + rate * rate * self.t2[j]) / n
++            )
++            ess = min(n, n * n / self.q[j])
++            se.append((variance + 1.0) ** 0.5 / (self.t[j] / n) / (ess + 1) ** 0.5)
++        fractions = [t / (t + self.w * c) for t, c in zip(self.t, predicted_t)]
++        gate = [f * (s * s + se[self.k - 1] ** 2) ** 0.5 for f, s in zip(fractions, se)]
++        hist = self.history[i]
++        mass = sum(hist)
++        model_se = []
++        for j in range(K):
++            if j >= i:
++                model_se.append(0.0)
++                continue
++            diffs = [
++                ((1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i])
++                * scale
++                / time_scale
++                for a in range(K + 1)
++            ]
++            mean = sum(w * d for w, d in zip(hist, diffs)) / mass if mass else 0.0
++            variance = (
++                sum(w * (d - mean) ** 2 for w, d in zip(hist, diffs)) / mass
++                if mass
++                else 0.0
++            )
++            model_se.append((variance / (mass + 1)) ** 0.5)
++        gate = [(a * a + b * b) ** 0.5 for a, b in zip(gate, model_se)]
++        ready = bool(
++            self.latest and self.latest["k"] == self.k and self.latest["timing_valid"]
++        )
++        best = self.k
++        if ready:
++            if not self.trimmed:
++                peak = max(scores)
++                cold = max(k for k in range(1, K + 1) if scores[k - 1] >= 0.98 * peak)
++                if scores[cold - 1] > scores[best - 1] * 1.03:
++                    best = cold
++            else:
++                for k in range(1, min(K, self.k + 1) + 1):
++                    if (
++                        scores[k - 1] - scores[self.k - 1]
++                        > 0.03 * scores[self.k - 1] + gate[k - 1]
++                        and scores[k - 1] > scores[best - 1]
++                    ):
++                        best = k
++        if best < K:
++            self.trimmed = True
++        self.diagnostics = dict(score=scores, se=se, gate=gate, ready=ready)
++        return best
++
++
++class MeasuredWidthPolicy:
++    """Scheduler adapter: generation-pinned per-request entries.
++
++    Only valid actual-width feedback advances selection; the retained width is
++    used between decisions. Feedback recurrence is CPU-visible cadence (PP
++    cadence and queueing included), not GPU kernel time.
++    """
++
++    def __init__(self, logger, k_max, decay=0.95):
++        if isinstance(decay, bool) or not math.isfinite(decay) or not 0 <= decay < 1:
++            raise ValueError("invalid history decay")
++        self.logger = logger
++        self.K = int(k_max)
++        self.decay = decay
++        self.active = {}
++        self.generation = 0
++        self.feedback_time = None
++        self.warned = False
++        logger.info(
++            "Qwen3.8 measured MTP verification width policy: K=%d decay=%s",
++            self.K,
++            decay,
++        )
++
++    def admit(self, request):
++        if getattr(request, "verification_draft_limit", None) is None:
++            self.generation += 1
++            self.active[request.request_id] = SimpleNamespace(
++                plugin=Policy(self.K, self.decay),
++                k=self.K,
++                generation=self.generation,
++                previous=None,
++                fresh=False,
++                failed=False,
++            )
++
++    def forget(self, request_id):
++        self.active.pop(request_id, None)
++
++    def _fail(self, entry, exc):
++        # Fail closed to full K. No retry until the next admission.
++        entry.failed = True
++        entry.k = self.K
++        entry.fresh = False
++        if not self.warned:
++            self.logger.warning(
++                "Qwen3.8 width policy failure (%s); full K retained",
++                type(exc).__name__,
++            )
++            self.warned = True
++
++    def manages(self, request):
++        return request.request_id in self.active
++
++    def next_width(self, requests, concurrency):
++        """Next draft count for one scheduled batch.
++
++        Each managed request's measured choice is updated only after fresh
++        feedback. One batch count is needed (exact uniform graphs): among the
++        widths between the smallest and the largest member choice, take the
++        one with the highest summed relative score, i.e. each request's
++        policy score at that width divided by its score at its own choice. A
++        single request (or a batch that agrees) gets exactly its choice."""
++        entries = []
++        for r in requests:
++            entry = self.active.get(r.request_id)
++            if entry is None:
++                continue
++            if not entry.failed and entry.fresh:
++                try:
++                    k = entry.plugin.choose(
++                        dict(current_k=entry.k, concurrency=concurrency)
++                    )
++                    if type(k) is not int or not 1 <= k <= self.K or k > entry.k + 1:
++                        raise ValueError("policy width outside allowed transition")
++                    entry.k = k
++                    entry.fresh = False
++                    entry.scores = list(entry.plugin.diagnostics.get("score", ()))
++                except Exception as exc:  # noqa: BLE001 - fail closed
++                    self._fail(entry, exc)
++            entries.append(entry)
++        if not entries:
++            return 1
++        lo = min(e.k for e in entries)
++        hi = max(e.k for e in entries)
++        if lo == hi:
++            return hi
++
++        def utility(k):
++            total = 0.0
++            for e in entries:
++                scores = getattr(e, "scores", None)
++                if e.failed or not scores or len(scores) < self.K or scores[e.k - 1] <= 0:
++                    # No usable model: this member only accepts its own width
++                    # or wider (never narrower than an unknown preference).
++                    total += 1.0 if k >= e.k else 0.0
++                else:
++                    total += scores[k - 1] / scores[e.k - 1]
++            return total
++
++        # Ties prefer the wider width (as the per-request cold rule does).
++        return max(range(lo, hi + 1), key=lambda k: (utility(k), k))
++
++    def scheduled(self, output, residents, concurrency):
++        if not self.active:
++            return
++        now = time.perf_counter()
++        key = tuple(sorted(r.request_id for r in residents))
++        prefilling = any(r.is_prefill_chunk for r in residents)
++        stamps = {}
++        for rid, drafts in output.scheduled_spec_decode_tokens.items():
++            entry = self.active.get(rid)
++            if entry is not None and not entry.failed:
++                stamps[rid] = (entry.generation, now, key, prefilling, len(drafts))
++        output._qwen38_width_stamps = stamps
++
++    def begin_feedback(self):
++        self.feedback_time = time.perf_counter()
++
++    def feedback(self, output, request, drafted, accepted, output_tokens, valid):
++        rid = request.request_id
++        entry = self.active.get(rid)
++        stamp = getattr(output, "_qwen38_width_stamps", {}).get(rid)
++        if entry is None or stamp is None or stamp[0] != entry.generation or entry.failed:
++            return
++        _, sent, key, prefilling, actual_k = stamp
++        now = self.feedback_time if self.feedback_time is not None else time.perf_counter()
++        previous = entry.previous
++        entry.previous = (now, key, prefilling, actual_k)
++        seconds = now - sent
++        timing_valid = bool(
++            valid
++            and not prefilling
++            and previous is not None
++            and previous[1] == key
++            and not previous[2]
++            and previous[3] == actual_k
++        )
++        if timing_valid:
++            seconds = now - previous[0]
++        if not valid:
++            entry.previous = None
++            return
++        if not 0 < seconds < 60 or actual_k != drafted or drafted < 1:
++            timing_valid = False
++        if drafted < 1:
++            return
++        try:
++            entry.plugin.observe(
++                dict(
++                    k=drafted,
++                    accepted=accepted,
++                    output_tokens=output_tokens,
++                    seconds=seconds,
++                    timing_valid=timing_valid,
++                    load_epoch=hash(key),
++                )
++            )
++            entry.fresh = True
++        except Exception as exc:  # noqa: BLE001 - fail closed
++            self._fail(entry, exc)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 487871f..a27952e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -323,6 +323,27 @@ class Scheduler(SchedulerInterface):
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
++        # Qwen3.8 MTP draft widths: the scheduler decides, per scheduled batch,
++        # how many drafts the last PP rank generates next; the next step then
++        # verifies exactly the drafts that were generated.
++        import os
++
++        _spec = vllm_config.speculative_config
++        self.qwen38_widths = bool(
++            os.environ.get("VLLM_QWEN38_VERIFICATION_WIDTHS", "0") == "1"
++            and _spec is not None
++            and _spec.method == "mtp"
++            and _spec.num_speculative_tokens > 1
++        )
++        if self.qwen38_widths and not self.use_v2_model_runner:
++            raise ValueError("Qwen3.8 MTP draft widths require Model Runner V2")
++        self.qwen38_width_policy = None
++        if self.qwen38_widths and os.environ.get("VLLM_QWEN38_ADAPTIVE_WIDTH", "0") == "1":
++            from .qwen38_verification_policy import MeasuredWidthPolicy
++
++            self.qwen38_width_policy = MeasuredWidthPolicy(
++                logger, _spec.num_speculative_tokens
++            )
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
+@@ -680,6 +701,9 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            limit = self._qwen38_verify_limit(request)
++            if limit is not None and len(request.spec_token_ids) > limit:
++                request.spec_token_ids = request.spec_token_ids[:limit]
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -853,6 +877,9 @@ class Scheduler(SchedulerInterface):
+                     - request.num_tokens
+                     - request.num_output_placeholders
+                 )
++                limit = self._qwen38_verify_limit(request)
++                if limit is not None:
++                    num_scheduled_spec_tokens = min(num_scheduled_spec_tokens, limit)
+                 if num_scheduled_spec_tokens > 0:
+                     spec_token_ids = request.spec_token_ids
+                     if len(spec_token_ids) > num_scheduled_spec_tokens:
+@@ -1081,6 +1108,7 @@ class Scheduler(SchedulerInterface):
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        and not self.qwen38_widths
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -1508,9 +1536,68 @@ class Scheduler(SchedulerInterface):
+             self.sched_step_seq += 1
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
++            if self.qwen38_widths:
++                self._qwen38_plan_drafts(scheduler_output)
+             self._update_after_schedule(scheduler_output)
++        if self.qwen38_width_policy is not None:
++            self.qwen38_width_policy.scheduled(
++                scheduler_output,
++                self.running,
++                min(
++                    self.max_num_running_reqs,
++                    len(self.running) + len(self.waiting) + len(self.skipped_waiting),
++                ),
++            )
+         return scheduler_output
+ 
++    def _qwen38_verify_limit(self, request: Request) -> int | None:
++        """Drafts to verify: exactly the drafts generated for this request
++        (capped by a manual vllm_xargs.spec_k). None = feature off."""
++        if not self.qwen38_widths:
++            return None
++        drafted = getattr(request, "qwen38_drafted", None)
++        limit = self.num_spec_tokens if drafted is None else drafted
++        manual = getattr(request, "verification_draft_limit", None)
++        return limit if manual is None else min(limit, manual)
++
++    def _qwen38_plan_drafts(self, scheduler_output: SchedulerOutput) -> None:
++        """Decide how many drafts the last PP rank generates for this batch.
++
++        One count per scheduled batch keeps the next verification uniform (exact
++        decode graphs on both PP stages). Manual spec_k requests contribute
++        their pinned width; policy-managed requests their measured choice;
++        anything else full K. Every scheduled request records the count, which
++        is exactly what its next verification may consume."""
++        requests = [self.requests[rid] for rid in scheduler_output.num_scheduled_tokens]
++        if not requests:
++            return
++        wants = []
++        managed = []
++        for r in requests:
++            manual = getattr(r, "verification_draft_limit", None)
++            if manual is not None:
++                wants.append(manual)
++            elif self.qwen38_width_policy is not None and self.qwen38_width_policy.manages(r):
++                managed.append(r)
++            else:
++                wants.append(self.num_spec_tokens)
++        if managed:
++            wants.append(
++                self.qwen38_width_policy.next_width(
++                    managed,
++                    min(
++                        self.max_num_running_reqs,
++                        len(self.running) + len(self.waiting) + len(self.skipped_waiting),
++                    ),
++                )
++            )
++        # At least one draft so the drafter's position-0 routine (the only
++        # graph-captured entry point) always runs; spec_k=0 then verifies none.
++        width = max(1, min(self.num_spec_tokens, max(wants)))
++        for r in requests:
++            r.qwen38_drafted = width
++        scheduler_output.qwen38_next_draft_k = width
++
+     def _get_max_num_scheduled_decodes(self) -> int:
+         return self.max_num_running_reqs
+ 
+@@ -1559,6 +1646,8 @@ class Scheduler(SchedulerInterface):
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        if hasattr(request, "qwen38_drafted"):
++            request.qwen38_drafted = None
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+@@ -1947,6 +2036,8 @@ class Scheduler(SchedulerInterface):
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        if self.qwen38_width_policy is not None:
++            self.qwen38_width_policy.begin_feedback()
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+@@ -2049,6 +2140,26 @@ class Scheduler(SchedulerInterface):
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 num_rejected = num_draft_tokens - num_accepted
++                if self.qwen38_width_policy is not None:
++                    self.qwen38_width_policy.feedback(
++                        scheduler_output,
++                        request,
++                        num_draft_tokens,
++                        num_accepted,
++                        len(generated_token_ids),
++                        valid=(
++                            not output_is_stale
++                            and 0 <= num_accepted <= num_draft_tokens
++                            and not (scheduler_output.num_invalid_spec_tokens or {}).get(
++                                req_id
++                            )
++                            and not self.structured_output_manager.should_advance(
++                                request
++                            )
++                            and request.num_output_tokens + len(generated_token_ids)
++                            < request.max_tokens
++                        ),
++                    )
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+@@ -2502,7 +2613,10 @@ class Scheduler(SchedulerInterface):
+                 metadata = request.structured_output_request
+                 spec_token_ids = strip_speculative_padding(spec_token_ids)
+                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+-            request.spec_token_ids = spec_token_ids
++            limit = self._qwen38_verify_limit(request)
++            request.spec_token_ids = (
++                spec_token_ids if limit is None else spec_token_ids[:limit]
++            )
+ 
+     def update_draft_token_ids_in_output(
+         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
+@@ -2551,6 +2665,20 @@ class Scheduler(SchedulerInterface):
+         return self.kv_cache_manager.usage
+ 
+     def add_request(self, request: Request) -> None:
++        from vllm.v1.core.sched.qwen38_spec_k import draft_limit, is_qwen38
++
++        if is_qwen38(self.vllm_config.model_config.architectures):
++            limit = draft_limit(
++                request,
++                self.vllm_config.speculative_config,
++                self.num_spec_tokens,
++                self.use_v2_model_runner,
++            )
++            if limit is not None:
++                request.verification_draft_limit = limit
++        if self.qwen38_width_policy is not None:
++            self.qwen38_width_policy.forget(request.request_id)
++            self.qwen38_width_policy.admit(request)
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+@@ -2673,6 +2801,8 @@ class Scheduler(SchedulerInterface):
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+         self._free_request_blocks(request)
++        if self.qwen38_width_policy is not None:
++            self.qwen38_width_policy.forget(request.request_id)
+         del self.requests[request.request_id]
+ 
+     @property
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 4cc433c..9e86b8d 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -100,6 +100,13 @@ class InputProcessor:
+                 self.structured_outputs_config,
+                 self.tokenizer,
+             )
++            from vllm.v1.core.sched.qwen38_spec_k import is_qwen38
++
++            if is_qwen38(self.model_config.architectures):
++                # Qwen3.8 request-local verification width (vllm_xargs.spec_k).
++                from vllm.v1.core.sched.qwen38_spec_k import validate_request
++
++                validate_request(params.extra_args, self.speculative_config)
+ 
+             if self.model_config.return_sampling_mask:
+                 if params.temperature <= 0:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 274cf1f..2b470b1 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
+ import itertools
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable
+ from dataclasses import dataclass
+@@ -255,6 +256,24 @@ class CudaGraphManager:
+                     for num_spec in dense_schedule[1:]
+                 }
+             )
++        elif (
++            speculative_config
++            and speculative_config.method == "mtp"
++            and os.environ.get("VLLM_QWEN38_VERIFICATION_WIDTHS", "0") == "1"
++            # Target verification (and the drafter's position-0 routine) only;
++            # single-query draft decode graphs keep their one width.
++            and self.decode_query_len == self.vllm_config.num_speculative_tokens + 1
++        ):
++            # Request-local MTP verification widths: scheduled widths are
++            # CPU-known and uniform per batch, so capture an exact uniform
++            # decode graph for every width 1 + k, k in [1, K].
++            num_new_sampled_tokens_per_step = (
++                self.decode_query_len - self.vllm_config.num_speculative_tokens
++            )
++            decode_query_lens = [
++                k + num_new_sampled_tokens_per_step
++                for k in range(1, self.vllm_config.num_speculative_tokens + 1)
++            ]
+         else:
+             decode_query_lens = [self.decode_query_len]
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ffa0cc7..549375e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1736,6 +1736,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     scheduler_output, empty_output
+                 )
+ 
++        # Qwen3.8 MTP draft widths: drafts the last PP rank generates this step.
++        self._qwen38_next_draft_k = getattr(scheduler_output, "qwen38_next_draft_k", None)
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+@@ -2221,6 +2223,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            self.speculator.qwen38_draft_steps = getattr(
++                self, "_qwen38_next_draft_k", None
++            )
+             with use_workspace_lane(self._draft_workspace_lane):
+                 draft_tokens = self.speculator.propose(
+                     input_batch,
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 16003c9..93c3a73 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -26,6 +26,17 @@ from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
+ logger = init_logger(__name__)
+ 
+ 
++def _qwen38_draft_widths(vllm_config) -> bool:
++    import os
++
++    spec = vllm_config.speculative_config
++    return bool(
++        os.environ.get("VLLM_QWEN38_VERIFICATION_WIDTHS", "0") == "1"
++        and spec is not None
++        and spec.method == "mtp"
++    )
++
++
+ class AutoRegressiveSpeculator(DraftModelSpeculator):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+@@ -98,6 +109,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         )
+         self._configure_fused_multi_step_decode()
+ 
++    def _qwen38_last_step(self) -> int:
++        """Exclusive bound of the draft-decode loop (positions 1..n-1)."""
++        steps = getattr(self, "_qwen38_fused_steps", None)
++        return self.num_speculative_steps if steps is None else steps + 1
++
+     def _configure_fused_multi_step_decode(self) -> None:
+         if self.num_speculative_steps == 1:
+             self.use_fused_multi_step_decode = False
+@@ -146,6 +162,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             cudagraph_mode,
+             decode_query_len=1,
+         )
++        # Qwen3.8 MTP draft widths: the scheduler may ask for fewer than
++        # num_speculative_steps drafts. The fused decode loop is recorded with
++        # its step count, so capture one fused graph per shorter count.
++        self.qwen38_decode_managers: dict[int, SpeculatorCudaGraphManager] = {}
++        if _qwen38_draft_widths(self.vllm_config) and self.num_speculative_steps > 2:
++            for steps in range(1, self.num_speculative_steps - 1):
++                self.qwen38_decode_managers[steps] = SpeculatorCudaGraphManager(
++                    self.vllm_config,
++                    self.device,
++                    cudagraph_mode,
++                    decode_query_len=1,
++                )
+ 
+     def capture(self) -> None:
+         logger.info("Capturing model for speculator...")
+@@ -198,6 +226,21 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             self.kv_cache_config,
+             progress_bar_desc="Capturing decode CUDA graphs",
+         )
++        if self.use_fused_multi_step_decode:
++            for steps, manager in self.qwen38_decode_managers.items():
++                self._qwen38_fused_steps = steps
++                try:
++                    manager.capture(
++                        self._generate_fused_drafts,
++                        self.model_state,
++                        self.input_buffers,
++                        self.block_tables,
++                        self.attn_groups,
++                        self.kv_cache_config,
++                        progress_bar_desc=f"Capturing {steps + 1}-draft CUDA graphs",
++                    )
++                finally:
++                    self._qwen38_fused_steps = None
+         self.on_multi_step_decode_end(self.max_num_reqs)
+ 
+     @torch.inference_mode()
+@@ -323,6 +366,20 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         if self.num_speculative_steps == 1:
+             # Early exit.
+             return self.draft_tokens[:num_reqs, :1]
++        # Qwen3.8 MTP draft widths: generate only the drafts the scheduler
++        # will verify next step (positions >= num_drafts are never consumed).
++        num_drafts = getattr(self, "qwen38_draft_steps", None)
++        if num_drafts is None or dummy_run:
++            num_drafts = self.num_speculative_steps
++        num_drafts = max(1, min(int(num_drafts), self.num_speculative_steps))
++        if num_drafts == 1:
++            return self.draft_tokens[:num_reqs]
++        decode_manager = self.decode_cudagraph_manager
++        self._qwen38_fused_steps = None
++        if num_drafts < self.num_speculative_steps:
++            self._qwen38_fused_steps = num_drafts - 1
++            if self.use_fused_multi_step_decode:
++                decode_manager = self.qwen38_decode_managers[num_drafts - 1]
+ 
+         # Prepare the inputs for the decode steps.
+         prepare_decode_inputs(
+@@ -344,7 +401,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+         # Each request produces exactly 1 token per draft generation step,
+         # enabling FULL graph replay.
+         decode_batch_desc, decode_batch_sync = dispatch_cg_and_sync_dp(
+-            self.decode_cudagraph_manager,
++            decode_manager,
+             num_reqs,
+             num_batch_tokens,
+             uniform_token_count=1,
+@@ -366,13 +423,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             if self.use_fused_multi_step_decode
+             else self._multi_step_decode
+         )
+-        decode_fn(
+-            num_reqs,
+-            dummy_run and skip_attn_for_dummy_run,
+-            decode_batch_desc,
+-            num_tokens_across_dp,
+-            input_batch.seq_lens_cpu_upper_bound,
+-        )
++        self._qwen38_decode_manager = decode_manager
++        try:
++            decode_fn(
++                num_reqs,
++                dummy_run and skip_attn_for_dummy_run,
++                decode_batch_desc,
++                num_tokens_across_dp,
++                input_batch.seq_lens_cpu_upper_bound,
++            )
++        finally:
++            self._qwen38_decode_manager = None
++            self._qwen38_fused_steps = None
+         self.on_multi_step_decode_end(num_reqs)
+ 
+         return self.draft_tokens[:num_reqs]
+@@ -506,7 +568,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+-        for step in range(1, self.num_speculative_steps):
++        for step in range(1, self._qwen38_last_step()):
+             # Rebuild every step when positions advance, or just once
+             # on the first step when positions are constant (Gemma4 MTP).
+             if not skip_attn and (self.advance_draft_positions or step == 1):
+@@ -579,7 +641,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+ 
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             assert self.decode_cudagraph_manager is not None
+-            self.decode_cudagraph_manager.run_fullgraph(batch_desc)
++            (
++                getattr(self, "_qwen38_decode_manager", None)
++                or self.decode_cudagraph_manager
++            ).run_fullgraph(batch_desc)
+             return
+ 
+         self._generate_fused_drafts(
+@@ -609,7 +674,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+             else []
+         )
+ 
+-        for step in range(1, self.num_speculative_steps):
++        last_step = self._qwen38_last_step()
++        for step in range(1, last_step):
+             self.current_draft_step.fill_(step)
+             self._generate_draft(
+                 num_reqs,
+@@ -620,7 +686,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
+                 cudagraph_runtime_mode,
+             )
+             if (
+-                step < self.num_speculative_steps - 1
++                step < last_step - 1
+                 and attn_metadata is not None
+                 and self.advance_draft_positions
+             ):
