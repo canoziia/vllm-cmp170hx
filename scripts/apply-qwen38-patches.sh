@@ -48,6 +48,8 @@ apply_model_series "$MODEL_DIR/patches/series.post-common"
 python3 "$MODEL_DIR/tests/test_decode_checkpoint_scheduler.py" "$SOURCE_TREE"
 python3 "$MODEL_DIR/tests/test_qwen_mtp_group_annotation.py" "$SOURCE_TREE"
 python3 "$MODEL_DIR/tests/test_qsa_logits_workspace.py" "$SOURCE_TREE"
+python3 "$MODEL_DIR/tests/test_mtp_width_policy.py" "$SOURCE_TREE" 3
+python3 "$MODEL_DIR/tests/test_mtp_width_policy.py" "$SOURCE_TREE" 5
 git -C "$SOURCE_TREE" diff --check
 python3 -m compileall -q \
   "$SOURCE_TREE/vllm/config" \
