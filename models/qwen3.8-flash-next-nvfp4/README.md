@@ -42,11 +42,77 @@ Applied in this order:
    size in the CUDA caching allocator.
 6. The complete shared `patches/lmcache/series`, including MTP align-mode
    speculative-block relocation tracking.
+7. Decode optimisation patches `0005`-`0013` (after the QSA patches in
+   `series.post-common`), each behind its own default-off switch and enabled
+   together by `VLLM_QWEN38_OPT_PROFILE=default`; see
+   [Decode optimisation](#decode-optimisation).
 
 The two vLLM Mamba fixes are shared with DeepSeek and therefore live in root
 `patches/vllm/`; Qwen's PLE, generated-history, and QSA workspace changes remain
 model-specific. The complete runtime tree is reproducible from the pinned clean
 source and these ordered patch series.
+
+## Decode optimisation
+
+Every switch defaults to off (switch off = the code path before the patch).
+`compose.yml` sets `VLLM_QWEN38_OPT_PROFILE: "default"`, which sets each switch
+below to `1` unless that variable is already present, so a single switch can be
+overridden by listing it in the compose environment (`"0"`), and
+`VLLM_QWEN38_OPT_PROFILE: "off"` disables all of them.
+
+| patch | switch | effect | numerics |
+|---|---|---|---|
+| `0005-single-kernel-moe-align` | `VLLM_QWEN38_FAST_MOE_ALIGN` | one Triton program replaces the ~45-kernel torch deterministic MoE align (~80-95 us -> 7-22 us per MoE layer at decode, <= 4096 routed entries) | bitwise identical |
+| `0006-mtp-draft-head-fp8` | `VLLM_QWEN38_DRAFT_HEAD_FP8` | MTP draft logits from a per-row FP8 copy of lm_head via Marlin W8A16 (0.77 -> 0.45 ms per draft step; +0.59 GiB on PP1) | target unchanged; draft logits FP8 (acceptance only) |
+| `0007-thin-m-bf16-gemm` | `VLLM_QWEN38_THIN_GEMM` | split-K thin-M Triton GEMM for the measured BF16 projection cells (<= 32 rows), cuBLAS elsewhere | FP32 accumulate, different summation order, error <= cuBLAS vs FP64 |
+| `0008-ple-native-ngram-hash` | `VLLM_QWEN38_PLE_NATIVE_HASH` | PLE offload worker hashes n-grams in `native/ple_pread.c` (~0.5 ms -> ~0.07 ms per step on the PP0 critical path) | bitwise identical |
+| `0009-mtp-draft-widths` | `VLLM_QWEN38_VERIFICATION_WIDTHS` | draft k, verify exactly those k: the scheduler decides per scheduled batch how many drafts the MTP drafter generates (`vllm_xargs.spec_k` 0..K pins a request), the drafter runs only k MTP steps (fused draft graph per step count) and the next step verifies exactly the generated drafts (exact uniform target graphs per width) | target unchanged |
+| `0009-mtp-draft-widths` | `VLLM_QWEN38_ADAPTIVE_WIDTH` | DeepSeek V4.1 measured verification policy ported to MTP k<=K chooses k per request (at-risk acceptance, 0.95 decay, measured/predicted blend, 3 % gates, +1 width growth, manual first); a batch drafts the width (between its members' smallest and largest choice) with the highest summed relative policy score | target unchanged |
+| `0010-ple-no-spec-blocks` | `VLLM_QWEN38_PLE_NO_SPEC_BLOCKS` | the PLE short conv keeps its speculative window in the running block, so it reserves no speculative state blocks (align mode); MTP5 holds 21 instead of 26 blocks per request | none (byte-identical outputs) |
+| `0011-gdn-recoverssm` | `VLLM_QWEN38_GDN_RECOVER` | MTP verification reads the committed state and records per-token update operands; after sampling every PP rank replays the accepted prefix (bit-identical state). GDN and PLE reserve no speculative state blocks: MTP5 6 instead of 21 blocks per request, c32 runs without preemption (KV 27 %). Verification uses `native/gdn_mtp_record` (a copy of the fused CUDA MTP kernel with a recording mode, built into the image); without it the Triton path is used (slower) | none (bit-identical greedy output) |
+| `0012-fused-shared-gate` | `VLLM_QWEN38_FUSED_SHARED_GATE` | shared-expert `sigmoid(gate) * out` in one Triton kernel | none (bit-identical) |
+| `0013-qwen38-opt-profile` | `VLLM_QWEN38_OPT_PROFILE` | the profile switch; registers the switches in `vllm.envs` | - |
+
+`vllm_xargs.spec_k` (0..K) is handled only in Qwen3.8 code
+(`vllm/v1/core/sched/qwen38_spec_k.py`), reached from two call sites gated on
+the Qwen3.8 architecture (input validation -> HTTP 400, scheduler admission);
+the generic request model and `SamplingParams` are unchanged and other models
+ignore the key. JSON `true`/`false` arrive as 1/0 after the generic coercion.
+
+GPU checks (run in the image before deployment):
+`python3 /opt/qwen-cache-tests/test_decode_opt_kernels_gpu.py [--bench]`;
+the width policy CPU check `tests/test_mtp_width_policy.py` runs during the build.
+The compose default is MTP5 (`QWEN_MTP_TOKENS=5`, LMCache chunk and prefix
+retention 1632, the policy chooses 1..5 drafts). Without `0010`/`0011` MTP5
+fits only ~27 concurrent requests in the fixed 16 GiB KV budget (26 blocks per
+request: 4 Mamba groups x (1+K) + 2; MTP3: 18 blocks, ~39 requests);
+with the default profile (`0010` + `0011`) a request holds 6 blocks and c32
+runs without preemption at unchanged speed.
+GPU checks for `0011`: `python3 /opt/qwen-cache-tests/test_gdn_recover_gpu.py`
+and `python3 /opt/qwen-cache-tests/test_gdn_mtp_record_native.py` (native kernel
+vs the image's fused CUDA kernel, bit-identical).
+Measured on node1 (2x CMP 170HX, 180 W stock, PP2, same 16 GiB/GPU KV budget
+and 1M context), full-batch decode tok/s, mean of the measured rounds, 500
+output tokens, fresh cache salt, thinking off. Baseline = previous image
+(profile off, MTP3); optimised = default profile with MTP5
+(`QWEN_MTP_TOKENS=5`, `LMCACHE_CHUNK_SIZE=1632`,
+`QWEN_PREFIX_RETENTION_INTERVAL=1632`, a separate `LMCACHE_L2_PATH`):
+
+| prompt | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---|---|---|---|---|---|
+| counting | 143.9 -> 229.0 | 269.9 -> 446.4 | 462.6 -> 729.0 | 766.4 -> 1156 | 1247 -> 1644 | 2171 -> 2590 |
+| code | 135.6 -> 220.3 | 252.3 -> 379.3 | 432.4 -> 633.1 | 733.5 -> 980.3 | 1135 -> 1403 | 1952 -> 2320 |
+| prose | 82.3 -> 107.4 | 150.3 -> 199.1 | 251.9 -> 314.3 | 429.1 -> 538.2 | 681 -> 792 | 1081 -> 1189 |
+
+c24: counting 2241, code 1911, prose 999. MTP5 + RecoverSSM fits 32 concurrent
+requests with no preemption (6 KV blocks per request). With MTP3
+(`QWEN_MTP_TOKENS=3`, chunk/retention 1600) the profile still applies
+(c1 counting 181.8, code 174.5, prose 108.3). Acceptance with MTP5: counting 5.4-5.8, code 5.1,
+prose 2.0-2.2 tokens/step (the measured width policy verifies ~2.4-3.3 drafts
+for prose).
+
+Cold prefill (c1, default profile, MTP5): 7k 1.46 s, 28k 4.24 s, 114k 16.3 s,
+456k 78.7 s, 912k 200-286 s (run-to-run).
 
 ## Build
 
@@ -74,10 +140,10 @@ max_model_len=1,000,000
 max_num_batched_tokens=4,096
 max_num_seqs=32
 KV=bfloat16, 16 GiB per GPU
-MTP=3 by default; set QWEN_MTP_TOKENS=5 to test a longer draft window
+MTP=5 by default (QWEN_MTP_TOKENS; 3 restores the previous window)
 prefix_match_unit=32
 mamba_cache_mode=align
-prefix_cache_retention_interval=1,600
+prefix_cache_retention_interval=1,632 (MTP5; 1,600 for MTP3)
 CUDA Graph=FULL_AND_PIECEWISE
 PLE backend=pread, 48 workers, next-chunk prefetch
 LMCache chunk=1,600, L1=64 GiB by default, buffered native-FS L2
@@ -108,8 +174,10 @@ block size: QSA's ring is rounded from `indexer_compress_ratio + MTP depth`.
 Set `LMCACHE_CHUNK_SIZE` to a multiple of the **resolved** block size for that
 depth, and choose a distinct `LMCACHE_L2_PATH` for incompatible cache geometry.
 `QWEN_PREFIX_RETENTION_INTERVAL` can track that chunk size. An optional
-`LMCACHE_L2_CAPACITY_GB` bounds a new test cache. Defaults preserve the
-MTP3/1600-token production configuration. The PP2 generated-history snapshot
+`LMCACHE_L2_CAPACITY_GB` bounds a new test cache. Defaults are the MTP5 /
+1632-token configuration with its own L2 directory (`...-mtp5`); data written
+with the MTP3 / 1600-token geometry is not reused. `compose.pd.yml` keeps MTP3 /
+1600 (not validated with MTP5). The PP2 generated-history snapshot
 retention and scheduler lookahead follow the configured window; verify both
 GPU decode state and multi-turn cache hits when raising it. Before switching
 an existing service, keep the original image and Compose/.env for rollback.

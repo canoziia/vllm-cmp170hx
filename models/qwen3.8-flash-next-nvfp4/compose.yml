@@ -35,6 +35,12 @@ services:
       NCCL_IB_DISABLE: "1"
       PYTHONUNBUFFERED: "1"
       VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-1}"
+      # Optimisation patches 0005-0012 (README "Decode optimisation": MoE align,
+      # fp8 draft head, thin GEMM, PLE hash, MTP draft widths, PLE/GDN without
+      # speculative state blocks, fused shared gate), enabled by patch 0013.
+      # "off" disables all; a single switch can be overridden by listing it
+      # here, e.g. VLLM_QWEN38_THIN_GEMM: "0".
+      VLLM_QWEN38_OPT_PROFILE: "default"
     command:
       - nvidia/Qwen3.8-Flash-Next-NVFP4
       - --host=0.0.0.0
@@ -50,7 +56,7 @@ services:
       - --max-num-batched-tokens=4096
       - --kv-cache-memory=17179869184
       - --kv-cache-dtype=bfloat16
-      - '--speculative-config={"method":"mtp","num_speculative_tokens":${QWEN_MTP_TOKENS:-3}}'
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":${QWEN_MTP_TOKENS:-5}}'
       - --per-request-spec-decode-metrics=detailed
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - '--hf-overrides={"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":4.0,"original_max_position_embeddings":262144}}}'
@@ -59,7 +65,7 @@ services:
       - --enable-prefix-caching
       - --prefix-match-unit=32
       - --mamba-cache-mode=align
-      - --prefix-cache-retention-interval=${QWEN_PREFIX_RETENTION_INTERVAL:-1600}
+      - --prefix-cache-retention-interval=${QWEN_PREFIX_RETENTION_INTERVAL:-1632}
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5557}}'
       - --enable-auto-tool-choice
       - --tool-call-parser=qwen3_xml
@@ -86,7 +92,7 @@ services:
       - --port=5557
       - --http-host=127.0.0.1
       - --http-port=18557
-      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1600}
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1632}
       - --separate-object-groups
       - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
       - --eviction-policy=LRU
@@ -103,7 +109,7 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       PYTHONUNBUFFERED: "1"
     volumes:
-      - ${LMCACHE_L2_PATH:-/mnt/lmcache-sdb/nvidia/Qwen3.8-Flash-Next-NVFP4}:/lmcache-l2
+      - ${LMCACHE_L2_PATH:-/mnt/lmcache-sdb/nvidia/Qwen3.8-Flash-Next-NVFP4-mtp5}:/lmcache-l2
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18557/status"]
       interval: 10s
