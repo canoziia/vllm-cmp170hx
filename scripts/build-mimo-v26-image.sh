@@ -51,6 +51,7 @@ PAYLOAD_CID=
 find "$WORKDIR/source/vllm" -name __pycache__ -type d -prune -exec rm -rf {} +
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
+cp -a "$MIMO_DIR/native/mimo_moe" "$WORKDIR/context/mimo_moe"
 INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 SERIES_SHA=$(sha256sum "$MIMO_DIR/patches/series" | cut -c1-12)
 
@@ -60,6 +61,12 @@ USER root
 COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY lmcache-payload/ /opt/lmcache-patched/
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
+COPY mimo_moe/ /tmp/mimo_moe/
+# patch 0009: compile the MiMo MXFP4 decode kernels into the vllm package (no
+# GPU needed; sm_80 only). Loaded only with VLLM_MIMO26_MXFP4_DECODE=1.
+RUN bash /tmp/mimo_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
+    && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build /tmp/mimo_moe /root/.cache/torch_extensions \\
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_mimo26_moe_C.abi3.so
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/vllm /opt/lmcache-patched/lmcache \\
     && python3 -c 'import lmcache,sys,torch,lmcache.cuda_ops,lmcache.lmcache_native,lmcache.lmcache_fs; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert sys.version_info[:2] == (3,12); assert torch.version.cuda == "13.0"; print(lmcache.__version__, lmcache.__file__, torch.__version__, torch.version.cuda)' \\
