@@ -1,0 +1,992 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: GDN RecoverSSM - speculative verification without
+ state blocks
+
+VLLM_QWEN38_GDN_RECOVER (default 0 = unchanged; align mode). MTP verification
+reads the committed state of the running block and records, per request slot
+outside the KV pool, the exact operands of each token's state update (decay,
+normalised key, correction). After sampling, every PP rank commits on its own
+layers in postprocess_state (the non-last rank's deferred postprocess carries
+the same accepted counts): the accepted prefix is replayed with the verifying
+kernel's update operations (bit-identical state), the boundary state is
+written when a 1632-token block boundary is crossed, GDN and PLE conv windows
+are compacted and num_accepted reset, so the align pre/postprocess and the
+generated-history checkpoints see normalised states. GDN and PLE reserve no
+speculative state blocks: with MTP5 a request holds 6 instead of 21 blocks
+(c32: KV 27 % instead of 94.5 %, no preemption).
+
+Verification uses a native copy of the fused CUDA MTP decode kernel
+(models/qwen3.8-flash-next-nvfp4/native/gdn_mtp_record, built into the image,
+same flags as _C) with a recording mode; without the library it falls back to
+the Triton recording kernel. Greedy outputs are bit-identical to the baseline
+(native path vs the fused CUDA kernel; Triton path vs the Triton kernel).
+Adapted from the Kimi KDA RecoverSSM design (vLLM PR #58863 for Qwen GDN),
+extended to pipeline parallelism.
+---
+ .../layers/mamba/gdn/qwen_gdn_linear_attn.py  |  84 ++++
+ vllm/models/qwen4_exp/nvidia/gdn_recover.py   | 458 ++++++++++++++++++
+ vllm/models/qwen4_exp/nvidia/ple_layer.py     |   5 +-
+ .../ops/fused_sigmoid_gating.py               |  35 +-
+ vllm/v1/attention/backends/gdn_attn.py        |  53 +-
+ .../worker/gpu/model_states/mamba_hybrid.py   |  72 ++-
+ 6 files changed, 702 insertions(+), 5 deletions(-)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/gdn_recover.py
+
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index bbbb1c8..09f2c05 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -368,6 +368,55 @@ class ChunkGatedDeltaRule(CustomOp):
+ 
+ @PluggableLayer.register("qwen_gated_delta_net_attention")
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
++    # ---- Qwen3.8 GDN RecoverSSM (VLLM_QWEN38_GDN_RECOVER) ----
++    def get_kv_cache_spec(self, vllm_config):
++        spec = super().get_kv_cache_spec(vllm_config)
++        from vllm.models.qwen4_exp.nvidia import gdn_recover
++
++        if (
++            spec is not None
++            and gdn_recover.enabled()
++            and vllm_config.cache_config.mamba_cache_mode == "align"
++            and vllm_config.speculative_config is not None
++        ):
++            import dataclasses
++
++            # Verification reads the committed running-block state and the
++            # accepted prefix is replayed at commit: no speculative state
++            # blocks per request.
++            spec = dataclasses.replace(spec, num_speculative_blocks=0)
++            self._qwen38_rec = None
++            self._qwen38_rec_shape = (
++                vllm_config.scheduler_config.max_num_seqs,
++                vllm_config.speculative_config.num_speculative_tokens + 1,
++            )
++        return spec
++
++    @property
++    def qwen38_rec_heads(self) -> int:
++        return self.num_k_heads // self.tp_size
++
++    def qwen38_record_buffer(self, max_num_reqs: int | None = None) -> torch.Tensor:
++        if self._qwen38_rec is None:
++            slots, tokens = self._qwen38_rec_shape
++            if max_num_reqs is not None:
++                slots = max(slots, max_num_reqs)
++            hv = self.num_v_heads // self.tp_size
++            h = self.num_k_heads // self.tp_size
++            feats = hv + h * self.head_k_dim + hv * self.head_v_dim
++            self._qwen38_rec = torch.zeros(
++                (slots, tokens, feats),
++                dtype=torch.float32,
++                device=self.A_log.device,
++            )
++        return self._qwen38_rec
++
++    def _qwen38_record_args(self, attn_metadata) -> dict:
++        slots = getattr(attn_metadata, "qwen38_spec_req_slots", None)
++        if not hasattr(self, "_qwen38_rec") or slots is None:
++            return {}
++        return {"rec": self.qwen38_record_buffer(), "rec_slots": slots}
++
+     def get_state_shape(
+         self,
+     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+@@ -1484,6 +1533,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+                     ssm_state_indices=spec_state_indices_tensor,
+                     num_accepted_tokens=num_accepted_tokens,
+                     use_qk_l2norm_in_kernel=True,
++                    **self._qwen38_record_args(attn_metadata),
+                 )
+             )
+         else:
+@@ -1772,6 +1822,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+         assert num_accepted_tokens is not None
+ 
+         num_requests = attn_metadata.num_spec_decodes
++        rec_slots = getattr(attn_metadata, "qwen38_spec_req_slots", None)
++        if rec_slots is not None and hasattr(self, "_qwen38_rec"):
++            # RecoverSSM: same kernel, recording instead of per-token states.
++            self._qwen38_native_mtp()(
++                mixed_qkv,
++                a,
++                b,
++                self.A_log,
++                self.dt_bias,
++                state_indices[:num_requests],
++                cu_seqlens[: num_requests + 1],
++                num_accepted_tokens[:num_requests],
++                self.kv_cache[1],
++                output_gate,
++                self.norm.weight,
++                core_attn_out,
++                self.head_k_dim**-0.5,
++                self.layer_norm_epsilon,
++                self.norm.activation,
++                self.qwen38_record_buffer(),
++                rec_slots[:num_requests],
++            )
++            return
+         ops.fused_gdn_decode_post_conv_mtp(
+             mixed_qkv=mixed_qkv,
+             a=a,
+@@ -1837,8 +1910,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+             and state_indices is not None
+             and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
+             and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
++            # Qwen3.8 GDN RecoverSSM verifies with a recording kernel: the
++            # native copy of this kernel when built, else the Triton path.
++            and (
++                getattr(attn_metadata, "qwen38_spec_req_slots", None) is None
++                or self._qwen38_native_mtp() is not None
++            )
+         )
+ 
++    def _qwen38_native_mtp(self):
++        from vllm.models.qwen4_exp.nvidia import gdn_recover
++
++        return gdn_recover.native_op()
++
+     def _rms_norm_gated_cuda(
+         self,
+         x: torch.Tensor,
+diff --git a/vllm/models/qwen4_exp/nvidia/gdn_recover.py b/vllm/models/qwen4_exp/nvidia/gdn_recover.py
+new file mode 100644
+index 0000000..578a77d
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/gdn_recover.py
+@@ -0,0 +1,458 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Qwen3.8 GDN RecoverSSM: speculative verification without speculative
++state blocks (VLLM_QWEN38_GDN_RECOVER, align mode, any PP size).
++
++Baseline MTP verification writes the recurrent state after every verified
++token into its own KV block (1 + K blocks per request and Mamba group) and the
++next step reads the accepted one. Here the verify kernel reads the committed
++state of the running block, writes no state, and records per request slot the
++exact operands of each token's state update (gate g, normalised key k and
++correction v'). After sampling, every PP rank commits on its own layers in
++``postprocess_state`` (the non-last rank's deferred postprocess carries the
++same accepted counts): the accepted prefix is replayed with the baseline's two
++update operations (``h *= exp(g); h += v' k^T``), so the committed state is
++bit-identical to the baseline's accepted-position state. The final state goes
++to the running block column ``(new - 1) // B``; when the window crossed a
++block boundary the boundary state goes to the boundary block (what the align
++postprocess would have copied there). Conv windows (GDN and PLE short conv)
++are compacted the same way (shift by ``accepted - 1``) and ``num_accepted``
++is reset to 1, so the unchanged align pre/postprocess and the generated-
++history checkpoints see normalised states. Records live per request slot,
++outside the KV pool.
++"""
++
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++
++from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++from vllm.triton_utils import tl, triton
++
++
++def enabled() -> bool:
++    import os
++
++    return os.environ.get("VLLM_QWEN38_GDN_RECOVER", "0") == "1"
++
++
++_NATIVE = None
++
++
++def native_op():
++    """The native fused GDN MTP kernel with a recording mode
++    (models/qwen3.8-flash-next-nvfp4/native/gdn_mtp_record), or None."""
++    global _NATIVE
++    if _NATIVE is None:
++        import glob
++        import os
++
++        op = False
++        for so in glob.glob(os.path.join(os.path.dirname(os.path.dirname(
++                os.path.dirname(os.path.dirname(__file__)))), "_qwen38_gdn_mtp_C*.so")):
++            try:
++                torch.ops.load_library(so)
++                op = torch.ops._qwen38_gdn_mtp_C.post_conv_mtp
++                break
++            except Exception:  # noqa: BLE001 - fall back to the Triton path
++                op = False
++        _NATIVE = op
++    return _NATIVE or None
++
++
++@triton.jit
++def _plan_kernel(
++    idx_mapping_ptr,
++    num_sampled_ptr,
++    pending_ptr,
++    num_computed_ptr,
++    state_idx_ptr,
++    plan_ptr,  # [max_reqs, 5]: n, src_col, final_col, boundary_col, boundary_len
++    MAMBA_BLOCK_SIZE: tl.constexpr,
++):
++    row = tl.program_id(0)
++    slot = tl.load(idx_mapping_ptr + row)
++    if slot < 0:
++        return
++    pending = tl.load(pending_ptr + slot)
++    n = tl.minimum(tl.load(num_sampled_ptr + row), pending)
++    n = tl.where(pending > 0, tl.maximum(n, 0), 0)
++    new = tl.load(num_computed_ptr + slot)
++    old = new - n
++    src_col = tl.load(state_idx_ptr + slot)
++    final_col = (new - 1) // MAMBA_BLOCK_SIZE
++    next_boundary = (old // MAMBA_BLOCK_SIZE + 1) * MAMBA_BLOCK_SIZE
++    # A distinct boundary block only when the accepted prefix passes it; an
++    # exactly aligned end is the final state itself (same block).
++    has_boundary = new > next_boundary
++    boundary_col = tl.where(has_boundary, next_boundary // MAMBA_BLOCK_SIZE - 1, -1)
++    p = plan_ptr + slot * 5
++    tl.store(p + 0, n)
++    tl.store(p + 1, src_col)
++    tl.store(p + 2, final_col)
++    tl.store(p + 3, boundary_col)
++    tl.store(p + 4, next_boundary - old)
++
++
++@triton.jit
++def _finalize_kernel(
++    idx_mapping_ptr,
++    pending_ptr,
++    state_idx_ptr,
++    num_accepted_ptr,
++    plan_ptr,
++):
++    row = tl.program_id(0)
++    slot = tl.load(idx_mapping_ptr + row)
++    if slot < 0:
++        return
++    n = tl.load(plan_ptr + slot * 5)
++    tl.store(pending_ptr + slot, 0)
++    if n > 0:
++        tl.store(state_idx_ptr + slot, tl.load(plan_ptr + slot * 5 + 2))
++        tl.store(num_accepted_ptr + slot, 1)
++
++
++@triton.jit
++def _replay_kernel(
++    idx_mapping_ptr,
++    plan_ptr,
++    block_table_ptrs_ptr,
++    block_table_stride_req,
++    layer_group_ptr,
++    state_addrs_ptr,
++    state_block_strides_ptr,
++    rec_addrs_ptr,
++    state_ref_ptr,
++    H: tl.constexpr,
++    HV: tl.constexpr,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BV: tl.constexpr,
++    REC_T: tl.constexpr,
++    REC_F: tl.constexpr,
++    USE_DECAY: tl.constexpr = True,
++):
++    i_v = tl.program_id(0)
++    row = tl.program_id(1)
++    i_lh = tl.program_id(2)
++    layer = i_lh // HV
++    i_hv = i_lh % HV
++    i_h = i_hv // (HV // H)
++    slot = tl.load(idx_mapping_ptr + row).to(tl.int64)
++    if slot < 0:
++        return
++    p = plan_ptr + slot * 5
++    n = tl.load(p + 0)
++    if n <= 0:
++        return
++    src_col = tl.load(p + 1)
++    final_col = tl.load(p + 2)
++    boundary_col = tl.load(p + 3)
++    boundary_len = tl.load(p + 4)
++
++    group = tl.load(layer_group_ptr + layer)
++    bt = tl.load(block_table_ptrs_ptr + group).to(tl.pointer_type(tl.int32))
++    bt = bt + slot * block_table_stride_req
++    src_block = tl.load(bt + src_col).to(tl.int64)
++    final_block = tl.load(bt + final_col).to(tl.int64)
++    if (src_block <= 0) | (final_block <= 0):
++        return
++
++    state = tl.load(state_addrs_ptr + layer).to(tl.pointer_type(state_ref_ptr.dtype.element_ty))
++    block_stride = tl.load(state_block_strides_ptr + layer)
++    rec = tl.load(rec_addrs_ptr + layer).to(tl.pointer_type(tl.float32))
++
++    o_k = tl.arange(0, K)
++    o_v = i_v * BV + tl.arange(0, BV)
++    mask_v = o_v < V
++    mask_h = mask_v[:, None] & (o_k[None, :] < K)
++    tile = i_hv * V * K + o_v[:, None] * K + o_k[None, :]
++    b_h = tl.load(state + src_block * block_stride + tile, mask=mask_h, other=0).to(
++        tl.float32
++    )
++    for t in range(0, n):
++        p_rec = rec + (slot * REC_T + t) * REC_F
++        b_g = tl.load(p_rec + i_hv)
++        b_k = tl.load(p_rec + HV + i_h * K + o_k)
++        b_v = tl.load(p_rec + HV + H * K + i_hv * V + o_v, mask=mask_v, other=0)
++        # The verifying kernel's state update, operand for operand: the
++        # Triton kernel records the gate g (decay exp(g) recomputed here), the
++        # native CUDA kernel records the decay itself.
++        if USE_DECAY:
++            # Native kernel: h *= decay; h = fma(k, delta, h).
++            b_h *= b_g
++            b_h = tl.fma(b_v[:, None], b_k[None, :], b_h)
++        else:
++            b_h *= tl.exp(b_g)
++            b_h += b_v[:, None] * b_k[None, :]
++        if (boundary_col >= 0) & (t + 1 == boundary_len):
++            boundary_block = tl.load(bt + boundary_col).to(tl.int64)
++            if boundary_block > 0:
++                tl.store(
++                    state + boundary_block * block_stride + tile,
++                    b_h.to(state_ref_ptr.dtype.element_ty),
++                    mask=mask_h,
++                )
++    tl.store(
++        state + final_block * block_stride + tile,
++        b_h.to(state_ref_ptr.dtype.element_ty),
++        mask=mask_h,
++    )
++
++
++@triton.jit
++def _compact_conv_kernel(
++    idx_mapping_ptr,
++    plan_ptr,
++    block_table_ptrs_ptr,
++    block_table_stride_req,
++    conv_group_ptr,
++    conv_addrs_ptr,
++    conv_block_strides_ptr,
++    conv_dim_strides_ptr,
++    conv_tok_strides_ptr,
++    conv_dims_ptr,
++    conv_hist_ptr,
++    conv_ref_ptr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_HIST: tl.constexpr,
++):
++    pid_d = tl.program_id(0)
++    row = tl.program_id(1)
++    layer = tl.program_id(2)
++    slot = tl.load(idx_mapping_ptr + row).to(tl.int64)
++    if slot < 0:
++        return
++    p = plan_ptr + slot * 5
++    n = tl.load(p + 0)
++    if n <= 0:
++        return
++    src_col = tl.load(p + 1)
++    final_col = tl.load(p + 2)
++    boundary_col = tl.load(p + 3)
++    boundary_len = tl.load(p + 4)
++    dims = tl.load(conv_dims_ptr + layer)
++    hist = tl.load(conv_hist_ptr + layer)
++    if pid_d * BLOCK_D >= dims:
++        return
++
++    group = tl.load(conv_group_ptr + layer)
++    bt = tl.load(block_table_ptrs_ptr + group).to(tl.pointer_type(tl.int32))
++    bt = bt + slot * block_table_stride_req
++    src_block = tl.load(bt + src_col).to(tl.int64)
++    final_block = tl.load(bt + final_col).to(tl.int64)
++    if (src_block <= 0) | (final_block <= 0):
++        return
++    conv = tl.load(conv_addrs_ptr + layer).to(tl.pointer_type(conv_ref_ptr.dtype.element_ty))
++    block_stride = tl.load(conv_block_strides_ptr + layer)
++    dim_stride = tl.load(conv_dim_strides_ptr + layer)
++    tok_stride = tl.load(conv_tok_strides_ptr + layer)
++
++    o_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
++    o_t = tl.arange(0, BLOCK_HIST)
++    mask = (o_d[:, None] < dims) & (o_t[None, :] < hist)
++    src = conv + src_block * block_stride + o_d[:, None] * dim_stride
++    final_vals = tl.load(src + (n - 1 + o_t[None, :]) * tok_stride, mask=mask)
++    has_boundary = boundary_col >= 0
++    boundary_vals = tl.load(
++        src + (boundary_len - 1 + o_t[None, :]) * tok_stride,
++        mask=mask & has_boundary,
++    )
++    # All loads precede the stores: source and destination may be one block.
++    tl.debug_barrier()
++    if has_boundary:
++        boundary_block = tl.load(bt + boundary_col).to(tl.int64)
++        if boundary_block > 0:
++            tl.store(
++                conv
++                + boundary_block * block_stride
++                + o_d[:, None] * dim_stride
++                + o_t[None, :] * tok_stride,
++                boundary_vals,
++                mask=mask,
++            )
++    tl.store(
++        conv + final_block * block_stride + o_d[:, None] * dim_stride
++        + o_t[None, :] * tok_stride,
++        final_vals,
++        mask=mask,
++    )
++
++
++def _addrs(tensors, device):
++    return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64, device=device)
++
++
++@dataclass
++class GDNRecoverContext:
++    """Static per-rank layout: GDN layers (state + record) and every conv
++    state (GDN conv and PLE short conv) with its Mamba group position."""
++
++    state_ref: torch.Tensor | None
++    layer_group: torch.Tensor
++    state_addrs: torch.Tensor
++    state_block_strides: torch.Tensor
++    rec_addrs: torch.Tensor
++    num_layers: int
++    H: int
++    HV: int
++    K: int
++    V: int
++    rec_t: int
++    rec_f: int
++    conv_ref: torch.Tensor | None
++    conv_group: torch.Tensor
++    conv_addrs: torch.Tensor
++    conv_block_strides: torch.Tensor
++    conv_dim_strides: torch.Tensor
++    conv_tok_strides: torch.Tensor
++    conv_dims: torch.Tensor
++    conv_hist: torch.Tensor
++    num_convs: int
++    max_dim: int
++    max_hist: int
++    plan: torch.Tensor
++    pending: torch.Tensor
++
++    @classmethod
++    def create(
++        cls,
++        kv_cache_config,
++        forward_context: dict[str, Any],
++        mamba_group_ids: list[int],
++        max_num_reqs: int,
++        num_spec: int,
++        device: torch.device,
++    ) -> "GDNRecoverContext":
++        gdn, gdn_groups, convs, conv_groups, hists = [], [], [], [], []
++        for pos, gid in enumerate(mamba_group_ids):
++            for name in kv_cache_config.kv_cache_groups[gid].layer_names:
++                layer = forward_context[name]
++                # Both layers canonicalise their conv cache to
++                # [block, channel, window] the same way.
++                conv = layer.kv_cache[0]
++                if not is_conv_state_dim_first():
++                    conv = conv.transpose(-1, -2)
++                if hasattr(layer, "_qwen38_rec"):
++                    gdn.append(layer)
++                    gdn_groups.append(pos)
++                    hists.append(conv.shape[2] - num_spec)
++                else:
++                    # PLE short conv uses the trailing window of its cache.
++                    capacity = layer.conv_state_len + layer.num_spec_tokens
++                    conv = conv[..., -capacity:]
++                    hists.append(layer.conv_state_len)
++                convs.append(conv)
++                conv_groups.append(pos)
++        states = [layer.kv_cache[1] for layer in gdn]
++        recs = [layer.qwen38_record_buffer(max_num_reqs) for layer in gdn]
++        ref = states[0] if states else None
++        if ref is not None:
++            assert all(
++                s.shape[1:] == ref.shape[1:]
++                and s.dtype == ref.dtype
++                and s.stride()[1:] == (ref.shape[2] * ref.shape[3], ref.shape[3], 1)
++                for s in states
++            ), "GDN RecoverSSM needs one contiguous state layout per rank"
++            HV, V, K = ref.shape[1:]
++            H = gdn[0].qwen38_rec_heads
++        else:
++            HV = V = K = H = 1
++        i32 = dict(dtype=torch.int32, device=device)
++        i64 = dict(dtype=torch.int64, device=device)
++        return cls(
++            state_ref=ref,
++            layer_group=torch.tensor(gdn_groups or [0], **i32),
++            state_addrs=_addrs(states, device) if states else torch.zeros(1, **i64),
++            state_block_strides=torch.tensor([s.stride(0) for s in states] or [0], **i64),
++            rec_addrs=_addrs(recs, device) if recs else torch.zeros(1, **i64),
++            num_layers=len(gdn),
++            H=H,
++            HV=HV,
++            K=K,
++            V=V,
++            rec_t=recs[0].shape[1] if recs else 1,
++            rec_f=recs[0].shape[2] if recs else 1,
++            conv_ref=convs[0] if convs else None,
++            conv_group=torch.tensor(conv_groups or [0], **i32),
++            conv_addrs=_addrs(convs, device) if convs else torch.zeros(1, **i64),
++            conv_block_strides=torch.tensor([c.stride(0) for c in convs] or [0], **i64),
++            conv_dim_strides=torch.tensor([c.stride(1) for c in convs] or [0], **i64),
++            conv_tok_strides=torch.tensor([c.stride(2) for c in convs] or [0], **i64),
++            conv_dims=torch.tensor([c.shape[1] for c in convs] or [0], **i32),
++            conv_hist=torch.tensor(hists or [0], **i32),
++            num_convs=len(convs),
++            max_dim=max([c.shape[1] for c in convs] or [1]),
++            max_hist=max(hists or [1]),
++            plan=torch.zeros(max_num_reqs, 5, **i32),
++            pending=torch.zeros(max_num_reqs, **i32),
++        )
++
++    def commit(
++        self,
++        idx_mapping: torch.Tensor,
++        num_sampled: torch.Tensor,
++        num_computed: torch.Tensor,
++        state_idx: torch.Tensor,
++        num_accepted: torch.Tensor,
++        block_table_ptrs: torch.Tensor,
++        block_table_stride_req: int,
++        mamba_block_size: int,
++    ) -> None:
++        rows = idx_mapping.shape[0]
++        if rows == 0:
++            return
++        _plan_kernel[(rows,)](
++            idx_mapping,
++            num_sampled,
++            self.pending,
++            num_computed,
++            state_idx,
++            self.plan,
++            MAMBA_BLOCK_SIZE=mamba_block_size,
++            num_warps=1,
++        )
++        if self.num_layers:
++            BV = 32
++            _replay_kernel[(triton.cdiv(self.V, BV), rows, self.num_layers * self.HV)](
++                idx_mapping,
++                self.plan,
++                block_table_ptrs,
++                block_table_stride_req,
++                self.layer_group,
++                self.state_addrs,
++                self.state_block_strides,
++                self.rec_addrs,
++                self.state_ref,
++                H=self.H,
++                HV=self.HV,
++                K=self.K,
++                V=self.V,
++                BV=BV,
++                REC_T=self.rec_t,
++                REC_F=self.rec_f,
++                num_warps=4,
++            )
++        if self.num_convs:
++            BD = 128
++            _compact_conv_kernel[(triton.cdiv(self.max_dim, BD), rows, self.num_convs)](
++                idx_mapping,
++                self.plan,
++                block_table_ptrs,
++                block_table_stride_req,
++                self.conv_group,
++                self.conv_addrs,
++                self.conv_block_strides,
++                self.conv_dim_strides,
++                self.conv_tok_strides,
++                self.conv_dims,
++                self.conv_hist,
++                self.conv_ref,
++                BLOCK_D=BD,
++                BLOCK_HIST=triton.next_power_of_2(self.max_hist),
++                num_warps=4,
++            )
++        _finalize_kernel[(rows,)](
++            idx_mapping, self.pending, state_idx, num_accepted, self.plan, num_warps=1
++        )
+diff --git a/vllm/models/qwen4_exp/nvidia/ple_layer.py b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+index e89af40..993b633 100644
+--- a/vllm/models/qwen4_exp/nvidia/ple_layer.py
++++ b/vllm/models/qwen4_exp/nvidia/ple_layer.py
+@@ -196,7 +196,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
+ 
+         if (
+             spec is not None
+-            and os.environ.get("VLLM_QWEN38_PLE_NO_SPEC_BLOCKS", "0") == "1"
++            and (
++                os.environ.get("VLLM_QWEN38_PLE_NO_SPEC_BLOCKS", "0") == "1"
++                or os.environ.get("VLLM_QWEN38_GDN_RECOVER", "0") == "1"
++            )
+             and vllm_config.cache_config.mamba_cache_mode == "align"
+         ):
+             # The PLE short conv keeps its speculative window inside the
+diff --git a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+index 7e0c7e0..5802e93 100644
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -18,6 +18,7 @@ from vllm.triton_utils import tl, triton
+         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
+         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
++        "RECORD": lambda args: args["rec"] is not None,
+     }
+ )
+ @triton.jit(do_not_specialize=["N", "T"])
+@@ -37,6 +38,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     cu_seqlens,
+     ssm_state_indices,
+     num_accepted_tokens,
++    rec,
++    rec_slots,
+     scale,
+     N: tl.int64,  # num of sequences
+     T: tl.int64,  # num of tokens
+@@ -58,6 +61,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     IS_CONTINUOUS_BATCHING: tl.constexpr,
+     IS_SPEC_DECODING: tl.constexpr,
+     IS_KDA: tl.constexpr,
++    RECORD: tl.constexpr = False,
++    REC_T: tl.constexpr = 1,
++    REC_F: tl.constexpr = 1,
+ ):
+     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+     i_n, i_hv = i_nh // HV, i_nh % HV
+@@ -102,7 +108,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+     b_h = tl.zeros([BV, BK], dtype=tl.float32)
+     if USE_INITIAL_STATE:
+         if IS_CONTINUOUS_BATCHING:
+-            if IS_SPEC_DECODING:
++            if RECORD:
++                # Qwen3.8 GDN RecoverSSM: verify off the committed state in
++                # the request's running block (no speculative state blocks).
++                i_t = 0
++            elif IS_SPEC_DECODING:
+                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+             else:
+                 i_t = 0
+@@ -119,6 +129,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+         p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+ 
++    if RECORD:
++        rec_slot = tl.load(rec_slots + i_n).to(tl.int64)
+     for i_t in range(0, T):
+         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+@@ -147,6 +159,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+         # [BV]
+         b_v -= tl.sum(b_h * b_k[None, :], 1)
+         b_v *= b_beta
++        if RECORD:
++            # Exactly the operands of this token's state update, so a later
++            # replay of the accepted prefix reproduces the state bit for bit.
++            if rec_slot >= 0:
++                p_rec = rec + (rec_slot * REC_T + i_t) * REC_F
++                if i_v == 0:
++                    # Record the decay itself (as the native CUDA kernel does).
++                    tl.store(p_rec + i_hv, tl.exp(b_g))
++                    if i_hv % (HV // H) == 0:
++                        tl.store(p_rec + HV + i_h * K + o_k, b_k, mask=mask_k)
++                tl.store(p_rec + HV + H * K + i_hv * V + o_v, b_v, mask=mask_v)
+         # [BV, BK]
+         b_h += b_v[:, None] * b_k[None, :]
+         # [BV]
+@@ -154,7 +177,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
+         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+ 
+         # keep the states for multi-query tokens
+-        if INPLACE_FINAL_STATE:
++        if RECORD:
++            pass
++        elif INPLACE_FINAL_STATE:
+             # Load state index and check for invalid entries
+             final_state_idx = tl.load(
+                 ssm_state_indices + i_n * stride_indices_seq + i_t
+@@ -196,6 +221,8 @@ def fused_sigmoid_gating_delta_rule_update(
+     num_accepted_tokens: torch.Tensor | None = None,
+     use_qk_l2norm_in_kernel: bool = False,
+     is_kda: bool = False,
++    rec: torch.Tensor | None = None,
++    rec_slots: torch.Tensor | None = None,
+ ):
+     """
+     Fused triton implementation of sigmoid gating delta rule update.
+@@ -255,6 +282,8 @@ def fused_sigmoid_gating_delta_rule_update(
+         cu_seqlens=cu_seqlens,
+         ssm_state_indices=ssm_state_indices,
+         num_accepted_tokens=num_accepted_tokens,
++        rec=rec,
++        rec_slots=rec_slots,
+         scale=scale,
+         N=N,
+         T=T,
+@@ -272,6 +301,8 @@ def fused_sigmoid_gating_delta_rule_update(
+         INPLACE_FINAL_STATE=inplace_final_state,
+         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+         IS_KDA=is_kda,
++        REC_T=rec.shape[1] if rec is not None else 1,
++        REC_F=rec.shape[2] if rec is not None else 1,
+         num_warps=num_warps,
+         num_stages=num_stages,
+     )
+diff --git a/vllm/v1/attention/backends/gdn_attn.py b/vllm/v1/attention/backends/gdn_attn.py
+index 23daff5..c519aa2 100644
+--- a/vllm/v1/attention/backends/gdn_attn.py
++++ b/vllm/v1/attention/backends/gdn_attn.py
+@@ -64,6 +64,8 @@ class GDNAttentionMetadata:
+     non_spec_token_indx: torch.Tensor | None = None
+ 
+     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
++    # Qwen3.8 GDN RecoverSSM: request-state slot of each spec row (-1 = pad).
++    qwen38_spec_req_slots: torch.Tensor | None = None
+ 
+     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
+     chunk_indices: torch.Tensor | None = None
+@@ -163,6 +165,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             dtype=torch.int32,
+             device=device,
+         )
++        self.qwen38_spec_req_slots: torch.Tensor = torch.full(
++            (self.decode_cudagraph_max_bs,),
++            -1,
++            dtype=torch.int32,
++            device=device,
++        )
+ 
+     def _build_chunk_metadata(
+         self,
+@@ -213,8 +221,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         num_accepted_tokens: torch.Tensor | None = None,
+         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+         fast_build: bool = False,
++        qwen38_req_slots: torch.Tensor | None = None,
+     ) -> GDNAttentionMetadata:
+         m = common_attn_metadata
++        qwen38_spec_req_slots = None
+ 
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+@@ -225,6 +235,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             self.kv_cache_spec,
+             self.vllm_config.cache_config.mamba_cache_mode,
+         )
++        if (
++            self.use_spec_decode
++            and block_table_tensor.dim() == 2
++            and block_table_tensor.shape[1] < self.num_spec + 1
++        ):
++            # Qwen3.8 GDN RecoverSSM (no speculative state blocks): keep the
++            # K + 1 wide index table the spec kernels size their query window
++            # by (causal_conv1d_update max_query_len); every column is the
++            # running block, and verification reads column 0 only.
++            block_table_tensor = (
++                block_table_tensor[:, :1].expand(-1, self.num_spec + 1).contiguous()
++            )
+ 
+         spec_sequence_masks_cpu: torch.Tensor | None = None
+         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+@@ -363,6 +385,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+ 
+             assert num_accepted_tokens is not None
+             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
++            if qwen38_req_slots is not None:
++                qwen38_spec_req_slots = qwen38_req_slots[spec_sequence_masks_cpu]
+ 
+         chunk_indices: torch.Tensor | None = None
+         chunk_offsets: torch.Tensor | None = None
+@@ -472,6 +496,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
+             num_accepted_tokens[num_spec_decodes:].fill_(1)
+ 
++            if qwen38_spec_req_slots is not None:
++                self.qwen38_spec_req_slots[:num_spec_decodes].copy_(
++                    qwen38_spec_req_slots, non_blocking=True
++                )
++                qwen38_spec_req_slots = self.qwen38_spec_req_slots[:batch_size]
++                qwen38_spec_req_slots[num_spec_decodes:].fill_(-1)
++
+         if (
+             self.use_full_cuda_graph
+             and num_prefills == 0
+@@ -515,6 +546,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+             spec_token_indx=spec_token_indx,
+             non_spec_token_indx=non_spec_token_indx,
+             num_accepted_tokens=num_accepted_tokens,
++            qwen38_spec_req_slots=qwen38_spec_req_slots,
+             nums_dict=nums_dict,
+             batch_ptr=batch_ptr,
+             token_chunk_offset_ptr=token_chunk_offset_ptr,
+@@ -545,4 +577,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
+         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
+         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
+ 
+-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
++        qwen38_req_slots = None
++        import os
++
++        if (
++            self.use_spec_decode
++            and os.environ.get("VLLM_QWEN38_GDN_RECOVER", "0") == "1"
++            and self.vllm_config.cache_config.mamba_cache_mode == "align"
++        ):
++            # Qwen3.8 GDN RecoverSSM: capture the recording verify kernel
++            # reading the persistent slot buffer (pad slots never record).
++            qwen38_req_slots = torch.full(
++                (m.num_reqs,), -1, dtype=torch.int32, device=m.query_start_loc.device
++            )
++        return self.build(
++            0,
++            m,
++            num_accepted_tokens,
++            num_decode_draft_tokens_cpu,
++            qwen38_req_slots=qwen38_req_slots,
++        )
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index 666fb14..d0b3fbf 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -41,6 +41,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+     is_prefilling: torch.Tensor
+     num_accepted_tokens: torch.Tensor | None = None
+     num_decode_draft_tokens_cpu: torch.Tensor | None = None
++    # Qwen3.8 GDN RecoverSSM: request-state slot per batch row (-1 = pad).
++    qwen38_req_slots: torch.Tensor | None = None
+ 
+     def get_extra_common_attn_kwargs(
+         self,
+@@ -64,7 +66,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+             ),
+         ):
+             return {}
+-        return {
++        kwargs = {
+             "num_accepted_tokens": None
+             if self.num_accepted_tokens is None
+             else self.num_accepted_tokens[:num_reqs],
+@@ -72,6 +74,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
+             if self.num_decode_draft_tokens_cpu is None
+             else self.num_decode_draft_tokens_cpu[:num_reqs],
+         }
++        if self.qwen38_req_slots is not None and isinstance(
++            attn_metadata_builder, GDNAttentionMetadataBuilder
++        ):
++            kwargs["qwen38_req_slots"] = self.qwen38_req_slots[:num_reqs]
++        return kwargs
+ 
+ 
+ class MambaHybridModelState(DefaultModelState):
+@@ -97,6 +104,14 @@ class MambaHybridModelState(DefaultModelState):
+         self.recoverssm = (
+             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
+         )
++        from vllm.models.qwen4_exp.nvidia import gdn_recover as _gdn_recover
++
++        self._qwen38_recover = bool(
++            _gdn_recover.enabled()
++            and self._align_mode
++            and vllm_config.num_speculative_tokens > 0
++        )
++        self._qwen38_recover_ctx = None
+         if self._align_mode:
+             self._mamba_state_idx_gpu = torch.zeros(
+                 self.max_num_reqs, dtype=torch.int32, device=self.device
+@@ -126,6 +141,8 @@ class MambaHybridModelState(DefaultModelState):
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
++        if self._qwen38_recover_ctx is not None:
++            self._qwen38_recover_ctx.pending[req_index].fill_(0)
+         if self._align_mode:
+             # The align block table is laid out in Mamba blocks, which page
+             # unification can make larger than cache_config.block_size.
+@@ -180,6 +197,22 @@ class MambaHybridModelState(DefaultModelState):
+             )
+         return ctx
+ 
++    def _ensure_qwen38_recover(self, kv_cache_config, block_tables):
++        if self._qwen38_recover_ctx is None:
++            from vllm.models.qwen4_exp.nvidia.gdn_recover import GDNRecoverContext
++
++            mamba_group_ids, _ = self._get_mamba_group_info()
++            self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
++            self._qwen38_recover_ctx = GDNRecoverContext.create(
++                kv_cache_config,
++                self.vllm_config.compilation_config.static_forward_context,
++                mamba_group_ids,
++                self.max_num_reqs,
++                self.vllm_config.num_speculative_tokens,
++                self.device,
++            )
++        return self._qwen38_recover_ctx
++
+     def preprocess_state(
+         self,
+         input_batch: InputBatch,
+@@ -287,6 +320,22 @@ class MambaHybridModelState(DefaultModelState):
+                 )
+             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+ 
++        qwen38_req_slots = None
++        if self._qwen38_recover and not for_capture:
++            ctx_r = self._ensure_qwen38_recover(kv_cache_config, block_tables)
++            qwen38_req_slots = torch.full(
++                (num_reqs,), -1, dtype=torch.int32, device=self.device
++            )
++            qwen38_req_slots[: input_batch.num_reqs] = input_batch.idx_mapping
++            # Verified window length per request slot (0 = nothing to commit).
++            pending_np = np.zeros(input_batch.num_reqs, dtype=np.int32)
++            if num_decode_draft_tokens_cpu is not None:
++                drafts = num_decode_draft_tokens_np[: input_batch.num_reqs]
++                pending_np = np.where(drafts >= 0, drafts + 1, 0).astype(np.int32)
++            ctx_r.pending[input_batch.idx_mapping] = torch.from_numpy(pending_np).to(
++                self.device, non_blocking=True
++            )
++
+         if self._align_mode:
+             mamba_group_ids, _ = self._get_mamba_group_info()
+             aligned_index_builders = []
+@@ -309,6 +358,7 @@ class MambaHybridModelState(DefaultModelState):
+             is_prefilling=is_prefilling,
+             num_accepted_tokens=num_accepted_tokens,
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            qwen38_req_slots=qwen38_req_slots,
+         )
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+@@ -363,6 +413,26 @@ class MambaHybridModelState(DefaultModelState):
+                     max(num_sampled, 1),
+                 )
+ 
++        if (
++            self._qwen38_recover_ctx is not None
++            and num_reqs
++            and not isinstance(num_sampled, int)
++            and num_computed_tokens is not None
++            and self._mamba_ctx is not None
++            and self._mamba_ctx.is_initialized
++        ):
++            _, mamba_spec = self._get_mamba_group_info()
++            self._qwen38_recover_ctx.commit(
++                idx_mapping,
++                num_sampled,
++                num_computed_tokens,
++                self._mamba_state_idx_gpu,
++                self.num_accepted_tokens_gpu,
++                self._mamba_ctx.block_table_ptrs,
++                self._mamba_ctx.block_table_stride_req,
++                mamba_spec.block_size,
++            )
++
+         if self.recoverssm is not None:
+             self.recoverssm.commit_step(
+                 num_sampled,
