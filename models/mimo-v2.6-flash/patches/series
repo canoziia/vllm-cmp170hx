@@ -7,3 +7,7 @@
 0004-moe-align-bitonic-sort.patch
 0005-mimo-v2-fp8-draft-head.patch
 0006-mimo-v2-dflash-drafter.patch
+0007-mimo-v2-mtp-draft-widths.patch
+0008-pp-deferred-feedback-recv.patch
+0009-mimo-v2-mxfp4-moe-decode.patch
+0010-diffkv-prefill-block-m.patch

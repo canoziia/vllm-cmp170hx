@@ -1,0 +1,219 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] pp: post the sampled/draft feedback receive when it is consumed
+
+VLLM_PP_DEFERRED_FEEDBACK_RECV=1 (default 0 = unchanged). Under PP the
+non-last ranks receive step T's sampled tokens and drafts from the last rank
+by an NCCL broadcast on a side stream, posted right after step T's forward
+and consumed pp_size steps later. With several batches in flight the posted
+receive spins an NCCL kernel on a few SMs for about pp_size stages, and every
+Marlin MoE GEMM (persistent grid = all SMs) that overlaps it runs a second
+wave: on MiMo PP4 at c32 the MoE GEMMs of ranks 0-2 took 401-504 us when
+overlapped vs 243 us not (rank 3, which only sends, never overlaps). The
+amount of overlap depends on the pipeline phase, which made steady-state
+step time bistable (the same width ran at 12 or 16 ms per batch interval).
+
+With the switch the receive stays queued with its metadata and its
+broadcasts are issued (same collectives, same order) when the slot is
+consumed at step T + pp_size, when the last rank has just sent it. Every
+consumed slot is posted before any early return, so all ranks keep issuing
+the group's collectives in the sender's order. Deferred receives are flushed
+(FIFO) before the profiling run and graph capture (the last rank synchronizes
+there with its warm-up sends outstanding), on empty steps, and in the worker
+process before every RPC other than the per-step ones (execute_model,
+sample_tokens, take_draft_token_ids, execute_dummy_batch): a profiler start or
+any other RPC may synchronize the last rank while its sends are outstanding
+and the other ranks wait in the same RPC (seen as an NCCL timeout on
+start_profile under c32 load).
+---
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index c86900d..3d7a381 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -595,6 +595,18 @@ class UnreadyWorkerProcHandle:
+     death_writer: Connection | None = None
+ 
+ 
++_PP_STEP_RPCS = frozenset(
++    ("execute_model", "sample_tokens", "take_draft_token_ids", "execute_dummy_batch"))
++
++
++def _flush_pp_deferred(worker) -> None:
++    runner = getattr(worker, "model_runner", None)
++    handler = getattr(runner, "pp_handler", None)
++    flush = getattr(handler, "flush_deferred", None)
++    if flush is not None:
++        flush()
++
++
+ @dataclass
+ class WorkerProcHandle:
+     proc: BaseProcess
+@@ -1072,6 +1084,12 @@ class WorkerProc:
+             elif isinstance(method, bytes):
+                 func = partial(cloudpickle.loads(method), self.worker)
+ 
++            if method not in _PP_STEP_RPCS:
++                # VLLM_PP_DEFERRED_FEEDBACK_RECV: post this rank's deferred
++                # feedback receives before any non-step RPC (profiling, sleep,
++                # ...), which may synchronize the device on the last rank
++                # while its sends are outstanding.
++                _flush_pp_deferred(self.worker)
+             output = func(*args, **kwargs)
+ 
+             if output_rank is None or self.rank == output_rank:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fbfd585..c0661fa 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -914,6 +914,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     @torch.inference_mode()
+     def profile_run(self) -> None:
++        if self.pp_handler is not None:
++            self.pp_handler.flush_deferred()
+         if self.supports_mm_inputs and self.is_first_pp_rank:
+             mm_config = self.model_config.multimodal_config
+             if mm_config is not None and not mm_config.skip_mm_profiling:
+@@ -964,6 +966,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     @torch.inference_mode()
+     def capture_model(self, *, profile_only: bool = False) -> int:
++        if self.pp_handler is not None:
++            self.pp_handler.flush_deferred()
+         assert self.cudagraph_manager is not None
+         capture_encoder = (
+             self.model_state.supports_mm_inputs
+@@ -1649,6 +1653,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.update_requests(scheduler_output)
+             self.block_tables.apply_staged_writes()
+             if scheduler_output.total_num_scheduled_tokens == 0:
++                if self.pp_handler is not None:
++                    self.pp_handler.flush_deferred()
+                 # No need to run the model.
+                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                 return self._merge_ec_connector_no_forward(
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 87ee207..e581dcf 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -34,6 +34,9 @@ class PendingRecv:
+     gen_at_receive_np: np.ndarray  # [num_reqs]
+     draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+     draft_confidences: torch.Tensor | None = None  # same rows/generation as drafts
++    # VLLM_PP_DEFERRED_FEEDBACK_RECV: number of requests whose broadcasts are
++    # posted only when this slot is consumed (event is None until then).
++    deferred_num_reqs: int | None = None
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -89,6 +92,19 @@ class PPHandler:
+         self.broadcast_group = get_pp_group().make_sibling_device_group(
+             group_desc="pp_broadcast"
+         )
++        # VLLM_PP_DEFERRED_FEEDBACK_RECV=1 (default 0): post the feedback
++        # receive of step T when it is consumed (step T + pp_size), when the
++        # last rank has just sent it, instead of right after step T's forward.
++        # A receive posted early spins an NCCL kernel on a few SMs for about
++        # pp_size stages, and every Marlin MoE GEMM (persistent grid = all
++        # SMs) that overlaps it runs a second wave (measured on MiMo PP4 at
++        # c32: 243 -> 425 us per MoE GEMM on ranks 0-2).
++        import os
++
++        self.deferred_recv = (
++            not self.is_last_rank
++            and os.environ.get("VLLM_PP_DEFERRED_FEEDBACK_RECV", "0") == "1"
++        )
+         self.aux_hidden_state_relay_keys: tuple[str, ...] = ()
+ 
+     def on_req_idx_freed(self, req_idx: int) -> None:
+@@ -131,6 +147,10 @@ class PPHandler:
+         self.queue.append(None)
+         if slot is None:
+             return None
++        if slot.deferred_num_reqs is not None:
++            # Post the broadcasts now (FIFO = the sender's order), before any
++            # early return: every rank must issue them.
++            self._post_recv(slot)
+ 
+         # Skip requests which did not need sampled output and/or those already
+         # finished. The post_update kernel skips the -1 entries.
+@@ -172,6 +192,59 @@ class PPHandler:
+             idx_mapping=idx_mapping,
+         )
+ 
++    def flush_deferred(self) -> None:
++        """Post every still-deferred receive (FIFO). Called before anything
++        that may synchronize the device (profiling run, graph capture) and on
++        empty steps, so the last rank's sends never wait on an idle receiver."""
++        if not self.deferred_recv:
++            return
++        for slot in self.queue:
++            if slot is not None and slot.deferred_num_reqs is not None:
++                self._post_recv(slot)
++
++    def _post_recv(self, slot: PendingRecv) -> None:
++        """Issue a deferred slot's receives (same collectives and order as
++        `receive`) and fill its tensors and event."""
++        num_reqs = slot.deferred_num_reqs
++        with torch.cuda.stream(self.broadcast_stream):
++            self.broadcast_stream.wait_stream(self.main_stream)
++            sampled_tokens = torch.empty(
++                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
++            )
++            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
++            torch.distributed.broadcast(
++                sampled_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            torch.distributed.broadcast(
++                combined, src=self.last_rank, group=self.broadcast_group
++            )
++            draft_payload = None
++            if self.num_speculative_steps > 0:
++                draft_payload = torch.empty(
++                    num_reqs,
++                    self.num_speculative_steps * (2 if self.relay_draft_confidences else 1),
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_payload, src=self.last_rank, group=self.broadcast_group
++                )
++                slot.draft_tokens = draft_payload[:, :self.num_speculative_steps]
++                if self.relay_draft_confidences:
++                    slot.draft_confidences = draft_payload[
++                        :, self.num_speculative_steps:
++                    ].to(torch.int32).view(torch.float32)
++            slot.event = self.broadcast_stream.record_event()
++            slot.num_sampled, slot.num_rejected = combined.unbind(dim=0)
++            slot.sampled_tokens = sampled_tokens
++            sampled_tokens.record_stream(self.main_stream)
++            combined.record_stream(self.main_stream)
++            if draft_payload is not None:
++                draft_payload.record_stream(self.main_stream)
++            if slot.draft_confidences is not None:
++                slot.draft_confidences.record_stream(self.main_stream)
++        slot.deferred_num_reqs = None
++
+     def broadcast_drafts(
+         self, draft_tokens: torch.Tensor, input_batch: InputBatch,
+         draft_confidences: torch.Tensor | None = None,
+@@ -216,6 +289,19 @@ class PPHandler:
+         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+ 
+         num_reqs = input_batch.num_reqs
++        if self.deferred_recv:
++            self.queue[-1] = PendingRecv(
++                None,
++                None,
++                None,
++                None,
++                input_batch.idx_mapping,
++                input_batch.idx_mapping_np,
++                need_sampled_mask,
++                gen_at_receive_np,
++                deferred_num_reqs=num_reqs,
++            )
++            return bool(need_sampled_mask.all())
+         with torch.cuda.stream(self.broadcast_stream):
+             self.broadcast_stream.wait_stream(self.main_stream)
+             sampled_tokens = torch.empty(

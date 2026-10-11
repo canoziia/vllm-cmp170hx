@@ -1,0 +1,186 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] diffkv attention: larger query tiles for prefill chunks
+
+VLLM_MIMO26_DIFFKV_PREFILL_BM (default 0 = unchanged). The TRITON_ATTN_DIFFKV
+kernel sizes its query tile as BLOCK_M = 16 rows; with MiMo's GQA 16 that is
+one query token per program, so every token of a prefill chunk re-reads the
+whole K/V prefix: a 4096-token chunk of a full-attention layer at 80k context
+took ~600 ms (24 TFLOP/s) in isolation and ~900 ms in the engine, ~85 % of
+long-prompt prefill. For launches with max_seqlen_q > 16 (decode and MTP
+verification keep BLOCK_M 16 and their CUDA graphs) the switch uses 64 rows
+(4 tokens per program; bitwise equal to the default), 128 rows (8 tokens) or
+256 rows (16 tokens, 8 warps); 128/256 differ at rounding level with the same
+error vs fp64 (tests/test_diffkv_prefill_gpu.py). 4096-token chunk at 131k
+context: 64 -> 464 ms (48 TFLOP/s), 256 -> 255 ms (88 TFLOP/s; bf16 GEMM peak
+on this card ~145).
+
+VLLM_MIMO26_DIFFKV_QK_SPLIT=1 (with the above): the qk head dim 192 is not
+padded to 256; Q/K are loaded as 128 + 64 and the second dot accumulates into
+the first (same k-chunk order: bitwise equal to the padded kernel at the same
+BLOCK_M). With it the best tile is 128 rows / 4 warps / 2 stages: 238 ms
+(94 TFLOP/s) at 131k, 20 ms at 8k (padded 256: 253 / 22.5 ms).
+VLLM_MIMO26_DIFFKV_PREFILL_WARPS / _STAGES override the launch for tuning.
+---
+diff --git a/vllm/v1/attention/ops/triton_unified_attention_diffkv.py b/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
+index eaf62b6..2bbb1bc 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
++++ b/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
+@@ -24,6 +24,8 @@ Both 2D and 3D launches are supported:
+ 
+ from typing import Any
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -103,6 +105,11 @@ def kernel_unified_attention_diffkv(
+     # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
+     # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
+     IS_3D: tl.constexpr,
++    # VLLM_MIMO26_DIFFKV_QK_SPLIT: > 0 splits the qk head dim into two
++    # power-of-two parts (QK_SPLIT + rest, e.g. 128 + 64 for 192) instead of
++    # padding it to the next power of two; the second dot accumulates into
++    # the first, so the k-chunk order of the qk reduction is unchanged.
++    QK_SPLIT: tl.constexpr = 0,
+ ):
+     q_block_global_idx = tl.program_id(0)
+     kv_head_idx = tl.program_id(1)
+@@ -147,12 +154,23 @@ def kernel_unified_attention_diffkv(
+     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+ 
+-    # Q : (BLOCK_M, HEAD_SIZE_QK_PADDED)
+-    Q = tl.load(
+-        query_ptr + query_offset,
+-        mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+-        other=0.0,
+-    )
++    if QK_SPLIT > 0:
++        offs_qa = tl.arange(0, QK_SPLIT)
++        offs_qb = QK_SPLIT + tl.arange(0, HEAD_SIZE_QK - QK_SPLIT)
++        q_row = (
++            query_offset_0[:, None] * query_stride_0
++            + query_offset_1[:, None] * query_stride_1
++        )
++        q_mask = query_mask_0[:, None] & query_mask_1[:, None]
++        Q = tl.load(query_ptr + q_row + offs_qa[None, :], mask=q_mask, other=0.0)
++        Qb = tl.load(query_ptr + q_row + offs_qb[None, :], mask=q_mask, other=0.0)
++    else:
++        # Q : (BLOCK_M, HEAD_SIZE_QK_PADDED)
++        Q = tl.load(
++            query_ptr + query_offset,
++            mask=dim_mask_qk[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
++            other=0.0,
++        )
+ 
+     block_table_offset = seq_idx * block_table_stride
+ 
+@@ -200,19 +218,36 @@ def kernel_unified_attention_diffkv(
+             + offs_d_v[None, :] * stride_v_cache_3
+             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+         )
+-        k_offset = (
+-            physical_block_idx[None, :] * stride_k_cache_0
+-            + kv_head_idx * stride_k_cache_2
+-            + offs_d_qk[:, None] * stride_k_cache_3
+-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+-        )
+-        # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
+-        K_load = tl.load(
+-            key_cache_ptr + k_offset,
+-            mask=dim_mask_qk[:, None] & tile_mask[None, :],
+-            other=0.0,
+-        )
+-        K = K_load.to(Q.dtype)
++        if QK_SPLIT > 0:
++            k_col = (
++                physical_block_idx[None, :] * stride_k_cache_0
++                + kv_head_idx * stride_k_cache_2
++                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
++            )
++            K = tl.load(
++                key_cache_ptr + k_col + offs_qa[:, None] * stride_k_cache_3,
++                mask=tile_mask[None, :],
++                other=0.0,
++            ).to(Q.dtype)
++            Kb = tl.load(
++                key_cache_ptr + k_col + offs_qb[:, None] * stride_k_cache_3,
++                mask=tile_mask[None, :],
++                other=0.0,
++            ).to(Q.dtype)
++        else:
++            k_offset = (
++                physical_block_idx[None, :] * stride_k_cache_0
++                + kv_head_idx * stride_k_cache_2
++                + offs_d_qk[:, None] * stride_k_cache_3
++                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
++            )
++            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
++            K_load = tl.load(
++                key_cache_ptr + k_offset,
++                mask=dim_mask_qk[:, None] & tile_mask[None, :],
++                other=0.0,
++            )
++            K = K_load.to(Q.dtype)
+         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
+         V_load = tl.load(
+             value_cache_ptr + v_offset,
+@@ -235,7 +270,10 @@ def kernel_unified_attention_diffkv(
+ 
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        S += scale * tl.dot(Q, K)
++        if QK_SPLIT > 0:
++            S += scale * tl.dot(Qb, Kb, tl.dot(Q, K))
++        else:
++            S += scale * tl.dot(Q, K)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -422,6 +460,37 @@ def unified_attention_diffkv(
+     BLOCK_M = (
+         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+     )
++    # VLLM_MIMO26_DIFFKV_PREFILL_BM (default 0 = unchanged): for launches with
++    # max_seqlen_q > 16 (prefill chunks; decode/verification keeps BLOCK_M and
++    # its graphs), use BLOCK_M = 64, 128 or 256 query rows per program. With
++    # GQA 16 the default BLOCK_M 16 is ONE query token per program, which
++    # re-reads the whole K/V prefix per token. 64 (4 tokens) is bitwise equal
++    # to the default; 128 and 256 (8 / 16 tokens, 256 with 8 warps) differ at
++    # rounding level with the same error vs fp64.
++    launch_kw: dict[str, int] = {}
++    prefill_bm = int(os.environ.get("VLLM_MIMO26_DIFFKV_PREFILL_BM", "0"))
++    if (
++        prefill_bm in (64, 128, 256)
++        and max_seqlen_q > 16
++        and prefill_bm >= BLOCK_M
++        and prefill_bm % num_queries_per_kv == 0
++    ):
++        BLOCK_M = prefill_bm
++        launch_kw = {"num_warps": 8 if prefill_bm == 256 else 4, "num_stages": 2}
++        # VLLM_MIMO26_DIFFKV_QK_SPLIT=1: no qk head-dim padding (192 = 128 + 64)
++        qk_a = 1 << (head_size_qk.bit_length() - 1)
++        qk_b = head_size_qk - qk_a
++        if (
++            os.environ.get("VLLM_MIMO26_DIFFKV_QK_SPLIT", "0") == "1"
++            and 16 <= qk_b < qk_a
++            and qk_b & (qk_b - 1) == 0
++        ):
++            launch_kw["QK_SPLIT"] = qk_a
++        # tuning overrides (default: the measured choice above)
++        for key, env in (("num_warps", "VLLM_MIMO26_DIFFKV_PREFILL_WARPS"),
++                         ("num_stages", "VLLM_MIMO26_DIFFKV_PREFILL_STAGES")):
++            if os.environ.get(env):
++                launch_kw[key] = int(os.environ[env])
+     BLOCK_Q = BLOCK_M // num_queries_per_kv
+ 
+     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+@@ -508,6 +577,7 @@ def unified_attention_diffkv(
+         BLOCK_M=BLOCK_M,
+         NUM_SEGMENTS_PER_SEQ=num_segments,
+         IS_3D=use_3d,
++        **launch_kw,
+     )
+ 
+     if use_3d:

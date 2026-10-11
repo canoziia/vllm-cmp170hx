@@ -1,6 +1,12 @@
 From: canoziia <canoziia@users.noreply.github.com>
 Subject: [PATCH] mimo26: one profile switch for the MiMo series
 
+VLLM_MIMO26_OPT_PROFILE=default sets the deployed value of every switch of
+the series (0002 MTP3 parallel heads, DeepSeek 0003 fast deterministic MoE
+align, 0004 sort align, 0005 fp8 MTP draft head, 0007 adaptive draft widths,
+0008 deferred PP feedback receive, 0009 MXFP4 MoE decode v2 with DQ2, 0010 prefill attention BLOCK_M 128 + qk split) unless that variable is already set.
+---
+
 diff --git a/vllm/env_override.py b/vllm/env_override.py
 index 9c3046d..c157f42 100644
 --- a/vllm/env_override.py
@@ -19,10 +25,10 @@ index 9c3046d..c157f42 100644
      """Peripheral function to _maybe_set_cuda_compatibility_path().
 diff --git a/vllm/mimo26_opt_profile.py b/vllm/mimo26_opt_profile.py
 new file mode 100644
-index 0000000..3716bc8
+index 0000000..f6fea83
 --- /dev/null
 +++ b/vllm/mimo26_opt_profile.py
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,52 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""One switch for the MiMo-V2.6-Flash patch series (models/mimo-v2.6-flash).
 +
@@ -47,6 +53,20 @@ index 0000000..3716bc8
 +        "VLLM_MIMO26_SORT_MOE_ALIGN": "1",
 +        # 0005 fp8 copy of lm_head for MTP draft logits
 +        "VLLM_MIMO26_DRAFT_HEAD_FP8": "1",
++        # 0007 MTP draft widths with the measured per-request width policy
++        "VLLM_MIMO26_DRAFT_WIDTHS": "1",
++        "VLLM_MIMO26_ADAPTIVE_WIDTH": "1",
++        # 0008 PP feedback receive posted when consumed (generic PP)
++        "VLLM_PP_DEFERRED_FEEDBACK_RECV": "1",
++        # 0009 weight-streaming MXFP4 MoE decode, v2 epilogues, cheaper dequant
++        "VLLM_MIMO26_MXFP4_DECODE": "1",
++        "VLLM_MIMO26_MXFP4_V2": "1",
++        "VLLM_MIMO26_MXFP4_DQ": "2",
++        # 0010 prefill attention: 128-row query tiles (8 tokens/program; error
++        # vs fp64 equal; 64 is the bitwise-equal alternative) and the qk head
++        # dim split 128 + 64 instead of padding to 256 (bitwise equal)
++        "VLLM_MIMO26_DIFFKV_PREFILL_BM": "128",
++        "VLLM_MIMO26_DIFFKV_QK_SPLIT": "1",
 +    },
 +}
 +

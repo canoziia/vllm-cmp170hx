@@ -33,7 +33,11 @@ shared and adaptive series applied exactly as for that image, then
 | 0003-mimo26-opt-profile | `VLLM_MIMO26_OPT_PROFILE`: one switch for the series |
 | 0004-moe-align-bitonic-sort | single-sort deterministic MoE align up to 4096 entries |
 | 0005-mimo-v2-fp8-draft-head | fp8 copy of the shared lm_head for draft logits |
-| 0006-mimo-v2-dflash-drafter | the bundled DFlash drafter under PP (experimental, below) |
+| 0006-mimo-v2-dflash-drafter | the bundled DFlash drafter under PP (experimental, not deployed; only active with `method: dflash`) |
+| 0007-mimo-v2-mtp-draft-widths | draft k, verify those k; measured per-request width policy; `vllm_xargs.spec_k` in MiMo-only code |
+| 0008-pp-deferred-feedback-recv | PP sampled/draft feedback receive posted when consumed (generic PP, switch) |
+| 0009-mimo-v2-mxfp4-moe-decode | weight-streaming MXFP4 MoE decode kernels for MiMo's experts (`native/mimo_moe`, built into the image) |
+| 0010-diffkv-prefill-block-m | TRITON_ATTN_DIFFKV prefill query tiles and qk head-dim split |
 
 The pinned tree already has everything else: `MiMoV2OmniForCausalLM` (the
 checkpoint has `vision_config`, so vLLM loads text + vision + audio), the
@@ -82,7 +86,7 @@ Tests:
 | `MIMO_GPU_0..3` | 5,6,7,8 | PP ranks 0–3 |
 | `MIMO_PP_LAYER_PARTITION` | 13,13,13,9 | model loading 44.2 / 46.0 / 46.0 / 36.8 GiB per rank (rank 3 also holds lm_head, MTP, fp8 draft head) |
 | `MIMO_MAX_MODEL_LEN` | 1048576 | 1M |
-| `MIMO_KV_CACHE_MEMORY` | 12 GiB | 1,401,951 tokens, 1.34× at 1M; one 1M request needs 8.98 GiB/rank (5 padding layers in the hybrid groups, ≤12.5% waste) |
+| `MIMO_KV_CACHE_MEMORY` | 12 GiB | 1,401,773 tokens, 1.34× at 1M; one 1M request needs 8.98 GiB/rank (5 padding layers in the hybrid groups, ≤12.5% waste) |
 | `MIMO_MAX_NUM_SEQS` / `MIMO_MAX_NUM_BATCHED_TOKENS` | 32 / 4096 | 32 like DeepSeek/Qwen; 4096 covers 32 x (1 + 3 drafts) |
 | `MIMO_SPECULATIVE_CONFIG` | `{"method":"mtp","num_speculative_tokens":3}` | MTP3, see below |
 | `VLLM_MIMO26_OPT_PROFILE` | default | switch table below |
@@ -128,6 +132,10 @@ unless it is already set; unset/off leaves every patch at its own default
 | DeepSeek 0003 | `VLLM_DSV4_FAST_DET_MOE_ALIGN` | 1 | single-kernel deterministic MoE align, bitwise equal, <= 512 routed entries (c <= 16 at MTP3); c1 +13-14 %, c8 +5-11 % |
 | 0004 | `VLLM_MIMO26_SORT_MOE_ALIGN` | 1 | single-sort align for every size up to 4096 entries (4-8 us vs 11-59 us; c32 1024 entries no longer on the torch path), bitwise equal; c32 +4-6 % |
 | 0005 | `VLLM_MIMO26_DRAFT_HEAD_FP8` | 1 | fp8 copy of lm_head for draft logits (target keeps bf16); c1 +4 % counting/code, +12 % prose; +0.6 GiB on the last rank |
+| 0007 | `VLLM_MIMO26_DRAFT_WIDTHS` + `VLLM_MIMO26_ADAPTIVE_WIDTH` | 1 | draft k, verify those k; measured per-request width: prose at c1/c8/c32 reaches 99 / 106 / 102 % of the best fixed width with the full profile, counting/code stay k3; manual `vllm_xargs.spec_k` 0-3 (MiMo only; other models ignore it) |
+| 0008 | `VLLM_PP_DEFERRED_FEEDBACK_RECV` | 1 | PP feedback receive posted when consumed: no NCCL spin under Marlin MoE on ranks 0-2 (fixed k1 prose c32 31.8 -> 35.4, k3 26.1 -> 29.7) |
+| 0009 | `VLLM_MIMO26_MXFP4_DECODE` + `VLLM_MIMO26_MXFP4_V2` + `VLLM_MIMO26_MXFP4_DQ=2` | 1 / 1 / 2 | weight-streaming MXFP4 MoE decode (DeepSeek kernels for MiMo's shape, fused act/sum, cheaper dequant; error = Marlin's, greedy divergences only at near-ties): c1 +9 %, c8 +5-18 %, c32 +25-40 % vs Marlin |
+| 0010 | `VLLM_MIMO26_DIFFKV_PREFILL_BM` + `VLLM_MIMO26_DIFFKV_QK_SPLIT` | 128 / 1 | prefill attention: 8 query tokens per program instead of 1 (error vs fp64 equal, greedy divergences only at near-ties; 64 = bitwise alternative) and qk 192 = 128 + 64 instead of padding to 256 (bitwise): see the prefill table below |
 
 Not in the profile but set in `.env` (measured on top of the profile):
 
@@ -136,20 +144,53 @@ Not in the profile but set in `.env` (measured on top of the profile):
 | `MIMO_PP_LAYER_PARTITION` | 13,13,13,9 | the last rank also drafts; c32 counting +5 %, frees 14 GiB there |
 | `VLLM_PP_DECODE_COHORT_BALANCE` | 1 | spreads decodes over the PP in-flight batches; c32 counting/code/prose +57 / +63 / +36 %, c1 bit-identical |
 
+## Results (profile default, `.env.example`)
+
+Decode, per-request tok/s, `scripts/benchmark-vllm.mjs`, 500 tokens,
+`enable_thinking` false, 2 warm-up + 3 measured rounds:
+
+| | c1 | c8 | c32 |
+|---|---|---|---|
+| counting | 92 -> 180 | 53 -> 122 | 28 -> 84 |
+| code | 92 -> 175 | 44 -> 93 | 27 -> 75 |
+| prose | 81 -> 112 | 36 -> 56 | 21 -> 44 |
+
+(left: MTP1, upstream defaults, 12,12,12,12; right: everything above). c8
+code varies between runs (PP phase), 87-104.
+
+Cold prefill (unique random-token prompts, `max_tokens` 1, chunk 4096):
+
+| prompt | upstream kernel | profile |
+|---|---|---|
+| 8k | 2.46 s | 2.18 s |
+| 32k | 8.18 s | 5.61 s |
+| 131k | 63.8 s | 26.6 s |
+| 512k | 884 s | 229 s |
+| 1M | not run (~3000 s est.) | 785 s |
+
+Long-prompt prefill is bounded by the 9 global-attention layers (rank 0
+holds three of them; 9 over 4 ranks always leaves one rank with three). The
+prefill attention kernel runs at ~94 TFLOP/s against a measured bf16 GEMM
+peak of ~145 on this card.
+
 ## DFlash drafter (0006, experimental)
 
 `--speculative-config={"method":"dflash","model":"/models/MiMo-V2.6-Flash-MOPD/dflash","num_speculative_tokens":7}`
 runs the bundled 5-layer drafter (block 8, attention sinks, SWA 1024, value
 scale 0.612, separate mask embedding). It reads aux hidden states of target
 layers 0/11/23/35/47 across all PP ranks and needs the target embedding on the
-last rank (+1.25 GiB). Against MTP3 (c1/c8/c32 per-request tok/s):
+last rank (+1.25 GiB). Everything it adds is inert unless the speculative
+method is `dflash`. Measured before 0007-0010, against MTP3 at that time
+(c1/c8/c32 per-request tok/s):
 counting +54 / +12 / +15 %, code +26 / +12 / 0 %, prose -43 / -46 / -50 %
 (prose acceptance 10.5 %). At k=3 its first three positions are below the MTP
 heads' (code 0.84/0.73/0.58 vs 0.90/0.80/0.67). Not deployed:
 
-- KV: with the drafter's SWA layers (page size differs from the target's) the
-  hybrid KV manager splits into 11 groups and the KV pool drops to 294k tokens
-  (1M needs 29.45 GiB/rank), so it currently needs max-model-len <= 262144.
+- KV: with the drafter loaded the KV pool drops to 294k tokens and 1M needs
+  29.45 GiB/rank instead of 8.98. The +20.5 GiB equals the drafter's 5
+  layers x 8 KV heads x (128+128) x 2 B per token over 1M tokens, i.e. its
+  SWA layers are budgeted as full attention (11 hybrid groups). Until that is
+  fixed it needs max-model-len <= 262144.
 - `VLLM_MIMO26_DFLASH_DRAFT_HEAD_FP8` (fp8 draft head for DFlash, default 0,
   not in the profile) lowers DFlash's deep-position acceptance (code 4.68 ->
   4.21 tok/step).

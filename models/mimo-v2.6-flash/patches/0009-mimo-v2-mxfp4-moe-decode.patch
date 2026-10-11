@@ -1,0 +1,361 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] mimo-v2: weight-streaming MXFP4 MoE decode kernels
+
+VLLM_MIMO26_MXFP4_DECODE (default 0 = unchanged). For decode batches of at
+most VLLM_MIMO26_MXFP4_DECODE_MAX_TOKENS (64) tokens, fused_marlin_moe runs
+MiMo's two expert GEMMs with the DeepSeek V4.1 weight-streaming MXFP4 kernels
+(deepseek-v4.1-flash 0004) instantiated for MiMo's experts (hidden 4096,
+intermediate 2048) in their own library, _mimo26_moe_C
+(models/mimo-v2.6-flash/native/mimo_moe, built into the image). Same
+Marlin-packed weights and e8m0 scales, exact dequantisation, fixed-order
+split-K partials; the activation is the caller's own and the slot sum stays
+moe_sum. Only the fp32 accumulation order differs from Marlin: error against
+an fp64 reference equals Marlin's (tests/test_mxfp4_decode_gpu.py), graph
+replay equals eager, repeated calls are bitwise identical. Kernel time vs
+Marlin at MiMo decode sizes: -3 % (M=1) to -11 % (M=16..32). The hook runs
+after DeepSeek's, which declines MiMo's shapes.
+
+VLLM_MIMO26_MXFP4_V2=1 uses the DeepSeek v2 kernels (deepseek-v4.1-flash
+0008 plus the DQ=3 prototype, also instantiated for MiMo): split-K sum and
+SiLU-mul fused into w13 (clamp limit +inf: bitwise equal to sum +
+_C.silu_and_mul) and, for at most 16 tokens, the top-k sum fused into w2
+(order 1: bitwise equal to moe_sum) - the v1 result bit for bit with two
+fewer kernels per layer. VLLM_MIMO26_MXFP4_DQ=2 selects the cheaper dequant
+(exact weights, different fp32 order, error equal to Marlin's). DQ=3 (integer
+LUT/PRMT dequant) is bitwise equal to DQ0 but measured 1.8x slower here and
+is not selectable. tests/test_mxfp4_decode_v2_gpu.py checks all of it.
+---
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index c972726..7648156 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
+     LoRAExpertsMixin,
+ )
+ from vllm.model_executor.layers.fused_moe import dsv4_mxfp4_decode as _dsv4_mxfp4_decode
++from vllm.model_executor.layers.fused_moe import mimo26_mxfp4_decode as _mimo26_mxfp4_decode
+ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+     batched_moe_align_block_size,
+     moe_align_block_size,
+@@ -342,9 +343,10 @@ def fused_marlin_moe(
+ 
+     assert activation is not None
+     moe_output = None
+-    if _dsv4_mxfp4_decode.enabled():
+-        # VLLM_DSV4_MXFP4_DECODE: weight-streaming MXFP4 decode kernels for
+-        # eligible small batches; None keeps the Marlin path below.
++    if _dsv4_mxfp4_decode.enabled() or _mimo26_mxfp4_decode.enabled():
++        # VLLM_DSV4_MXFP4_DECODE / VLLM_MIMO26_MXFP4_DECODE: weight-streaming
++        # MXFP4 decode kernels for eligible small batches (each declines the
++        # other model's shapes); None keeps the Marlin path below.
+         if intermediate_cache13 is None:
+             intermediate_cache13 = torch.empty(
+                 (hidden_states.size(0) * topk * max(2 * w2.size(1) * 16, K),),
+@@ -353,7 +355,7 @@ def fused_marlin_moe(
+             intermediate_cache2 = torch.empty(
+                 (hidden_states.size(0) * topk * w2.size(1) * 16,),
+                 device=hidden_states.device, dtype=hidden_states.dtype)
+-        moe_output = _dsv4_mxfp4_decode.try_run(
++        moe_output = None if not _dsv4_mxfp4_decode.enabled() else _dsv4_mxfp4_decode.try_run(
+             hidden_states=hidden_states, w1=w1, w2=w2, w1_scale=w1_scale,
+             w2_scale=w2_scale, topk_weights=topk_weights, topk_ids=topk_ids,
+             quant_type=quant_type, bias1=bias1, bias2=bias2,
+@@ -377,6 +379,29 @@ def fused_marlin_moe(
+                 # v2 fused moe_sum already wrote the final [M, K] output.
+                 return moe_output
+             moe_output = moe_output.view(-1, topk, K)
++        elif _mimo26_mxfp4_decode.enabled():
++            moe_output = _mimo26_mxfp4_decode.try_run(
++                hidden_states=hidden_states, w1=w1, w2=w2, w1_scale=w1_scale,
++                w2_scale=w2_scale, topk_weights=topk_weights, topk_ids=topk_ids,
++                quant_type=quant_type, bias1=bias1, bias2=bias2,
++                global_scale1=global_scale1, global_scale2=global_scale2,
++                input_global_scale1=input_global_scale1,
++                input_global_scale2=input_global_scale2, w1_zeros=w1_zeros,
++                w2_zeros=w2_zeros, expert_map=expert_map,
++                apply_router_weight_on_input=apply_router_weight_on_input,
++                block_size_m=block_size_m, input_dtype=input_dtype,
++                activation=activation, activation_func=activation_func,
++                activation_config=activation_config,
++                sorted_token_ids=sorted_token_ids, expert_ids=expert_ids,
++                num_tokens_post_padded=num_tokens_post_padded,
++                intermediate_cache13=intermediate_cache13,
++                intermediate_cache2=intermediate_cache2,
++                moe_sum=moe_sum, output=output)
++            if moe_output is not None:
++                moe_output, summed = moe_output
++                if summed:
++                    return moe_output
++                moe_output = moe_output.view(-1, topk, K)
+     if moe_output is None:
+         moe_output = _fused_marlin_moe(
+             hidden_states=hidden_states,
+diff --git a/vllm/model_executor/layers/fused_moe/mimo26_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/mimo26_mxfp4_decode.py
+new file mode 100644
+index 0000000..070eea5
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/mimo26_mxfp4_decode.py
+@@ -0,0 +1,263 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Weight-streaming MXFP4 MoE decode for MiMo-V2.6-Flash on sm_80.
++
++VLLM_MIMO26_MXFP4_DECODE=1 (default 0 = unchanged). The DeepSeek V4.1
++weight-streaming kernels (dsv4_mxfp4_decode.py, patch 0004 of that series)
++instantiated for MiMo's experts (hidden 4096, intermediate 2048) in their own
++library, ``_mimo26_moe_C`` (models/mimo-v2.6-flash/native/mimo_moe). For
++decode batches of at most VLLM_MIMO26_MXFP4_DECODE_MAX_TOKENS (64) tokens the
++two expert GEMMs of ``fused_marlin_moe`` read the same Marlin-packed MXFP4
++weights and e8m0 scales, dequantised exactly; w13 is split four ways over K
++into fixed-order fp32 partials (deterministic). The activation is the
++caller's own ``activation_func`` on the bf16 w13 result and the slot sum stays
++``moe_sum``; only the fp32 accumulation order differs from Marlin.
++
++v2 (``_mimo26_moe2`` in the same library), VLLM_MIMO26_MXFP4_V2=1: the w13
++kernel also sums the split-K partials and applies SiLU-mul (limit +inf:
++bitwise equal to the sum + _C.silu_and_mul path) and, for at most 16 tokens,
++the w2 kernel writes the top-k sum (order 1: bitwise equal to moe_sum), so v2
++with VLLM_MIMO26_MXFP4_DQ=0 returns the v1 result bit for bit with two fewer
++kernels per layer. VLLM_MIMO26_MXFP4_DQ=2: cheaper dequant (scale applied per
++32-k group in fp32; exact weights, different fp32 order, error equal to
++Marlin's). DQ=3 (integer LUT dequant) is bitwise equal to DQ0 but 1.8x slower
++on this card and is not offered.
++
++Eligible calls: as for DeepSeek (sm_80, bf16, float4_e2m1f, no bias / zero
++points / global scales / expert map, router weight on the output, block-8
++alignment), MiMo's shapes, and every e8m0 scale of the layer <= 128 (checked
++once per weight tensor outside CUDA-graph capture). Anything else keeps
++Marlin.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import _counters, _scales_ok
++
++logger = init_logger(__name__)
++
++_K, _NI = 4096, 2048
++_OPS = None
++_OPS2 = None
++_SYNC: dict[tuple, torch.Tensor] = {}
++_LOGGED = False
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_MIMO26_MXFP4_DECODE", "0") == "1"
++
++
++def _max_tokens() -> int:
++    return int(os.environ.get("VLLM_MIMO26_MXFP4_DECODE_MAX_TOKENS", "64"))
++
++
++def _cfg(m: int) -> int:
++    """Kernel variant (CR, TW) by token count; VLLM_MIMO26_MXFP4_CFG overrides."""
++    forced = os.environ.get("VLLM_MIMO26_MXFP4_CFG")
++    if forced:
++        return int(forced)
++    return 2 if m <= 6 else 5
++
++
++def _v2() -> bool:
++    return os.environ.get("VLLM_MIMO26_MXFP4_V2", "0") == "1"
++
++
++def _dq() -> int:
++    dq = int(os.environ.get("VLLM_MIMO26_MXFP4_DQ", "0"))
++    return dq if dq in (0, 2) else 0
++
++
++def _sync(dev: torch.device) -> torch.Tensor | None:
++    """Zeroed int32 counters (self-resetting inside the kernels)."""
++    key = (str(dev), torch.cuda.current_stream(dev).cuda_stream)
++    t = _SYNC.get(key)
++    if t is None:
++        if torch.cuda.is_current_stream_capturing():
++            return None
++        t = torch.zeros(32768, dtype=torch.int32, device=dev)
++        _SYNC[key] = t
++    return t
++
++
++def _plain_silu(activation, activation_func, activation_config) -> bool:
++    """The activation is exactly SiLU-mul without clamp (the fused epilogue
++    with limit +inf reproduces it bit for bit)."""
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    if activation != MoEActivation.SILU:
++        return False
++    if activation_func is None:
++        cfg = activation_config
++    else:
++        f = getattr(activation_func, "__func__", None)
++        if f is None or f.__qualname__ != "FusedMoEExpertsModular.activation":
++            return False
++        cfg = getattr(activation_func.__self__, "activation_config", None)
++    return cfg is None or getattr(cfg, "clamp_limit", None) is None
++
++
++def _plain_moe_sum(moe_sum) -> bool:
++    if moe_sum is None:
++        return True
++    f = getattr(moe_sum, "__func__", None)
++    return f is not None and f.__qualname__ == "MarlinExperts.moe_sum"
++
++
++def _ops():
++    global _OPS
++    if _OPS is None:
++        path = os.environ.get("VLLM_MIMO26_MXFP4_DECODE_LIB") or os.path.join(
++            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
++                os.path.abspath(__file__))))), "_mimo26_moe_C.abi3.so")
++        torch.ops.load_library(path)
++        ops = torch.ops._mimo26_moe_C
++        if int(ops.abi()) != 1:
++            raise RuntimeError("unexpected _mimo26_moe_C ABI")
++        _OPS = ops
++    return _OPS
++
++
++def _ops2():
++    global _OPS2
++    if _OPS2 is None:
++        _ops()
++        _OPS2 = torch.ops._mimo26_moe2
++    return _OPS2
++
++
++def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
++            quant_type, bias1, bias2, global_scale1, global_scale2,
++            input_global_scale1, input_global_scale2, w1_zeros, w2_zeros,
++            expert_map, apply_router_weight_on_input, block_size_m, input_dtype,
++            activation, activation_func, activation_config,
++            sorted_token_ids, expert_ids, num_tokens_post_padded,
++            intermediate_cache13, intermediate_cache2, moe_sum=None, output=None):
++    """Return (tensor, summed) or None to keep the Marlin path. summed=False:
++    the [M*topk, K] w2 output (caller runs moe_sum); True: the final [M, K]."""
++    from vllm.scalar_type import scalar_types
++
++    M, K = hidden_states.shape
++    topk = topk_ids.size(1)
++    if (quant_type != scalar_types.float4_e2m1f or K != _K or w2.size(1) * 16 != _NI
++            or M > _max_tokens() or block_size_m != 8
++            or hidden_states.dtype != torch.bfloat16 or not hidden_states.is_cuda
++            or input_dtype is not None or apply_router_weight_on_input
++            or expert_map is not None
++            or any(t is not None for t in (bias1, bias2, global_scale1, global_scale2,
++                                           input_global_scale1, input_global_scale2,
++                                           w1_zeros, w2_zeros))
++            or not activation.is_gated
++            or w1_scale.element_size() != 1 or w2_scale.element_size() != 1
++            or torch.cuda.get_device_capability(hidden_states.device) != (8, 0)):
++        return None
++    if not (_scales_ok(w1_scale) and _scales_ok(w2_scale)):
++        return None
++    slots = M * topk
++    ctr = _counters(hidden_states.device)
++    if ctr is None:
++        return None
++    if (intermediate_cache13.numel() < slots * max(2 * _NI, _K)
++            or intermediate_cache2.numel() < slots * _NI
++            or not intermediate_cache13.is_contiguous()
++            or not intermediate_cache2.is_contiguous()):
++        return None
++    ops = _ops()
++    if _v2():
++        r = _try_run_v2(ops, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights,
++                        topk_ids, activation, activation_func, activation_config,
++                        sorted_token_ids, expert_ids, num_tokens_post_padded,
++                        intermediate_cache13, intermediate_cache2, ctr, moe_sum, output)
++        if r is not None:
++            return r
++    global _LOGGED
++    if not _LOGGED:
++        _LOGGED = True
++        logger.info("VLLM_MIMO26_MXFP4_DECODE: weight-streaming MXFP4 MoE decode active "
++                    "(<= %d tokens)", _max_tokens())
++    dev = hidden_states.device
++    cfg = _cfg(M)
++    part = torch.empty(4 * slots * 2 * _NI, dtype=torch.float32, device=dev)
++    act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
++    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    tw = topk_weights.view(-1)
++    ks = ops.gemm(hidden_states, w1, w1_scale.view(torch.uint8), sorted_token_ids,
++                  expert_ids, num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True,
++                  cfg, ctr, part)
++    ops.sum(part, ks, slots, 2 * _NI, act_in)
++    if activation_func is None:
++        from vllm.model_executor.layers.fused_moe.activation import (
++            ApplyMoEActivationConfig, apply_moe_activation)
++        apply_moe_activation(activation, h, act_in,
++                             activation_config=activation_config or ApplyMoEActivationConfig(),
++                             topk_ids=topk_ids, expert_map=None)
++    else:
++        activation_func(activation, h, act_in, topk_ids=topk_ids, expert_map=None)
++    out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
++    ops.gemm(h, w2, w2_scale.view(torch.uint8), sorted_token_ids, expert_ids,
++             num_tokens_post_padded, tw, topk, slots, _NI, _K, False, cfg, ctr, out)
++    return out, False
++
++
++def _try_run_v2(ops, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids,
++                activation, activation_func, activation_config, sorted_token_ids,
++                expert_ids, num_tokens_post_padded, intermediate_cache13,
++                intermediate_cache2, ctr, moe_sum, output):
++    M, K = hidden_states.shape
++    topk = topk_ids.size(1)
++    slots = M * topk
++    dev = hidden_states.device
++    sync = _sync(dev)
++    if sync is None or 128 + slots * 36 > sync.numel():
++        return None
++    ops2 = _ops2()
++    dq = _dq()
++    fact = _plain_silu(activation, activation_func, activation_config)
++    fsum = (M <= 16 and topk <= 8 and _plain_moe_sum(moe_sum)
++            and (output is None or (output.dtype == torch.bfloat16
++                                    and output.is_contiguous()
++                                    and tuple(output.shape) == (M, K))))
++    global _LOGGED
++    if not _LOGGED:
++        _LOGGED = True
++        logger.info("VLLM_MIMO26_MXFP4_DECODE v2 active: dq=%d fused_act=%s "
++                    "fused_sum(<=16 tokens)=%s", dq, fact, fsum)
++    cfg = _cfg(M)
++    part = torch.empty(4 * slots * 2 * _NI, dtype=torch.float32, device=dev)
++    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    tw = topk_weights.view(-1)
++    w1s, w2s = w1_scale.view(torch.uint8), w2_scale.view(torch.uint8)
++    if fact:
++        ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids,
++                  num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True, cfg, dq,
++                  True, float("inf"), 0, ctr, sync, part, h)
++    else:
++        dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
++        ks = ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids,
++                       num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True, cfg, dq,
++                       False, 0.0, 0, ctr, sync, part, dummy)
++        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
++        ops.sum(part, ks, slots, 2 * _NI, act_in)
++        if activation_func is None:
++            from vllm.model_executor.layers.fused_moe.activation import (
++                ApplyMoEActivationConfig, apply_moe_activation)
++            apply_moe_activation(activation, h, act_in,
++                                 activation_config=activation_config
++                                 or ApplyMoEActivationConfig(),
++                                 topk_ids=topk_ids, expert_map=None)
++        else:
++            activation_func(activation, h, act_in, topk_ids=topk_ids, expert_map=None)
++    out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
++    if fsum:
++        y = output if output is not None else torch.empty_like(hidden_states)
++        ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw,
++                  topk, slots, _NI, _K, False, cfg, dq, True, 0.0, 1, ctr, sync, out, y)
++        return y, True
++    dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
++    ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw, topk,
++              slots, _NI, _K, False, cfg, dq, False, 0.0, 0, ctr, sync, out, dummy)
++    return out, False
