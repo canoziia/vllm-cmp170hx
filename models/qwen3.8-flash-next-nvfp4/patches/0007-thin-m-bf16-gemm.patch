@@ -1,0 +1,707 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: sm80 thin-M BF16 GEMM for measured unquantized
+ shapes
+
+VLLM_QWEN38_THIN_GEMM (default 0 = unchanged). The GLM 5.3 split-K Triton
+thin-M GEMM (FP32 accumulate, deterministic last-CTA reduction, pre-capture
+warmup, capture fallback) for the projections the NVFP4 checkpoint leaves in
+BF16, dispatched only for the (N, K, row bucket 1/4/8/16/32) cells where it was
+measured >= 5 % faster than cuBLAS on CMP 170HX (GDN in_proj/ba, QSA qkvg/o,
+indexer, HC down/up, shared expert, router). Every other shape and every batch
+above 32 rows keeps F.linear. Not bitwise equal to cuBLAS (summation order);
+max error against an FP64 reference is no larger than cuBLAS's.
+---
+ vllm/model_executor/layers/utils.py           |  19 +
+ vllm/model_executor/warmup/kernel_warmup.py   |   9 +
+ vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py | 618 ++++++++++++++++++
+ 3 files changed, 646 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py
+
+diff --git a/vllm/model_executor/layers/utils.py b/vllm/model_executor/layers/utils.py
+index 3e19c2b..bdc09b7 100644
+--- a/vllm/model_executor/layers/utils.py
++++ b/vllm/model_executor/layers/utils.py
+@@ -3,6 +3,7 @@
+ """Utility methods for model layers."""
+ 
+ import functools
++import os
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+@@ -560,6 +561,24 @@ def dispatch_unquantized_gemm(
+     elif not current_platform.is_cuda():
+         return default_unquantized_gemm
+ 
++    # sm_80 thin-M BF16 GEMM (vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py)
++    # for the projections Qwen3.8 NVFP4 leaves in BF16. The env check comes
++    # first, so with the flag unset nothing (triton included) is imported and
++    # the code below runs exactly as before. Ahead of the FlashInfer backends,
++    # which need sm_100 and so never co-apply.
++    if os.environ.get("VLLM_QWEN38_THIN_GEMM", "0") == "1":
++        from vllm.models.qwen4_exp.nvidia.ops.thin_gemm import (
++            qwen38_thin_unquantized_gemm,
++            use_thin_gemm,
++        )
++
++        if use_thin_gemm():
++            logger.info_once(
++                "VLLM_QWEN38_THIN_GEMM: sm_80 thin-M BF16 GEMM for measured "
++                "unquantized linear shapes."
++            )
++            return qwen38_thin_unquantized_gemm
++
+     backend_spec = _FLASHINFER_BF16_BACKENDS.get(linear_backend)
+     if backend_spec is None:
+         return default_unquantized_gemm
+diff --git a/vllm/model_executor/warmup/kernel_warmup.py b/vllm/model_executor/warmup/kernel_warmup.py
+index c9c740f..fc5a8a0 100644
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -6,6 +6,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
+ happen during model execution.
+ """
+ 
++import os
+ import sys
+ import time
+ from typing import TYPE_CHECKING
+@@ -193,6 +194,14 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+     compilation_config = worker.vllm_config.compilation_config
+     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+ 
++    # sm_80 thin-M BF16 GEMM: compile and allocate its split-K workspace for
++    # every (M, N, K) the decode graphs can replay. Must precede capture.
++    # No-op (nothing imported) unless VLLM_QWEN38_THIN_GEMM=1.
++    if os.environ.get("VLLM_QWEN38_THIN_GEMM", "0") == "1":
++        from vllm.models.qwen4_exp.nvidia.ops.thin_gemm import warmup_thin_gemm
++
++        warmup_thin_gemm(worker, cudagraph_capture_sizes)
++
+     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
+     # layer per token; warm them across token sizes first so the first real
+     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py b/vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py
+new file mode 100644
+index 0000000..e706b44
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/thin_gemm.py
+@@ -0,0 +1,618 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""sm_80 thin-M BF16 GEMM for the projections Qwen3.8 NVFP4 leaves in BF16.
++
++The split-K Triton kernel, workspace handling and capture guard are the GLM
++5.3 port (models/glm-5.3-flash patch 0005, originally Morrowmake/vllm-cmp170hx
++``ampere-glm53``); the dispatch table is Qwen's own.
++
++    thin_linear(x[M, K] bf16, w[N, K] bf16) -> y[M, N] bf16   == F.linear(x, w)
++
++At decode a BF16 linear with few rows is weight-bandwidth bound; cuBLAS picks
++few large CTAs (or a separate split-K reduce launch) for these skinny shapes.
++This kernel splits K across many small CTAs and reduces FP32 partials in the
++last-arriving CTA of each output tile in a fixed order (bitwise run-to-run
++deterministic, no extra launch). Semantics are ``F.linear(x, w)`` without
++bias: BF16 x BF16 products, FP32 accumulation, one rounding to BF16; only the
++*summation order* differs from cuBLAS (equally close to an FP64 reference).
++
++Default OFF (``VLLM_QWEN38_THIN_GEMM=0``): nothing here is imported and
++``dispatch_unquantized_gemm`` returns exactly the callable it returned before.
++With it on, only the (N, K, row-bucket) cells of ``_QWEN_TABLE`` -- measured on
++CMP 170HX with CUDA-graph replay and rotating weights, kept only where the
++kernel beat cuBLAS -- use the kernel; every other shape and every batch above
++the largest bucket keeps ``F.linear``. Inside a CUDA-graph capture a shape that
++was never run eagerly falls back to ``F.linear`` instead of compiling or
++allocating in the capture; the pre-capture warmup normally makes that
++unreachable.
++"""
++
++import functools
++import os
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++_MIN_K = 128
++
++# --------------------------------------------------------------------------
++# Tuning knobs (unchanged from the GLM port).
++# --------------------------------------------------------------------------
++_CTA_PER_SM_TARGET = 1.8
++_MIN_K_PER_SPLIT = 256
++_MAX_SMEM = 150 * 1024
++
++# Row buckets of the measured table. A batch of M rows uses the smallest
++# bucket >= M; above the last bucket cuBLAS is used.
++_BUCKETS = (1, 4, 8, 16, 32)
++
++# (N, K) -> {bucket: (BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages)}.
++# Only buckets where the kernel beat cuBLAS by >= 5 % are listed.
++_QWEN_TABLE: dict[tuple[int, int], dict[int, tuple[int, int, int, int, int]]] = {
++    # gdn_ba
++    (96, 2560): {
++        4: (32, 128, 8, 4, 3),  # 5.6 us vs cuBLAS 9.4
++        8: (32, 128, 8, 4, 3),  # 5.8 us vs cuBLAS 9.4
++        16: (32, 128, 8, 4, 3),  # 6.0 us vs cuBLAS 8.5
++        32: (32, 64, 8, 2, 4),  # 6.7 us vs cuBLAS 8.5
++    },
++    # gdn_in_qkvz
++    (16384, 2560): {
++        1: (128, 64, 1, 4, 3),  # 58.9 us vs cuBLAS 64.5
++        4: (64, 64, 1, 4, 3),  # 59.7 us vs cuBLAS 65.4
++        # Re-measured under CUDA graphs: the former (128, 256, 1, 4, 3) loses
++        # a pipeline stage to the shared-memory cap at runtime (72.9 us).
++        8: (128, 64, 1, 8, 4),  # 59.6 us vs cuBLAS 63.5 (M=6)
++        16: (128, 64, 1, 8, 4),  # 60.3 us vs cuBLAS 63.5 (M=12)
++        32: (128, 64, 1, 8, 4),  # 63.6 us vs cuBLAS 65.4 (M=24)
++    },
++    # hc_down
++    (336, 10240): {
++        1: (64, 256, 8, 4, 3),  # 11.2 us vs cuBLAS 16.6
++        4: (64, 256, 8, 4, 3),  # 11.4 us vs cuBLAS 13.0
++        8: (64, 256, 8, 4, 3),  # 9.6 us vs cuBLAS 13.1
++    },
++    # hc_up
++    (10240, 320): {
++        1: (32, 64, 1, 2, 4),  # 8.0 us vs cuBLAS 11.6
++        4: (32, 64, 1, 2, 4),  # 8.2 us vs cuBLAS 11.4
++        8: (32, 64, 1, 2, 4),  # 8.4 us vs cuBLAS 11.4
++        16: (64, 64, 1, 4, 3),  # 8.6 us vs cuBLAS 11.5
++        32: (128, 64, 1, 4, 3),  # 10.1 us vs cuBLAS 12.2
++    },
++    # idx_qk
++    (640, 2560): {
++        1: (32, 64, 8, 2, 4),  # 7.8 us vs cuBLAS 10.8
++        4: (32, 64, 8, 2, 4),  # 8.0 us vs cuBLAS 10.3
++        8: (32, 64, 8, 2, 4),  # 7.9 us vs cuBLAS 10.4
++        16: (64, 128, 4, 2, 4),  # 8.6 us vs cuBLAS 13.5
++        32: (32, 256, 2, 4, 4),  # 10.1 us vs cuBLAS 11.3
++    },
++    # o_proj
++    (2560, 6144): {
++        1: (32, 64, 4, 2, 4),  # 26.3 us vs cuBLAS 29.7
++        4: (32, 64, 4, 2, 4),  # 26.9 us vs cuBLAS 31.1
++        8: (64, 256, 1, 4, 3),  # 24.2 us vs cuBLAS 31.7
++    },
++    # qsa_qkvg
++    (13312, 2560): {
++        1: (64, 64, 1, 4, 4),  # 48.7 us vs cuBLAS 56.7
++        4: (64, 64, 1, 4, 4),  # 48.9 us vs cuBLAS 61.1
++        8: (64, 64, 1, 4, 4),  # 47.9 us vs cuBLAS 61.8
++        16: (64, 64, 1, 4, 4),  # 50.3 us vs cuBLAS 57.0
++        32: (128, 128, 1, 4, 4),  # 54.4 us vs cuBLAS 64.4
++    },
++    # router
++    (512, 2560): {
++        1: (64, 128, 8, 4, 3),  # 6.8 us vs cuBLAS 9.5
++        4: (64, 64, 8, 4, 3),  # 7.1 us vs cuBLAS 9.6
++        8: (64, 64, 8, 4, 4),  # 7.2 us vs cuBLAS 9.8
++        16: (32, 128, 4, 4, 4),  # 7.3 us vs cuBLAS 12.7
++        32: (32, 128, 4, 4, 3),  # 8.2 us vs cuBLAS 9.6
++    },
++    # sh_down
++    (2560, 640): {
++        1: (64, 128, 1, 4, 3),  # 5.9 us vs cuBLAS 8.0
++        4: (32, 128, 1, 4, 3),  # 6.1 us vs cuBLAS 7.9
++        8: (32, 128, 1, 4, 3),  # 6.2 us vs cuBLAS 8.0
++        16: (32, 128, 1, 4, 3),  # 6.5 us vs cuBLAS 8.0
++        32: (64, 128, 1, 4, 3),  # 7.6 us vs cuBLAS 8.4
++    },
++    # sh_gate_up
++    (1280, 2560): {
++        1: (32, 64, 4, 2, 4),  # 10.3 us vs cuBLAS 13.9
++        4: (32, 64, 4, 2, 4),  # 10.4 us vs cuBLAS 12.1
++        8: (64, 64, 4, 4, 4),  # 10.6 us vs cuBLAS 12.1
++        16: (32, 64, 4, 2, 4),  # 10.8 us vs cuBLAS 13.4
++    },
++}
++
++
++_num_sms_cache = None
++
++
++def num_sms() -> int:
++    global _num_sms_cache
++    if _num_sms_cache is None:
++        _num_sms_cache = torch.cuda.get_device_properties(
++            torch.cuda.current_device()).multi_processor_count
++    return _num_sms_cache
++
++
++def _pow2_at_least(x, lo=16):
++    v = lo
++    while v < x:
++        v *= 2
++    return v
++
++
++def _heuristic(M, N, K, BLOCK_M):
++    """Fallback for any (N, K) the sweep did not measure.
++
++    Same principle the measured table encodes: pick the *largest* BLOCK_N that
++    still yields ~_CTA_PER_SM_TARGET CTAs per SM from the N dimension alone, so
++    SPLIT_K stays 1 and no reduction kernel runs; only split K when N cannot
++    fill the machine by itself.
++    """
++    BLOCK_K = 128 if K >= 1024 else _pow2_at_least(min(K, 64), 16)
++    want = max(1, int(_CTA_PER_SM_TARGET * num_sms()))
++
++    BLOCK_N = 16
++    for cand in (128, 64, 32):
++        if triton.cdiv(N, cand) >= want:
++            BLOCK_N = cand
++            break
++
++    tiles_n = triton.cdiv(N, BLOCK_N)
++    max_split = max(1, min(triton.cdiv(K, BLOCK_K), K // _MIN_K_PER_SPLIT))
++    SPLIT_K = max(1, min(max_split, -(-want // tiles_n)))
++
++    num_warps = 4 if BLOCK_N >= 64 else 2
++    num_stages = 4 if BLOCK_N * BLOCK_K <= 8192 else 3
++    return BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
++
++
++def _bucket(M: int) -> int | None:
++    for b in _BUCKETS:
++        if M <= b:
++            return b
++    return None
++
++
++def table_config(M: int, N: int, K: int):
++    """Measured (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages) or None (= cuBLAS)."""
++    b = _bucket(M)
++    if b is None:
++        return None
++    return _QWEN_TABLE.get((N, K), {}).get(b)
++
++
++@functools.cache
++def _select_config(M, N, K):
++    """-> (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages)."""
++    # tl.dot needs M >= 16 on Ampere (m16n8k16), so M is padded up to 16 and
++    # masked.  The cap at 64 is a shared-memory bound, NOT a bound on M: the
++    # kernel tiles M over grid dim 2, so any M is covered.
++    BLOCK_M = min(64, _pow2_at_least(M, 16))
++    cfg = table_config(M, N, K)
++    if cfg is None:
++        cfg = _heuristic(M, N, K, BLOCK_M)
++    BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = cfg
++    while num_stages > 2 and \
++            num_stages * (BLOCK_N + BLOCK_M) * BLOCK_K * 2 > _MAX_SMEM:
++        num_stages -= 1
++    return BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages
++
++
++# --------------------------------------------------------------------------
++# Kernels
++# --------------------------------------------------------------------------
++
++@triton.jit
++def _thin_gemm_kernel(
++    X, W, Y, P, LOCK,
++    M, N, K,
++    stride_xm, stride_xk,
++    stride_wn, stride_wk,
++    stride_ym, stride_yn,
++    stride_pk, stride_pm, stride_pn,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    SPLIT_K: tl.constexpr,
++    EVEN_K: tl.constexpr,
++    EVEN_N: tl.constexpr,
++    TILED_M: tl.constexpr,
++):
++    """One CTA per (M tile, N tile, K split).  Reads its K-blocks of W once.
++
++    When SPLIT_K > 1 the FP32 partials are reduced by whichever CTA of the
++    column arrives last, not by a second launch: the second launch cost 2-3.5 us
++    per call (a bare in-graph launch is ~0.9 us on this part, and the rest is
++    the drain plus one full HBM latency round with nothing left to overlap it).
++
++    The reduction stays bitwise deterministic because the *order* is fixed -
++    always partial 0, then 1, ... SPLIT_K-1 - even though *which* CTA performs
++    it varies run to run.  That is the whole reason this is not an atomic_add
++    into Y, which would not be reproducible.
++    """
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++
++    # BLOCK_M is capped by shared memory, so a caller with more rows than one
++    # tile gets several M tiles over grid dim 2.  Masking alone is NOT enough:
++    # with a pinned BLOCK_M and no pid_m, rows past BLOCK_M were never written.
++    # Every M the model uses (1..64) is a single tile, and there the row offset
++    # must stay a compile-time zero -- a runtime `pid_m * BLOCK_M` in the
++    # address arithmetic costs 0.5-4.5 % on every shape (measured), so the
++    # one-tile case is specialized rather than paying for generality.
++    if TILED_M:
++        pid_m = tl.program_id(2)
++        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++    else:
++        pid_m = 0
++        offs_m = tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    offs_k = tl.arange(0, BLOCK_K)
++
++    m_mask = offs_m < M
++    n_mask = offs_n < N
++    # Clamping the row/column index keeps every address inside the tensor, so
++    # the masked-off lanes of a ragged tile cannot fault even before the mask
++    # is applied.
++    x_m = tl.where(m_mask, offs_m, 0)
++    w_n = tl.where(n_mask, offs_n, 0)
++
++    x_ptrs = X + x_m[:, None] * stride_xm + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_xk
++    w_ptrs = W + w_n[:, None] * stride_wn + \
++        (pid_k * BLOCK_K + offs_k)[None, :] * stride_wk
++
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    step = BLOCK_K * SPLIT_K
++    n_iter = tl.cdiv(K, step)
++    for i in range(n_iter):
++        if EVEN_K:
++            x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
++            w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
++        else:
++            k_now = i * step + pid_k * BLOCK_K + offs_k
++            k_mask = k_now < K
++            x = tl.load(x_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
++            w = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
++        acc += tl.dot(x, tl.trans(w), out_dtype=tl.float32)
++        x_ptrs += step * stride_xk
++        w_ptrs += step * stride_wk
++
++    y_ptrs = Y + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
++    if SPLIT_K == 1:
++        if EVEN_N:
++            tl.store(y_ptrs, acc.to(Y.dtype.element_ty), mask=m_mask[:, None])
++        else:
++            tl.store(y_ptrs, acc.to(Y.dtype.element_ty),
++                     mask=m_mask[:, None] & n_mask[None, :])
++    else:
++        p_mask = m_mask[:, None] & n_mask[None, :]
++        p_off = offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
++        # ".cg" keeps the partial out of the non-coherent per-SM L1 so the
++        # reducing CTA, which runs on a different SM, can see it in L2.
++        tl.store(P + pid_k * stride_pk + p_off, acc, mask=p_mask,
++                 cache_modifier=".cg")
++        # Release the store, then count arrivals for this N column.  No CTA
++        # ever spins, so this cannot deadlock however the grid is scheduled.
++        # One counter per (M tile, N tile) output block; grid dim 0 is the
++        # number of N tiles, so this indexes the column within this M tile.
++        if TILED_M:
++            lock = LOCK + pid_m * tl.num_programs(0) + pid_n
++        else:
++            lock = LOCK + pid_n
++        arrived = tl.atomic_add(lock, 1, sem="acq_rel", scope="gpu")
++        if arrived == SPLIT_K - 1:
++            tot = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++            for k in tl.static_range(SPLIT_K):
++                tot += tl.load(P + k * stride_pk + p_off, mask=p_mask,
++                               other=0.0, cache_modifier=".cv")
++            tl.store(y_ptrs, tot.to(Y.dtype.element_ty), mask=p_mask)
++            # Leave the counter at zero for the next launch.  Launches on one
++            # stream are serialized, so no later CTA can race this reset.
++            tl.atomic_xchg(lock, 0, sem="release", scope="gpu")
++
++
++
++
++# --------------------------------------------------------------------------
++# Workspace
++# --------------------------------------------------------------------------
++# Allocated once, never freed: a captured graph records the pointers. The
++# kernel always leaves the arrival counters at zero, so a buffer is reusable
++# across launches and replays of the same shape.
++
++_WORKSPACE: dict = {}
++# (device index, M, N, K) that have run at least once outside a capture, i.e.
++# whose Triton binary and workspace exist.
++_READY: set = set()
++
++
++def _partials(split_k, M, N, K, device):
++    key = (device.index, "p", split_k, M, N, K)
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.empty((split_k, M, N), dtype=torch.float32, device=device)
++        _WORKSPACE[key] = buf
++    return buf
++
++
++def _locks(tiles, M, N, K, device):
++    key = (device.index, "lock", M, N, K, tiles)
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = torch.zeros(tiles, dtype=torch.int32, device=device)
++        _WORKSPACE[key] = buf
++    return buf
++
++
++def _dummy(device):
++    key = (device.index, "dummy")
++    buf = _WORKSPACE.get(key)
++    if buf is None:
++        buf = (
++            torch.zeros(1, dtype=torch.float32, device=device),
++            torch.zeros(1, dtype=torch.int32, device=device),
++        )
++        _WORKSPACE[key] = buf
++    return buf
++
++
++# --------------------------------------------------------------------------
++# Kernel entry point
++# --------------------------------------------------------------------------
++
++
++def thin_gemm(
++    x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None
++) -> torch.Tensor:
++    """y = x @ w.T for BF16 x [M, K] and BF16 w [N, K], FP32 accumulate."""
++    assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
++    assert x.ndim == 2 and w.ndim == 2 and x.shape[1] == w.shape[1]
++    M, K = x.shape
++    N = w.shape[0]
++    if out is None:
++        out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
++    if M == 0 or N == 0:
++        return out
++
++    BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages = _select_config(
++        M, N, K
++    )
++    even_k = (K % (BLOCK_K * SPLIT_K)) == 0
++    even_n = (N % BLOCK_N) == 0
++    tiles_n = triton.cdiv(N, BLOCK_N)
++    tiles_m = triton.cdiv(M, BLOCK_M)
++    if SPLIT_K == 1:
++        # Unused by the kernel (constexpr-folded away) but must be pointers.
++        p, lock = _dummy(x.device)
++        sp = (0, 0, 0)
++    else:
++        p = _partials(SPLIT_K, M, N, K, x.device)
++        sp = (p.stride(0), p.stride(1), p.stride(2))
++        lock = _locks(tiles_n * tiles_m, M, N, K, x.device)
++
++    _thin_gemm_kernel[(tiles_n, SPLIT_K, tiles_m)](
++        x, w, out, p, lock,
++        M, N, K,
++        x.stride(0), x.stride(1),
++        w.stride(0), w.stride(1),
++        out.stride(0), out.stride(1),
++        sp[0], sp[1], sp[2],
++        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, SPLIT_K=SPLIT_K,
++        EVEN_K=even_k, EVEN_N=even_n, TILED_M=(tiles_m > 1),
++        num_warps=num_warps, num_stages=num_stages,
++    )  # fmt: skip
++    return out
++
++
++# --------------------------------------------------------------------------
++# Gates
++# --------------------------------------------------------------------------
++
++
++@functools.cache
++def _device_supported() -> bool:
++    """sm_80 (GA100: A100 / CMP 170HX) only; the table was measured there."""
++    return current_platform.is_cuda() and current_platform.is_device_capability(80)
++
++
++def use_thin_gemm() -> bool:
++    """True only when the operator opted in AND the part is sm_80."""
++    if os.environ.get("VLLM_QWEN38_THIN_GEMM", "0") != "1":
++        return False
++    return _device_supported()
++
++
++def dispatch_threshold() -> int:
++    """Largest M that can reach the kernel (the last measured bucket)."""
++    return _BUCKETS[-1]
++
++
++def static_supported(
++    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
++) -> bool:
++    """Shape-independent part of the gate (dtype/layout only, no M).
++
++    2-D only, so no reshape copy can appear on the captured path; any bias,
++    non-BF16 or K-strided weight falls through to F.linear.
++    """
++    return (
++        bias is None
++        and x.ndim == 2
++        and weight.ndim == 2
++        and x.dtype is torch.bfloat16
++        and weight.dtype is torch.bfloat16
++        and weight.stride(1) == 1
++        and x.shape[1] == weight.shape[1]
++        and weight.shape[1] >= _MIN_K
++    )
++
++
++def rows_supported(M: int, N: int, K: int) -> bool:
++    """Row-count part of the gate: only measured winning cells."""
++    return M >= 1 and table_config(M, N, K) is not None
++
++
++# --------------------------------------------------------------------------
++# Custom op (opaque to torch.compile; the row branch runs at call time)
++# --------------------------------------------------------------------------
++
++_capture_fallback_logged: set = set()
++
++
++def _qwen38_thin_linear_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    M, K = x.shape
++    N = weight.shape[0]
++    if not rows_supported(M, N, K) or x.stride(1) != 1:
++        return torch.nn.functional.linear(x, weight)
++    key = (x.device.index, M, N, K)
++    if key not in _READY:
++        if torch.cuda.is_current_stream_capturing():
++            # Never compile or allocate inside a capture.
++            if key not in _capture_fallback_logged:
++                _capture_fallback_logged.add(key)
++                logger.warning(
++                    "VLLM_QWEN38_THIN_GEMM: (M=%d, N=%d, K=%d) was not warmed up "
++                    "before CUDA-graph capture; this graph uses F.linear.",
++                    M,
++                    N,
++                    K,
++                )
++            return torch.nn.functional.linear(x, weight)
++        out = thin_gemm(x, weight)
++        _READY.add(key)
++        return out
++    return thin_gemm(x, weight)
++
++
++def _qwen38_thin_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    return x.new_empty((x.shape[0], weight.shape[0]))
++
++
++direct_register_custom_op(
++    op_name="qwen38_thin_linear",
++    op_func=_qwen38_thin_linear_impl,
++    fake_impl=_qwen38_thin_linear_fake,
++)
++
++
++def thin_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    """``F.linear(x, weight)`` with the thin-M kernel when eligible.
++
++    For call sites that never build a LinearBase. Callers must only reach this
++    when ``use_thin_gemm()``.
++    """
++    if static_supported(x, weight, None):
++        return torch.ops.vllm.qwen38_thin_linear(x, weight)
++    return torch.nn.functional.linear(x, weight)
++
++
++def qwen38_thin_unquantized_gemm(
++    layer: torch.nn.Module,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Drop-in for ``default_unquantized_gemm`` (same signature)."""
++    if static_supported(x, weight, bias):
++        return torch.ops.vllm.qwen38_thin_linear(x, weight)
++    return torch.nn.functional.linear(x, weight, bias)
++
++
++# --------------------------------------------------------------------------
++# Warmup (must run before CUDA-graph capture)
++# --------------------------------------------------------------------------
++
++# Small M an eager decode step can hit outside the capture sizes.
++_EXTRA_MS = (1, 2, 3, 4, 5, 6, 7, 8)
++
++
++def _candidate_models(worker) -> list[torch.nn.Module]:
++    models = []
++    try:
++        models.append(worker.get_model())
++    except Exception:  # pragma: no cover - worker shape varies
++        pass
++    runner = getattr(worker, "model_runner", None)
++    for attr in ("drafter", "speculator"):
++        obj = getattr(runner, attr, None)
++        if obj is None:
++            continue
++        for inner in (getattr(obj, "model", None), obj):
++            if isinstance(inner, torch.nn.Module):
++                models.append(inner)
++                break
++    return models
++
++
++def discover_weights(models) -> dict[tuple[int, int], torch.Tensor]:
++    """One live weight per (N, K) that can reach the thin path.
++
++    The real weights are used for the warmup launches, so nothing of weight
++    size is allocated (kernel_warmup runs after the KV cache is allocated).
++    """
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        UnquantizedEmbeddingMethod,
++    )
++
++    unquant = (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
++    found: dict[tuple[int, int], torch.Tensor] = {}
++    for model in models:
++        for _name, module in model.named_modules():
++            w = None
++            if isinstance(getattr(module, "quant_method", None), unquant):
++                w = getattr(module, "weight", None)
++            if (
++                isinstance(w, torch.Tensor)
++                and w.is_cuda
++                and w.ndim == 2
++                and w.dtype is torch.bfloat16
++                and w.stride(1) == 1
++                and w.shape[1] >= _MIN_K
++            ):
++                found.setdefault((int(w.shape[0]), int(w.shape[1])), w)
++    return found
++
++
++def warmup_thin_gemm(worker, capture_sizes) -> None:
++    """Compile and preallocate every (M, N, K) a graph can replay.
++
++    Must run before capture (called from kernel_warmup). Outputs are discarded;
++    the inputs are zeros, so nothing reads uninitialised memory.
++    """
++    if not use_thin_gemm():
++        return
++    bound = dispatch_threshold()
++    ms = {int(s) for s in capture_sizes if 1 <= int(s) <= bound}
++    ms.update(m for m in _EXTRA_MS if m <= bound)
++    weights = discover_weights(_candidate_models(worker))
++    n = 0
++    for (N, K), w in sorted(weights.items()):
++        for M in sorted(ms):
++            if not rows_supported(M, N, K):
++                continue
++            x = torch.zeros((M, K), dtype=torch.bfloat16, device=w.device)
++            _qwen38_thin_linear_impl(x, w)
++            n += 1
++    torch.cuda.synchronize()
++    logger.info(
++        "VLLM_QWEN38_THIN_GEMM: warmed %d (M, N, K) over %d weight shapes, M in %s "
++        "(bound %d).",
++        n,
++        len(weights),
++        sorted(ms),
++        bound,
++    )

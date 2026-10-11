@@ -1,0 +1,152 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: single-kernel deterministic MoE block alignment
+
+VLLM_QWEN38_FAST_MOE_ALIGN (default 0 = unchanged). With
+VLLM_DETERMINISTIC_MOE_ALIGN on, every Marlin MoE layer aligned its routed
+entries with ~45 small int64 ATen kernels (stable argsort, scatter_add, two
+cumsums, searchsorted, ...): ~80-95 us per layer at decode on CMP 170HX, i.e.
+~2.1-2.5 ms per PP stage per decode step for Qwen3.8's 48 MoE layers. One
+Triton program now produces exactly the same sorted_ids / expert_ids /
+num_tokens_post_pad (entries ordered by (expert, flat index) through a single
+bitonic sort of expert<<13|index keys, invalid entries dropped, unused slots =
+numel, blocks past the padded total = -1). Integer-only, no atomics, no host
+sync, CUDA-graph capturable. 512 experts, block 8: 40 entries 95 -> 7 us,
+320 -> 9 us, 1280 -> 22 us. Used only without an expert map and for at most
+4096 routed entries; larger (prefill) batches keep the torch path.
+---
+ .../layers/fused_moe/fast_moe_align.py        | 90 +++++++++++++++++++
+ .../layers/fused_moe/moe_align_block_size.py  | 17 +++-
+ 2 files changed, 106 insertions(+), 1 deletion(-)
+ create mode 100644 vllm/model_executor/layers/fused_moe/fast_moe_align.py
+
+diff --git a/vllm/model_executor/layers/fused_moe/fast_moe_align.py b/vllm/model_executor/layers/fused_moe/fast_moe_align.py
+new file mode 100644
+index 0000000..2fe2835
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/fast_moe_align.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Single-kernel replacement for _moe_align_block_size_deterministic.
++
++VLLM_QWEN38_FAST_MOE_ALIGN=1 (default 0 = unchanged). One Triton program
++produces exactly the outputs of the torch deterministic path (entries ordered
++by (expert, flat index) through a single bitonic sort of
++``expert << 13 | flat_index`` keys, invalid entries dropped, unused sorted_ids
++slots = numel, blocks past the padded total = -1). Integer-only, no atomics,
++CUDA-graph capturable, no host sync. Used only without an expert map and for at
++most MAX_ENTRIES routed entries; larger (prefill) batches keep the torch path.
++"""
++import os
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++MAX_ENTRIES = 4096
++MAX_EXPERTS = 1024
++_KEY_SHIFT = 13  # 2**13 = 8192 > MAX_ENTRIES
++
++
++@triton.jit
++def _align_kernel(ids, sorted_ids, expert_ids, ntpp, offs, S, E, BS, CAP, NB,
++                  P: tl.constexpr, EP: tl.constexpr, FILL: tl.constexpr,
++                  SHIFT: tl.constexpr):
++    i = tl.arange(0, P)
++    e = tl.load(ids + i, mask=i < S, other=-1).to(tl.int32)
++    valid = (i < S) & (e >= 0) & (e < E)
++    big: tl.constexpr = 2147483647
++    key = tl.where(valid, (e << SHIFT) | i, big)
++    counts = tl.histogram(tl.where(valid, e, 0), EP, mask=valid)
++    padded = ((counts + BS - 1) // BS) * BS
++    start = tl.cumsum(padded, 0) - padded
++    cu = tl.cumsum(counts, 0) - counts
++    total = tl.sum(padded, 0)
++    es = tl.arange(0, EP)
++    tl.store(offs + es, start)
++    tl.store(offs + EP + es, cu)
++    for p0 in range(0, CAP, FILL):
++        p = p0 + tl.arange(0, FILL)
++        tl.store(sorted_ids + p, S, mask=p < CAP)
++    for b0 in range(0, NB, FILL):
++        b = b0 + tl.arange(0, FILL)
++        tl.store(expert_ids + b, -1, mask=(b < NB) & (b * BS >= total))
++    tl.debug_barrier()
++    sk = tl.sort(key)
++    ok = sk != big
++    se = tl.where(ok, sk >> SHIFT, 0)
++    si = sk & ((1 << SHIFT) - 1)
++    base = tl.load(offs + se, mask=ok, other=0)
++    cue = tl.load(offs + EP + se, mask=ok, other=0)
++    tl.store(sorted_ids + base + (i - cue), si, mask=ok)
++    nblk = padded // BS
++    maxblk = tl.max(nblk, 0)
++    sblk = start // BS
++    live = es < E
++    for k in range(0, maxblk):
++        tl.store(expert_ids + sblk + k, es, mask=live & (k < nblk))
++    tl.store(ntpp, total)
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_QWEN38_FAST_MOE_ALIGN", "0") == "1"
++
++
++def try_align(topk_ids, num_experts, block_size, sorted_ids, expert_ids,
++              num_tokens_post_pad, expert_map) -> bool:
++    """Fill the outputs and return True, or return False to keep the torch path."""
++    if expert_map is not None or not topk_ids.is_cuda:
++        return False
++    if not topk_ids.is_contiguous() or topk_ids.dtype not in (torch.int32, torch.int64):
++        return False
++    s = topk_ids.numel()
++    if s == 0 or s > MAX_ENTRIES or not 0 < num_experts <= MAX_EXPERTS:
++        return False
++    if not (sorted_ids.is_contiguous() and expert_ids.is_contiguous()
++            and sorted_ids.dtype == expert_ids.dtype == torch.int32
++            and num_tokens_post_pad.dtype == torch.int32):
++        return False
++    ep = triton.next_power_of_2(num_experts)
++    p = max(16, triton.next_power_of_2(s))
++    offs = torch.empty(2 * ep, dtype=torch.int32, device=topk_ids.device)
++    with torch.cuda.device(topk_ids.device):
++        _align_kernel[(1,)](
++            topk_ids, sorted_ids, expert_ids, num_tokens_post_pad, offs, s,
++            num_experts, block_size, sorted_ids.numel(), expert_ids.numel(),
++            P=p, EP=ep, FILL=1024, SHIFT=_KEY_SHIFT, num_warps=8 if p <= 1024 else 16)
++    return True
+diff --git a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+index 8c17688..3adae78 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
++++ b/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+@@ -5,6 +5,7 @@ import torch
+ 
+ import vllm.envs as envs
+ from vllm import _custom_ops as ops
++from vllm.model_executor.layers.fused_moe import fast_moe_align as _fast_moe_align
+ from vllm.triton_utils import triton
+ from vllm.utils.math_utils import round_up
+ 
+@@ -175,7 +176,21 @@ def moe_align_block_size(
+     )
+     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
+ 
+-    if envs.VLLM_DETERMINISTIC_MOE_ALIGN:
++    if (
++        envs.VLLM_DETERMINISTIC_MOE_ALIGN
++        and _fast_moe_align.enabled()
++        and _fast_moe_align.try_align(
++            topk_ids,
++            num_experts,
++            block_size,
++            sorted_ids,
++            expert_ids,
++            num_tokens_post_pad,
++            expert_map if ignore_invalid_experts else None,
++        )
++    ):
++        pass
++    elif envs.VLLM_DETERMINISTIC_MOE_ALIGN:
+         _moe_align_block_size_deterministic(
+             topk_ids,
+             num_experts,

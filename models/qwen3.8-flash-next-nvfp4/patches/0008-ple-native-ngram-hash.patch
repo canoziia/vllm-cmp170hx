@@ -1,0 +1,139 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: native n-gram hashing in the PLE offload worker
+
+VLLM_QWEN38_PLE_NATIVE_HASH (default 0 = unchanged). The NVMe PLE offload
+worker computed each batch's n-gram ids with ~40 small CPU torch ops (~0.5 ms
+per decode step, on the PP0 critical path: layer 1 waits for the PLE rows).
+ple_ngram_ids() in the native PLE library (native/ple_pread.c, same .so as
+the pread gather) is a bit-exact port of that CPU path, including EOS segment
+boundaries and CUDA-graph padding rows, ~0.07 ms per call. Layouts it does not
+cover, or a library without the symbol, keep the torch path.
+---
+ .../qwen4_exp/nvidia/ngram_embedding.py       | 97 ++++++++++++++++++-
+ 1 file changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+index 07e2a94..e78d371 100644
+--- a/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
++++ b/vllm/models/qwen4_exp/nvidia/ngram_embedding.py
+@@ -2,10 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
+ 
++import ctypes
+ import os
+ from abc import ABC, abstractmethod
+ from collections.abc import Iterable
+-from typing import ClassVar
++from typing import Any, ClassVar
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -563,6 +564,95 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
+         return output
+ 
+ 
++
++# VLLM_QWEN38_PLE_NATIVE_HASH=1 (default 0 = unchanged): the PLE offload worker
++# computes the n-gram ids of each decode/prefill batch with ple_ngram_ids() from
++# the native PLE library (models/qwen3.8-flash-next-nvfp4/native/ple_pread.c),
++# a bit-exact port of the CPU torch path below, instead of ~40 small CPU torch
++# ops (~0.5 ms per decode step on the PP0 critical path). Any layout the native
++# routine does not cover falls back to the torch path.
++_NATIVE_HASH: Any = None  # None = not loaded yet, False = unavailable
++
++
++def _load_native_hash() -> Any:
++    global _NATIVE_HASH
++    if _NATIVE_HASH is None:
++        _NATIVE_HASH = False
++        path = os.getenv(
++            "VLLM_PLE_NATIVE_PREAD_LIBRARY", "/usr/local/lib/libvllm_ple_pread.so"
++        )
++        try:
++            fn = ctypes.CDLL(path).ple_ngram_ids
++            fn.restype = ctypes.c_int
++            fn.argtypes = [
++                ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
++                ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64,
++                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
++                ctypes.c_void_p,
++            ]  # fmt: skip
++            _NATIVE_HASH = fn
++            logger.info("VLLM_QWEN38_PLE_NATIVE_HASH: native n-gram hashing from %s", path)
++        except (OSError, AttributeError) as error:
++            logger.warning(
++                "VLLM_QWEN38_PLE_NATIVE_HASH: %s has no ple_ngram_ids (%s); "
++                "keeping the torch path",
++                path,
++                error,
++            )
++    return _NATIVE_HASH
++
++
++def _native_ngram_ids(
++    module: "Qwen4ExpNGramEmbedding",
++    input_ids: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    ngram_context: torch.Tensor,
++    num_reqs: int,
++    num_tokens: int,
++) -> torch.Tensor | None:
++    if os.environ.get("VLLM_QWEN38_PLE_NATIVE_HASH", "0") != "1":
++        return None
++    if (
++        num_reqs <= 0
++        or input_ids.device.type != "cpu"
++        or input_ids.dtype != torch.int32
++        or query_start_loc.dtype != torch.int32
++        or ngram_context.dtype != torch.int32
++        or ngram_context.dim() != 2
++        or ngram_context.shape[0] < num_reqs
++        or ngram_context.shape[1] != module.ngram_size - 1
++        or not 2 <= module.ngram_size <= 8
++    ):
++        return None
++    fn = _load_native_hash()
++    if not fn:
++        return None
++    ids = input_ids.contiguous()
++    qsl = query_start_loc.contiguous()
++    ctx = ngram_context[:num_reqs].contiguous()
++    tables = getattr(module, "_native_hash_tables", None)
++    if tables is None:
++        tables = module._native_hash_tables = tuple(
++            t.detach().to("cpu", torch.int64).contiguous()
++            for t in (
++                module.layer_multipliers,
++                module.ngram_heads_vocab_sizes,
++                module.ngram_heads_offsets,
++            )
++        )
++    mult, sizes, offsets = tables
++    out = torch.empty(
++        (num_tokens, (module.ngram_size - 1) * module.heads_per_ngram),
++        dtype=torch.int64,
++    )
++    status = fn(
++        ids.data_ptr(), num_tokens, qsl.data_ptr(), num_reqs, ctx.data_ptr(),
++        module.ngram_size - 1, mult.data_ptr(), module.ngram_size,
++        sizes.data_ptr(), offsets.data_ptr(), module.heads_per_ngram,
++        module.eos_token_id, out.data_ptr(),
++    )  # fmt: skip
++    return out if status == 0 else None
++
+ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+     _MASK64 = (1 << 64) - 1
+     _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+@@ -835,6 +925,11 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
+                 heads_per_ngram=self.heads_per_ngram,
+                 output=output,
+             )
++        native = _native_ngram_ids(
++            self, input_ids, query_start_loc, ngram_context, num_reqs, num_tokens
++        )
++        if native is not None:
++            return native
+         input_ids = input_ids.long()
+         query_start_loc = query_start_loc.long()
+         positions = torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
