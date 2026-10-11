@@ -1,0 +1,253 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] qwen3.8: fp8 copy of lm_head for MTP draft logits
+
+VLLM_QWEN38_DRAFT_HEAD_FP8 (default 0 = unchanged). The MTP drafter reads its
+draft logits from a per-row e4m3 copy of the shared lm_head through Marlin
+W8A16 instead of the BF16 head: 248320 x 2560, 0.45 ms instead of 0.77 ms per
+draft step at one row on CMP 170HX, three draft steps per decode step. Target
+verification keeps the BF16 head, so the output distribution is unchanged;
+only draft quality (acceptance) can move. Built in MTPSpeculator.load_draft_model
+on the stage that hosts the head, before CUDA-graph capture (+0.59 GiB). TP=1.
+---
+ vllm/models/qwen4_exp/nvidia/mtp.py           |  45 +++++++
+ vllm/models/qwen4_exp/nvidia/mtp_fp8_head.py  | 120 ++++++++++++++++++
+ .../worker/gpu/spec_decode/mtp/speculator.py  |  12 ++
+ 3 files changed, 177 insertions(+)
+ create mode 100644 vllm/models/qwen4_exp/nvidia/mtp_fp8_head.py
+
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp.py b/vllm/models/qwen4_exp/nvidia/mtp.py
+index 49d7903..bab1f50 100644
+--- a/vllm/models/qwen4_exp/nvidia/mtp.py
++++ b/vllm/models/qwen4_exp/nvidia/mtp.py
+@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
+ )
+ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -59,6 +60,8 @@ from .model import (
+ )
+ 
+ 
++logger = init_logger(__name__)
++
+ def _remap_ignored_layers(
+     ignored_layers: list[str],
+     mtp_start_layer_idx: int,
+@@ -430,6 +433,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        # VLLM_QWEN38_DRAFT_HEAD_FP8: fp8 copy of lm_head for draft logits
++        # only (built by build_fp8_draft_head; None = bf16 shared head).
++        self._fp8_draft_head = None
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+         )
+@@ -457,9 +463,48 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
+             spec_step_idx=spec_step_idx,
+         )
+ 
++    def build_fp8_draft_head(self) -> None:
++        """Build the weight-only fp8 draft head from the (shared) lm_head.
++
++        Must run after load_eagle_model shared the target lm_head and before
++        CUDA-graph capture. No-op on stages that do not host the head.
++        """
++        if not isinstance(self.lm_head, ParallelLMHead):
++            return
++        from .mtp_fp8_head import Fp8DraftHead
++
++        lp = self.logits_processor
++        if self.lm_head.tp_size != 1:
++            raise ValueError("VLLM_QWEN38_DRAFT_HEAD_FP8 requires TP=1")
++        if getattr(self.lm_head, "bias", None) is not None:
++            raise ValueError("VLLM_QWEN38_DRAFT_HEAD_FP8: lm_head has a bias")
++        if lp.head_dtype is not None and lp.head_dtype != self.lm_head.weight.dtype:
++            raise ValueError("VLLM_QWEN38_DRAFT_HEAD_FP8: head_dtype override set")
++        if lp.logits_as_input:
++            raise ValueError("VLLM_QWEN38_DRAFT_HEAD_FP8: logits_as_input set")
++        with torch.no_grad():
++            self._fp8_draft_head = Fp8DraftHead(self.lm_head.weight.data)
++        torch.cuda.empty_cache()
++        logger.info(
++            "Qwen3.8 MTP: fp8 draft lm_head built (%.2f GiB, shape %s)",
++            self._fp8_draft_head.nbytes() / 2**30,
++            tuple(self.lm_head.weight.shape),
++        )
++
+     def compute_logits(
+         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
+     ) -> torch.Tensor | None:
++        if self._fp8_draft_head is not None:
++            # Mirrors LogitsProcessor.forward at TP=1 with the projection
++            # swapped: drop vocab padding, then soft cap and scale.
++            lp = self.logits_processor
++            logits = self._fp8_draft_head(hidden_states)
++            logits = logits[..., : lp.org_vocab_size]
++            if lp.soft_cap is not None:
++                logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
++            if lp.scale != 1.0:
++                logits = logits * lp.scale
++            return logits
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+diff --git a/vllm/models/qwen4_exp/nvidia/mtp_fp8_head.py b/vllm/models/qwen4_exp/nvidia/mtp_fp8_head.py
+new file mode 100644
+index 0000000..763046d
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/mtp_fp8_head.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Weight-only FP8 copy of the lm_head for Qwen3.8 MTP *draft* logits only.
++
++``VLLM_QWEN38_DRAFT_HEAD_FP8=1`` (default 0 = off, bitwise unchanged).
++
++The MTP drafter re-uses the target's bf16 lm_head ([248320 x 2560], 1.27 GB)
++for every draft step; on the last PP stage that is three purely
++bandwidth-bound full-vocabulary passes per decode step (~0.77 ms each on CMP
++170HX). With this switch the drafter reads a per-output-channel FP8 (e4m3)
++copy through the Marlin W8A16 kernel instead (0.64 GB, ~0.45 ms). The target's
++verification logits keep the bf16 head, so the generated text distribution is
++unchanged: greedy drafts can only differ in acceptance, and probabilistic
++drafting samples and rejection-tests against the *same* (fp8-derived) q.
++
++Memory: +N*K bytes (+0.59 GiB) on the stage that hosts the drafter. Built in
++``load_draft_model`` (before CUDA-graph capture), in row chunks so the
++transient peak is about 2x the fp8 copy. TP=1 only.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++import vllm._custom_ops as ops
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    marlin_make_workspace_new,
++    marlin_permute_scales,
++)
++from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
++    apply_fp8_marlin_linear,
++    fp8_fused_exponent_bias_into_scales,
++)
++
++FP8_MAX = 448.0
++_QUANT_CHUNK_ROWS = 8192
++
++
++def draft_head_fp8_enabled() -> bool:
++    return os.environ.get("VLLM_QWEN38_DRAFT_HEAD_FP8", "0") == "1"
++
++
++def quantize_rows_fp8(
++    weight: torch.Tensor, chunk_rows: int = _QUANT_CHUNK_ROWS
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Per-row (= per output channel) symmetric e4m3 quantization.
++
++    Returns ``(fp8 [N, K], scale [N] in weight.dtype)``. The scale is rounded to
++    ``weight.dtype`` *before* dividing, so dequant ``fp8 * scale`` uses exactly
++    the value Marlin sees; values are clamped to +-448 (torch's fp8 cast does not
++    saturate).
++    """
++    assert weight.dim() == 2
++    n, k = weight.shape
++    q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=weight.device)
++    scale = torch.empty((n,), dtype=weight.dtype, device=weight.device)
++    for s in range(0, n, chunk_rows):
++        e = min(n, s + chunk_rows)
++        w = weight[s:e].float()
++        amax = w.abs().amax(dim=1).clamp_min(1e-12)
++        sc = (amax / FP8_MAX).to(weight.dtype)
++        sc = torch.where(sc == 0, torch.ones_like(sc), sc)
++        scf = sc.float()
++        q[s:e] = (w / scf[:, None]).clamp_(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
++        scale[s:e] = sc
++        del w
++    return q, scale
++
++
++class Fp8DraftHead:
++    """Marlin W8A16 (per-channel) projection [M, K] bf16 -> [M, N] bf16."""
++
++    def __init__(self, weight: torch.Tensor) -> None:
++        n, k = weight.shape
++        if n % 64 != 0 or k % 128 != 0:
++            raise ValueError(
++                f"VLLM_QWEN38_DRAFT_HEAD_FP8: lm_head shape {tuple(weight.shape)} "
++                "is not Marlin tile aligned (N%64, K%128)"
++            )
++        if weight.dtype not in (torch.bfloat16, torch.float16):
++            raise ValueError(
++                f"VLLM_QWEN38_DRAFT_HEAD_FP8: unsupported lm_head dtype {weight.dtype}"
++            )
++        self.size_n, self.size_k = n, k
++        self.dtype = weight.dtype
++        q, scale = quantize_rows_fp8(weight)
++        # GPTQ layout: [K/4, N] int32, 4 consecutive k per word.
++        packed = q.view(torch.int32).T.contiguous()
++        del q
++        self.qweight = ops.gptq_marlin_repack(
++            b_q_weight=packed, size_k=k, size_n=n, num_bits=8, is_a_8bit=False
++        )
++        del packed
++        s = marlin_permute_scales(
++            s=scale.view(1, n), size_k=k, size_n=n, group_size=-1
++        )
++        self.scale = fp8_fused_exponent_bias_into_scales(s)
++        # Keep the plain scale for tests / reference dequant.
++        self.row_scale = scale
++        self.workspace = marlin_make_workspace_new(weight.device)
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        assert x.dtype == self.dtype, (x.dtype, self.dtype)
++        return apply_fp8_marlin_linear(
++            input=x,
++            weight=self.qweight,
++            weight_scale=self.scale,
++            workspace=self.workspace,
++            size_n=self.size_n,
++            size_k=self.size_k,
++            bias=None,
++        )
++
++    def nbytes(self) -> int:
++        return (
++            self.qweight.numel() * self.qweight.element_size()
++            + self.scale.numel() * self.scale.element_size()
++        )
+diff --git a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+index 4889e9a..d10a179 100644
+--- a/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/mtp/speculator.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import torch.nn as nn
+ 
+ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+@@ -18,6 +20,16 @@ class MTPSpeculator(AutoRegressiveSpeculator):
+         target_attn_layer_names: set[str],
+     ) -> nn.Module:
+         draft_model = load_eagle_model(target_model, self.vllm_config)
++        if os.environ.get("VLLM_QWEN38_DRAFT_HEAD_FP8", "0") == "1":
++            # Weight-only fp8 lm_head copy for draft logits only (the target's
++            # verification head stays bf16). Built here: before CUDA-graph
++            # capture. Unsupported drafters fail at start-up.
++            if not hasattr(draft_model, "build_fp8_draft_head"):
++                raise ValueError(
++                    "VLLM_QWEN38_DRAFT_HEAD_FP8=1 is not supported by "
++                    f"{type(draft_model).__name__}"
++                )
++            draft_model.build_fp8_draft_head()
+         spec_config = self.vllm_config.speculative_config
+         draft_hf_config = (
+             spec_config.draft_model_config.hf_config

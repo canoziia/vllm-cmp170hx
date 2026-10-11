@@ -1,3 +1,7 @@
 0002-generated-history-checkpoints-pp2.patch
 0003-qsa-fixed-logits-workspace.patch
 0004-qsa-dynamic-mtp-block-alignment.patch
+0005-single-kernel-moe-align.patch
+0006-mtp-draft-head-fp8.patch
+0007-thin-m-bf16-gemm.patch
+0008-ple-native-ngram-hash.patch
