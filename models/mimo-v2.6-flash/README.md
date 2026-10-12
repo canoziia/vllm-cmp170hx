@@ -46,7 +46,7 @@ shared and adaptive series applied exactly as for that image, then
 | 0008-pp-deferred-feedback-recv | PP sampled/draft feedback receive posted when consumed (generic PP, switch) |
 | 0009-mimo-v2-mxfp4-moe-decode | weight-streaming MXFP4 MoE decode kernels for MiMo's experts (`native/mimo_moe`, built into the image) |
 | 0010-diffkv-prefill-block-m | TRITON_ATTN_DIFFKV prefill query tiles and qk head-dim split |
-| 0011-diffkv-spec-verify-split-kv | split-KV (3D) attention for MTP verification on full-attention layers |
+| 0011-diffkv-spec-verify-split-kv | split-KV decode and MTP verification on full-attention layers |
 
 The pinned tree already has everything else: `MiMoV2OmniForCausalLM` (the
 checkpoint has `vision_config`, so vLLM loads text + vision + audio), the
@@ -145,7 +145,7 @@ unless it is already set; unset/off leaves every patch at its own default
 | 0008 | `VLLM_PP_DEFERRED_FEEDBACK_RECV` | 1 | PP feedback receive posted when consumed: no NCCL spin under Marlin MoE on ranks 0-2 (fixed k1 prose c32 31.8 -> 35.4, k3 26.1 -> 29.7) |
 | 0009 | `VLLM_MIMO26_MXFP4_DECODE` + `VLLM_MIMO26_MXFP4_V2` + `VLLM_MIMO26_MXFP4_DQ=2` | 1 / 1 / 2 | weight-streaming MXFP4 MoE decode (DeepSeek kernels for MiMo's shape, fused act/sum, cheaper dequant; error = Marlin's, greedy divergences only at near-ties): c1 +9 %, c8 +5-18 %, c32 +25-40 % vs Marlin |
 | 0010 | `VLLM_MIMO26_DIFFKV_PREFILL_BM` + `VLLM_MIMO26_DIFFKV_QK_SPLIT` | 128 / 1 | prefill attention: 8 query tokens per program instead of 1 (error vs fp64 equal, greedy divergences only at near-ties; 64 = bitwise alternative) and qk 192 = 128 + 64 instead of padding to 256 (bitwise): see the prefill table below |
-| 0011 | `VLLM_MIMO26_DIFFKV_SPEC_3D` | 1 | MTP verification (1 + k query tokens) on the 9 full-attention layers uses the split-KV 3D kernel instead of one program per query token walking the whole KV prefix; long-context c1 decode below; outputs differ at rounding level |
+| 0011 | `VLLM_MIMO26_DIFFKV_SPEC_3D` + `_SPEC_BM` + `VLLM_MIMO26_DIFFKV_SEGMENTS` | 1 / 1 / 128 | long-context decode on the 9 full-attention layers: MTP verification uses the split-KV 3D kernel, one program per sequence for all 1 + k verify tokens (64-key tiles, qk split), 128 split-KV segments instead of 16; see "Long-context decode"; outputs differ at rounding level |
 
 Not in the profile but set in `.env` (measured on top of the profile):
 
@@ -185,30 +185,31 @@ peak of ~145 on this card.
 
 ## Long-context decode (0011)
 
-MTP verification sends 1 + k query tokens per request; the TRITON_ATTN_DIFFKV
+MTP verification sends 1 + k query tokens per request. The TRITON_ATTN_DIFFKV
 launcher ran those steps with the 2D kernel (one program per query token and
 kv head walking the whole KV prefix), so c1 decode slowed by about 0.47 ms per
-1k context tokens. 0011 runs them with the existing split-KV 3D kernel on the
-9 full-attention layers. One global layer, c1, 4 query tokens: 55k context
-3.70 -> 0.88 ms, 134k 7.79 -> 1.62 ms, 268k 14.29 -> 3.20 ms.
+1k context tokens. 0011, on the 9 full-attention layers: verify steps use the
+split-KV 3D kernel, one program covers all 1 + k tokens of a sequence (each KV
+tile read once; 64-key tiles, qk split), and 128 split-KV segments instead of
+16. One global layer, c1, 4 query tokens, 2D -> 0011: 55k 3.70 -> 0.34 ms,
+134k 7.25 -> 0.53, 268k 14.28 -> 0.94, 512k 27.61 -> 1.74 (error vs fp64
+equal).
 
-PD on 8401, c1, thinking off, 500 tokens (decode tok/s / ms per step):
+PD on 8401, c1, thinking off, 500 tokens, ms per decode step:
 
-| prompt tokens | before | 0011 |
+| prompt tokens | 2D (before) | 0011 |
 |---|---|---|
-| 7.3k | 93.7 / 23.6 | 119.2 / 21.1 |
-| 22k | 77.5 / 30.2 | 96.4 / 22.2 |
-| 45k | 55.3 / 42.5 | 89.1 / 23.7 |
-| 111k | 29.3 / 71.2 | 91.7 / 30.2 |
-| 273k | 14.2 / 148.3 | 47.8 / 45.0 |
+| 7.3k | 23.6 | 19.9 |
+| 45k | 42.5 | 20.3 |
+| 111k | 71.2 | 23.0 |
+| 273k | 148.3 | 27.0 |
+| 520k | not measured | 31.6 |
 
-tok/s also moves with acceptance (2.1-2.8 tokens/step on these texts); ms
-per step is the kernel effect (now about +0.09 ms per 1k tokens). Short
-context, decode port, full-batch tok/s against the same configuration without
-0011: code c8/c32 829 / 2327 vs 823 / 2315, counting 864 / 2512 vs 860 / 2525,
-prose c8 561 vs 564, prose c32 1279 (sd 38, 6 rounds) vs 1335 (sd 47, 5
-rounds), about -4 %. Outputs differ from the 2D kernel at rounding level;
-greedy texts first diverge at near-ties (logprob margin 0.125).
+Short context, decode port, full-batch tok/s against the same configuration
+without 0011: c8 code / counting / prose 829 / 847 / 554 vs 823 / 860 / 564;
+c32 2264 / 2451 / 1266 vs 2315 / 2525 / 1335 (prose 6 rounds, sd 78 vs 47),
+i.e. c32 2-5 % lower, inside about one standard deviation. Greedy texts
+diverge from the 2D kernel only at near-ties (logprob margin <= 0.125).
 
 ## Prefill/decode with LMCache (`compose.pd.yml`)
 

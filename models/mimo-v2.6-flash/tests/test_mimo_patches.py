@@ -107,6 +107,10 @@ _diffkv = (root / "vllm/v1/attention/ops/triton_unified_attention_diffkv.py").re
 assert '"VLLM_MIMO26_DIFFKV_SPEC_3D", "0") == "1"' in _diffkv
 assert "and window_size[0] < 0" in _diffkv
 assert '"VLLM_MIMO26_DIFFKV_SPEC_3D": "1"' in prof
+assert '"VLLM_MIMO26_DIFFKV_SPEC_BM": "1"' in prof and '"VLLM_MIMO26_DIFFKV_SEGMENTS": "128"' in prof
+assert '"VLLM_MIMO26_DIFFKV_SPEC_BM", "0") == "1"' in _diffkv
+assert '"VLLM_MIMO26_DIFFKV_SEGMENTS", "0"' in (
+    root / "vllm/v1/attention/backends/triton_attn_diffkv.py").read_text()
 
 # Upstream pieces the deployment relies on (fail loudly if a rebase drops them).
 assert '"MiMoV2ForCausalLM": ("mimo_v2", "MiMoV2ForCausalLM")' in (
