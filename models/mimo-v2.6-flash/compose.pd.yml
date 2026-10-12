@@ -1,0 +1,233 @@
+# XiaomiMiMo/MiMo-V2.6-Flash-MOPD prefill/decode pair: PP4 prefill on four
+# CMP 170HX GPUs, PP4 decode on four more, one LMCache server, PD router.
+# Same image, partition, profile and MTP3 on both engines (the prefill engine
+# also computes the MTP heads' prompt KV, which the decode engine's drafter
+# reads back through LMCache).
+#
+# Images: scripts/build-mimo-v26-image.sh (engine; carries the shared patched
+# LMCache payload), scripts/build-lmcache-server-image.sh (server, same
+# payload), scripts/build-router-image.sh (router).
+#
+# .env (0600, not committed): see .env.example (PD block), shared with
+# compose.yml. Run either compose.yml (single engine) or this file, not both.
+# Start: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
+# Restart: `podman compose -f compose.pd.yml down` first (podman-compose
+# recreates every container on `up`).
+x-podman:
+  in_pod: false
+
+services:
+  mimo-v2.6-flash-lmcache:
+    image: ${LMCACHE_IMAGE:?set LMCACHE_IMAGE}
+    container_name: mimo-v2.6-flash-lmcache
+    restart: "no"
+    # the default 10 s is too short for the server to exit, it is then killed
+    stop_grace_period: 1m
+    entrypoint: ["lmcache"]
+    network_mode: host
+    ipc: host
+    devices:
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_0:?set MIMO_PREFILL_GPU_0}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_1:?set MIMO_PREFILL_GPU_1}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_2:?set MIMO_PREFILL_GPU_2}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_3:?set MIMO_PREFILL_GPU_3}
+      - nvidia.com/gpu=${MIMO_GPU_0:?set MIMO_GPU_0}
+      - nvidia.com/gpu=${MIMO_GPU_1:?set MIMO_GPU_1}
+      - nvidia.com/gpu=${MIMO_GPU_2:?set MIMO_GPU_2}
+      - nvidia.com/gpu=${MIMO_GPU_3:?set MIMO_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTHONUNBUFFERED: "1"
+      LMCACHE_MERGE_BOUNDED_PD: "${LMCACHE_MERGE_BOUNDED_PD:-0}"
+      # LMCache 0010: MiMo's SWA-128 groups (16-token blocks) must be stored as
+      # full chunks; the sub-chunk window path reloads wrong KV for them.
+      LMCACHE_FULL_SW_KV: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:?set LMCACHE_L2_PATH}:/lmcache-l2
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=${MIMO_LMCACHE_PORT:?set MIMO_LMCACHE_PORT}
+      - --http-host=127.0.0.1
+      - --http-port=${MIMO_LMCACHE_HTTP_PORT:?set MIMO_LMCACHE_HTTP_PORT}
+      - --chunk-size=${MIMO_LMCACHE_CHUNK:?set MIMO_LMCACHE_CHUNK}
+      - --separate-object-groups
+      - --l1-size-gb=${MIMO_LMCACHE_L1_GB:?set MIMO_LMCACHE_L1_GB}
+      - --eviction-policy=LRU
+      - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${MIMO_LMCACHE_L2_GB:?set MIMO_LMCACHE_L2_GB},"adopt_existing":true,"eviction":{"eviction_policy":"LRU","trigger_watermark":0.6,"eviction_ratio":0.2}}'
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_LMCACHE_HTTP_PORT}/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+
+  mimo-v2.6-flash-prefill:
+    image: ${MIMO_IMAGE:?set MIMO_IMAGE}
+    container_name: mimo-v2.6-flash-prefill
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_0}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_1}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_2}
+      - nvidia.com/gpu=${MIMO_PREFILL_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${MIMO_MODEL_DIR:?set MIMO_MODEL_DIR}:/models/MiMo-V2.6-Flash-MOPD:ro
+      - ${MIMO_VLLM_CACHE_PREFILL:?set MIMO_VLLM_CACHE_PREFILL}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_PP_LAYER_PARTITION: "${MIMO_PP_LAYER_PARTITION:?set MIMO_PP_LAYER_PARTITION}"
+      VLLM_MIMO26_OPT_PROFILE: "${VLLM_MIMO26_OPT_PROFILE}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+      LMCACHE_MERGE_BOUNDED_PD: "${LMCACHE_MERGE_BOUNDED_PD:-0}"
+      # same cohort rule as the decode engine (see there)
+      VLLM_PP_DECODE_COHORT_LIVE_LOAD: "1"
+    command:
+      - /models/MiMo-V2.6-Flash-MOPD
+      - --host=0.0.0.0
+      - --port=${MIMO_PREFILL_PORT:?set MIMO_PREFILL_PORT}
+      - --served-model-name=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --generation-config=vllm
+      - --max-model-len=${MIMO_MAX_MODEL_LEN:?set MIMO_MAX_MODEL_LEN}
+      - --max-num-seqs=${MIMO_MAX_NUM_SEQS:?set MIMO_MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${MIMO_MAX_NUM_BATCHED_TOKENS:?set MIMO_MAX_NUM_BATCHED_TOKENS}
+      - --kv-cache-memory=${MIMO_KV_CACHE_MEMORY:?set MIMO_KV_CACHE_MEMORY}
+      - --enable-prefix-caching
+      # SWA groups: LMCache needs the window state retained at every chunk boundary
+      - --prefix-cache-retention-interval=${MIMO_LMCACHE_CHUNK}
+      - --speculative-config=${MIMO_SPECULATIVE_CONFIG:?set MIMO_SPECULATIVE_CONFIG}
+      - --disable-custom-all-reduce
+      - --enable-auto-tool-choice
+      - --tool-call-parser=mimo
+      - --reasoning-parser=mimo
+      - --enable-prompt-tokens-details
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":${MIMO_PREFILL_KV_PORT:?set MIMO_PREFILL_KV_PORT},"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${MIMO_LMCACHE_PORT}}}'
+      # drain on stop so every worker unregisters its KV cache from LMCache
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_PREFILL_PORT}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40m
+      retries: 3
+
+  mimo-v2.6-flash-decode:
+    image: ${MIMO_IMAGE}
+    container_name: mimo-v2.6-flash-decode
+    restart: "no"
+    network_mode: host
+    ipc: host
+    stop_grace_period: 2m
+    devices:
+      - nvidia.com/gpu=${MIMO_GPU_0}
+      - nvidia.com/gpu=${MIMO_GPU_1}
+      - nvidia.com/gpu=${MIMO_GPU_2}
+      - nvidia.com/gpu=${MIMO_GPU_3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${MIMO_MODEL_DIR}:/models/MiMo-V2.6-Flash-MOPD:ro
+      - ${MIMO_VLLM_CACHE:?set MIMO_VLLM_CACHE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+      TRITON_CACHE_DIR: /root/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/inductor
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      VLLM_PP_LAYER_PARTITION: "${MIMO_PP_LAYER_PARTITION}"
+      VLLM_MIMO26_OPT_PROFILE: "${VLLM_MIMO26_OPT_PROFILE}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-0}"
+      LMCACHE_MERGE_BOUNDED_PD: "${LMCACHE_MERGE_BOUNDED_PD:-0}"
+      # Requests become runnable together when their LMCache load completes;
+      # bound each decode micro-batch by the live load so they spread over
+      # the four PP stages (otherwise c8 runs as one batch, ~2x step period).
+      VLLM_PP_DECODE_COHORT_LIVE_LOAD: "1"
+    command:
+      - /models/MiMo-V2.6-Flash-MOPD
+      - --host=0.0.0.0
+      - --port=${MIMO_DECODE_PORT:?set MIMO_DECODE_PORT}
+      - --served-model-name=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+      - --pipeline-parallel-size=4
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --generation-config=vllm
+      - --max-model-len=${MIMO_MAX_MODEL_LEN}
+      - --max-num-seqs=${MIMO_MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${MIMO_MAX_NUM_BATCHED_TOKENS}
+      - --kv-cache-memory=${MIMO_KV_CACHE_MEMORY}
+      - --enable-prefix-caching
+      # SWA groups: LMCache needs the window state retained at every chunk boundary
+      - --prefix-cache-retention-interval=${MIMO_LMCACHE_CHUNK}
+      - --speculative-config=${MIMO_SPECULATIVE_CONFIG}
+      - --disable-custom-all-reduce
+      - --enable-auto-tool-choice
+      - --tool-call-parser=mimo
+      - --reasoning-parser=mimo
+      - --enable-prompt-tokens-details
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":${MIMO_DECODE_KV_PORT:?set MIMO_DECODE_KV_PORT},"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${MIMO_LMCACHE_PORT}}}'
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_DECODE_PORT}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40m
+      retries: 3
+
+  mimo-v2.6-flash-pd-router:
+    # patches/router/ (scripts/build-router-image.sh): merges both hops' usage.
+    image: ${ROUTER_IMAGE:?set ROUTER_IMAGE}
+    container_name: mimo-v2.6-flash-pd-router
+    restart: "no"
+    network_mode: host
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    entrypoint: ["vllm-router"]
+    environment:
+      OPENAI_API_KEY: ${VLLM_API_KEY}
+      PYTHONUNBUFFERED: "1"
+    command:
+      - --service-discovery=static
+      - --static-backends=http://127.0.0.1:${MIMO_PREFILL_PORT},http://127.0.0.1:${MIMO_DECODE_PORT}
+      - --static-models=XiaomiMiMo/MiMo-V2.6-Flash-MOPD,XiaomiMiMo/MiMo-V2.6-Flash-MOPD
+      - --static-model-labels=prefill,decode
+      - --prefill-model-labels=prefill
+      - --decode-model-labels=decode
+      - --routing-logic=disaggregated_prefill
+      - --host=0.0.0.0
+      - --port=${MIMO_PD_PORT:?set MIMO_PD_PORT}
