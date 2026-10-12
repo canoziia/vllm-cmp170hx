@@ -13,6 +13,9 @@ Two deployments, same image and `.env`, both serving port **8401** as
 - `compose.pd.yml`: prefill/decode pair on eight GPUs with LMCache and the PD
   router (section "Prefill/decode with LMCache").
 
+Both require `Authorization: Bearer $VLLM_API_KEY` on 8401 (the router checks it
+since `patches/router/0002`; only `/health` is open).
+
 ```bash
 # engine image; REBUILD_LMCACHE_IMAGE=1 when patches/lmcache changed (shared server image)
 CONTAINER_ENGINE=podman REBUILD_LMCACHE_IMAGE=1 bash scripts/build-mimo-v26-image.sh
