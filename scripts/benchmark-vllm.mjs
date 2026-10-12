@@ -190,6 +190,13 @@ async function discoverModel(c) {
   return model;
 }
 
+// Every concurrent request of a run sends the same prompt (except --mode
+// prefill), so with temperature 0 all outputs are identical. Step rates under
+// concurrency on such a load can be unstable and need not match a realistic,
+// diverse load: on MiMo-V2.6 PD (c32) the decode engine without a KV
+// connector was sometimes much faster on identical prompts, while with 32
+// different prompts the connector cost about 2 %. Keep this in mind when
+// comparing deployments.
 async function oneRequest(c, model, concurrency, index) {
   const prompt = c.promptFile ? readFileSync(c.promptFile, "utf8").trim()
     : c.mode === "prefill"
