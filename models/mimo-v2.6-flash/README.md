@@ -6,14 +6,19 @@
 (the RL release has the tool-call repetition problem the MOPD distillation
 mitigates).
 
-Single engine, PP4 on four GPUs, container `mimo-v2.6-flash`, port **8401**,
-served name `XiaomiMiMo/MiMo-V2.6-Flash-MOPD`.
+Two deployments, same image and `.env`, both serving port **8401** as
+`XiaomiMiMo/MiMo-V2.6-Flash-MOPD` (run one of them):
+
+- `compose.yml`: single engine, PP4 on four GPUs, container `mimo-v2.6-flash`;
+- `compose.pd.yml`: prefill/decode pair on eight GPUs with LMCache and the PD
+  router (section "Prefill/decode with LMCache").
 
 ```bash
-CONTAINER_ENGINE=podman bash scripts/build-mimo-v26-image.sh   # localhost/vllm-backport:mimo-v2.6-flash
+# engine image; REBUILD_LMCACHE_IMAGE=1 when patches/lmcache changed (shared server image)
+CONTAINER_ENGINE=podman REBUILD_LMCACHE_IMAGE=1 bash scripts/build-mimo-v26-image.sh
 cd models/mimo-v2.6-flash
 cp .env.example .env && chmod 600 .env                          # VLLM_API_KEY, GPUs, paths
-podman compose -f compose.yml --podman-run-args=--ipc=host up -d
+podman compose -f compose.yml --podman-run-args=--ipc=host up -d      # or compose.pd.yml
 ```
 
 `--podman-run-args=--ipc=host` is required: podman-compose otherwise starts the
@@ -172,6 +177,73 @@ Long-prompt prefill is bounded by the 9 global-attention layers (rank 0
 holds three of them; 9 over 4 ranks always leaves one rank with three). The
 prefill attention kernel runs at ~94 TFLOP/s against a measured bf16 GEMM
 peak of ~145 on this card.
+
+## Prefill/decode with LMCache (`compose.pd.yml`)
+
+| container | GPUs | port |
+|---|---|---|
+| `mimo-v2.6-flash-pd-router` (vllm-router, `disaggregated_prefill`) | - | 8401 (`MIMO_PD_PORT`) |
+| `mimo-v2.6-flash-prefill` | 1-4 | 8402 |
+| `mimo-v2.6-flash-decode` | 5-8 | 8403 |
+| `mimo-v2.6-flash-lmcache` (shared `localhost/lmcache-server` image) | all eight | 5561 / http 18561 |
+
+Both engines use the same image, profile, partition and MTP3; KV moves through
+LMCache (L2 `fs_native` at `LMCACHE_L2_PATH`). Settings that matter:
+
+- **LMCache 0010, `LMCACHE_FULL_SW_KV=1` (server):** required for correctness.
+  The default sub-chunk sliding-window path reloads wrong KV for MiMo's
+  SWA-128 groups (16-token blocks): every reload decoded garbage (3k/8k
+  prompts, same engine and prefill -> decode); with full chunks every reload
+  matches the GPU-prefix-hit run token for token, logprobs included.
+- **`--prefix-cache-retention-interval` = chunk (256):** LMCache refuses
+  sliding-window models without a state checkpoint at every chunk boundary.
+- **`VLLM_PP_DECODE_COHORT_LIVE_LOAD=1` (prefill and decode):** see measurements below.
+
+### Measurements (decode engine on GPU5-8, official image, same day)
+
+Metric: the benchmark's full-batch figures (only the interval in which every
+request is decoding: from the last first token to the first finish), 3 rounds
+plus 2 warm-up, 2 more rounds where the spread exceeded 3 %; direct to the
+decode port, `enable_thinking=false`, 500 tokens. Values are full-batch
+tok/s, mean (sd).
+
+| decode config | code c8 | counting c8 | prose c8 | code c32 | counting c32 | prose c32 |
+|---|---|---|---|---|---|---|
+| A no connector, LIVE off (= single engine) | 764 (99) | 924 (103) | 439 (18) | 2549 (46) | 2660 (125) | 1430 (87) |
+| B no connector, LIVE on | 835 (5) | 858 (24) | 545 (6) | 2458 (65) | 2470 (44) | 1411 (53) |
+| C LMCache, LIVE off | 723 (61) | 835 (90) | 541 (37) | 2291 (100) | 2425 (70) | 1318 (87) |
+| D LMCache, LIVE on (deployed) | 823 (14) | 860 (16) | 564 (19) | 2315 (46) | 2525 (79) | 1335 (47) |
+
+- **The c32 gap in this table is specific to the benchmark's workload.**
+  `scripts/benchmark-vllm.mjs` sends the same prompt to all 32 requests
+  (greedy, so 32 identical outputs) with a per-request `cache_salt`. On that
+  workload the engine without a connector is unstable and sometimes much
+  faster (stream steps/s per request over the full-batch window, code c32,
+  500 tokens: 14.8, 15.4, 17.4, 22.8), while the LMCache engine stays at
+  15.3-16.3. With 32 different prompts both are the same within the spread:
+  13.5-14.8 (mean 13.9, 7 rounds) without vs 13.2-14.1 (mean 13.6, 9 rounds)
+  with the connector. Why identical sequences sometimes step much faster
+  without the connector is **not measured**. Ruled out for the table's gap:
+  cohorts ([8, 8, 8, 8] in every c32 round), drafted width (code 3.00 every
+  round; fixed k3 prose shows the same gap), acceptance, GPU clocks (mean
+  c32 SM clock within 1.5 %), per-request `cache_salt`/`return_token_ids`
+  (no consistent effect), the LMCache server process (pausing it changes
+  nothing), block-allocation reports, scheduler and worker CPU (py-spy
+  within about 1 %).
+- **LIVE_LOAD:** without it, c8 throughput depends on how the eight
+  requests happen to split into PP cohorts: code c8 rounds with cohorts
+  [5, 2, 1] gave 716-726 tok/s, one round with [6, 1, 1] gave 941, LIVE_LOAD
+  always gives [2, 2, 2, 2] and 831-844 (sd 1 % instead of 13 %). With the
+  LMCache connector LIVE_LOAD is equal or better in every cell (D vs C), so
+  it is on for both PD engines. Without a connector it costs c32
+  (B vs A: counting -7 %), so it is not part of the single-engine profile.
+- Run-to-run spread at c32 (same config) partly follows GPU clocks under
+  the 180 W limit (SM clock 1101-1222 MHz across rounds of the same config).
+- Correctness: short-prompt texts identical to the single engine;
+  cross-engine answers correct at 3k/8k/20k/32k.
+- TTFT through the router is above the single engine (8k 4.0 s vs 2.2 s,
+  32k 9.3 s vs 5.6 s, 131k 42 s vs 27 s); decode only sees chunks whose store
+  completed (an 8k prompt is fully visible about 0.5 s after prefill returns).
 
 ## DFlash drafter (0006, experimental)
 
