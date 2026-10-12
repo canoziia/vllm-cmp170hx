@@ -26,6 +26,10 @@ services:
     entrypoint: ["lmcache"]
     network_mode: host
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
     devices:
       - nvidia.com/gpu=${MIMO_PREFILL_GPU_0:?set MIMO_PREFILL_GPU_0}
       - nvidia.com/gpu=${MIMO_PREFILL_GPU_1:?set MIMO_PREFILL_GPU_1}
@@ -73,6 +77,10 @@ services:
     restart: "no"
     network_mode: host
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
     stop_grace_period: 2m
     devices:
       - nvidia.com/gpu=${MIMO_PREFILL_GPU_0}
@@ -144,6 +152,10 @@ services:
     restart: "no"
     network_mode: host
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
     stop_grace_period: 2m
     devices:
       - nvidia.com/gpu=${MIMO_GPU_0}

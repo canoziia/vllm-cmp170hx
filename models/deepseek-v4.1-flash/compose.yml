@@ -21,6 +21,10 @@ services:
     # and expose only 64 MiB /dev/shm, so start with --podman-run-args=--ipc=host
     # as well (see README).
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
 
     devices:
       - nvidia.com/gpu=${DSV41_GPU_0:-0}
@@ -118,6 +122,10 @@ services:
     restart: "no"
     network_mode: host
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
     devices:
       - nvidia.com/gpu=${DSV41_GPU_0:-0}
       - nvidia.com/gpu=${DSV41_GPU_1:-1}
