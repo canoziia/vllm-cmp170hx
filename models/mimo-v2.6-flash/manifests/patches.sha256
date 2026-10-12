@@ -1,4 +1,4 @@
-16b53a3a6129df1be59d59af9805404109f9fd296943bf3f8fe50c94e7d4727b  models/mimo-v2.6-flash/patches/series
+d0f1e145ada6f86649ae967ad1257d255f9e7fa2dc75044bd230dfac2f294b9e  models/mimo-v2.6-flash/patches/series
 e8a1308f4843c6b43c5ad348d21d3ee7a3c3f2abd7481800afada41c55f0ac2f  models/mimo-v2.6-flash/patches/0001-mimo-v2-fp8-qkv-checkpoint-shards.patch
 776112223f39aa0110fb1020df3cdecbf555c23e223556d79f82e528063e0355  models/mimo-v2.6-flash/patches/0002-mimo-v2-multi-layer-mtp.patch
 769aa966d94f1dbcb354f3bff479f114dbf30bfe0199d98d78d402bd43ced75f  models/mimo-v2.6-flash/patches/0003-mimo26-opt-profile.patch
@@ -9,3 +9,4 @@ e8a1308f4843c6b43c5ad348d21d3ee7a3c3f2abd7481800afada41c55f0ac2f  models/mimo-v2
 05a8bd08ae901e394c30e787f079e7d5bf262623274064bbaa3a0fec4ae0d956  models/mimo-v2.6-flash/patches/0008-pp-deferred-feedback-recv.patch
 b5c0a885aaf46a537e70de8145d5a183f5401253a1a15cb88f7db51264645dfb  models/mimo-v2.6-flash/patches/0009-mimo-v2-mxfp4-moe-decode.patch
 521e5cc5fe8f2bd07f8cc849b578129a454d56881c0f20efb376ac8a519a627a  models/mimo-v2.6-flash/patches/0010-diffkv-prefill-block-m.patch
+0c38ab70f989c654bd0289cf19afc07500e6ad00d3687a150975ce3481f6a0aa  models/mimo-v2.6-flash/patches/0011-diffkv-spec-verify-split-kv.patch

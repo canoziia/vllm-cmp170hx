@@ -46,6 +46,7 @@ shared and adaptive series applied exactly as for that image, then
 | 0008-pp-deferred-feedback-recv | PP sampled/draft feedback receive posted when consumed (generic PP, switch) |
 | 0009-mimo-v2-mxfp4-moe-decode | weight-streaming MXFP4 MoE decode kernels for MiMo's experts (`native/mimo_moe`, built into the image) |
 | 0010-diffkv-prefill-block-m | TRITON_ATTN_DIFFKV prefill query tiles and qk head-dim split |
+| 0011-diffkv-spec-verify-split-kv | split-KV (3D) attention for MTP verification on full-attention layers |
 
 The pinned tree already has everything else: `MiMoV2OmniForCausalLM` (the
 checkpoint has `vision_config`, so vLLM loads text + vision + audio), the
@@ -144,6 +145,7 @@ unless it is already set; unset/off leaves every patch at its own default
 | 0008 | `VLLM_PP_DEFERRED_FEEDBACK_RECV` | 1 | PP feedback receive posted when consumed: no NCCL spin under Marlin MoE on ranks 0-2 (fixed k1 prose c32 31.8 -> 35.4, k3 26.1 -> 29.7) |
 | 0009 | `VLLM_MIMO26_MXFP4_DECODE` + `VLLM_MIMO26_MXFP4_V2` + `VLLM_MIMO26_MXFP4_DQ=2` | 1 / 1 / 2 | weight-streaming MXFP4 MoE decode (DeepSeek kernels for MiMo's shape, fused act/sum, cheaper dequant; error = Marlin's, greedy divergences only at near-ties): c1 +9 %, c8 +5-18 %, c32 +25-40 % vs Marlin |
 | 0010 | `VLLM_MIMO26_DIFFKV_PREFILL_BM` + `VLLM_MIMO26_DIFFKV_QK_SPLIT` | 128 / 1 | prefill attention: 8 query tokens per program instead of 1 (error vs fp64 equal, greedy divergences only at near-ties; 64 = bitwise alternative) and qk 192 = 128 + 64 instead of padding to 256 (bitwise): see the prefill table below |
+| 0011 | `VLLM_MIMO26_DIFFKV_SPEC_3D` | 1 | MTP verification (1 + k query tokens) on the 9 full-attention layers uses the split-KV 3D kernel instead of one program per query token walking the whole KV prefix; long-context c1 decode below; outputs differ at rounding level |
 
 Not in the profile but set in `.env` (measured on top of the profile):
 
