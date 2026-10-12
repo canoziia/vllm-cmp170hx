@@ -14,6 +14,29 @@ ValueError. Fold the index into [0, world_size) for that case and log the
 resolution (instance, model, device, hint, result) so a mis-derivation is
 diagnosable from the server log.
 
+The hint itself never arrived: the REGISTER_KV_CACHE payload is decoded into
+the LayoutHints TypedDict and msgspec drops keys it does not declare, so the
+server always logged hint=None and fell back to the device index even though
+the client (0005) sends mp_worker_rank. Declare mp_worker_rank in LayoutHints.
+
+--- a/lmcache/v1/gpu_connector/kv_format/types.py
++++ b/lmcache/v1/gpu_connector/kv_format/types.py
+@@ -52,6 +52,10 @@
+             daemon-side un-flattening and 3-D to 4-D reshaping even when
+             tensor parallelism leaves one KV head per rank.
+         head_dim: Per-head dimension. Used by TRT-LLM (same).
++        mp_worker_rank: Logical worker (PP/TP) rank of the registering MP
++            worker. The REGISTER_KV_CACHE payload is decoded into this
++            TypedDict, which drops undeclared keys, so the rank must be
++            declared here to reach the server.
+     """
+ 
+     kv_layout: KVLayoutName
+@@ -59,3 +63,4 @@
+     tokens_per_block: int
+     kv_list_layout: Literal["k_v"]
+     head_dim: int
++    mp_worker_rank: int
 --- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
 +++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
 @@ -992,11 +992,33 @@

@@ -168,5 +168,15 @@ class RegressionTests(unittest.TestCase):
                 adapter.close()
 
 
+    def test_register_payload_keeps_mp_worker_rank(self):
+        # 0008: REGISTER_KV_CACHE decodes layout hints into LayoutHints; an
+        # undeclared mp_worker_rank was silently dropped (server saw hint=None).
+        import msgspec
+        from lmcache.v1.gpu_connector.utils import LayoutHints
+        raw = msgspec.msgpack.encode({"kv_layout": "NHD", "mp_worker_rank": 3})
+        self.assertEqual(msgspec.msgpack.decode(raw, type=LayoutHints),
+                         {"kv_layout": "NHD", "mp_worker_rank": 3})
+
+
 if __name__ == "__main__":
     unittest.main()
