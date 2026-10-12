@@ -11,3 +11,4 @@
 0008-pp-deferred-feedback-recv.patch
 0009-mimo-v2-mxfp4-moe-decode.patch
 0010-diffkv-prefill-block-m.patch
+0011-diffkv-spec-verify-split-kv.patch

@@ -1,0 +1,69 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] diffkv attention: split-KV (3D) launch for MTP verification
+
+VLLM_MIMO26_DIFFKV_SPEC_3D=1 (default 0 = unchanged; on in profile default).
+The TRITON_ATTN_DIFFKV launcher takes the split-KV 3D kernel only for
+max_seqlen_q == 1, so MTP verification (1 + k query tokens per request) runs
+the 2D kernel: with MiMo's GQA 16 that is one program per (query token, kv
+head) walking the whole KV prefix, a few programs on 104 SMs. Verify steps on
+full-attention layers now also use the 3D kernel when 1 < max_seqlen_q <= 16,
+the batch has at most seq_threshold_3D sequences and its tokens fit the
+preallocated segment buffers. The 3D kernel and its reduction already store
+and combine partials per query token. The choice depends only on the batch
+shape, so each CUDA graph captures one fixed path. Sliding-window layers are
+left on the 2D kernel (their 128-token window gains nothing).
+
+One global layer (64 q / 4 kv heads, qk 192, v 128), c1 with 4 query tokens:
+8k 0.62 -> 0.21 ms, 55k 3.70 -> 0.88, 134k 7.79 -> 1.62, 268k 14.29 -> 3.20;
+c8 (32 tokens) 55k 4.38 -> 3.95. Outputs differ from the 2D kernel at
+rounding level (max |diff| <= 4.9e-4), always finite.
+---
+diff --git a/vllm/mimo26_opt_profile.py b/vllm/mimo26_opt_profile.py
+index f6fea83..6072e78 100644
+--- a/vllm/mimo26_opt_profile.py
++++ b/vllm/mimo26_opt_profile.py
+@@ -36,6 +36,9 @@ PROFILES: dict[str, dict[str, str]] = {
+         # dim split 128 + 64 instead of padding to 256 (bitwise equal)
+         "VLLM_MIMO26_DIFFKV_PREFILL_BM": "128",
+         "VLLM_MIMO26_DIFFKV_QK_SPLIT": "1",
++        # 0011 MTP verification on full-attention layers uses split-KV (3D)
++        # attention (c1 at 55k context: 3.7 -> 0.9 ms per global layer)
++        "VLLM_MIMO26_DIFFKV_SPEC_3D": "1",
+     },
+ }
+ 
+diff --git a/vllm/v1/attention/ops/triton_unified_attention_diffkv.py b/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
+index 2bbb1bc..bd53b78 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
++++ b/vllm/v1/attention/ops/triton_unified_attention_diffkv.py
+@@ -510,6 +510,30 @@ def unified_attention_diffkv(
+         or num_seqs > seq_threshold_3D
+         or is_batch_invariant
+     )
++    # VLLM_MIMO26_DIFFKV_SPEC_3D=1 (default 0 = unchanged): MTP verification
++    # launches (1 < max_seqlen_q <= 16 query tokens per sequence) also use the
++    # split-KV 3D kernel when the batch fits the preallocated segment buffers.
++    # The 2D kernel gives each (query token, kv head) ONE program that walks
++    # the whole KV prefix, so a c1 verify step over a long context runs on a
++    # handful of SMs; the 3D kernel and its reduction already index partials
++    # per query token. The path depends only on the batch shape, so every
++    # CUDA graph captures one fixed path. Full-attention layers only: the
++    # sliding-window (128) layers read a short window either way.
++    if (
++        not use_3d
++        and window_size[0] < 0
++        and os.environ.get("VLLM_MIMO26_DIFFKV_SPEC_3D", "0") == "1"
++        and 1 < max_seqlen_q <= 16
++        and softmax_segm_output is not None
++        and softmax_segm_max is not None
++        and softmax_segm_expsum is not None
++        and num_par_softmax_segments is not None
++        and seq_threshold_3D is not None
++        and num_seqs <= seq_threshold_3D
++        and q.shape[0] <= softmax_segm_output.shape[0]
++        and not is_batch_invariant
++    ):
++        use_3d = True
+ 
+     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
+     # smaller tiles to expose more parallelism along the KV dim.

@@ -102,6 +102,12 @@ assert "_K, _NI = 4096, 2048" in (
 assert '"VLLM_MIMO26_DIFFKV_PREFILL_BM", "0"' in (
     root / "vllm/v1/attention/ops/triton_unified_attention_diffkv.py").read_text()
 
+# 0011: split-KV (3D) attention for MTP verification, on in the profile.
+_diffkv = (root / "vllm/v1/attention/ops/triton_unified_attention_diffkv.py").read_text()
+assert '"VLLM_MIMO26_DIFFKV_SPEC_3D", "0") == "1"' in _diffkv
+assert "and window_size[0] < 0" in _diffkv
+assert '"VLLM_MIMO26_DIFFKV_SPEC_3D": "1"' in prof
+
 # Upstream pieces the deployment relies on (fail loudly if a rebase drops them).
 assert '"MiMoV2ForCausalLM": ("mimo_v2", "MiMoV2ForCausalLM")' in (
     root / "vllm/model_executor/models/registry.py"
@@ -118,4 +124,4 @@ assert 'store_dtype == "mxfp4"' in (
 for f in (mimo, omni, root / "vllm/model_executor/models/mimo_v2_mtp.py",
           root / "vllm/mimo26_opt_profile.py"):
     py_compile.compile(str(f), doraise=True)
-print("PASS 0001-0010 present; mimo_v2 / mimo_v2_omni / MTP / fp8+mxfp4 upstream hooks intact")
+print("PASS 0001-0011 present; mimo_v2 / mimo_v2_omni / MTP / fp8+mxfp4 upstream hooks intact")
