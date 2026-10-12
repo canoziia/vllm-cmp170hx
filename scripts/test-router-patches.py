@@ -187,5 +187,79 @@ class PatchLandedTests(unittest.TestCase):
         self.assertIn("cache_write_prefill_compute", src)
 
 
+class ClientAuthTests(unittest.TestCase):
+    """patches/router/0002: VLLM_API_KEY gates every router except /health."""
+
+    def setUp(self):
+        import os
+
+        self._old = os.environ.get("VLLM_API_KEY")
+        os.environ["VLLM_API_KEY"] = "k-one, k-two"
+
+    def tearDown(self):
+        import os
+
+        if self._old is None:
+            os.environ.pop("VLLM_API_KEY", None)
+        else:
+            os.environ["VLLM_API_KEY"] = self._old
+
+    def _status(self, path, auth=None):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from vllm_router.auth import verify_api_key
+        from fastapi import Depends
+
+        app = FastAPI()
+
+        @app.get("/health")
+        @app.get("/v1/models")
+        @app.get("/metrics")
+        def _ok():
+            return {}
+
+        app.router.dependencies.append(Depends(verify_api_key))
+        headers = {"Authorization": auth} if auth else {}
+        return TestClient(app).get(path, headers=headers).status_code
+
+    def test_dependency(self):
+        try:
+            import httpx  # noqa: F401  (TestClient)
+        except ImportError:
+            self.skipTest("httpx missing")
+        self.assertEqual(self._status("/health"), 200)
+        self.assertEqual(self._status("/v1/models"), 401)
+        self.assertEqual(self._status("/metrics"), 401)
+        self.assertEqual(self._status("/v1/models", "Bearer nope"), 401)
+        self.assertEqual(self._status("/v1/models", "Basic k-one"), 401)
+        self.assertEqual(self._status("/v1/models", "Bearer k-one"), 200)
+        self.assertEqual(self._status("/v1/models", "Bearer k-two"), 200)
+
+    def test_parse_and_disable(self):
+        import os
+
+        from vllm_router.auth import get_allowed_api_keys
+
+        self.assertEqual(get_allowed_api_keys(), frozenset({"k-one", "k-two"}))
+        os.environ["VLLM_API_KEY"] = ""
+        self.assertEqual(get_allowed_api_keys(), frozenset())
+
+    def test_static_wiring(self):
+        import inspect
+
+        import importlib.util
+
+        import vllm_router.auth as auth_mod
+
+        src = inspect.getsource(auth_mod)
+        self.assertIn("hmac.compare_digest", src)
+        self.assertNotIn("logger", src)  # never log keys
+        with open(importlib.util.find_spec("vllm_router.app").origin) as f:
+            app_src = f.read()
+        for name in ("main_router", "files_router", "batches_router", "metrics_router"):
+            self.assertIn(f"app.include_router({name}, dependencies=_auth)", app_src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

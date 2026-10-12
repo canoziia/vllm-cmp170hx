@@ -206,7 +206,11 @@ of the pinned release and the result ships as our own image (built by
   client waited for both generations;
 * both hops' usage is merged into the standard fields the client sees
   (`cached_tokens` = `min(prefill, decode)`), with the raw per-hop numbers
-  attached under `router_hops` for billing.
+  attached under `router_hops` for billing;
+* client authentication (port of upstream PR #937): with `VLLM_API_KEY` set
+  (comma-separated for several keys) every endpoint except `/health`, including
+  `/v1/models` and `/metrics`, requires `Authorization: Bearer <key>`. Upstream
+  0.1.13 accepted unauthenticated requests on a 0.0.0.0 port.
 
 The router must be started with `--routing-logic disaggregated_prefill`; see the
 model READMEs for the measured behaviour and the pitfalls of the alternatives.

@@ -194,6 +194,8 @@ services:
     environment:
       # the router builds the backend Authorization header from OPENAI_API_KEY
       OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
+      # clients must send it too (patches/router/0002); /health stays open
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
       PYTHONUNBUFFERED: "1"
     command:
       - --service-discovery=static
