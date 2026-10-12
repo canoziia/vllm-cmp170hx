@@ -183,6 +183,33 @@ holds three of them; 9 over 4 ranks always leaves one rank with three). The
 prefill attention kernel runs at ~94 TFLOP/s against a measured bf16 GEMM
 peak of ~145 on this card.
 
+## Long-context decode (0011)
+
+MTP verification sends 1 + k query tokens per request; the TRITON_ATTN_DIFFKV
+launcher ran those steps with the 2D kernel (one program per query token and
+kv head walking the whole KV prefix), so c1 decode slowed by about 0.47 ms per
+1k context tokens. 0011 runs them with the existing split-KV 3D kernel on the
+9 full-attention layers. One global layer, c1, 4 query tokens: 55k context
+3.70 -> 0.88 ms, 134k 7.79 -> 1.62 ms, 268k 14.29 -> 3.20 ms.
+
+PD on 8401, c1, thinking off, 500 tokens (decode tok/s / ms per step):
+
+| prompt tokens | before | 0011 |
+|---|---|---|
+| 7.3k | 93.7 / 23.6 | 119.2 / 21.1 |
+| 22k | 77.5 / 30.2 | 96.4 / 22.2 |
+| 45k | 55.3 / 42.5 | 89.1 / 23.7 |
+| 111k | 29.3 / 71.2 | 91.7 / 30.2 |
+| 273k | 14.2 / 148.3 | 47.8 / 45.0 |
+
+tok/s also moves with acceptance (2.1-2.8 tokens/step on these texts); ms
+per step is the kernel effect (now about +0.09 ms per 1k tokens). Short
+context, decode port, full-batch tok/s against the same configuration without
+0011: code c8/c32 829 / 2327 vs 823 / 2315, counting 864 / 2512 vs 860 / 2525,
+prose c8 561 vs 564, prose c32 1279 (sd 38, 6 rounds) vs 1335 (sd 47, 5
+rounds), about -4 %. Outputs differ from the 2D kernel at rounding level;
+greedy texts first diverge at near-ties (logprob margin 0.125).
+
 ## Prefill/decode with LMCache (`compose.pd.yml`)
 
 | container | GPUs | port |
