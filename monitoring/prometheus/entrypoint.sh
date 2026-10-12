@@ -66,15 +66,15 @@ render vllm-router "${ROUTER_METRICS_TARGETS:-}"
 render lmcache "${LMCACHE_METRICS_TARGETS:-}"
 render gpu "${GPU_METRICS_TARGETS:-}"
 
-# vLLM only guards /v1/* with --api-key, so /metrics is normally public.
-# If a proxy in front requires a bearer token, mount it as a file.
+# vLLM only guards /v1/* with --api-key, so its /metrics is public; the
+# patched vllm-router guards /metrics too. Mount the key as a file.
 TOKEN_FILE=${VLLM_METRICS_BEARER_TOKEN_FILE:-/run/secrets/vllm_metrics_token}
 AUTH=""
 if [ -s "$TOKEN_FILE" ]; then
 	AUTH="    authorization:
       type: Bearer
       credentials_file: $TOKEN_FILE"
-	echo "vllm job: bearer token file enabled" >&2
+	echo "vllm, vllm-router jobs: bearer token file enabled" >&2
 fi
 
 job() { # name interval timeout [auth]
@@ -105,7 +105,7 @@ scrape_configs:
         labels: {instance: prometheus, server: monitor}
 EOF
 	job vllm "${PROM_SCRAPE_INTERVAL:-10s}" 8s "$AUTH"
-	job vllm-router "${PROM_SCRAPE_INTERVAL:-10s}" 8s
+	job vllm-router "${PROM_SCRAPE_INTERVAL:-10s}" 8s "$AUTH"
 	job lmcache "${PROM_SCRAPE_INTERVAL:-10s}" 8s
 	job gpu "${GPU_SCRAPE_INTERVAL:-30s}" 20s
 } >"$OUT/prometheus.yml"
