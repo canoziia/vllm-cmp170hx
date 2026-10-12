@@ -69,6 +69,13 @@ class RegressionTests(unittest.TestCase):
             "the superseded fail-closed guard is back in the shipped connector",
         )
 
+    def test_full_sw_kv_switch_landed_in_the_server(self):
+        """0010: LMCACHE_FULL_SW_KV is read by the MP server (default off)."""
+        import lmcache.v1.multiprocess.server as server_mod
+        src = inspect.getsource(server_mod)
+        self.assertIn('os.environ.get("LMCACHE_FULL_SW_KV", "0") == "1"', src)
+        self.assertIn("full_sw_kv=full_sw_kv,", src)
+
     def test_mtp_mamba_relocation(self):
         tracker = object.__new__(LMCacheMPRequestTracker)
         tracker.allocated_block_ids = {}

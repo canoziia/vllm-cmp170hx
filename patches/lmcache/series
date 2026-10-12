@@ -7,3 +7,4 @@
 0007-mtp-mamba-relocation.patch
 0008-shared-server-mp-worker-rank.patch
 0009-bounded-pd-object-groups.patch
+0010-full-sliding-window-chunks.patch
