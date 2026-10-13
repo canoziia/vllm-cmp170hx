@@ -102,16 +102,6 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
    - only for plain PD store/retrieve: `enable_full_sw_kv` (CacheBlend)
      rejects it. All ranks must still have identical window buckets.
 
-10. `0010-full-sliding-window-chunks.patch`
-   - `LMCACHE_FULL_SW_KV=1` (server; default off) turns on the existing full
-     per-chunk sliding-window mode (`enable_full_sw_kv`, used by CacheBlend)
-     for plain store/retrieve: sliding-window groups keep every block of a
-     chunk instead of the chunk's last sub-chunk window;
-   - MiMo-V2.6-Flash (SWA-128, 16-token blocks, 256-token chunks) reloads
-     wrong KV through the sub-chunk window path and needs it; the SWA
-     groups' stored bytes double. Not combinable with
-     `LMCACHE_MERGE_BOUNDED_PD`.
-
 The server-image build runs `scripts/test-lmcache-patches.py`. It checks native
 extension ABI, salt isolation, mixed-size native-FS round trips, six-rank
 layout lifetime, and existing-file adoption. The DeepSeek client build also

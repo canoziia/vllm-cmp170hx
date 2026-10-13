@@ -47,9 +47,6 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       PYTHONUNBUFFERED: "1"
       LMCACHE_MERGE_BOUNDED_PD: "${LMCACHE_MERGE_BOUNDED_PD:-0}"
-      # LMCache 0010: MiMo's SWA-128 groups (16-token blocks) must be stored as
-      # full chunks; the sub-chunk window path reloads wrong KV for them.
-      LMCACHE_FULL_SW_KV: "1"
     volumes:
       - ${LMCACHE_L2_PATH:?set LMCACHE_L2_PATH}:/lmcache-l2
     command:
