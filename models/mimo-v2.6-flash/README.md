@@ -223,11 +223,29 @@ diverge from the 2D kernel only at near-ties (logprob margin <= 0.125).
 Both engines use the same image, profile, partition and MTP3; KV moves through
 LMCache (L2 `fs_native` at `LMCACHE_L2_PATH`). Settings that matter:
 
-- **LMCache 0010, `LMCACHE_FULL_SW_KV=1` (server):** required for correctness.
-  The default sub-chunk sliding-window path reloads wrong KV for MiMo's
-  SWA-128 groups (16-token blocks): every reload decoded garbage (3k/8k
-  prompts, same engine and prefill -> decode); with full chunks every reload
-  matches the GPU-prefix-hit run token for token, logprobs included.
+- **LMCache sliding-window groups use the default sub-chunk window path.** Each
+  chunk keeps its last 128 SWA tokens; a retrieve reads all full-attention
+  chunks plus only the prefix's last SWA chunk. A former LMCache patch that
+  stored full SWA chunks instead (removed) was adopted after reloads decoded
+  garbage, a finding that predates `pid: host`: the CUDA IPC event-pool
+  collision it fixes produces the same symptom. `tests/lmcache_sw_roundtrip_gpu.py`
+  (real MP server and worker/scheduler adapters, MiMo's registered geometry:
+  13 layers, full bs32/4 heads, SWA bs16/8 heads, hs 320, shared pages and
+  block pool, null blocks outside the window) restores full prefixes, shorter
+  prefixes and partial GPU hits (skip 64/128) bit-exactly.
+
+  Bytes (whole model, 9 full + 39 SWA layers, bf16):
+
+  | | stored per token | retrieve needs in L1 at once | 320k-token prefix: stored / needed |
+  |---|---|---|---|
+  | full SWA chunks (removed patch) | 227 KB | every chunk, 227 KB/token | 72.7 GB / 72.7 GB |
+  | window path | 125 KB | 22 KB/token + 26 MB | 39.8 GB / 7.1 GB |
+
+  With full SWA chunks a 320k prefix could never be retrieved from the 64 GB
+  L1 (repeated "Failed to batched allocate ... short by", recompute, 600 s+
+  TTFT). Scaled test (one rank, L1 2 GB + L2, 51,200-token prefix): full SWA
+  chunks hit 32,768 tokens with allocation failures, 1.20 s; the window path
+  hit all 51,200 with 201/400 objects prefetched (200 full + 1 SWA), 0.17 s.
 - **`--prefix-cache-retention-interval` = chunk (256):** LMCache refuses
   sliding-window models without a state checkpoint at every chunk boundary.
 - **`VLLM_PP_DECODE_COHORT_LIVE_LOAD=1` (prefill and decode):** see measurements below.
