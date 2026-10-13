@@ -261,5 +261,102 @@ class ClientAuthTests(unittest.TestCase):
             self.assertIn(f"app.include_router({name}, dependencies=_auth)", app_src)
 
 
+class ClientDisconnectTests(unittest.TestCase):
+    """patches/router/0003: backend hops are raced against http.disconnect."""
+
+    def test_disconnect_wiring_is_shipped(self):
+        import inspect
+
+        import vllm_router.services.request_service.request as mod
+
+        self.assertTrue(callable(mod._await_or_disconnect))
+        self.assertTrue(callable(mod._anext_or_disconnect))
+        self.assertEqual(mod._log_safe("a\r\nb"), "ab")
+        src = inspect.getsource(mod.route_disaggregated_prefill_request)
+        self.assertIn("_await_or_disconnect(", src)
+        self.assertNotIn("is_disconnected", src)
+
+    def test_disconnect_cancels_hop(self):
+        import asyncio
+
+        import vllm_router.services.request_service.request as mod
+        from starlette.requests import ClientDisconnect
+
+        class FakeRequest:
+            async def receive(self):
+                await asyncio.sleep(0.05)
+                return {"type": "http.disconnect"}
+
+        cancelled = []
+
+        async def hop():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+        async def run():
+            with self.assertRaises(ClientDisconnect):
+                await mod._await_or_disconnect(FakeRequest(), hop(), "r", "prefill")
+            self.assertEqual(cancelled, [True])
+
+            class Quiet:
+                async def receive(self):
+                    await asyncio.sleep(10)
+
+            async def ok():
+                return 42
+
+            self.assertEqual(
+                await mod._await_or_disconnect(Quiet(), ok(), "r", "prefill"), 42
+            )
+
+        asyncio.run(run())
+
+
+class StreamedPrefillTests(unittest.TestCase):
+    """patches/router/0004: streamed prefill hop, SSE comments forwarded."""
+
+    def test_events_and_payloads(self):
+        import asyncio
+
+        import vllm_router.services.request_service.request as mod
+
+        raw = (
+            b": keep-alive\n\n: keep-alive\r\n\r\n"
+            b'data: {"choices":[{"delta":{"content":"A"}}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":3}}\n\ndata: [DONE]\n\n'
+        )
+
+        class Content:
+            async def iter_any(self):
+                for i in range(0, len(raw), 5):
+                    yield raw[i : i + 5]
+
+        class Resp:
+            content = Content()
+
+        async def collect():
+            return [e async for e in mod._prefill_stream_events(Resp())]
+
+        events = asyncio.run(collect())
+        self.assertEqual(events[:2], [b": keep-alive", b": keep-alive"])
+        self.assertIsNone(mod._prefill_event_payload(events[0]))
+        self.assertIsNone(mod._prefill_event_payload(events[-1]))
+        self.assertEqual(
+            mod._prefill_event_payload(events[3])["usage"], {"prompt_tokens": 3}
+        )
+
+    def test_stream_path_is_shipped(self):
+        import inspect
+
+        import vllm_router.services.request_service.request as mod
+
+        src = inspect.getsource(mod.open_prefill_stream)
+        self.assertIn('req_data["stream"] = True', src)
+        self.assertIn("include_usage", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
