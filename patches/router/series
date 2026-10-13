@@ -1,2 +1,4 @@
 0001-merge-hop-usage.patch
 0002-client-api-key-auth.patch
+0003-client-disconnect-cancel.patch
+0004-stream-prefill-keep-alive.patch

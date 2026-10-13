@@ -1,0 +1,296 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] router: abort backend requests when the client disconnects
+
+Ported from vllm-project/production-stack PR #1040 (open, "[Router][Bugfix]
+propagate client cancellation", fixes issue #634): route_general_request
+races the backend reply against the ASGI http.disconnect message (same as
+vllm.entrypoints.utils.with_cancellation, no is_disconnected() polling) and
+cancels the pending call, which closes the backend connection; X-Request-Id
+is CR/LF-stripped before logging. The PR's on_request_complete-in-finally
+hunks are already in vllm-stack-0.1.13 and are not taken.
+
+Extended to the PD path (route_disaggregated_prefill_request), which the PR
+does not cover: the prefill hop and the non-streaming decode hop are raced
+against http.disconnect the same way; on disconnect the hop is cancelled,
+its aiohttp response is closed (never returned to the pool), a warning with
+request id, phase and waited seconds is logged, and 499 is returned. The
+streaming decode hop is already cancelled by Starlette (ASGI spec 2.3) on
+disconnect; send_request_to_decode now closes the socket explicitly and the
+disconnect is logged. Without a disconnect nothing changes.
+---
+--- a/vllm_router/services/request_service/request.py
++++ b/vllm_router/services/request_service/request.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import asyncio
+ import json
+ import os
+ import time
+@@ -19,12 +20,14 @@ import uuid
+ from typing import Optional
+ 
+ import aiohttp
++import anyio
+ 
+ # --- Request Processing & Routing ---
+ from aiohttp import FormData
+ from fastapi import BackgroundTasks, HTTPException, Request, UploadFile
+ from fastapi.responses import JSONResponse, Response, StreamingResponse
+ from requests import JSONDecodeError
++from starlette.requests import ClientDisconnect
+ 
+ from vllm_router.log import init_logger
+ from vllm_router.routers.routing_logic import (
+@@ -100,6 +103,9 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
+     "server",
+ }
+ 
++# Client went away before a response could be sent; never reaches the client.
++_CLIENT_CLOSED_REQUEST = 499
++
+ 
+ def _is_json_media_type(content_type: str) -> bool:
+     media_type = content_type.partition(";")[0].strip().lower()
+@@ -227,6 +233,85 @@ def _build_backend_request_headers(
+     return headers
+ 
+ 
++def _log_safe(value: str) -> str:
++    """Strip CR/LF so a crafted X-Request-Id can't forge a fake log line."""
++    if not isinstance(value, str):
++        value = str(value)
++    return value.replace("\r", "").replace("\n", "")
++
++
++async def _listen_for_disconnect(request: Request) -> None:
++    """Return once the client has disconnected."""
++    while True:
++        message = await request.receive()
++        if message["type"] == "http.disconnect":
++            return
++
++
++async def _cancel_and_wait(task: asyncio.Task) -> None:
++    """Cancel a task and wait for it to finish unwinding.
++
++    ``task.cancelled()`` can't tell our own cancel() apart from an unrelated
++    cancellation of the caller that propagated into ``task`` via its
++    ``_fut_waiter``, since both leave ``task`` cancelled either way. The
++    caller's own ``cancelling()`` count is unaffected by that propagation, so
++    it is what actually distinguishes the two.
++
++    Args:
++        task (asyncio.Task): The task to cancel.
++
++    Raises:
++        asyncio.CancelledError: If the caller itself was independently
++            cancelled while waiting, rather than only as a side effect of
++            cancelling ``task``.
++    """
++    current = asyncio.current_task()
++    pending_before = current.cancelling() if current else 0
++    task.cancel()
++    try:
++        await task
++    except asyncio.CancelledError:
++        if current is not None and current.cancelling() > pending_before:
++            raise
++    except Exception:
++        # A backend error that raced the disconnect is irrelevant now.
++        pass
++
++
++async def _anext_or_disconnect(stream_generator, request: Request):
++    """Wait for the backend response headers, or for the client to disconnect.
++
++    Same approach as ``vllm.entrypoints.utils.with_cancellation``.
++
++    Args:
++        stream_generator: The ``process_request`` generator for this attempt.
++        request (Request): The incoming HTTP request.
++
++    Returns:
++        The backend response headers and status code.
++
++    Raises:
++        ClientDisconnect: If the client disconnected before the backend replied.
++    """
++    headers_task = asyncio.ensure_future(anext(stream_generator))
++    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(request))
++    try:
++        await asyncio.wait(
++            (headers_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
++        )
++        if headers_task.done():
++            return headers_task.result()
++        raise ClientDisconnect()
++    finally:
++        # Runs on every exit path, including our own cancellation before a winner
++        # was picked: asyncio.wait() leaves its member tasks running.
++        await _cancel_and_wait(disconnect_task)
++        if not headers_task.done():
++            await _cancel_and_wait(headers_task)
++            with anyio.CancelScope(shield=True):
++                await stream_generator.aclose()
++
++
+ # TODO: (Brian) check if request is json beforehand
+ async def process_request(
+     request: Request,
+@@ -667,7 +752,7 @@ async def route_general_request(
+                 background_tasks,
+                 parent_span_context=span_context,
+             )
+-            headers, status = await anext(stream_generator)
++            headers, status = await _anext_or_disconnect(stream_generator, request)
+             media_type = headers.get("content-type", "text/event-stream")
+             headers_dict = {
+                 key: value
+@@ -678,6 +763,14 @@ async def route_general_request(
+             headers_dict["X-Request-Id"] = request_id
+             last_error = None
+             break
++        except ClientDisconnect:
++            logger.info(
++                f"Client disconnected before request {_log_safe(request_id)} was "
++                f"answered by {server_url}, aborted the backend request"
++            )
++            if tracing_active:
++                end_span(span, status_code=_CLIENT_CLOSED_REQUEST)
++            return Response(status_code=_CLIENT_CLOSED_REQUEST)
+         except HTTPException:
+             raise
+         except Exception as e:
+@@ -731,7 +824,45 @@ async def send_request_to_prefiller(
+ 
+     async with client.post(endpoint, json=req_data, headers=headers) as response:
+         response.raise_for_status()
+-        return await response.json()
++        try:
++            return await response.json()
++        except asyncio.CancelledError:
++            # Client went away: drop the socket instead of pooling it so the
++            # engine sees the disconnect and aborts the request.
++            response.close()
++            raise
++
++
++async def _await_or_disconnect(request: Request, coro, request_id: str, phase: str):
++    """Await a PD hop, or cancel it once the client disconnects.
++
++    The PD counterpart of ``_anext_or_disconnect`` (upstream PR #1040): race the
++    hop against ``http.disconnect`` instead of polling
++    ``request.is_disconnected()``. Cancelling the hop closes its aiohttp
++    connection, so the engine aborts the request. Without a disconnect the
++    hop's result or exception is returned unchanged.
++
++    Raises:
++        ClientDisconnect: If the client disconnected before the hop finished.
++    """
++    started = time.time()
++    hop_task = asyncio.ensure_future(coro)
++    disconnect_task = asyncio.ensure_future(_listen_for_disconnect(request))
++    try:
++        await asyncio.wait(
++            (hop_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
++        )
++        if hop_task.done():
++            return hop_task.result()
++        logger.warning(
++            f"{_log_safe(request_id)} client disconnected during {phase} after "
++            f"{time.time() - started:.1f}s, aborted the backend request"
++        )
++        raise ClientDisconnect()
++    finally:
++        await _cancel_and_wait(disconnect_task)
++        if not hop_task.done():
++            await _cancel_and_wait(hop_task)
+ 
+ 
+ class _UsageMergeState:
+@@ -894,8 +1025,14 @@ async def send_request_to_decode(
+ 
+     async with client.post(endpoint, json=req_data, headers=headers) as response:
+         response.raise_for_status()
+-        async for chunk in response.content.iter_any():
+-            yield chunk
++        try:
++            async for chunk in response.content.iter_any():
++                yield chunk
++        except (asyncio.CancelledError, GeneratorExit):
++            # Client went away mid-stream: close the socket (not pooled) so the
++            # decode engine aborts the request.
++            response.close()
++            raise
+ 
+ 
+ async def route_orchestrated_disaggregated_request(
+@@ -1129,8 +1266,13 @@ async def route_disaggregated_prefill_request(
+ 
+     st = time.time()
+     try:
+-        prefill_response = await send_request_to_prefiller(
+-            request.app.state.prefill_client, endpoint, request_json, request_id
++        prefill_response = await _await_or_disconnect(
++            request,
++            send_request_to_prefiller(
++                request.app.state.prefill_client, endpoint, request_json, request_id
++            ),
++            request_id,
++            "prefill",
+         )
+         prefill_usage = (
+             prefill_response.get("usage") if isinstance(prefill_response, dict) else None
+@@ -1142,6 +1284,8 @@ async def route_disaggregated_prefill_request(
+         )
+         # Use original request for decode phase
+         request_json = orig_request_json
++    except ClientDisconnect:
++        return Response(status_code=_CLIENT_CLOSED_REQUEST)
+     except aiohttp.ClientResponseError as e:
+         logger.error(f"HTTP error in prefiller: {e}", exc_info=True)
+         return JSONResponse(
+@@ -1177,11 +1321,17 @@ async def route_disaggregated_prefill_request(
+         # through untouched, leaking the decode hop's own non-standard fields
+         # (created_cache_tokens) and omitting router_hops. Merge it here.
+         body = bytearray()
+-        try:
++
++        async def read_decode_body():
+             async for chunk in send_request_to_decode(
+                 request.app.state.decode_client, endpoint, request_json, request_id
+             ):
+                 body.extend(chunk)
++
++        try:
++            await _await_or_disconnect(request, read_decode_body(), request_id, "decode")
++        except ClientDisconnect:
++            return Response(status_code=_CLIENT_CLOSED_REQUEST)
+         except aiohttp.ClientResponseError as e:
+             logger.error(f"HTTP error in decoder: {e}", exc_info=True)
+             return JSONResponse(
+@@ -1224,6 +1374,7 @@ async def route_disaggregated_prefill_request(
+         )
+ 
+     async def generate_stream():
++        decode_started = time.time()
+         try:
+             async for chunk in send_request_to_decode(
+                 request.app.state.decode_client, endpoint, request_json, request_id
+@@ -1233,6 +1384,14 @@ async def route_disaggregated_prefill_request(
+             tail = merge_state.flush()
+             if tail:
+                 yield tail
++        except asyncio.CancelledError:
++            # Starlette (ASGI spec < 2.4) cancels the body iterator on
++            # http.disconnect; send_request_to_decode already closed the socket.
++            logger.warning(
++                f"{_log_safe(request_id)} client disconnected during decode stream "
++                f"after {time.time() - decode_started:.1f}s, aborted the backend request"
++            )
++            raise
+         except aiohttp.ClientResponseError as e:
+             logger.error(f"HTTP error in decoder: {e}", exc_info=True)
+             try:
