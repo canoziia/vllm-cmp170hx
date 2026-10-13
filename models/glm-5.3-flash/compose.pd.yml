@@ -83,6 +83,7 @@ services:
       - --revision=${GLM_REVISION:-da920bb0b9f4a06727223a349e55468e38352348}
       - --host=0.0.0.0
       - --port=8301
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=nvidia/GLM-5.3-Flash-NVFP4
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
@@ -157,6 +158,7 @@ services:
       - --revision=${GLM_REVISION:-da920bb0b9f4a06727223a349e55468e38352348}
       - --host=0.0.0.0
       - --port=8302
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=nvidia/GLM-5.3-Flash-NVFP4
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1

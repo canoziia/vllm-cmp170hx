@@ -81,6 +81,7 @@ services:
       - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
       - --host=0.0.0.0
       - --port=8201
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1
@@ -151,6 +152,7 @@ services:
       - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
       - --host=0.0.0.0
       - --port=8202
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1

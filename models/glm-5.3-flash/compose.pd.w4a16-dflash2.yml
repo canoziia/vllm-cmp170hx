@@ -121,6 +121,7 @@ services:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0
       - --port=8301
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=canada-quant/GLM-5.3-Flash-W4A16-MTP
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
@@ -198,6 +199,7 @@ services:
       - /root/app/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0
       - --port=8302
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=canada-quant/GLM-5.3-Flash-W4A16-MTP
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
