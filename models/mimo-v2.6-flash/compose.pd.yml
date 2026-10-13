@@ -136,7 +136,7 @@ services:
       # drain on stop so every worker unregisters its KV cache from LMCache
       - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
-      - --sse-keep-alive-interval=${MIMO_SSE_KEEP_ALIVE:-0}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_PREFILL_PORT}/health"]
       interval: 30s
@@ -213,7 +213,7 @@ services:
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":${MIMO_DECODE_KV_PORT:?set MIMO_DECODE_KV_PORT},"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${MIMO_LMCACHE_PORT}}}'
       - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY}
-      - --sse-keep-alive-interval=${MIMO_SSE_KEEP_ALIVE:-0}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${MIMO_DECODE_PORT}/health"]
       interval: 30s

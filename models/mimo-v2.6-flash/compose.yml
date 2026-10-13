@@ -55,6 +55,7 @@ services:
       - /models/MiMo-V2.6-Flash-MOPD
       - --host=0.0.0.0
       - --port=${MIMO_PORT:?set MIMO_PORT}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=XiaomiMiMo/MiMo-V2.6-Flash-MOPD
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1

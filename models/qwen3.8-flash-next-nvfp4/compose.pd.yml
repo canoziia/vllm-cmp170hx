@@ -124,6 +124,7 @@ services:
       - nvidia/Qwen3.8-Flash-Next-NVFP4
       - --host=0.0.0.0
       - --port=8101
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=nvidia/Qwen3.8-Flash-Next-NVFP4
       - --revision=${QWEN_REVISION:-fc694b54fb0174e0913e6adf86691ef85a4ead47}
       - --pipeline-parallel-size=2
@@ -211,6 +212,7 @@ services:
       - nvidia/Qwen3.8-Flash-Next-NVFP4
       - --host=0.0.0.0
       - --port=8102
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=nvidia/Qwen3.8-Flash-Next-NVFP4
       - --revision=${QWEN_REVISION:-fc694b54fb0174e0913e6adf86691ef85a4ead47}
       - --pipeline-parallel-size=2

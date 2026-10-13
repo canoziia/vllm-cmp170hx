@@ -63,6 +63,7 @@ services:
       - /srv/models/GLM-5.3-Flash-W4A16-MTP
       - --host=0.0.0.0
       - --port=${GLM_PORT:-8303}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=${GLM_SERVED_MODEL_NAME:-glm-5.3-flash}
       - --pipeline-parallel-size=4
       - --tensor-parallel-size=1
