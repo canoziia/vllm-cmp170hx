@@ -7,31 +7,34 @@ DEBUG_DIR=${VLLM_PERF_DEBUG_HOST_DIR:-$CACHE_ROOT/vllm-perf-debug}
 CONTROL=$DEBUG_DIR/control.json
 mkdir -p "$DEBUG_DIR"
 
+# Signal only the PP workers of $CONTAINER. Deployments run with --pid=host, so a
+# /proc scan from inside the container sees every process on the host (including
+# other engines' "VLLM::Worker" processes, for which SIGUSR2 is fatal; `podman
+# top` lists every host process too). A worker is therefore selected only if its
+# cgroup equals the cgroup of the container's init process, and the number found
+# must equal the engine's pipeline-parallel size, otherwise nothing is signaled.
 signal_workers() {
-  podman exec "$CONTAINER" python3 -c '
-import os, signal
-from pathlib import Path
-processes = {}
-for p in Path("/proc").iterdir():
-    if not p.name.isdigit():
-        continue
-    try:
-        cmd = (p / "cmdline").read_bytes()
-        parent = int((p / "stat").read_text().rsplit(")", 1)[1].split()[1])
-        processes[int(p.name)] = (parent, cmd, (p / "comm").read_text().strip())
-    except (OSError, ValueError):
-        pass
-workers = [pid for pid, (parent, cmd, comm) in processes.items()
-           if comm.startswith("VLLM::Worker") or (
-               b"spawn_main" in cmd and parent in processes
-               and b"spawn_main" in processes[parent][1]
-               and processes[parent][0] == 1)]
-if not workers:
-    raise SystemExit("No PP worker children found; no signal sent")
-for pid in workers:
-    os.kill(pid, signal.SIGUSR2)
-print("Signaled", len(workers), "PP workers")
-'
+  local init_pid cg pp pid comm
+  local -a pids=()
+  init_pid=$(podman inspect --format '{{.State.Pid}}' "$CONTAINER")
+  [[ $init_pid =~ ^[0-9]+$ && $init_pid -gt 0 ]] || { echo "Container $CONTAINER is not running" >&2; return 1; }
+  cg=$(cat "/proc/$init_pid/cgroup")
+  pp=${PP_SIZE:-$(podman inspect --format '{{join .Args " "}}' "$CONTAINER" |
+    grep -oE -- '--pipeline-parallel-size[= ]+[0-9]+' | grep -oE '[0-9]+$' || true)}
+  [[ $pp =~ ^[0-9]+$ && $pp -gt 0 ]] || { echo "Cannot determine PP size; set PP_SIZE" >&2; return 1; }
+  for pid in /proc/[0-9]*; do
+    pid=${pid#/proc/}
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+    [[ $comm == VLLM::Worker* ]] || continue
+    [[ $(cat "/proc/$pid/cgroup" 2>/dev/null) == "$cg" ]] || continue
+    pids+=("$pid")
+  done
+  if [[ ${#pids[@]} -ne $pp ]]; then
+    echo "Refusing to signal: found ${#pids[@]} worker(s) in $CONTAINER (${pids[*]:-none}), expected PP size $pp" >&2
+    return 1
+  fi
+  kill -USR2 "${pids[@]}"
+  echo "Signaled ${#pids[@]} PP workers of $CONTAINER: ${pids[*]}"
 }
 
 case "${1:-}" in
