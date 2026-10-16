@@ -35,4 +35,5 @@ python3 -m py_compile \
   "$SOURCE_TREE/vllm/model_executor/kernels/linear/scaled_mm/marlin.py" \
   "$SOURCE_TREE/vllm/v1/worker/gpu/pp_utils.py"
 grep -q '"dsv4-flash"' "$SOURCE_TREE/vllm/dsv41_opt_profile.py"
+python3 "$MODEL_DIR/tests/test_dsv4_verification.py" "$SOURCE_TREE"
 echo "DeepSeek-V4-Flash source validation completed successfully."

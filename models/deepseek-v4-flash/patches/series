@@ -1,8 +1,10 @@
 # DeepSeek-V4-Flash-only vLLM patches, applied after the DeepSeek V4.1 + shared +
 # adaptive series (scripts/apply-deepseek-v4-flash-patches.sh). Every switch
 # defaults off; VLLM_DSV41_OPT_PROFILE=dsv4-flash enables the measured set.
-0001-dsv4-flash-mxfp4-moe-decode-shapes.patch
-0002-dsv4-mhc-v2-hidden-4096.patch
-0003-pp-deferred-feedback-recv.patch
-0004-dsv4-dense-fp8-decode.patch
-0005-dsv4-flash-opt-profile.patch
+0001-dspark-native-block-verification-widths.patch
+0002-dspark-draft-head-fp8.patch
+0003-dsv4-flash-mxfp4-moe-decode-shapes.patch
+0004-dsv4-mhc-v2-hidden-4096.patch
+0005-pp-deferred-feedback-recv.patch
+0006-dsv4-dense-fp8-decode.patch
+0007-dsv4-flash-opt-profile.patch
