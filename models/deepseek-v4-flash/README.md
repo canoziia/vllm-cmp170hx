@@ -235,3 +235,23 @@ c8 (PP cohorts of 8-12 tokens) per layer MoE ~69 %, dense ~14 %, attention and
 small ops ~14 %. Long context (c1, prose): 48 / 41.5 / 38.8 steps/s at short /
 50k / 159k tokens; the growth is mostly the indexer (logits + top-k over the
 compressed keys).
+
+### Merged stack (dsv4-flash profile, dspark K=5 + adaptive verification)
+
+Image `deepseek-v4-flash-0e1b0ad` (+ re-swept cost table), max-num-seqs 32,
+node2 GPUs 1-3, tok/s (c1 per request, others full batch):
+
+| load | c1 | c4 | c8 | c16 | c32 |
+|---|---|---|---|---|---|
+| code | 197.0 | 555 | 848 | 1339 | 1515 |
+| counting | 168.1 | 497 | 745 | 1113 | 1189 |
+| prose | 102.3 | 283 | 447 | 687 | 717 |
+
+Against the same target kernels with fixed K=3: c1-c16 equal or better (c8
++19-31 %), c32 worse (K=3: 1588 / 1382 / 896). On the K=5 engine a c32 cohort
+at spec_k=3 costs 101.8 ms/step against ~78 ms with a K=3 engine, and spec_k=4
+144 ms; see the c=32 row of `COST_MS_DSV4_PP3`.
+
+`COST_MS_DSV4_PP3` (patch 0001) was re-swept with the target kernels on
+(`spec_k` 1-5, counting, c = 1-32; the old table was measured with the default
+kernels and is 6-8 ms/step higher at c1).
