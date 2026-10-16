@@ -46,8 +46,10 @@ git -C "$WORKDIR/source" init -q
 git -C "$WORKDIR/source" remote add origin "$SOURCE_REPO"
 git -C "$WORKDIR/source" fetch --depth=1 origin "$SOURCE_COMMIT"
 git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
-ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG \
-  "$REPO_ROOT/scripts/apply-deepseek-v41-patches.sh" "$WORKDIR/source"
+# scripts/build-deepseek-v4-flash-image.sh reuses this build with its own
+# apply script (V4.1 stack + models/deepseek-v4-flash/patches/series).
+APPLY_SCRIPT=${APPLY_SCRIPT:-$REPO_ROOT/scripts/apply-deepseek-v41-patches.sh}
+ENABLE_PERF_DEBUG=$ENABLE_PERF_DEBUG "$APPLY_SCRIPT" "$WORKDIR/source"
 
 # The server image is shared with Qwen. Reuse :latest unless it is missing or
 # REBUILD_LMCACHE_IMAGE=1 was explicitly requested. Client and server get the

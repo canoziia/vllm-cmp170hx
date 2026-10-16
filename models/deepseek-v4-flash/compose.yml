@@ -1,0 +1,72 @@
+services:
+  # Single-engine PP3: the decode role of compose.pd.yml without LMCache.
+  # start with: podman compose --podman-run-args="--ipc=host --pid=host" up -d
+  deepseek-v4-flash:
+    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    container_name: ${DSFLASH_CONTAINER:-deepseek-v4-flash}
+    restart: "no"
+    network_mode: host
+    ipc: host
+    pid: host
+    stop_grace_period: 10m
+    devices:
+      - nvidia.com/gpu=${DSFLASH_GPU_0:-1}
+      - nvidia.com/gpu=${DSFLASH_GPU_1:-2}
+      - nvidia.com/gpu=${DSFLASH_GPU_2:-3}
+    security_opt: ["label=disable", "apparmor=unconfined"]
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    volumes:
+      - ${DSFLASH_MODEL_DIR:?set DSFLASH_MODEL_DIR}:/models/DeepSeek-V4-Flash-Vision-Exp:ro
+      - ${VLLM_CACHE_SINGLE:?set VLLM_CACHE_SINGLE}:/root/.cache
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+      # 43 target layers; the MTP layers live on the last rank.
+      VLLM_PP_LAYER_PARTITION: "${DSFLASH_PP_PARTITION:-15,16,12}"
+      # Optimisations are opt-in; off reproduces the unmodified baseline.
+      VLLM_DSV41_OPT_PROFILE: "${DSFLASH_OPT_PROFILE:-off}"
+      VLLM_PP_DECODE_COHORT_BALANCE: "${DSFLASH_PP_COHORT_BALANCE:-1}"
+      VLLM_PP_DECODE_COHORT_LIVE_LOAD: "${DSFLASH_PP_COHORT_LIVE_LOAD:-0}"
+      NCCL_ALGO: Ring
+      NCCL_PROTO: Simple
+      NCCL_IB_DISABLE: "1"
+      PYTHONUNBUFFERED: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      TMPDIR: /root/.cache/tmp
+    command:
+      - /models/DeepSeek-V4-Flash-Vision-Exp
+      - --host=0.0.0.0
+      - --port=${DSFLASH_PORT:-8501}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
+      - --served-model-name=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
+      - --pipeline-parallel-size=3
+      - --tensor-parallel-size=1
+      - --trust-remote-code
+      - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
+      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
+      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-512}
+      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
+      - --kv-cache-dtype=fp8_ds_mla
+      - --disable-custom-all-reduce
+      - --enable-prefix-caching
+      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":3}'
+      - --per-request-spec-decode-metrics=detailed
+      - --tokenizer-mode=deepseek_v4
+      - --enable-auto-tool-choice
+      - --tool-call-parser=deepseek_v4
+      - --reasoning-parser=deepseek_v4
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --enable-prompt-tokens-details
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:${DSFLASH_PORT:-8501}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3

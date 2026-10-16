@@ -1,0 +1,228 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: small-M dense FP8 decode GEMMs
+
+VLLM_DSV4_DENSE_FP8_DECODE (default 0). DeepSeek-V4-Flash dense projections
+are FP8 e4m3 with 128x128 e8m0 block scales and run through Marlin FP8
+(group 128) on sm_80. The DeepSeek V4.1 dense MXFP8 decode kernels
+(deepseek-v4.1-flash 0013, _dsv41_dense_mxfp8.so) read the same Marlin 8-bit
+weight layout with e8m0 group-32 scales; a block scale is the same value for
+each of its group-32 slots, so at load the block scales are expanded into a
+group-32 copy (N*K/32 bytes, ~3 % of the weight; ~60 MiB per PP3 rank).
+Dequantised weights are bit-identical to Marlin's; only the fp32
+accumulation order differs (fixed order, deterministic, graph safe).
+
+Per (K, N) and M tier a cold-L2 scan on CMP 170HX picked stream-K (M <= 8)
+or split-K (M <= 64) configurations; a tier is used only where it beat
+Marlin by >= 3 %. Other shapes, M > 64, bias or scales that are not powers of
+two in [2^-126, 2^7] keep Marlin. One layer's six dense projections:
+M=1 126 -> 107 us, M=4 118 -> 105, M=24 142 -> 120, M=32 140 -> 133,
+M=64 223 -> 186 us. models/deepseek-v4-flash/tests/test_dense_fp8_decode_gpu.py.
+---
+ .../kernels/linear/mxfp8/dsv4_dense_fp8.py    | 140 ++++++++++++++++++
+ .../linear/mxfp8/dsv4_dense_fp8_table.py      |  11 ++
+ .../kernels/linear/scaled_mm/marlin.py        |  15 ++
+ 3 files changed, 166 insertions(+)
+ create mode 100644 vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8.py
+ create mode 100644 vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8_table.py
+
+diff --git a/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8.py b/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8.py
+new file mode 100644
+index 0000000..af70588
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8.py
+@@ -0,0 +1,140 @@
++"""Small-M decode GEMMs for DeepSeek-V4-Flash dense FP8 (e4m3, 128x128 e8m0 blocks).
++
++Default OFF.  VLLM_DSV4_DENSE_FP8_DECODE=1 enables it on sm_80;
++VLLM_DSV4_DENSE_FP8_MAX_M (default 64) caps the token count it handles.
++
++The weights stay in the Marlin 8-bit layout that MarlinFP8ScaledMMLinearKernel
++already builds; the DeepSeek V4.1 dense MXFP8 decode kernels
++(native/dsv41_dense_mxfp8, ``_dsv41_dense_mxfp8.so`` in the image) read exactly
++that layout plus e8m0 group-32 scales.  A 128x128 e8m0 block scale is the same
++value for each of its 4 x 128 group-32 slots, so at load time the block scales
++are expanded into a group-32 e8m0 copy (N * K / 32 bytes per layer, ~3 % of
++the fp8 weight).  Dequantised weights are therefore bit-identical to Marlin's;
++only the fp32 accumulation order differs (deterministic, fixed order).
++
++Dispatch: dsv4_dense_fp8_table.TIERS, per (K, N) and M tier (a call with M
++uses the smallest tier >= M), measured cold-L2 on CMP 170HX; an entry exists
++only where it beat Marlin by >= 3 %.  Anything else (other shapes, M > 64,
++bias, scales that are not powers of two in [2^-126, 2^7]) keeps Marlin.
++"""
++import os
++
++import torch
++
++from vllm.logger import init_logger
++
++from .dsv4_dense_fp8_table import TIERS
++
++logger = init_logger(__name__)
++_LOADED = False
++_LOGGED = False
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_DSV4_DENSE_FP8_DECODE", "0") == "1"
++
++
++def _ops():
++    global _LOADED
++    if not _LOADED:
++        lib = os.environ.get("VLLM_DSV41_DENSE_MXFP8_LIB") or os.path.join(
++            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
++                os.path.dirname(os.path.abspath(__file__)))))), "_dsv41_dense_mxfp8.so")
++        if not hasattr(torch.ops, "_dsv41_dense_mxfp8") or not hasattr(
++                torch.ops._dsv41_dense_mxfp8, "streamk"):
++            torch.ops.load_library(lib)
++        _LOADED = True
++    return torch.ops._dsv41_dense_mxfp8
++
++
++def _scratch(device: torch.device):
++    from . import dsv41_dense_mxfp8 as _d41
++    return _d41.scratch(device)
++
++
++def _block_scale_bytes(scale: torch.Tensor) -> torch.Tensor | None:
++    """float32 power-of-two block scales -> e8m0 bytes, or None if not exact."""
++    s = scale.float()
++    if not bool(torch.isfinite(s).all()) or not bool((s > 0).all()):
++        return None
++    m, e = torch.frexp(s)
++    if not bool((m == 0.5).all()):
++        return None
++    b = e.to(torch.int32) - 1 + 127
++    if not bool(((b >= 1) & (b <= 134)).all()):
++        return None
++    return b.to(torch.uint8)
++
++
++def prepare(layer, block_scale: torch.Tensor, weight_block_size) -> None:
++    """Load time, after prepare_fp8_layer_for_marlin; never inside graph capture."""
++    layer._dsv4_dense_fp8 = None
++    if not enabled() or not torch.cuda.is_available():
++        return
++    K, N = layer.input_size_per_partition, layer.output_size_per_partition
++    if (K, N) not in TIERS or list(weight_block_size) != [128, 128]:
++        return
++    if torch.cuda.get_device_capability(layer.weight.device) != (8, 0):
++        return
++    if K % 128 or N % 128 or tuple(block_scale.shape) != (N // 128, K // 128):
++        return
++    b = _block_scale_bytes(block_scale)
++    if b is None:
++        return
++    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++        marlin_permute_scales)
++    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
++        mxfp8_marlin_process_scales)
++    # [N/128, K/128] -> [N, K/32] e8m0, then the MXFP8 Marlin scale layout
++    g32 = b.repeat_interleave(128, 0).repeat_interleave(4, 1).contiguous()
++    s = g32.view(torch.float8_e8m0fnu).to(torch.bfloat16).T.contiguous()
++    s = marlin_permute_scales(s=s, size_k=K, size_n=N, group_size=32)
++    layer._dsv4_dense_fp8 = mxfp8_marlin_process_scales(s).view(torch.uint8).contiguous()
++    _ops()
++    _scratch(layer.weight.device)
++    global _LOGGED
++    if not _LOGGED:
++        _LOGGED = True
++        logger.info("VLLM_DSV4_DENSE_FP8_DECODE: small-M kernels enabled (first layer K=%d N=%d)", K, N)
++
++
++def _max_m() -> int:
++    return int(os.environ.get("VLLM_DSV4_DENSE_FP8_MAX_M", "64"))
++
++
++_MAX_M = _max_m()
++
++
++def _select(M: int, K: int, N: int):
++    tiers = TIERS.get((K, N))
++    if not tiers or M > _MAX_M:
++        return None
++    for t in sorted(tiers):
++        if M <= t:
++            return tiers[t]
++    return None
++
++
++def try_apply(x: torch.Tensor, layer, bias) -> torch.Tensor | None:
++    s = getattr(layer, "_dsv4_dense_fp8", None)
++    if s is None or bias is not None:
++        return None
++    K, N = layer.input_size_per_partition, layer.output_size_per_partition
++    x2 = x.reshape(-1, x.shape[-1])
++    M = x2.size(0)
++    if (M < 1 or x2.dtype != torch.bfloat16 or x2.stride(1) != 1 or x2.stride(0) % 8
++            or x2.data_ptr() % 16):
++        return None
++    sel = _select(M, K, N)
++    if sel is None:
++        return None
++    kind, cfg, arg = sel
++    part, cnt, part4 = _scratch(x2.device)
++    if kind == "splitk" and arg > 1 and part4.numel() < arg * M * N:
++        return None
++    out = torch.empty(M, N, dtype=torch.bfloat16, device=x2.device)
++    if kind == "streamk":
++        _ops().streamk(x2, layer.weight, s, out, part, cnt, cfg, arg)
++    else:
++        _ops().splitk(x2, layer.weight, s, out, part4, cfg, arg)
++    return out.reshape(*x.shape[:-1], N)
+diff --git a/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8_table.py b/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8_table.py
+new file mode 100644
+index 0000000..2b1ecbc
+--- /dev/null
++++ b/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8_table.py
+@@ -0,0 +1,11 @@
++# (K, N) -> {M tier: (kind, cfg, arg) | None}; a call with M uses the smallest
++# tier >= M. Generated from a cold-L2 per-M scan on node2 (CMP 170HX) against
++# Marlin FP8 block-128; an entry exists only where it was >= 1.03x Marlin.
++TIERS = {
++    (1024, 8192): {1: ('streamk', 3, 64), 2: ('streamk', 3, 64), 4: ('streamk', 3, 64), 6: ('streamk', 3, 64), 8: ('streamk', 3, 64), 12: ('splitk', 20, 2), 16: ('splitk', 20, 2), 20: ('splitk', 30, 2), 24: ('splitk', 30, 2), 32: None, 40: ('splitk', 60, 2), 48: None, 64: None},
++    (1024, 32768): {1: ('streamk', 0, 128), 2: ('streamk', 3, 64), 4: ('streamk', 3, 128), 6: ('streamk', 0, 128), 8: ('splitk', 21, 1), 12: ('splitk', 20, 1), 16: ('splitk', 20, 1), 20: ('splitk', 30, 1), 24: ('splitk', 30, 1), 32: ('splitk', 40, 1), 40: ('splitk', 61, 1), 48: ('splitk', 60, 1), 64: ('splitk', 80, 1)},
++    (2048, 4096): {1: ('streamk', 3, 64), 2: ('streamk', 3, 64), 4: ('streamk', 3, 64), 6: ('streamk', 3, 64), 8: ('streamk', 3, 64), 12: ('splitk', 21, 4), 16: ('splitk', 21, 4), 20: ('splitk', 31, 4), 24: ('splitk', 31, 4), 32: None, 40: ('splitk', 61, 4), 48: ('splitk', 61, 4), 64: ('splitk', 80, 4)},
++    (4096, 1536): {1: ('streamk', 3, 56), 2: None, 4: None, 6: None, 8: None, 12: None, 16: None, 20: ('splitk', 30, 12), 24: ('splitk', 30, 12), 32: None, 40: ('splitk', 60, 12), 48: ('splitk', 60, 12), 64: ('splitk', 80, 12)},
++    (4096, 4096): {1: ('streamk', 3, 64), 2: ('streamk', 3, 64), 4: ('streamk', 3, 64), 6: None, 8: ('streamk', 3, 64), 12: None, 16: None, 20: ('splitk', 31, 4), 24: ('splitk', 31, 4), 32: None, 40: ('splitk', 61, 4), 48: ('splitk', 61, 4), 64: ('splitk', 81, 4)},
++    (8192, 4096): {1: ('streamk', 3, 64), 2: None, 4: None, 6: None, 8: None, 12: None, 16: None, 20: ('splitk', 32, 8), 24: ('splitk', 31, 4), 32: None, 40: ('splitk', 61, 4), 48: ('splitk', 61, 4), 64: ('splitk', 81, 4)},
++}
+diff --git a/vllm/model_executor/kernels/linear/scaled_mm/marlin.py b/vllm/model_executor/kernels/linear/scaled_mm/marlin.py
+index 5d71cc4..b7e2767 100644
+--- a/vllm/model_executor/kernels/linear/scaled_mm/marlin.py
++++ b/vllm/model_executor/kernels/linear/scaled_mm/marlin.py
+@@ -93,11 +93,21 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+                 "FP8 layers; falling back to Marlin for this layer."
+             )
+ 
++        block_scale = None
++        if self.block_quant:
++            # VLLM_DSV4_DENSE_FP8_DECODE: keep the block scales for the
++            # group-32 copy built after the Marlin repack (default off).
++            from vllm.model_executor.kernels.linear.mxfp8 import dsv4_dense_fp8
++            if dsv4_dense_fp8.enabled():
++                block_scale = getattr(layer, self._block_scale_name(layer)).data.clone()
+         layer.input_scale = None
+         prepare_fp8_layer_for_marlin(
+             layer, self.size_k_first, input_dtype=self.marlin_input_dtype
+         )
+         del layer.input_scale
++        if block_scale is not None:
++            dsv4_dense_fp8.prepare(layer, block_scale, layer.weight_block_size)
++            del block_scale
+ 
+     def _dequantize_layer_for_cublas(self, layer: torch.nn.Module) -> None:
+         """Dequantize the block-fp8 weight to the model dtype once at load
+@@ -142,6 +152,11 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+     ) -> torch.Tensor:
+         if getattr(layer, "marlin_fp8_dequant", False):
+             return torch.nn.functional.linear(x, layer.weight, bias)
++        if getattr(layer, "_dsv4_dense_fp8", None) is not None:
++            from vllm.model_executor.kernels.linear.mxfp8 import dsv4_dense_fp8
++            out = dsv4_dense_fp8.try_apply(x, layer, bias)
++            if out is not None:
++                return out
+         if self.block_quant:
+             weight_scale = getattr(layer, self._block_scale_name(layer))
+         else:
