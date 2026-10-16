@@ -1,4 +1,4 @@
-ad7d2a6ca24cc15843962b7de5f41b40d1c441b2100db375c312440130e8c442  models/deepseek-v4-flash/patches/0001-dspark-native-block-verification-widths.patch
+38166ce8275f8b83e0217a9ffb07e41c90938bf28b0eb4c0106b6eccd53c1826  models/deepseek-v4-flash/patches/0001-dspark-native-block-verification-widths.patch
 d7986ba124568828877ff39a3ebe9b68c1727821d4fec265317aa8d9c667f96b  models/deepseek-v4-flash/patches/0002-dspark-draft-head-fp8.patch
 493698d6bee022d14c4e9069df1f6486d35fd02ac2fac0ae7de96f168835c787  models/deepseek-v4-flash/patches/0003-dsv4-flash-mxfp4-moe-decode-shapes.patch
 febbe1b4986fa4d5365353cedee94e75702e011ff13f9c88c3b23ab1c89730a5  models/deepseek-v4-flash/patches/0004-dsv4-mhc-v2-hidden-4096.patch
