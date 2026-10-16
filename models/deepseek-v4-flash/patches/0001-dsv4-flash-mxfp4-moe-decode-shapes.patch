@@ -1,0 +1,165 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: MXFP4 MoE decode kernels for 4096/2048
+ experts
+
+VLLM_DSV4_MXFP4_DECODE and its v2 switches (deepseek-v4.1-flash 0004/0008)
+now also accept DeepSeek-V4-Flash experts (hidden 4096, intermediate 2048):
+the hook checks (hidden, intermediate) against a shape set instead of the
+fixed V4.1 pair and sizes every buffer from the call. The kernels themselves
+are shape templates; native/dsv4_moe instantiates the 4096/2048 cases next to
+the V4.1 ones (same kernel code as the MiMo-V2.6 library, which has the same
+expert shape). Defaults unchanged (off).
+
+On CMP 170HX, graph replay per MoE call vs Marlin (V4 shapes, top-6):
+M=4 / 18 experts 319 -> 284 us, M=8 / 36 experts 572 -> 492 us, M=32 / 100
+experts 1536 -> 1300 us (DQ2, fused activation and top-k sum). Error vs an
+fp64 reference equals Marlin's; graph replay == eager; deterministic.
+---
+ .../layers/fused_moe/dsv4_mxfp4_decode.py     | 52 ++++++++++---------
+ 1 file changed, 28 insertions(+), 24 deletions(-)
+
+diff --git a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+index a7b980a..c11c7e5 100644
+--- a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
++++ b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+@@ -15,7 +15,7 @@ Eligible calls: sm_80, bf16 activations, float4_e2m1f weights, no bias /
+ zero points / global scales / expert map / 8-bit activations, router weight
+ applied on the output, block-8 alignment, at most
+ VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS (default 64) tokens, the compiled shapes
+-(hidden 5120, intermediate 2304), and every e8m0 scale of the layer <= 128
++(hidden/intermediate 5120/2304 or 4096/2048), and every e8m0 scale of the layer <= 128
+ (checked once per weight tensor outside CUDA-graph capture). Anything else
+ uses the unchanged Marlin path.
+ 
+@@ -47,7 +47,9 @@ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+ 
+-_K, _NI = 5120, 2304
++# (hidden, expert intermediate) pairs compiled into _dsv4_moe_C:
++# DeepSeek V4.1 Flash (5120, 2304) and DeepSeek V4 Flash (4096, 2048).
++_SHAPES = frozenset({(5120, 2304), (4096, 2048)})
+ _OPS = None
+ _LOAD_ERROR: str | None = None
+ _SCALE_OK: dict[int, bool] = {}
+@@ -218,8 +220,9 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+     from vllm.scalar_type import scalar_types
+ 
+     M, K = hidden_states.shape
++    NI = w2.size(1) * 16
+     topk = topk_ids.size(1)
+-    if (quant_type != scalar_types.float4_e2m1f or K != _K or w2.size(1) * 16 != _NI
++    if (quant_type != scalar_types.float4_e2m1f or (K, NI) not in _SHAPES
+             or M > _max_tokens() or block_size_m != 8
+             or hidden_states.dtype != torch.bfloat16 or not hidden_states.is_cuda
+             or input_dtype is not None or apply_router_weight_on_input
+@@ -251,8 +254,8 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+     ctr = _counters(hidden_states.device)
+     if ctr is None:
+         return None
+-    if (intermediate_cache13.numel() < slots * max(2 * _NI, _K)
+-            or intermediate_cache2.numel() < slots * _NI
++    if (intermediate_cache13.numel() < slots * max(2 * NI, K)
++            or intermediate_cache2.numel() < slots * NI
+             or not intermediate_cache13.is_contiguous()
+             or not intermediate_cache2.is_contiguous()):
+         return None
+@@ -263,14 +266,14 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+                     "(<= %d tokens)", _max_tokens())
+     dev = hidden_states.device
+     cfg = 2 if M <= 6 else 5
+-    part = torch.empty(4 * slots * 2 * _NI, dtype=torch.float32, device=dev)
+-    act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
+-    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    part = torch.empty(4 * slots * 2 * NI, dtype=torch.float32, device=dev)
++    act_in = intermediate_cache13.reshape(-1)[: slots * 2 * NI].view(slots, 2 * NI)
++    h = intermediate_cache2.reshape(-1)[: slots * NI].view(slots, NI)
+     tw = topk_weights.view(-1)
+     ks = ops.gemm(hidden_states, w1, w1_scale.view(torch.uint8), sorted_token_ids,
+-                  expert_ids, num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True,
++                  expert_ids, num_tokens_post_padded, tw, topk, slots, K, 2 * NI, True,
+                   cfg, ctr, part)
+-    ops.sum(part, ks, slots, 2 * _NI, act_in)
++    ops.sum(part, ks, slots, 2 * NI, act_in)
+     if activation_func is None:
+         from vllm.model_executor.layers.fused_moe.activation import (
+             ApplyMoEActivationConfig, apply_moe_activation)
+@@ -279,9 +282,9 @@ def try_run(*, hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+                              topk_ids=topk_ids, expert_map=None)
+     else:
+         activation_func(activation, h, act_in, topk_ids=topk_ids, expert_map=None)
+-    out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
++    out = intermediate_cache13.reshape(-1)[: slots * K].view(slots, K)
+     ops.gemm(h, w2, w2_scale.view(torch.uint8), sorted_token_ids, expert_ids,
+-             num_tokens_post_padded, tw, topk, slots, _NI, _K, False, cfg, ctr, out)
++             num_tokens_post_padded, tw, topk, slots, NI, K, False, cfg, ctr, out)
+     return out, False
+ 
+ 
+@@ -294,7 +297,8 @@ def _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
+     smax = 128 if dq == 0 else 254
+     if not (_scales_ok(w1_scale, smax) and _scales_ok(w2_scale, smax)):
+         return None
+-    M = hidden_states.size(0)
++    M, K = hidden_states.shape
++    NI = w2.size(1) * 16
+     topk = topk_ids.size(1)
+     slots = M * topk
+     dev = hidden_states.device
+@@ -302,8 +306,8 @@ def _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
+     sync = _sync(dev)
+     if ctr is None or sync is None:
+         return None
+-    if (intermediate_cache13.numel() < slots * max(2 * _NI, _K)
+-            or intermediate_cache2.numel() < slots * _NI
++    if (intermediate_cache13.numel() < slots * max(2 * NI, K)
++            or intermediate_cache2.numel() < slots * NI
+             or not intermediate_cache13.is_contiguous()
+             or not intermediate_cache2.is_contiguous()):
+         return None
+@@ -316,22 +320,22 @@ def _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
+         logger.info("VLLM_DSV4_MXFP4_DECODE v2: dq=%d fused_act=%s fused_sum=%s (order %d)",
+                     dq, limit is not None, fsum, _sum_order())
+     cfg = 2 if M <= 6 else 5
+-    part = torch.empty(4 * slots * 2 * _NI, dtype=torch.float32, device=dev)
+-    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    part = torch.empty(4 * slots * 2 * NI, dtype=torch.float32, device=dev)
++    h = intermediate_cache2.reshape(-1)[: slots * NI].view(slots, NI)
+     tw = topk_weights.view(-1)
+     w1s = w1_scale.view(torch.uint8)
+     w2s = w2_scale.view(torch.uint8)
+     if limit is not None:
+         ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids, num_tokens_post_padded,
+-                  tw, topk, slots, _K, 2 * _NI, True, cfg, dq, True, limit, 0, ctr, sync,
++                  tw, topk, slots, K, 2 * NI, True, cfg, dq, True, limit, 0, ctr, sync,
+                   part, h)
+     else:
+         dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
+         ks = ops2.gemm(hidden_states, w1, w1s, sorted_token_ids, expert_ids,
+-                       num_tokens_post_padded, tw, topk, slots, _K, 2 * _NI, True, cfg, dq,
++                       num_tokens_post_padded, tw, topk, slots, K, 2 * NI, True, cfg, dq,
+                        False, 0.0, 0, ctr, sync, part, dummy)
+-        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
+-        ops.sum(part, ks, slots, 2 * _NI, act_in)
++        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * NI].view(slots, 2 * NI)
++        ops.sum(part, ks, slots, 2 * NI, act_in)
+         if activation_func is None:
+             from vllm.model_executor.layers.fused_moe.activation import (
+                 ApplyMoEActivationConfig, apply_moe_activation)
+@@ -341,13 +345,13 @@ def _try_run_v2(ops, dq, limit, fsum, hidden_states, w1, w2, w1_scale, w2_scale,
+                                  topk_ids=topk_ids, expert_map=None)
+         else:
+             activation_func(activation, h, act_in, topk_ids=topk_ids, expert_map=None)
+-    out = intermediate_cache13.reshape(-1)[: slots * _K].view(slots, _K)
++    out = intermediate_cache13.reshape(-1)[: slots * K].view(slots, K)
+     if fsum:
+         y = output if output is not None else torch.empty_like(hidden_states)
+         ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw, topk,
+-                  slots, _NI, _K, False, cfg, dq, True, 0.0, _sum_order(), ctr, sync, out, y)
++                  slots, NI, K, False, cfg, dq, True, 0.0, _sum_order(), ctr, sync, out, y)
+         return y, True
+     dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
+     ops2.gemm(h, w2, w2s, sorted_token_ids, expert_ids, num_tokens_post_padded, tw, topk,
+-              slots, _NI, _K, False, cfg, dq, False, 0.0, 0, ctr, sync, out, dummy)
++              slots, NI, K, False, cfg, dq, False, 0.0, 0, ctr, sync, out, dummy)
+     return out, False

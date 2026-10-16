@@ -648,6 +648,19 @@ int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor co
   DSV4_CASE2(false, 2304, 5120, 144, 3, 2, 1)
   DSV4_CASE2(false, 2304, 5120, 144, 4, 16, 1)
   DSV4_CASE2(false, 2304, 5120, 144, 5, 8, 2)
+  // DeepSeek-V4-Flash experts: hidden 4096, intermediate 2048 (R = 64 / 128)
+  DSV4_CASE2(true, 4096, 4096, 64, 0, 4, 1)
+  DSV4_CASE2(true, 4096, 4096, 64, 1, 4, 2)
+  DSV4_CASE2(true, 4096, 4096, 64, 2, 8, 1)
+  DSV4_CASE2(true, 4096, 4096, 64, 3, 2, 1)
+  DSV4_CASE2(true, 4096, 4096, 64, 4, 16, 1)
+  DSV4_CASE2(true, 4096, 4096, 64, 5, 8, 2)
+  DSV4_CASE2(false, 2048, 4096, 128, 0, 4, 1)
+  DSV4_CASE2(false, 2048, 4096, 128, 1, 4, 2)
+  DSV4_CASE2(false, 2048, 4096, 128, 2, 8, 1)
+  DSV4_CASE2(false, 2048, 4096, 128, 3, 2, 1)
+  DSV4_CASE2(false, 2048, 4096, 128, 4, 16, 1)
+  DSV4_CASE2(false, 2048, 4096, 128, 5, 8, 2)
 #undef DSV4_CASE2
   TORCH_CHECK(false, "unsupported shape/cfg/dq: w13=", w13, " K=", K, " N=", N, " cfg=", cfg,
               " dq=", dq);

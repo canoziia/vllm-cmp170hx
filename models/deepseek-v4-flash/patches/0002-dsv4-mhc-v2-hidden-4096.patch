@@ -1,0 +1,108 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: mHC decode v2 for hidden 4096
+
+VLLM_DSV4_MHC_V2 (deepseek-v4.1-flash 0007, default off) was pinned to
+hidden 5120. The Gluon/Triton kernels are already written for any hidden that
+is a multiple of their 32/128-wide slices; only the gate, the asserts and the
+startup warm-up fixed 5120. They now accept hidden 4096 (DeepSeek-V4-Flash) as
+well, and the warm-up compiles the hidden sizes of the loaded model's mHC
+layers (read from hc_ffn_fn).
+
+hidden 4096, CMP 170HX: TileLang 14.3 / 17.3 / 21.7 / 36.1 us -> 11.2 / 11.4
+/ 12.5 / 19.3 us at M = 1 / 6 / 12 / 48. The residual output stays bitwise
+equal to TileLang; the mixes differ in fp32 summation order: over 191 cases
+2 stress-scaled M=1 cases exceed 4x TileLang's fp64 max error (6.5x, at the
+1e-6 level; the hidden-5120 case peaks at 3.9x). End to end +1-3 %.
+---
+ .../model_executor/kernels/mhc/dsv4_mhc_v2.py |  6 +++--
+ .../kernels/mhc/dsv4_mhc_v2_gate.py           | 24 ++++++++++++-------
+ 2 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/model_executor/kernels/mhc/dsv4_mhc_v2.py b/vllm/model_executor/kernels/mhc/dsv4_mhc_v2.py
+index 903e167..dfe8ac3 100644
+--- a/vllm/model_executor/kernels/mhc/dsv4_mhc_v2.py
++++ b/vllm/model_executor/kernels/mhc/dsv4_mhc_v2.py
+@@ -967,6 +967,8 @@ def _pre_finish_kernel(
+ #
+ # HB=128 with NB=8 is one [8, 4, 128] fp32 fn tile = 16 KB per CTA and
+ # 32 * 3 * M CTAs; the ranking is dominated by that tile size, not by CTA count.
++# hidden sizes the decode path is validated for: V4.1 Flash, V4 Flash
++HIDDEN_SIZES = (5120, 4096)
+ HB_A = 128          # hidden elements per CTA; KSPLIT = hidden // HB_A
+ # Token blocking for kernel A.  BMS tokens of one CTA share one `fn` tile, so
+ # `fn` is streamed ceil(M/BMS) times per call instead of M times.  Measured
+@@ -1056,8 +1058,8 @@ def mhc_fused_post_pre(
+     Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur) with
+     shapes (..., hc, H), (..., hc, 1), (..., hc, hc), (..., H).
+     """
+-    assert residual.shape[-2:] == (4, 5120)
+-    assert 1 <= residual.numel() // (4 * 5120) <= 64
++    assert residual.shape[-2] == 4 and residual.shape[-1] in HIDDEN_SIZES
++    assert 1 <= residual.numel() // (4 * residual.shape[-1]) <= 64
+     assert residual.dtype == torch.bfloat16 and x.dtype == torch.bfloat16
+     assert post_layer_mix.dtype == torch.float32
+     assert comb_res_mix.dtype == torch.float32
+diff --git a/vllm/model_executor/kernels/mhc/dsv4_mhc_v2_gate.py b/vllm/model_executor/kernels/mhc/dsv4_mhc_v2_gate.py
+index 49f23fa..9fd57c7 100644
+--- a/vllm/model_executor/kernels/mhc/dsv4_mhc_v2_gate.py
++++ b/vllm/model_executor/kernels/mhc/dsv4_mhc_v2_gate.py
+@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
+ _WARMED = set()
+ _WARNED = set()
+ _IMPL = None
++_HIDDEN = (5120, 4096)  # == dsv4_mhc_v2.HIDDEN_SIZES (no import at module load)
+ 
+ 
+ def enabled():
+@@ -28,9 +29,10 @@ def maybe(x, residual, post, comb, fn, scale, base, rms_eps, pre_eps,
+     if not enabled():
+         return None
+     tensors = (x, residual, post, comb, fn, scale, base, norm_weight)
+-    if norm_weight is None or not x.is_cuda or residual.shape[-2:] != (4, 5120):
++    if (norm_weight is None or not x.is_cuda or residual.dim() < 2
++            or residual.shape[-2] != 4 or residual.shape[-1] not in _HIDDEN):
+         return None
+-    m = residual.numel() // 20480
++    m = residual.numel() // (4 * residual.shape[-1])
+     if not 1 <= m <= 64 or sinkhorn != 20:
+         return None
+     # Fixed layout/dtypes/alignment avoid a new Triton signature in capture.
+@@ -41,7 +43,7 @@ def maybe(x, residual, post, comb, fn, scale, base, rms_eps, pre_eps,
+         return None
+     dev = x.device.index
+     capturing = torch.cuda.is_current_stream_capturing()
+-    if (dev, m) not in _WARMED:
++    if (dev, m, residual.shape[-1]) not in _WARMED:
+         if capturing:
+             if (dev, m) not in _WARNED:
+                 _WARNED.add((dev, m))
+@@ -54,7 +56,7 @@ def maybe(x, residual, post, comb, fn, scale, base, rms_eps, pre_eps,
+         norm_weight, norm_eps)
+ 
+ 
+-def warmup(device):
++def warmup(device, hidden=5120):
+     if not enabled():
+         return
+     with torch.cuda.device(device):
+@@ -62,10 +64,16 @@ def warmup(device):
+             raise RuntimeError('mHC v2 warmup must precede capture')
+         if torch.cuda.get_device_capability() != (8, 0):
+             raise RuntimeError('VLLM_DSV4_MHC_V2 requires sm_80')
+-        _impl().warmup(range(1, 65), hidden=5120, hc=4, sinkhorn=20, device=device)
+-        _WARMED.update((torch.cuda.current_device(), m) for m in range(1, 65))
++        if hidden not in _HIDDEN:
++            raise RuntimeError(f'VLLM_DSV4_MHC_V2: hidden {hidden} not supported')
++        _impl().warmup(range(1, 65), hidden=hidden, hc=4, sinkhorn=20, device=device)
++        _WARMED.update((torch.cuda.current_device(), m, hidden) for m in range(1, 65))
+ 
+ 
+ def warmup_from_worker(worker):
+-    if enabled() and any(hasattr(mod, 'hc_ffn_fn') for mod in worker.get_model().modules()):
+-        warmup(worker.device)
++    if not enabled():
++        return
++    hidden = {int(mod.hc_ffn_fn.shape[-1]) // 4 for mod in worker.get_model().modules()
++              if isinstance(getattr(mod, 'hc_ffn_fn', None), torch.Tensor)}
++    for h in sorted(hidden):
++        warmup(worker.device, hidden=h)
