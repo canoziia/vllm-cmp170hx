@@ -130,3 +130,54 @@ Things worth knowing:
 
 The earlier vendored copy of vLLM's example `disagg_proxy_server.py` was removed in
 favour of this router.
+
+## DSpark speculative decoding (opt-in)
+
+The image built by `scripts/build-deepseek-v41-image.sh` also carries the
+V4-specific series `patches/series` (applied after the V4.1 adaptive series,
+checked against `manifests/patches.sha256`, tested by
+`tests/test_dsv4_verification.py`). Nothing changes unless enabled:
+
+- `0001` native DSpark block: V4 drafts `dspark_block_size` = 5 tokens per
+  parallel pass. Upstream treated the 3 MTP stages as `n_predict`, which only
+  allowed K <= 3 or multiples of 3 (K=6 then drafts one block of 6, one slot
+  past the trained block). Now K = 1..5 (or multiples of 5). It also extends
+  the V4.1 verification-width machinery (`spec_k`, exact small-cohort graphs,
+  decode metadata, measured history policy) to V4, with a PP3 cost table and
+  one shared width per scheduled cohort (mixed widths lose the FULL graph).
+- `0002` fp8 draft head (`VLLM_DSPARK_DRAFT_HEAD_FP8=1`): draft logits only;
+  target verification keeps the bf16 head. 823 -> 413 us per step at 5 rows.
+
+Recommended decode settings (single engine, PP3 `15,16,12`, max-num-seqs 8):
+
+```text
+VLLM_DSV41_OPT_PROFILE=v4-spec
+--speculative-config={"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":true}
+```
+
+`v4-spec` sets only `VLLM_DSV41_VERIFICATION`, `VLLM_DSV41_FAST_METADATA`,
+`VLLM_DSV41_METADATA_GRAPHS` and `VLLM_DSPARK_DRAFT_HEAD_FP8`; target kernel
+switches are independent. Adaptive history verification requires exactly
+K=5, PP3, greedy drafting and CUDA graphs. Requests may pin a width with
+`"vllm_xargs":{"spec_k":N}` (0..5). For PD, both roles must declare the same
+`num_speculative_tokens` (see above).
+
+Measured on node2 (CMP 170HX, tok/s; c1 per request, c4/c8 full batch; image
+`deepseek-v4-flash-87b407e`, target kernels at their defaults):
+
+| load | fixed K3 (old default) | fixed K5 | fixed K6 | K5 + v4-spec + adaptive |
+|---|---|---|---|---|
+| counting c1/c4/c8 | 121.5 / 265 / 446 | 119.9 / 318 / 502 | 109.9 / 275 / 460 | 127.1 / 328 / 573 |
+| code c1/c4/c8 | 125.2 / 274 / 525 | 144.4 / 370 / 663 | 133.4 / 367 / - | 146.7 / 378 / 662 |
+| prose c1/c4/c8 | 73.5 / 216* / 296 | 68.3 / 175 / 300 | 68.2 / 181 / 272 | 79.9 / 204 / 342 |
+
+`*` unstable (round spread 15 tok/s). K6 drafts one slot past the trained
+block and is worse than K5 everywhere. Prose acceptance is low (~2.1 tokens
+per step); an offline per-step oracle over the measured acceptance stream
+leaves no width headroom at c1, so the remaining prose cost is the target
+step. Prose c1 also moves +-8 % with the output trajectory (a near-tie at the
+first token changes the essay). `VLLM_PP_DECODE_COHORT_LIVE_LOAD=1` (a PP
+cohort switch, not part of `v4-spec`) added +5-16 % at c4 on top.
+Greedy outputs can differ between widths at near-ties (batch-shape numerics,
+see `../deepseek-v4.1-flash/docs/GREEDY-OUTPUT-ARGMAX-AUDIT.md`); identical
+counting outputs were observed at every width and concurrency.

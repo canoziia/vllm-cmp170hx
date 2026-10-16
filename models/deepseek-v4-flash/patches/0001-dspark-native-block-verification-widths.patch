@@ -1,0 +1,341 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4: native DSpark block and request-local verification widths
+
+DeepSeek V4 DSpark drafts dspark_block_size (5) tokens in one parallel
+pass, but n_predict was the MTP stage count (3), so num_speculative_tokens
+had to be <=3 or a multiple of 3. Use the block size, as V4.1 does.
+
+Extend the V4.1 verification-width hooks (spec_k, exact small-cohort
+graphs, decode metadata, measured history policy) to V4, including its
+resolved DeepseekV4ForConditionalGeneration architecture. The V4 history
+policy uses a PP3 cost table measured on CMP 170HX and picks one shared
+width per scheduled cohort, since mixed widths lose uniform FULL graphs.
+
+Adds the opt-in VLLM_DSV41_OPT_PROFILE=v4-spec. Everything stays off
+unless the profile or enable_adaptive_verification is set.
+---
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 331db79..9cc043d 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1438,7 +1438,7 @@ class SpeculativeConfig:
+                     draft_hf_config.architectures = [
+                         "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
+                     ]
+-                    if is_v41:
++                    if is_v41 or getattr(draft_hf_config, "dspark_block_size", None):
+                         # hf_config_override set n_predict to the number of
+                         # MTP stages (3), but one DSpark round drafts
+                         # dspark_block_size tokens; num_speculative_tokens
+@@ -1929,7 +1929,10 @@ class SpeculativeConfig:
+         return bool(
+             self.enable_adaptive_verification and self.use_dspark()
+             and target is not None
+-            and "DeepseekV41ForCausalLM" in target.architectures
++            # Same set as vllm.dsv41_opt_profile.VERIFICATION_WIDTH_ARCHS.
++            and not {"DeepseekV41ForCausalLM", "DeepseekV4ForCausalLM",
++                     "DeepseekV4ForConditionalGeneration"}.isdisjoint(
++                         target.architectures)
+         )
+ 
+     def uses_gpu_adaptive_verification(self) -> bool:
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 95da879..5a2656a 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -2727,10 +2727,13 @@ class VllmConfig:
+             from vllm.platforms import current_platform
+ 
+             parallel = self.parallel_config
++            # The measured cost tables cover V4.1 PP6 and V4 PP3.
++            pp_size = (6 if "DeepseekV41ForCausalLM" in self.model_config.architectures
++                       else 3)
+             if (not current_platform.is_device_capability_family(80)
+                     or spec_config.num_speculative_tokens != 5
+                     or spec_config.draft_sample_method != "greedy"
+-                    or parallel.pipeline_parallel_size != 6
++                    or parallel.pipeline_parallel_size != pp_size
+                     or parallel.tensor_parallel_size != 1
+                     or parallel.data_parallel_size != 1
+                     or parallel.prefill_context_parallel_size != 1
+@@ -2740,7 +2743,8 @@ class VllmConfig:
+                     or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE):
+                 raise ValueError(
+                     "Adaptive DeepSeek history verification currently requires "
+-                    "SM80, five greedy drafts, PP6/TP1/DP1/PCP1/DCP1, CUDA graphs "
++                    "SM80, five greedy drafts, PP6 (V4.1) or PP3 (V4), TP1/DP1/PCP1/DCP1, "
++                    "CUDA graphs "
+                     "and no LoRA/DBO")
+             return
+ 
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 2fb5da7..819da97 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -54,6 +54,17 @@ PROFILES["verification"] = {
+     "VLLM_DSV41_METADATA_GRAPHS": "1",
+ }
+ 
++# DeepSeek V4 (deepseek-v4-flash) DSpark: verification-width graphs, decode
++# metadata and the fp8 draft head only (speculative-decoding switches).
++# Target kernels, PP cohort switches and the automatic width policy
++# (enable_adaptive_verification) are separate choices.
++PROFILES["v4-spec"] = {
++    "VLLM_DSV41_VERIFICATION": "1",
++    "VLLM_DSV41_FAST_METADATA": "1",
++    "VLLM_DSV41_METADATA_GRAPHS": "1",
++    "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
++}
++
+ 
+ def apply() -> None:
+     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
+@@ -65,3 +76,17 @@ def apply() -> None:
+             f"(known: {', '.join(sorted(PROFILES))})")
+     for key, value in PROFILES[name].items():
+         os.environ.setdefault(key, value)
++
++
++# Architectures whose DSpark drafter supports request-local verification
++# widths (VLLM_DSV41_VERIFICATION, spec_k, the measured history policy).
++# The V4 vision checkpoint resolves to DeepseekV4ForConditionalGeneration.
++VERIFICATION_WIDTH_ARCHS = frozenset({
++    "DeepseekV41ForCausalLM",
++    "DeepseekV4ForCausalLM",
++    "DeepseekV4ForConditionalGeneration",
++})
++
++
++def uses_dsv4_verification_widths(architectures) -> bool:
++    return not VERIFICATION_WIDTH_ARCHS.isdisjoint(architectures or ())
+diff --git a/vllm/v1/core/sched/dsv41_fixed_policy.py b/vllm/v1/core/sched/dsv41_fixed_policy.py
+index 4b6ee06..9905cb4 100644
+--- a/vllm/v1/core/sched/dsv41_fixed_policy.py
++++ b/vllm/v1/core/sched/dsv41_fixed_policy.py
+@@ -13,11 +13,15 @@ from .dsv41_measured_policy import Policy
+ 
+ 
+ class FixedHistoryPolicy:
+-    def __init__(self, logger, decay=0.95):
++    def __init__(self, logger, decay=0.95, cost_ms=None, uniform=False):
+         if isinstance(decay, bool) or not math.isfinite(decay) or not 0 <= decay < 1:
+             raise ValueError("invalid history decay")
+         self.logger = logger
+         self.decay = decay
++        self.cost_ms = cost_ms
++        # One shared width per scheduled cohort (DeepSeek V4): mixed widths
++        # lose the uniform FULL graph and metadata replay.
++        self.uniform = uniform
+         self.active = {}
+         self.generation = 0
+         self.feedback_time = None
+@@ -27,7 +31,7 @@ class FixedHistoryPolicy:
+         )
+ 
+     def make_entry(self, request):
+-        return self.new_entry(Policy({"decay": self.decay}))
++        return self.new_entry(Policy({"decay": self.decay, "cost_ms": self.cost_ms}))
+ 
+     def new_entry(self, plugin):
+         self.generation += 1
+@@ -107,8 +111,29 @@ class FixedHistoryPolicy:
+                 except Exception as exc:
+                     self.fail(r.request_id, entry, exc)
+             result[r.request_id] = entry.k
++        if self.uniform and len(result) > 1:
++            self.unify(result)
+         return result
+ 
++    def unify(self, result):
++        """Replace per-request widths by the cohort width with the best summed
++        predicted throughput; keep the most common width unless the gain
++        exceeds 3%. Growth stays limited to one step above the widest."""
++        entries = [self.active[rid] for rid in result]
++        scores = [getattr(e.plugin, "diagnostics", {}).get("score") for e in entries]
++        widths = list(result.values())
++        incumbent = max(set(widths), key=lambda k: (widths.count(k), -k))
++        best = incumbent
++        if all(s is not None and len(s) == 5 for s in scores):
++            total = [sum(s[j] for s in scores) for j in range(5)]
++            cand = max(range(1, min(5, max(widths) + 1) + 1), key=lambda k: total[k - 1])
++            if total[cand - 1] > 1.03 * total[incumbent - 1]:
++                best = cand
++        for rid, e in zip(result, entries):
++            if not self.is_disabled(e):
++                e.k = best
++                result[rid] = best
++
+     def scheduled(self, output, residents, concurrency):
+         if not self.active:
+             return
+diff --git a/vllm/v1/core/sched/dsv41_measured_policy.py b/vllm/v1/core/sched/dsv41_measured_policy.py
+index f05d6e4..e00f440 100644
+--- a/vllm/v1/core/sched/dsv41_measured_policy.py
++++ b/vllm/v1/core/sched/dsv41_measured_policy.py
+@@ -19,24 +19,34 @@ COST_MS = {
+     32: (64.8606, 69.6108, 74.2044, 80.4401, 83.9715),
+ }
+ 
++# DeepSeek V4 (43 layers) PP3 15,16,12 on CMP 170HX, DSpark 5, uniform widths.
++COST_MS_DSV4_PP3 = {
++    1: (25.99, 27.93, 29.60, 32.25, 33.13),
++    2: (27.78, 33.09, 35.82, 40.07, 41.34),
++    4: (31.82, 38.49, 44.57, 50.25, 50.66),
++    8: (38.96, 45.13, 51.07, 58.72, 61.36),
++}
++
+ 
+-def costs(c):
+-    cs = sorted(COST_MS)
++def costs(c, table=None):
++    table = table or COST_MS
++    cs = sorted(table)
+     if c <= cs[0]:
+-        return [v / 1000 for v in COST_MS[cs[0]]]
++        return [v / 1000 for v in table[cs[0]]]
+     for lo, hi in zip(cs, cs[1:]):
+         if c <= hi:
+             w = (c - lo) / (hi - lo)
+             return [
+-                (a * (1 - w) + b * w) / 1000 for a, b in zip(COST_MS[lo], COST_MS[hi])
++                (a * (1 - w) + b * w) / 1000 for a, b in zip(table[lo], table[hi])
+             ]
+-    return [v / 1000 for v in COST_MS[cs[-1]]]
++    return [v / 1000 for v in table[cs[-1]]]
+ 
+ 
+ class Policy:
+     def __init__(self, config):
+         self.decay = float(config.get("decay", 0.95))
+         self.w = float(config.get("prediction_weight", 1.0))
++        self.cost_ms = config.get("cost_ms")
+         if not 0 <= self.decay < 1 or not 0 < self.w <= 100:
+             raise ValueError("invalid config")
+         self.k = 5
+@@ -109,7 +119,7 @@ class Policy:
+             )
+             p.append(previous)
+         E = [1 + sum(p[:k]) for k in range(1, 6)]
+-        C = costs(context["concurrency"])
++        C = costs(context["concurrency"], self.cost_ms)
+         # Calibrate predictions to the SAME current observed level. A bad
+         # current block cannot punish only the measured arm while unseen arms
+         # retain their optimistic absolute level. Preserve predicted k ratios.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index a0758c2..743bab1 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -7,6 +7,7 @@ from collections.abc import Iterable
+ from dataclasses import replace
+ from typing import Any
+ 
++from vllm.dsv41_opt_profile import uses_dsv4_verification_widths
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import KVEventsConfig, VllmConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+@@ -334,6 +335,12 @@ class Scheduler(SchedulerInterface):
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+         self.current_step = 0
++        if (self.dsv41_history_policy is not None
++                and "DeepseekV41ForCausalLM" not in vllm_config.model_config.architectures):
++            # DeepSeek V4 PP3: its own cost table and one width per cohort.
++            from .dsv41_measured_policy import COST_MS_DSV4_PP3
++            self.dsv41_history_policy.cost_ms = COST_MS_DSV4_PP3
++            self.dsv41_history_policy.uniform = True
+         # DP prefill balancing: Flag to track whether the last cadence-aligned
+         # prefill batch fully drained the waiting queue. Prefill throttling
+         # is disabled in this case.
+@@ -2602,7 +2609,7 @@ class Scheduler(SchedulerInterface):
+         return self.kv_cache_manager.usage
+ 
+     def add_request(self, request: Request) -> None:
+-        if "DeepseekV41ForCausalLM" in self.vllm_config.model_config.architectures:
++        if uses_dsv4_verification_widths(self.vllm_config.model_config.architectures):
+             from vllm.v1.core.sched.dsv41_spec_k import draft_limit
+ 
+             limit = draft_limit(request, self.vllm_config.speculative_config,
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index d1617c6..3733df0 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -6,6 +6,7 @@ from collections.abc import Mapping
+ from typing import Any, Literal
+ 
+ import vllm.envs as envs
++from vllm.dsv41_opt_profile import uses_dsv4_verification_widths
+ from vllm.config import VllmConfig
+ from vllm.exceptions import VLLMValidationError
+ from vllm.inputs import (
+@@ -100,7 +101,7 @@ class InputProcessor:
+                 self.structured_outputs_config,
+                 self.tokenizer,
+             )
+-            if "DeepseekV41ForCausalLM" in self.model_config.architectures:
++            if uses_dsv4_verification_widths(self.model_config.architectures):
+                 # DeepSeek V4.1 request-local verification width (vllm_xargs.spec_k).
+                 from vllm.v1.core.sched.dsv41_spec_k import validate_request
+ 
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index f493d60..a26ad08 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -14,6 +14,7 @@ import torch.nn as nn
+ from tqdm import tqdm
+ 
+ import vllm.envs as envs
++from vllm.dsv41_opt_profile import uses_dsv4_verification_widths
+ from vllm.compilation.breakable_cudagraph import (
+     BreakableCUDAGraphWrapper,
+     is_breakable_cudagraph_enabled,
+@@ -413,8 +414,7 @@ class CudaGraphManager:
+         # CPU divisibility alone must NEVER be treated as proof of uniformity.
+         if (capture_varlen_decode
+                 and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
+-                and "DeepseekV41ForCausalLM"
+-                in self.vllm_config.model_config.architectures):
++                and uses_dsv4_verification_widths(self.vllm_config.model_config.architectures)):
+             limit = min(48, max_cg_capture_size, max_decode_tokens)
+             for rows, loras in product(range(1, limit + 1), self.lora_capture_cases):
+                 key = (rows, loras)
+@@ -483,8 +483,7 @@ class CudaGraphManager:
+ 
+         if (separate_decode_routine and decode_mode
+                 and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
+-                and "DeepseekV41ForCausalLM"
+-                in self.vllm_config.model_config.architectures):
++                and uses_dsv4_verification_widths(self.vllm_config.model_config.architectures)):
+             # CPU-known scheduled verification widths do not need adaptive
+             # allocation or its PP length-vector dependency. Capture the small
+             # cohorts used by PP6, and powers of two for larger bursts.
+@@ -828,8 +827,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 and desc.uniform_token_count is not None
+                 and os.environ.get("VLLM_DSV41_METADATA_GRAPHS", "0") == "1"
+                 and current_platform.is_device_capability_family(80)
+-                and "DeepseekV41ForCausalLM"
+-                in self.vllm_config.model_config.architectures
++                and uses_dsv4_verification_widths(self.vllm_config.model_config.architectures)
+             )
+             attn_metadata, slot_mappings = prepare_inputs_to_capture(
+                 num_reqs,
+diff --git a/vllm/v1/worker/gpu/model_states/default.py b/vllm/v1/worker/gpu/model_states/default.py
+index 31b8ea7..02f810a 100644
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -6,6 +6,7 @@ from typing import Any
+ import torch
+ import torch.nn as nn
+ 
++from vllm.dsv41_opt_profile import uses_dsv4_verification_widths
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.v1.core.sched.output import NewRequestData
+@@ -39,7 +40,7 @@ class DefaultModelState(ModelState):
+         self.decode_token_owners = None
+         if (os.environ.get("VLLM_DSV41_FAST_METADATA", "0") == "1"
+                 and not vllm_config.parallel_config.use_ubatching
+-                and "DeepseekV41ForCausalLM" in self.model_config.architectures):
++                and uses_dsv4_verification_widths(self.model_config.architectures)):
+             # One stable address across all KV groups and capture/replay. This
+             # map depends only on query boundaries, never group-specific KV.
+             self.decode_token_owners = torch.empty(

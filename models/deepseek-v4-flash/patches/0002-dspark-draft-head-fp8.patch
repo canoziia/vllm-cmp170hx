@@ -1,0 +1,78 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4: fp8 draft head for DSpark
+
+Port VLLM_DSPARK_DRAFT_HEAD_FP8 (V4.1 0009) to the V4 DSpark drafter:
+draft logits read a weight-only per-channel e4m3 copy of lm_head through
+Marlin W8A16; target verification keeps the bf16 head. Measured on CMP
+170HX at 5 rows: 823 -> 413 us per step. Default off.
+---
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+index 653cd21..66a65cc 100644
+--- a/vllm/models/deepseek_v4/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -326,6 +326,47 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+             prefix=maybe_prefix(prefix, "lm_head"),
+         )
+         self.logits_processor = LogitsProcessor(self.config.vocab_size)
++        # VLLM_DSPARK_DRAFT_HEAD_FP8: fp8 copy of lm_head for draft logits
++        # only (built by build_fp8_draft_head; None = bf16 shared head).
++        self._fp8_draft_head = None
++
++    def build_fp8_draft_head(self) -> None:
++        """Build the weight-only fp8 draft head from the (aliased) lm_head.
++
++        Must run after load_dspark_model aliased the target lm_head and
++        before KV sizing / CUDA-graph capture. Target verification keeps the
++        bf16 head.
++        """
++        from vllm.models.deepseek_v4_1.nvidia.dspark_fp8_head import Fp8DraftHead
++
++        lp = self.logits_processor
++        if self.lm_head.tp_size != 1:
++            raise ValueError("VLLM_DSPARK_DRAFT_HEAD_FP8 requires TP=1")
++        if getattr(self.lm_head, "bias", None) is not None:
++            raise ValueError("VLLM_DSPARK_DRAFT_HEAD_FP8: lm_head has a bias")
++        if lp.head_dtype is not None and lp.head_dtype != self.lm_head.weight.dtype:
++            raise ValueError("VLLM_DSPARK_DRAFT_HEAD_FP8: head_dtype override set")
++        with torch.no_grad():
++            self._fp8_draft_head = Fp8DraftHead(self.lm_head.weight.data)
++        torch.cuda.empty_cache()
++        logger.info(
++            "DSpark: fp8 draft lm_head built (%.2f GiB, shape %s)",
++            self._fp8_draft_head.nbytes() / 2**30,
++            tuple(self.lm_head.weight.shape),
++        )
++
++    def _fp8_draft_shard_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Mirrors LogitsProcessor.get_shard_logits with the projection swapped.
++        lp = self.logits_processor
++        logits = self._fp8_draft_head(hidden_states)
++        if lp.soft_cap is not None:
++            logits = torch.tanh(logits / lp.soft_cap) * lp.soft_cap
++        if lp.scale != 1.0:
++            logits = logits * lp.scale
++        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
++        if num_pad > 0:
++            logits[..., -num_pad:] = -float("inf")
++        return logits
+ 
+     # --- Hooks used by the speculator -------------------------------------
+ 
+@@ -365,11 +406,17 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+ 
+     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Full-vocab draft: base logits, no d2t scatter.
++        if self._fp8_draft_head is not None:
++            # TP=1: no gather; drop vocab padding like LogitsProcessor.forward.
++            logits = self._fp8_draft_shard_logits(self.model.norm(hidden_states))
++            return logits[..., : self.logits_processor.org_vocab_size]
+         return self.compute_logits(hidden_states)
+ 
+     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         # Same logits, this rank's vocab columns only (no gather). The norm is
+         # part of the head, so it stays on this side of the split.
++        if self._fp8_draft_head is not None:
++            return self._fp8_draft_shard_logits(self.model.norm(hidden_states))
+         return self.logits_processor.get_shard_logits(
+             self.lm_head, self.model.norm(hidden_states)
+         )
