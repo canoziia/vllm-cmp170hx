@@ -27,10 +27,10 @@ services:
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
       # 43 target layers; the MTP layers live on the last rank.
       VLLM_PP_LAYER_PARTITION: "${DSFLASH_PP_PARTITION:-15,16,12}"
-      # Optimisations are opt-in; off reproduces the unmodified baseline.
+      # Optimisations are opt-in; off reproduces the unmodified baseline,
+      # dsv4-flash enables the measured set (incl. live-load PP cohorts).
       VLLM_DSV41_OPT_PROFILE: "${DSFLASH_OPT_PROFILE:-off}"
       VLLM_PP_DECODE_COHORT_BALANCE: "${DSFLASH_PP_COHORT_BALANCE:-1}"
-      VLLM_PP_DECODE_COHORT_LIVE_LOAD: "${DSFLASH_PP_COHORT_LIVE_LOAD:-0}"
       NCCL_ALGO: Ring
       NCCL_PROTO: Simple
       NCCL_IB_DISABLE: "1"

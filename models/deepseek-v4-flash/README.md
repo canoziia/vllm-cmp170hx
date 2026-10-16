@@ -130,3 +130,56 @@ Things worth knowing:
 
 The earlier vendored copy of vLLM's example `disagg_proxy_server.py` was removed in
 favour of this router.
+
+## Single engine (PP3, no PD) and the `dsv4-flash` profile
+
+`compose.yml` is the decode role of `compose.pd.yml` as one engine without
+LMCache (GPUs, port and container name from `.env.single`, see
+`.env.single.example`). The image is built by
+`scripts/build-deepseek-v4-flash-image.sh` (the DeepSeek V4.1 image plus
+`patches/series`). `DSFLASH_OPT_PROFILE=dsv4-flash` sets
+`VLLM_DSV41_OPT_PROFILE=dsv4-flash`; `off` (default) is the unmodified baseline.
+
+The checkpoint's `mtp.*` layers are a 3-layer DSpark drafter (`main_proj`,
+`markov_head`, `confidence_head`), so `method=mtp` does not load it;
+`dspark` requires `num_speculative_tokens` divisible by 3.
+
+Measured on node2 GPUs 1-3 (CMP 170HX), `benchmark-vllm.mjs`, 500 tokens, 2
+warm-up + 3 rounds (median), max-num-seqs 8 unless noted; restart-to-restart
+noise is about +-3 %.
+
+| tok/s (per request at c1, full batch at c8) | baseline (off) | dsv4-flash |
+|---|---|---|
+| code c1 / c8 | 123.8 / 485.1 | 166.5 / 647.2 |
+| counting c1 / c8 | 114.6 / 436.2 | 150.6 / 573.3 |
+| prose c1 / c8 | 73.1 / 291.6 | 105.0 / 376.4 |
+
+With `DSFLASH_MAX_NUM_SEQS=32` (no OOM at startup or in decode; 1M-token
+prefill not re-tested): c16 code/counting/prose 1198 / 1012 / 691, c32 1588 /
+1382 / 896 tok/s.
+
+Contributions, each measured on top of the previous ones:
+
+| switch | effect |
+|---|---|
+| `VLLM_PP_DECODE_COHORT_LIVE_LOAD=1` | counting c4 +33 %, others +-2 % |
+| MXFP4 MoE decode v2 for 4096/2048 experts (0001; DQ2, fused act/sum) | c8 +15-17 %, c1 +2-4 % |
+| `VLLM_PP_DEFERRED_FEEDBACK_RECV=1` (0003) | c8 +3.5 %, c4 +1-2 % |
+| `VLLM_DSV4_FAST_DET_MOE_ALIGN` + `VLLM_DSV4_CUDA_DET_ALIGN` | c1 +15 %, c8 +6 % (the torch deterministic align cost ~78 us per MoE call) |
+| sparse decode fast + attention direct out + thin wo_a + indexer q LUT | c1 +6-8 %, c8 +5-7 % |
+| small-M dense FP8 GEMMs (0004) | c1 +5 % per step, c8 +-2 % |
+| mHC v2 for hidden 4096 (0002, **not** in the profile) | +1-2 % per step; 2 of 191 stress cases exceed V4.1's 4x fp64 tolerance |
+
+Tried and not kept: V4.1 prefill switches (indexer prefill fast, MoE prefill
+split: neutral), per-M MoE kernel variants (within noise), w2 split-K for the
+MoE kernel (faster only with <= 4 distinct experts), fused next_n paged indexer
+logits (1.3x on the logits kernel only at >= 40k compressed tokens, slower
+below).
+
+Decode time split (sampled CUDA events + kernel micro-benchmarks, profile on):
+c1 (4 tokens/step) target forward 85 %, DSpark draft 10 %, sampling 3 %; per
+layer MoE ~55 %, dense FP8 ~29 %, mHC ~7 %, attention/indexer/small ops ~10 %.
+c8 (PP cohorts of 8-12 tokens) per layer MoE ~69 %, dense ~14 %, attention and
+small ops ~14 %. Long context (c1, prose): 48 / 41.5 / 38.8 steps/s at short /
+50k / 159k tokens; the growth is mostly the indexer (logits + top-k over the
+compressed keys).
