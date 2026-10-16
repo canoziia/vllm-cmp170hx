@@ -9,6 +9,10 @@ MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 source "$MODEL_DIR/manifests/source.env"
 
 (cd "$REPO_ROOT" && sha256sum -c models/deepseek-v4.1-flash/manifests/patches.sha256)
+# DeepSeek V4 (deepseek-v4-flash) is served from the same image; its DSpark
+# series is model-specific and inert unless enabled at runtime.
+V4_MODEL_DIR="$REPO_ROOT/models/deepseek-v4-flash"
+(cd "$REPO_ROOT" && sha256sum -c models/deepseek-v4-flash/manifests/patches.sha256)
 
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {
   echo "SOURCE_TREE must be a git checkout containing vllm/" >&2
@@ -25,10 +29,10 @@ actual=$(git -C "$SOURCE_TREE" rev-parse HEAD)
 }
 
 apply_series() {
-  local series=$1 patch patch_path
+  local series=$1 base=${2:-$MODEL_DIR/patches} patch patch_path
   while read -r patch; do
     [[ -n "$patch" && $patch != \#* ]] || continue
-    patch_path="$MODEL_DIR/patches/$patch"
+    patch_path="$base/$patch"
     [[ -f "$patch_path" ]] || { echo "Missing series patch: $patch" >&2; exit 6; }
     echo "Applying $patch"
     git -C "$SOURCE_TREE" apply --check "$patch_path"
@@ -61,6 +65,8 @@ if [[ $ENABLE_ADAPTIVE_VERIFICATION == 0 && $ENABLE_PERF_DEBUG == 1 ]]; then
 fi
 if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
   apply_series "$MODEL_DIR/patches/adaptive/series"
+  # V4 DSpark verification widths build on the adaptive series.
+  apply_series "$V4_MODEL_DIR/patches/series" "$V4_MODEL_DIR/patches"
 fi
 if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
   apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
@@ -95,6 +101,7 @@ if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
     "$SOURCE_TREE/vllm/config/speculative.py"
   python3 "$MODEL_DIR/tests/test_adaptive_switch_routing.py" "$SOURCE_TREE"
   python3 "$MODEL_DIR/tests/test_verification_profile.py" "$SOURCE_TREE"
+  python3 "$V4_MODEL_DIR/tests/test_dsv4_verification.py" "$SOURCE_TREE"
   # the budget published by the last rank can never exceed the drafts that exist
   grep -q 'pp_verification_budget = min(pp_verification_budget, scheduled_drafts)' \
     "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
