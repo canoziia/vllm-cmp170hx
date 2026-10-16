@@ -1,5 +1,7 @@
-493698d6bee022d14c4e9069df1f6486d35fd02ac2fac0ae7de96f168835c787  models/deepseek-v4-flash/patches/0001-dsv4-flash-mxfp4-moe-decode-shapes.patch
-febbe1b4986fa4d5365353cedee94e75702e011ff13f9c88c3b23ab1c89730a5  models/deepseek-v4-flash/patches/0002-dsv4-mhc-v2-hidden-4096.patch
-d79eef9642884294acbf8b1ce8da081c31fd0fe8f8b78cc37f3258477342f876  models/deepseek-v4-flash/patches/0003-pp-deferred-feedback-recv.patch
-26b8bccaf62a5b3945a1b2d6ec1b5d9c32b3498697c7ad1c4434a2869d76b668  models/deepseek-v4-flash/patches/0004-dsv4-dense-fp8-decode.patch
-083e070fbe4c1febe762bf595b8fc74ec79553c2b4264c88eb483bac489c4f46  models/deepseek-v4-flash/patches/0005-dsv4-flash-opt-profile.patch
+ad7d2a6ca24cc15843962b7de5f41b40d1c441b2100db375c312440130e8c442  models/deepseek-v4-flash/patches/0001-dspark-native-block-verification-widths.patch
+d7986ba124568828877ff39a3ebe9b68c1727821d4fec265317aa8d9c667f96b  models/deepseek-v4-flash/patches/0002-dspark-draft-head-fp8.patch
+493698d6bee022d14c4e9069df1f6486d35fd02ac2fac0ae7de96f168835c787  models/deepseek-v4-flash/patches/0003-dsv4-flash-mxfp4-moe-decode-shapes.patch
+febbe1b4986fa4d5365353cedee94e75702e011ff13f9c88c3b23ab1c89730a5  models/deepseek-v4-flash/patches/0004-dsv4-mhc-v2-hidden-4096.patch
+d79eef9642884294acbf8b1ce8da081c31fd0fe8f8b78cc37f3258477342f876  models/deepseek-v4-flash/patches/0005-pp-deferred-feedback-recv.patch
+26b8bccaf62a5b3945a1b2d6ec1b5d9c32b3498697c7ad1c4434a2869d76b668  models/deepseek-v4-flash/patches/0006-dsv4-dense-fp8-decode.patch
+84ba3e590046d0415d2931d0cccb169a3d599a4963ccae0d3372ee15c3fa48a0  models/deepseek-v4-flash/patches/0007-dsv4-flash-opt-profile.patch
