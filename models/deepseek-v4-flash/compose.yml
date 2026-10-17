@@ -49,7 +49,7 @@ services:
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-32}
       - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-512}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3006267392}
+      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-2684354560}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
