@@ -1,0 +1,35 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: uniform verification graphs for larger PP
+ cohorts
+
+VLLM_DSV4_VERIFICATION_COHORTS (default 0 = unchanged). With
+VLLM_DSV41_VERIFICATION the CPU-known uniform verification graphs exist for
+1-8, 16 and 32 requests per width. At max-num-seqs 32 over PP3 the live-load
+cohorts hold ~9-11 requests, so an 11-request width-4 step (44 rows) ran the
+16-request 64-row graph: +45 % verified rows, and the K=5 engine fell behind a
+K=3 engine at c32 (101.8 vs ~78 ms per step at width 3). The switch also
+captures 12 and 24 requests per width (10 more FULL graphs at K=5; every 2/4
+requests up to 32 did not fit in the tightest rank's memory). With it and the
+re-swept cost table, c32 at width 3 costs 84 ms per step (K=3 engine ~78) and
+width 4 no longer misses the graphs (97.9 instead of 144 ms).
+
+---
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -489,6 +489,15 @@
+             # cohorts used by PP6, and powers of two for larger bursts.
+             req_counts = sorted(set(range(1, min(8, self.max_num_reqs) + 1))
+                                 | {n for n in (16, 32) if n <= self.max_num_reqs})
++            if os.environ.get("VLLM_DSV4_VERIFICATION_COHORTS", "0") == "1":
++                # PP cohorts of 9..32 requests (max-num-seqs 32 over PP3 gives
++                # ~11) otherwise pad to the 16/32-request uniform graph: an
++                # 11-request width-4 step ran the 64-row graph (+45 % rows).
++                # 12 and 24 requests as well: every extra FULL graph costs
++                # memory on the tightest PP rank (all of 10..32 in steps of
++                # 2/4 failed to capture there).
++                req_counts = sorted(set(req_counts) | {
++                    n for n in (12, 24) if n <= self.max_num_reqs})
+             for reqs, width, loras in product(
+                 req_counts, range(1, self.decode_query_len + 1),
+                 self.lora_capture_cases,

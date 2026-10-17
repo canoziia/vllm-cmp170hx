@@ -5,7 +5,8 @@ VLLM_DSV41_OPT_PROFILE=dsv4-flash sets (setdefault, so each switch can still be
 overridden) the switches measured to help DeepSeek-V4-Flash on CMP 170HX PP3:
 
 * speculative decoding (0001/0002): verification-width graphs, decode metadata
-  and the fp8 draft head; pair with dspark K=5 and
+  and the fp8 draft head, uniform graphs for 12/24-request PP cohorts (0008);
+  pair with dspark K=5 and
   enable_adaptive_verification;
 * target decode: single-kernel deterministic MoE align (Triton + CUDA), MXFP4
   MoE decode v2 (DQ2, fused activation and top-k sum), fast sparse-attention
@@ -17,14 +18,14 @@ It replaces the speculative-only v4-spec profile of 0001. mHC v2 and the V4.1
 prefill switches are not in it (see models/deepseek-v4-flash/README.md). The
 default profile and unset/off are unchanged.
 ---
- vllm/dsv41_opt_profile.py | 29 ++++++++++++++++++++++++-----
- 1 file changed, 24 insertions(+), 5 deletions(-)
+ vllm/dsv41_opt_profile.py | 31 ++++++++++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
 
 diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
-index 819da97..e199e88 100644
+index 819da97..9c2f565 100644
 --- a/vllm/dsv41_opt_profile.py
 +++ b/vllm/dsv41_opt_profile.py
-@@ -54,15 +54,34 @@ PROFILES["verification"] = {
+@@ -54,15 +54,36 @@ PROFILES["verification"] = {
      "VLLM_DSV41_METADATA_GRAPHS": "1",
  }
  
@@ -44,6 +45,8 @@ index 819da97..e199e88 100644
      "VLLM_DSV41_FAST_METADATA": "1",
      "VLLM_DSV41_METADATA_GRAPHS": "1",
      "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
++    # uniform verification graphs for 12/24-request PP cohorts (0008)
++    "VLLM_DSV4_VERIFICATION_COHORTS": "1",
 +    # target decode kernels
 +    "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
 +    "VLLM_DSV4_CUDA_DET_ALIGN": "1",
