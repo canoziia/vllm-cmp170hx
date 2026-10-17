@@ -6,3 +6,4 @@ d79eef9642884294acbf8b1ce8da081c31fd0fe8f8b78cc37f3258477342f876  models/deepsee
 26b8bccaf62a5b3945a1b2d6ec1b5d9c32b3498697c7ad1c4434a2869d76b668  models/deepseek-v4-flash/patches/0006-dsv4-dense-fp8-decode.patch
 a8e0e3682638e4ee4f6dee60c7fd55dce3a6d2b2fce362ac1a77fe0e7291c06c  models/deepseek-v4-flash/patches/0007-dsv4-flash-opt-profile.patch
 727aff55ec6385ec8ca3cd015c005250b1e7430ad4d102e341e9e0b8f85e2757  models/deepseek-v4-flash/patches/0008-dsv4-verification-cohort-graphs.patch
+d2aa043be2220d8fb4bade3f74ce69442c342deb97dc14c1fc903f81061c79b7  models/deepseek-v4-flash/patches/0009-dsv4-narrow-dspark-draft.patch
