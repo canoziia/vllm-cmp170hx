@@ -1,19 +1,42 @@
+# DeepSeek-V4-Flash-Vision-Exp prefill/decode pair on host-b: PP3 prefill on
+# three CMP 170HX GPUs, PP3 decode on three more, one shared LMCache MP server,
+# production-stack PD router in front.
+#
+# Both engines run the same image, partition (15,16,12), `dsv4-flash` profile
+# and DSpark K=5: the drafter's three SWA layers are packed into the target's
+# SWA KV groups on rank 2, so the prefill engine must hold them too or the
+# LMCache objects of rank 2 differ in size (see README "PD").
+#
+# Images: scripts/build-deepseek-v4-flash-image.sh (engine, carries the shared
+# patched LMCache payload), scripts/build-lmcache-server-image.sh (server, same
+# payload), scripts/build-router-image.sh (router).
+# .env (0600, not committed): .env.pd.example.
+# Start: podman compose -f compose.pd.yml --env-file .env.pd \
+#          --podman-run-args="--ipc=host --pid=host" up -d
+# Restart: `podman compose -f compose.pd.yml --env-file .env.pd down` first.
+x-podman:
+  in_pod: false
+
 services:
   deepseek-v4-flash-lmcache:
-    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    image: ${LMCACHE_IMAGE:?set LMCACHE_IMAGE}
     container_name: deepseek-v4-flash-lmcache
     restart: "no"
+    stop_grace_period: 3m
     entrypoint: ["lmcache"]
     network_mode: host
-    # start with: podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
     ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
     devices:
-      - nvidia.com/gpu=2
-      - nvidia.com/gpu=3
-      - nvidia.com/gpu=4
-      - nvidia.com/gpu=7
-      - nvidia.com/gpu=8
-      - nvidia.com/gpu=9
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_0:?set DSFLASH_PREFILL_GPU_0}
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_1:?set DSFLASH_PREFILL_GPU_1}
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_2:?set DSFLASH_PREFILL_GPU_2}
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_0:?set DSFLASH_DECODE_GPU_0}
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_1:?set DSFLASH_DECODE_GPU_1}
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_2:?set DSFLASH_DECODE_GPU_2}
     security_opt: ["label=disable", "apparmor=unconfined"]
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
@@ -26,39 +49,41 @@ services:
     command:
       - server
       - --host=127.0.0.1
-      - --port=5558
+      - --port=${DSFLASH_LMCACHE_PORT:?set DSFLASH_LMCACHE_PORT}
       - --http-host=127.0.0.1
-      - --http-port=18558
-      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1024}
+      - --http-port=${DSFLASH_LMCACHE_HTTP_PORT:?set DSFLASH_LMCACHE_HTTP_PORT}
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:?set LMCACHE_CHUNK_SIZE}
       - --separate-object-groups
-      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      # host RAM; host-b is tight (Qwen's server already holds 64 GiB) and 64 GiB
+      # here OOM-killed the host while this model was loading
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:?set LMCACHE_L1_SIZE_GB}
       - --eviction-policy=LRU
       - --max-workers=8
-      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:?set LMCACHE_L2_CAPACITY_GB},"adopt_existing":true,"eviction":{"eviction_policy":"LRU","trigger_watermark":0.6,"eviction_ratio":0.2}}'
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18558/status"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${DSFLASH_LMCACHE_HTTP_PORT}/status"]
       interval: 10s
       timeout: 5s
       start_period: 2m
       retries: 30
 
   deepseek-v4-flash-prefill:
-    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    image: ${DSFLASH_IMAGE:?set DSFLASH_IMAGE}
     container_name: deepseek-v4-flash-prefill
     restart: "no"
     network_mode: host
-    # start with: podman compose --podman-run-args=--ipc=host up -d
     ipc: host
+    pid: host
     stop_grace_period: 10m
     devices:
-      - nvidia.com/gpu=2
-      - nvidia.com/gpu=3
-      - nvidia.com/gpu=4
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_0}
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_1}
+      - nvidia.com/gpu=${DSFLASH_PREFILL_GPU_2}
     security_opt: ["label=disable", "apparmor=unconfined"]
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
-      - ${DSFLASH_MODEL_CACHE:?set DSFLASH_MODEL_CACHE}:/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro
+      - ${DSFLASH_MODEL_DIR:?set DSFLASH_MODEL_DIR}:/models/DeepSeek-V4-Flash-Vision-Exp:ro
       - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
@@ -66,9 +91,9 @@ services:
       HF_HUB_OFFLINE: "1"
       VLLM_WORKER_MULTIPROC_METHOD: spawn
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-      VLLM_PP_LAYER_PARTITION: "15,16,12"   # must match decode: the resolved KV
-      #   geometry depends on the partition and on the speculative depth, and
-      #   the single shared LMCache server can only hold one layout.
+      # must match decode: the KV group layout depends on the partition
+      VLLM_PP_LAYER_PARTITION: "${DSFLASH_PP_PARTITION:?set DSFLASH_PP_PARTITION}"
+      VLLM_DSV41_OPT_PROFILE: "${DSFLASH_OPT_PROFILE:?set DSFLASH_OPT_PROFILE}"
       VLLM_PP_DECODE_COHORT_BALANCE: "1"
       NCCL_ALGO: Ring
       NCCL_PROTO: Simple
@@ -77,28 +102,28 @@ services:
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
       TMPDIR: /root/.cache/tmp
     command:
-      - deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-      - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
+      - /models/DeepSeek-V4-Flash-Vision-Exp
       - --host=0.0.0.0
-      - --port=8201
+      - --port=${DSFLASH_PREFILL_PORT:?set DSFLASH_PREFILL_PORT}
       - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1
       - --trust-remote-code
-      - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
-      - --max-num-batched-tokens=${DSFLASH_PREFILL_MAX_BATCHED_TOKENS:-1536}
-      - --long-prefill-token-threshold=1024
-      - --kv-cache-memory=${DSFLASH_PREFILL_KV_CACHE_MEMORY:-2684354560}
+      - --max-model-len=${DSFLASH_MAX_MODEL_LEN:?set DSFLASH_MAX_MODEL_LEN}
+      - --max-num-seqs=${DSFLASH_PREFILL_MAX_NUM_SEQS:?set DSFLASH_PREFILL_MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${DSFLASH_PREFILL_MAX_BATCHED_TOKENS:?set DSFLASH_PREFILL_MAX_BATCHED_TOKENS}
+      - --long-prefill-token-threshold=${DSFLASH_PREFILL_LONG_THRESHOLD:?set DSFLASH_PREFILL_LONG_THRESHOLD}
+      - --kv-cache-memory=${DSFLASH_PREFILL_KV_CACHE_MEMORY:?set DSFLASH_PREFILL_KV_CACHE_MEMORY}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
       # the LMCache fork needs a state checkpoint at every chunk boundary
-      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
+      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE}
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
-      - '--speculative-config={"method":"dspark","num_speculative_tokens":3}'
+      # same as decode: the drafter's SWA layers share rank 2's KV groups
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":true}'
       - --per-request-spec-decode-metrics=detailed
       - --tokenizer-mode=deepseek_v4
       - --enable-auto-tool-choice
@@ -106,32 +131,34 @@ services:
       - --reasoning-parser=deepseek_v4
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
       - --enable-prompt-tokens-details
-      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14581,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5558}}'
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":${DSFLASH_PREFILL_KV_PORT:?set DSFLASH_PREFILL_KV_PORT},"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${DSFLASH_LMCACHE_PORT}}}'
+      # drain on stop so every worker unregisters its KV cache from LMCache
+      - --shutdown-timeout=30
       - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8201/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${DSFLASH_PREFILL_PORT}/health"]
       interval: 30s
       timeout: 10s
       start_period: 30m
       retries: 3
 
   deepseek-v4-flash-decode:
-    image: ${DSFLASH_IMAGE:-localhost/vllm-backport:deepseek-v4.1-flash}
+    image: ${DSFLASH_IMAGE}
     container_name: deepseek-v4-flash-decode
     restart: "no"
     network_mode: host
-    # start with: podman compose --podman-run-args=--ipc=host up -d
     ipc: host
+    pid: host
     stop_grace_period: 10m
     devices:
-      - nvidia.com/gpu=7
-      - nvidia.com/gpu=8
-      - nvidia.com/gpu=9
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_0}
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_1}
+      - nvidia.com/gpu=${DSFLASH_DECODE_GPU_2}
     security_opt: ["label=disable", "apparmor=unconfined"]
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
-      - ${DSFLASH_MODEL_CACHE:?set DSFLASH_MODEL_CACHE}:/root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-Vision-Exp:ro
+      - ${DSFLASH_MODEL_DIR}:/models/DeepSeek-V4-Flash-Vision-Exp:ro
       - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
@@ -139,7 +166,10 @@ services:
       HF_HUB_OFFLINE: "1"
       VLLM_WORKER_MULTIPROC_METHOD: spawn
       VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
-      VLLM_PP_LAYER_PARTITION: "15,16,12"
+      VLLM_PP_LAYER_PARTITION: "${DSFLASH_PP_PARTITION}"
+      # dsv4-flash includes live-load PP cohorts (requests become runnable
+      # together when their LMCache load completes)
+      VLLM_DSV41_OPT_PROFILE: "${DSFLASH_OPT_PROFILE}"
       VLLM_PP_DECODE_COHORT_BALANCE: "1"
       NCCL_ALGO: Ring
       NCCL_PROTO: Simple
@@ -148,26 +178,27 @@ services:
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
       TMPDIR: /root/.cache/tmp
     command:
-      - deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
-      - --revision=${DSFLASH_REVISION:-6821d6ad3681a4b137b066b76094fa82ebd0a380}
+      - /models/DeepSeek-V4-Flash-Vision-Exp
       - --host=0.0.0.0
-      - --port=8202
+      - --port=${DSFLASH_DECODE_PORT:?set DSFLASH_DECODE_PORT}
       - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
       - --served-model-name=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --pipeline-parallel-size=3
       - --tensor-parallel-size=1
       - --trust-remote-code
-      - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-8}
-      - --max-num-batched-tokens=${DSFLASH_DECODE_MAX_BATCHED_TOKENS:-512}
-      - --kv-cache-memory=${DSFLASH_DECODE_KV_CACHE_MEMORY:-3006267392}
+      - --max-model-len=${DSFLASH_MAX_MODEL_LEN}
+      - --max-num-seqs=${DSFLASH_DECODE_MAX_NUM_SEQS:?set DSFLASH_DECODE_MAX_NUM_SEQS}
+      - --max-num-batched-tokens=${DSFLASH_DECODE_MAX_BATCHED_TOKENS:?set DSFLASH_DECODE_MAX_BATCHED_TOKENS}
+      - --kv-cache-memory=${DSFLASH_DECODE_KV_CACHE_MEMORY:?set DSFLASH_DECODE_KV_CACHE_MEMORY}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
-      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
+      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE}
       - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
       - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
-      - '--speculative-config={"method":"dspark","num_speculative_tokens":3}'
+      # K=5 is the drafter's native block; adaptive verification needs K=5,
+      # PP3, greedy drafting and CUDA graphs
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":true}'
       - --per-request-spec-decode-metrics=detailed
       - --tokenizer-mode=deepseek_v4
       - --enable-auto-tool-choice
@@ -175,37 +206,36 @@ services:
       - --reasoning-parser=deepseek_v4
       - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
       - --enable-prompt-tokens-details
-      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":14582,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5558}}'
-      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY}
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_ip":"127.0.0.1","kv_port":${DSFLASH_DECODE_KV_PORT:?set DSFLASH_DECODE_KV_PORT},"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${DSFLASH_LMCACHE_PORT}}}'
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY}
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:8202/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${DSFLASH_DECODE_PORT}/health"]
       interval: 30s
       timeout: 10s
       start_period: 30m
       retries: 3
 
   deepseek-v4-flash-pd-router:
-    # Built from patches/router/ (see scripts/build-router-image.sh): the router
-    # merges both hops' usage into the standard fields before returning.
-    image: ${ROUTER_IMAGE:-localhost/vllm-router:latest}
+    # patches/router/ (scripts/build-router-image.sh): usage merge (0001), client
+    # API key (0002), cancel on disconnect (0003), streamed prefill + keep-alive (0004)
+    image: ${ROUTER_IMAGE:?set ROUTER_IMAGE}
     container_name: deepseek-v4-flash-pd-router
     restart: "no"
     network_mode: host
     security_opt: ["label=disable", "apparmor=unconfined"]
     entrypoint: ["vllm-router"]
     environment:
-      # the router builds the backend Authorization header from OPENAI_API_KEY
       OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
-      # clients must send it too (patches/router/0002); /health stays open
       VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY}
       PYTHONUNBUFFERED: "1"
     command:
       - --service-discovery=static
-      - --static-backends=http://127.0.0.1:8201,http://127.0.0.1:8202
+      - --static-backends=http://127.0.0.1:${DSFLASH_PREFILL_PORT},http://127.0.0.1:${DSFLASH_DECODE_PORT}
       - --static-models=deepseek-ai/DeepSeek-V4-Flash-Vision-Exp,deepseek-ai/DeepSeek-V4-Flash-Vision-Exp
       - --static-model-labels=prefill,decode
       - --prefill-model-labels=prefill
       - --decode-model-labels=decode
       - --routing-logic=disaggregated_prefill
       - --host=0.0.0.0
-      - --port=9102
+      - --port=${DSFLASH_PD_PORT:?set DSFLASH_PD_PORT}
