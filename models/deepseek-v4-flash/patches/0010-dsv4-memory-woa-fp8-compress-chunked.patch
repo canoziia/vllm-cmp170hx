@@ -1,0 +1,312 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: FP8 wo_a and chunked KV compressor (memory)
+
+VLLM_DSV4_WOA_FP8=1 (default 0): sm_80 wo_a runs from the FP8 checkpoint
+weight (Triton thin GEMM, e4m3 decoded four bytes at a time) instead of a
+bf16 copy built at first use (64 MiB/layer, ~1 GiB per PP rank). Above 128
+tokens the weight is dequantized per call into a transient buffer and the
+unchanged einsum runs (bitwise equal to the bf16 path).
+
+VLLM_DSV4_COMPRESS_CHUNKED=1 (default 0): the ratio-128 KV compressor kernel
+loaded a [256, 512] fp32 tile twice and spilled 10-22 KB per thread; the
+driver reserves that local memory for the device's full thread capacity
+(~1.3 GiB per GPU outside the caching allocator). Online max / sum / weighted
+sum over 8-row slices: no stack, faster; reduction order differs from
+tl.softmax (1 of 9321 cache bytes differed in a synthetic test).
+
+PP3 on CMP 170HX, KV 2.5 GiB: device use 61.8/64.5/63.9 -> 58.8/61.4/60.8 GB.
+Both are in the dsv4-flash profile.
+
+---
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -69,6 +69,9 @@
+     "VLLM_DSV4_VERIFICATION_COHORTS": "1",
+     # cohorts of >= 9 requests draft and verify at most 4 positions (0009)
+     "VLLM_DSV4_NARROW_DRAFT": "4:9",
++    # FP8 wo_a without the bf16 copy; chunked ratio-128 KV compressor (0010)
++    "VLLM_DSV4_WOA_FP8": "1",
++    "VLLM_DSV4_COMPRESS_CHUNKED": "1",
+     # target decode kernels
+     "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
+     "VLLM_DSV4_CUDA_DET_ALIGN": "1",
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1386,6 +1386,25 @@
+     )
+     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
+ 
++    from vllm.v1.attention.ops import dsv4_woa_fp8
++
++    if dsv4_woa_fp8.enabled() and getattr(wo_a, "_dsv4_wo_a_bf16", None) is None:
++        # VLLM_DSV4_WOA_FP8: run from the FP8 weight, never build the bf16 copy.
++        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++            get_fp8_block_weight_scale,
++        )
++
++        scale = get_fp8_block_weight_scale(wo_a)
++        if dsv4_woa_fp8.supported(o_ref, wo_a.weight, scale, n_local_groups, o_lora_rank):
++            return dsv4_woa_fp8.woa_fp8(
++                o_ref, wo_a.weight, dsv4_woa_fp8.scale_f32(wo_a, scale),
++                n_local_groups, o_lora_rank)
++        if "woa" not in dsv4_woa_fp8._WARNED:
++            dsv4_woa_fp8._WARNED.add("woa")
++            logger.warning("VLLM_DSV4_WOA_FP8: falling back to the bf16 wo_a copy: %s",
++                           dsv4_woa_fp8.why_not(o_ref, wo_a.weight, scale,
++                                                n_local_groups, o_lora_rank))
++
+     wo_a_weight = _get_cached_wo_a_bf16(
+         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]
+     )
+diff --git a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+--- a/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
++++ b/vllm/models/deepseek_v4/common/ops/fused_compress_quant_cache.py
+@@ -24,6 +24,8 @@
+ from types import SimpleNamespace
+ from typing import Any
+ 
++import os
++
+ import torch
+ 
+ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+@@ -78,6 +80,9 @@
+         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
+         num_warps = 4
+         kernel_kwargs = {"SANITIZE_CACHE_NANS": _ON_GFX950}
++        if (os.environ.get("VLLM_DSV4_COMPRESS_CHUNKED", "0") == "1"
++                and (1 + int(overlap)) * compress_ratio > 32):
++            kernel_kwargs["CHUNK_TOKENS"] = int(os.environ.get("VLLM_DSV4_COMPRESS_CHUNK_TOKENS", "8"))
+     else:
+         _FUSED_KV_COMPRESS_NORM_ROPE_INSERT_INDEXER_TRITON_KERNEL(
+             state_cache=state_cache,
+@@ -184,6 +189,7 @@
+     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
+     KV_BLOCK_STRIDE: tl.constexpr,
+     SANITIZE_CACHE_NANS: tl.constexpr,
++    CHUNK_TOKENS: tl.constexpr = 0,
+ ):
+     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
+ 
+@@ -235,20 +241,68 @@
+     combined_mask = mask_pos[:, None] & mask[None, :]
+ 
+     # ── Softmax + weighted sum ───────────────────────────────────────
+-    score = tl.load(
+-        row_base[:, None] + STATE_WIDTH + block[None, :],
+-        mask=combined_mask,
+-        other=float("-inf"),
+-    )
+-    score = tl.softmax(score, dim=0)
++    if CHUNK_TOKENS == 0:
++        score = tl.load(
++            row_base[:, None] + STATE_WIDTH + block[None, :],
++            mask=combined_mask,
++            other=float("-inf"),
++        )
++        score = tl.softmax(score, dim=0)
+ 
+-    kv = tl.load(
+-        row_base[:, None] + block[None, :],
+-        mask=combined_mask,
+-        other=0.0,
+-    )
++        kv = tl.load(
++            row_base[:, None] + block[None, :],
++            mask=combined_mask,
++            other=0.0,
++        )
+ 
+-    compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
++        compressed_kv = tl.sum(kv * score, axis=0)  # [TRITON_BLOCK_SIZE] fp32
++    else:
++        # VLLM_DSV4_COMPRESS_CHUNKED: the whole [(1+OVERLAP)*RATIO, 512]
++        # score/kv tile (256 x 512 fp32 twice at ratio 128) spilled ~10.7 KB
++        # per thread, and the driver reserves local memory for the device's
++        # full thread capacity (~1.4 GB). Three passes over CHUNK_TOKENS-row
++        # slices: column max, exp sum, then sum(exp / sum * kv) - the same
++        # per-element formula as tl.softmax followed by the weighted sum.
++        NT: tl.constexpr = (1 + OVERLAP) * COMPRESS_RATIO
++        ct = tl.arange(0, CHUNK_TOKENS)
++        col_max = tl.full([TRITON_BLOCK_SIZE], float("-inf"), tl.float32)
++        for c0 in range(0, NT, CHUNK_TOKENS):
++            p_c = start + c0 + ct
++            ok = p_c >= 0
++            bn = tl.load(block_table_ptr + req_idx * block_table_stride + p_c // block_size,
++                         mask=ok, other=0).to(tl.int64)
++            rb = (state_cache_ptr + bn * state_cache_stride0
++                  + (p_c % block_size) * state_cache_stride1
++                  + ((c0 + ct) >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE)
++            sc = tl.load(rb[:, None] + STATE_WIDTH + block[None, :],
++                         mask=ok[:, None] & mask[None, :], other=float("-inf"))
++            col_max = tl.maximum(col_max, tl.max(sc, axis=0))
++        den = tl.zeros([TRITON_BLOCK_SIZE], tl.float32)
++        for c0 in range(0, NT, CHUNK_TOKENS):
++            p_c = start + c0 + ct
++            ok = p_c >= 0
++            bn = tl.load(block_table_ptr + req_idx * block_table_stride + p_c // block_size,
++                         mask=ok, other=0).to(tl.int64)
++            rb = (state_cache_ptr + bn * state_cache_stride0
++                  + (p_c % block_size) * state_cache_stride1
++                  + ((c0 + ct) >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE)
++            sc = tl.load(rb[:, None] + STATE_WIDTH + block[None, :],
++                         mask=ok[:, None] & mask[None, :], other=float("-inf"))
++            den += tl.sum(tl.exp(sc - col_max[None, :]), axis=0)
++        compressed_kv = tl.zeros([TRITON_BLOCK_SIZE], tl.float32)
++        for c0 in range(0, NT, CHUNK_TOKENS):
++            p_c = start + c0 + ct
++            ok = p_c >= 0
++            bn = tl.load(block_table_ptr + req_idx * block_table_stride + p_c // block_size,
++                         mask=ok, other=0).to(tl.int64)
++            rb = (state_cache_ptr + bn * state_cache_stride0
++                  + (p_c % block_size) * state_cache_stride1
++                  + ((c0 + ct) >= COMPRESS_RATIO).to(tl.int32) * HEAD_SIZE)
++            cm = ok[:, None] & mask[None, :]
++            sc = tl.load(rb[:, None] + STATE_WIDTH + block[None, :], mask=cm,
++                         other=float("-inf"))
++            kvc = tl.load(rb[:, None] + block[None, :], mask=cm, other=0.0)
++            compressed_kv += tl.sum(kvc * tl.math.fdiv(tl.exp(sc - col_max[None, :]), den[None, :]), axis=0)
+ 
+     # ── RMSNorm (fp32 throughout) ──────────────────────────────────────
+     rms_w = tl.load(rms_norm_weight_ptr + block, mask=mask, other=0.0)
+diff --git a/vllm/v1/attention/ops/dsv4_woa_fp8.py b/vllm/v1/attention/ops/dsv4_woa_fp8.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/v1/attention/ops/dsv4_woa_fp8.py
+@@ -0,0 +1,134 @@
++"""DeepSeek-V4 wo_a grouped GEMM straight from the FP8 checkpoint weight.
++
++VLLM_DSV4_WOA_FP8=1 (default 0 = unchanged). On sm_80 the attention output
++projection wo_a (o_groups x o_lora_rank x hidden, FP8 e4m3 with 128x128 block
++scales) is otherwise run from a bf16 copy built at first use
++(_get_cached_wo_a_bf16: 64 MiB per layer, ~1 GiB on a 16-layer PP rank, kept
++next to the 32 MiB FP8 weight). This kernel reads the FP8 bytes directly: four
++e4m3 bytes become four fp16 values x * 2^-8 with one prmt/shift/and/lop3
++sequence (exact for every code; 0x7f/0xff give the +-480 * 2^-8 the e4m3 LUT
++uses for NaN), the activations go to the tensor cores as fp16 and each 128 x
++128 block's fp32 scale (times 2^8) is applied to the fp32 partial of its k
++chunk, which is then added in fp32 (same short-chain form as dsv41_thin_woa).
++Not bitwise equal to the bf16 path (fp16 activations, different k-chunk
++scaling point); error against an fp32 reference is at the bf16 path's level.
++Faster for decode token counts (CMP 170HX: 31-39 us vs 46-49 us at M <= 32).
++From DEQUANT_FROM_M tokens the weight is dequantized per call instead (77 us
++per layer, then the unchanged einsum: bitwise equal to the bf16 path).
++"""
++import os
++
++import torch
++import triton
++import triton.language as tl
++
++
++def enabled() -> bool:
++    return os.environ.get("VLLM_DSV4_WOA_FP8", "0") == "1"
++
++
++@triton.jit
++def _e4m3x4_to_f16(b):
++    return tl.inline_asm_elementwise(
++        asm="{ .reg .b32 x0, x1, y0, y1; prmt.b32 x0, $2, 0, 0x1404; "
++            "prmt.b32 x1, $2, 0, 0x3424; shr.b32 y0, x0, 1; shr.b32 y1, x1, 1; "
++            "and.b32 y0, y0, 0x3FFF3FFF; and.b32 y1, y1, 0x3FFF3FFF; "
++            "lop3.b32 $0, x0, 0x80008000, y0, 0xEA; lop3.b32 $1, x1, 0x80008000, y1, 0xEA; }",
++        constraints="=r,=r,r", args=[b], dtype=tl.float16, is_pure=True, pack=4)
++
++
++@triton.jit
++def _woa_fp8_kernel(X, W, S, Y, M, SX, SG, G: tl.constexpr, N: tl.constexpr,
++                    K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    g = tl.program_id(1)
++    m = tl.program_id(2) * BM + tl.arange(0, BM)
++    k = tl.arange(0, BK)
++    nb = (tl.program_id(0) * BN) // 128
++    acc = tl.zeros((BM, BN), tl.float32)
++    for i in range(K // BK):
++        kk = i * BK + k
++        a = tl.load(X + m[:, None] * SX + g * SG + kk[None, :], m[:, None] < M, 0).to(tl.float16)
++        b = _e4m3x4_to_f16(tl.load(W + g * N * K + n[None, :] * K + kk[:, None]))
++        tmp = tl.dot(a, b) * (tl.load(S + (g * (N // 128) + nb) * (K // 128) + i) * 256.0)
++        acc = tl.inline_asm_elementwise(
++            "add.rn.f32 $0, $1, $2;", constraints="=f,f,f",
++            args=[acc, tmp], dtype=tl.float32, is_pure=True, pack=1)
++    tl.store(Y + (m[:, None] * G + g) * N + n[None, :], acc.to(tl.bfloat16), m[:, None] < M)
++
++
++@triton.jit
++def _dequant_kernel(W, S, O, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    n = tl.program_id(0) * BN + tl.arange(0, BN)
++    k = tl.program_id(1) * BK + tl.arange(0, BK)
++    b = _e4m3x4_to_f16(tl.load(W + n[:, None] * K + k[None, :])).to(tl.float32)
++    sc = tl.load(S + (n[:, None] // 128) * (K // 128) + k[None, :] // 128)
++    tl.store(O + n[:, None] * K + k[None, :], (b * (sc * 256.0)).to(tl.bfloat16))
++
++
++# Above this many tokens (prefill chunks) the FP8 tensor-core loop is compute
++# bound behind cuBLAS: dequantize the layer's weight into a transient bf16
++# buffer (64 MiB, released to the caching allocator after the call) and run
++# the reference einsum on it. That dequant is bit-identical to the bf16 copy
++# _get_cached_wo_a_bf16 would keep, so prefill results equal the bf16 path.
++DEQUANT_FROM_M = 129
++
++
++def _cfg(m: int):
++    # (BM, BN, warps, stages), CMP 170HX graph-replay scan
++    if m <= 16:
++        return 16, 128, 4, 3
++    if m <= 32:
++        return 32, 128, 4, 3
++    if m <= 64:
++        return 64, 128, 4, 4
++    return 128, 128, 8, 2
++
++
++def supported(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor | None,
++              n_groups: int, rank: int) -> bool:
++    return (enabled() and scale is not None and x.is_cuda and x.dtype == torch.bfloat16
++            and weight.dtype == torch.float8_e4m3fn and weight.is_contiguous()
++            and x.stride(-1) == 1 and rank % 128 == 0 and x.shape[-1] % 512 == 0
++            and tuple(scale.shape) == (n_groups * rank // 128, x.shape[-1] // 128)
++            and torch.cuda.get_device_capability(x.device) == (8, 0))
++
++
++_WARNED = set()
++
++
++def why_not(x, weight, scale, n_groups, rank) -> str:
++    return (f"x {tuple(x.shape)} {x.dtype} stride {x.stride()}; weight {tuple(weight.shape)} "
++            f"{weight.dtype} contiguous={weight.is_contiguous()}; scale "
++            f"{None if scale is None else (tuple(scale.shape), scale.dtype)}; G={n_groups} r={rank}")
++
++
++def scale_f32(module, scale: torch.Tensor) -> torch.Tensor:
++    """fp32 contiguous copy of the block scales, cached on the module (built on
++    the first eager call, before graph capture; 64 x 32 floats per layer)."""
++    s = getattr(module, "_dsv4_woa_scale_f32", None)
++    if s is None:
++        s = scale.to(torch.float32).contiguous()
++        module._dsv4_woa_scale_f32 = s
++    return s
++
++
++def woa_fp8(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor,
++            n_groups: int, rank: int) -> torch.Tensor:
++    """x [T, G, K] bf16, weight [G*rank, K] e4m3, scale [G*rank/128, K/128] fp32
++    -> [T, G, rank] bf16 (= einsum('tgd,grd->tgr', x, dequant(weight)))."""
++    t, g, kdim = x.shape
++    if t >= DEQUANT_FROM_M:
++        w = torch.empty((g * rank, kdim), device=x.device, dtype=torch.bfloat16)
++        _dequant_kernel[(g * rank // 32, kdim // 512)](
++            weight.view(torch.uint8), scale, w, kdim, 32, 512, num_warps=4)
++        return torch.einsum("tgd,grd->tgr", x, w.view(g, rank, kdim))
++    out = torch.empty((t, g, rank), device=x.device, dtype=torch.bfloat16)
++    if t == 0:
++        return out
++    bm, bn, warps, stages = _cfg(t)
++    _woa_fp8_kernel[(rank // bn, g, triton.cdiv(t, bm))](
++        x, weight.view(torch.uint8), scale, out, t, x.stride(0), x.stride(1),
++        g, rank, kdim, bm, bn, 128, num_warps=warps, num_stages=stages,
++        enable_fp_fusion=False)
++    return out

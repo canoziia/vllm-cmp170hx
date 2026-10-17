@@ -48,12 +48,12 @@ services:
       - --trust-remote-code
       - --max-model-len=${DSFLASH_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${DSFLASH_MAX_NUM_SEQS:-32}
-      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-512}
-      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-2684354560}
+      - --max-num-batched-tokens=${DSFLASH_MAX_BATCHED_TOKENS:-2048}
+      - --kv-cache-memory=${DSFLASH_KV_CACHE_MEMORY:-3758096384}
       - --kv-cache-dtype=fp8_ds_mla
       - --disable-custom-all-reduce
       - --enable-prefix-caching
-      - '--compilation-config={"cudagraph_mode":"FULL_AND_PIECEWISE"}'
+      - '--compilation-config={"cudagraph_mode":"${DSFLASH_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"}'
       - '--additional-config={"deepseek_v41_round_logits_alloc":false}'
       # K=5 is the drafter's native block; adaptive verification needs K=5,
       # PP3, greedy drafting and CUDA graphs (patches 0001/0002).
