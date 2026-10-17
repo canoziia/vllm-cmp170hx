@@ -8,3 +8,5 @@ a8e0e3682638e4ee4f6dee60c7fd55dce3a6d2b2fce362ac1a77fe0e7291c06c  models/deepsee
 727aff55ec6385ec8ca3cd015c005250b1e7430ad4d102e341e9e0b8f85e2757  models/deepseek-v4-flash/patches/0008-dsv4-verification-cohort-graphs.patch
 d2aa043be2220d8fb4bade3f74ce69442c342deb97dc14c1fc903f81061c79b7  models/deepseek-v4-flash/patches/0009-dsv4-narrow-dspark-draft.patch
 5ad1d7bd8329641e3d1168ccec44f44fc7d4f0805501cdfde26b689c713c4bcd  models/deepseek-v4-flash/patches/0010-dsv4-memory-woa-fp8-compress-chunked.patch
+5b9ed5358b99d65a8d6dfcdfd63218464efd94c5d5412b250e8a232754293cf2  models/deepseek-v4-flash/patches/0011-dsv4-moe-prefill-split.patch
+fb03774fa700f372498e47e332a8f01e3f680af14c873796fa430b28c2a0f73d  models/deepseek-v4-flash/patches/0012-dsv4-sparse-prefill-tile-workspace.patch
