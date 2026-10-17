@@ -1,0 +1,189 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4.1: prompt encoding for the 1017 checkpoint
+
+Sync vLLM's adapted V4.1 encoder with the reference encoding.py shipped in
+deepseek-ai/DeepSeek-V4.1-Flash-1017 (rev 1bae0e10):
+- reasoning effort low/high/max = 50/75/100, default high = 75 (xhigh removed;
+  the tokenizer wrapper still accepts xhigh from old clients as max);
+- user messages that only carry tool results do not start a new turn, so the
+  current turn keeps its reasoning across tool calls when thinking is dropped;
+- tool namespaces: tool/function namespace fields and qualified ns::name.
+Checked character-for-character against the checkpoint goldens and reference
+by tests/test_dsv41_encoding_1017.py.
+
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index a1449e5..ddcdc0b 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -76,12 +76,17 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                 effort = None
+             if effort is None:
+                 effort = "high"
++            # The 1017 checkpoint dropped "xhigh" (low/high/max = 50/75/100).
++            # Keep accepting it from existing clients as the next level above
++            # the default instead of rejecting the request.
++            if effort == "xhigh":
++                effort = "max"
+             if not (
+                 (type(effort) is int and 1 <= effort <= 100)
+                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
+             ):
+                 raise ValueError(
+-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
++                    "DeepSeek V4.1 reasoning_effort must be low, high, max, "
+                     "or an integer within [1, 100] in chat_template_kwargs"
+                 )
+ 
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 841de38..cee2b1a 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -9,7 +9,7 @@ Message normalization and serving controls live in deepseek_v41.py.
+ 
+ import copy
+ import json
+-from typing import Any, Dict, List, Optional, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ bos_token: str = "<｜begin▁of▁sentence｜>"
+ eos_token: str = "<｜end▁of▁sentence｜>"
+@@ -55,19 +55,61 @@ def to_json(value: Any) -> str:
+ 
+ 
+ def tools_from_openai_format(tools):
+-    """Extract function definitions from OpenAI-format tool list."""
+-    return [tool["function"] for tool in tools]
++    """Extract function definitions with namespace-qualified names."""
++    functions = []
++    for tool in tools:
++        function = dict(tool["function"])
++        if tool.get("namespace") is not None:
++            function["namespace"] = tool["namespace"]
++        function["name"] = _tool_name_for_encoding(function)
++        namespace = function.pop("namespace", None)
++        if isinstance(namespace, dict) and namespace.get("description"):
++            function["description"] = (
++                namespace["description"] + "\n" + (function.get("description") or "")
++            )
++        functions.append(function)
++    return functions
++
++
++def _split_tool_name(
++    name: str, namespace: Optional[str] = None
++) -> Tuple[Optional[str], str]:
++    """Split a qualified name and validate any explicit namespace."""
++    prefix, separator, bare_name = name.partition("::")
++    if separator:
++        assert namespace in (None, prefix), (
++            f"Conflicting tool namespaces: {namespace} != {prefix}"
++        )
++        namespace, name = prefix, bare_name
++    assert "::" not in name, f"Tool name must not contain '::': {name}"
++    assert namespace is None or "::" not in namespace, (
++        f"Tool namespace must not contain '::': {namespace}"
++    )
++    return namespace, name
++
++
++def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
++    namespace = tool.get("namespace")
++    if isinstance(namespace, dict):
++        namespace = namespace["name"]
++    namespace, name = _split_tool_name(tool["name"], namespace)
++    return name if namespace is None else f"{namespace}::{name}"
+ 
+ 
+ def tool_calls_from_openai_format(tool_calls):
+     """Convert OpenAI-format tool calls to internal format."""
+-    return [
+-        {
+-            "name": tool_call["function"]["name"],
+-            "arguments": tool_call["function"]["arguments"],
+-        }
+-        for tool_call in tool_calls
+-    ]
++    calls = []
++    for tool_call in tool_calls:
++        function = tool_call["function"]
++        namespace, name = _split_tool_name(
++            function["name"],
++            tool_call.get("namespace") or function.get("namespace"),
++        )
++        call = {"name": name, "arguments": function["arguments"]}
++        if namespace is not None:
++            call["namespace"] = namespace
++        calls.append(call)
++    return calls
+ 
+ 
+ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+@@ -85,10 +127,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+ 
+         if role == "tool":
+             # Convert tool message to a user message with tool_result block
++            content = msg.get("content", "")
++            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
++                content = msg["content_blocks"]
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": content,
+             }
+             # Merge into previous message if it's already a user (merged tool)
+             if (
+@@ -107,7 +152,12 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user":
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+-                content_blocks = [{"type": "text", "text": msg.get("content", "")}]
++                content = msg.get("content", "")
++                content_blocks = (
++                    content
++                    if isinstance(content, list)
++                    else [{"type": "text", "text": content}]
++                )
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -181,9 +231,8 @@ REASONING_EFFORT_TEMPLATE = (
+     "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+ )
+ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+-    "low": 25,
+-    "high": 50,
+-    "xhigh": 75,
++    "low": 50,
++    "high": 75,
+     "max": 100,
+ }
+ 
+@@ -296,11 +345,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+ 
+     V4.1 supports mid-conversation system messages, which count as user
+     messages for the purposes of the assistant generation header.
++    User messages containing only tool results do not start a new turn.
+     """
+     last_user_index = -1
+     for idx in range(len(messages) - 1, -1, -1):
+         role = messages[idx].get("role")
+         if role in ["user", "developer"] or (role == "system" and idx > 0):
++            content_blocks = messages[idx].get("content_blocks")
++            if content_blocks and not any(
++                block.get("type") in ("text", "image", "image_url")
++                for block in content_blocks
++            ):
++                continue
+             last_user_index = idx
+             break
+     return last_user_index
+@@ -424,7 +480,7 @@ def render_message(
+                 tool_call_template.format(
+                     dsml_token=dsml_token,
+                     tool_call_tag_name=tool_call_tag_name,
+-                    name=tc.get("name"),
++                    name=_tool_name_for_encoding(tc),
+                     arguments=encode_arguments_to_dsml(tc),
+                 )
+                 for tc in tool_calls

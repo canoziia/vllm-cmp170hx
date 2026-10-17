@@ -25,3 +25,4 @@ ffc874a807af15522069841b796494fc76b9b4794496b474d7926603adaf0b95  models/deepsee
 481395fecc96d05f99488ce6b702680abc1d14ea1e07a95d4350413f949aec05  models/deepseek-v4.1-flash/patches/optional/0003-hot-cpu-policy-debug.patch
 9b78cfd43e3edb778164f9d81f9f752b41de353c9833adcd916e908faaf79cf8  models/deepseek-v4.1-flash/patches/optional/series.perf-debug
 de3a6f5592045be6f2037b94d754bba54f7fb7e17731d5349a90577a6e8f3a40  models/deepseek-v4.1-flash/patches/adaptive/0009-measured-verification-policy.patch
+a6b8b8c9bb416e8287882218629bed92ffd0c74462c6aeedd59bf3096a0bdd96  models/deepseek-v4.1-flash/patches/0015-dsv41-encoding-1017.patch

@@ -77,6 +77,7 @@ grep -q '_pp_communicators_primed' \
 grep -q 'handler.broadcast_group' \
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 python3 "$MODEL_DIR/tests/test_triton_logits_workspace.py" "$SOURCE_TREE"
+python3 "$MODEL_DIR/tests/test_dsv41_encoding_1017.py" "$SOURCE_TREE"
 
 compile_files=(
   "$SOURCE_TREE/vllm/model_executor/layers/sparse_attn_indexer.py"

@@ -599,6 +599,35 @@ and greedy self-scoring unchanged. c8 shows no measurable change: PP6
 schedules the c8 requests in micro-batches of 1-2 requests per stage step
 (M 6-12), so the larger-M kernels matter only at higher concurrency.
 
+## Checkpoint 1017 and prompt encoding (patch 0015)
+
+Production serves `deepseek-ai/DeepSeek-V4.1-Flash-1017` at revision
+`1bae0e1088993b9b82de08f59de5be5a34e42170` from
+`/srv/models/DeepSeek-V4.1-Flash-1017`, selected in compose by
+`DSV41_MODEL_DIR` (default `DeepSeek-V4.1-Flash-1017`). Against the original
+checkpoint, `config.json`, `tokenizer.json`, `tokenizer_config.json`, all 96085
+weight names and their shard placement, and `total_size` are identical, so the
+weights are retrained in place and patches 0001-0014, PP6 and the 6 GiB KV
+layout are unchanged. LMCache L2 must not be shared with KV computed from other
+weights: use a fresh `LMCACHE_L2_PATH` whenever the checkpoint changes.
+
+The checkpoint's reference `encoding/encoding.py` changed the prompt format;
+patch 0015 ports it to `vllm/tokenizers/deepseek_v41_encoding.py`:
+
+- reasoning effort `low`/`high`/`max` = 50/75/100, default `high` = 75
+  (previously 25/50/75/100 with `xhigh`); the tokenizer wrapper still accepts
+  `xhigh` from existing clients and renders it as `max`;
+- a user message that only carries tool results does not start a new turn, so
+  with dropped thinking the current turn keeps its reasoning across tool calls
+  (requests that declare `tools` never drop thinking, as before);
+- tool namespaces: `namespace` on the tool or function (string or
+  `{name, description}`) and qualified `ns::name` names render as `ns::name`.
+
+`tests/test_dsv41_encoding_1017.py SOURCE_TREE` compares the patched encoder
+character-for-character with the checkpoint goldens and the reference encoder
+vendored in `tests/fixtures/deepseek-v4.1-flash-1017-encoding/` (MIT); it runs
+during the image build.
+
 ## Optimisation switches (patch 0014 profile)
 
 `compose.yml` enables all optimisation patches with one variable,
