@@ -1,0 +1,121 @@
+From 0d3770ccba18209ec55fe6fb50a5bac18ebad0d3 Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 19:08:46 +0800
+Subject: [PATCH] deepseek-v4: honour the top-level thinking {type} request
+ switch
+
+DeepSeek API clients turn thinking off with "thinking": {"type": "disabled"}
+at the top level of a chat request. vLLM kept the field in model_extra and
+ignored it, so the V4 tokenizer and output parser stayed in thinking mode.
+
+For DeepseekV4ForCausalLM only (V4.1 and every other architecture unchanged),
+the chat serving copies thinking.type into chat_template_kwargs.thinking and
+.enable_thinking (enabled -> true, disabled -> false) before the parser and the
+renderer read the kwargs, so both agree and a PD pair renders one prompt.
+Explicit chat_template_kwargs.thinking / enable_thinking win; any other value
+returns 400. Both keys are set because build_chat_params derives
+enable_thinking from reasoning_effort unless present.
+---
+ .../chat_completion/deepseek_v4_thinking.py   | 57 +++++++++++++++++++
+ .../openai/chat_completion/serving.py         | 14 +++++
+ 2 files changed, 71 insertions(+)
+ create mode 100644 vllm/entrypoints/openai/chat_completion/deepseek_v4_thinking.py
+
+diff --git a/vllm/entrypoints/openai/chat_completion/deepseek_v4_thinking.py b/vllm/entrypoints/openai/chat_completion/deepseek_v4_thinking.py
+new file mode 100644
+index 0000000..4e0cf83
+--- /dev/null
++++ b/vllm/entrypoints/openai/chat_completion/deepseek_v4_thinking.py
+@@ -0,0 +1,57 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4 request-level ``thinking`` switch (DeepSeek API format).
++
++DeepSeek's API takes ``"thinking": {"type": "enabled" | "disabled"}`` at the
++top level of a chat request. vLLM keeps unknown top-level fields in
++``model_extra`` and otherwise ignores them, so the V4 tokenizer and output
++parser (which read ``chat_template_kwargs``) fell back to thinking mode.
++
++For DeepSeek V4 models only (``DeepseekV4ForCausalLM`` and its resolved
++``DeepseekV4ForConditionalGeneration``; V4.1 is not touched)
++the switch is copied into ``chat_template_kwargs["thinking"]`` once, before the
++parser and the renderer read the kwargs, so both see the same value (and a PD
++prefill/decode pair renders the same prompt). An explicit
++``chat_template_kwargs.thinking`` / ``enable_thinking`` wins.
++"""
++
++from typing import Any
++
++# Vision-Exp checkpoints declare DeepseekV4ForCausalLM and resolve to
++# DeepseekV4ForConditionalGeneration; V4.1 (DeepseekV41ForCausalLM) is excluded.
++DEEPSEEK_V4_ARCHITECTURES = frozenset(
++    {"DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"}
++)
++_TYPES = {"enabled": True, "disabled": False}
++
++
++def is_deepseek_v4(architectures: Any) -> bool:
++    return any(a in DEEPSEEK_V4_ARCHITECTURES for a in (architectures or ()))
++
++
++def apply_deepseek_v4_thinking(request: Any, architectures: Any) -> str | None:
++    """Fold a top-level ``thinking`` into ``chat_template_kwargs``.
++
++    Returns an error message for an invalid value, otherwise None. Requests
++    for other architectures, or without a top-level ``thinking``, are not
++    modified.
++    """
++    if not is_deepseek_v4(architectures):
++        return None
++    extra = getattr(request, "model_extra", None) or {}
++    if "thinking" not in extra:
++        return None
++    value = extra["thinking"]
++    kind = value.get("type") if isinstance(value, dict) else None
++    if kind not in _TYPES:
++        return (
++            "'thinking' must be an object {\"type\": \"enabled\"} or "
++            f"{{\"type\": \"disabled\"}}; got {value!r}"
++        )
++    kwargs = dict(request.chat_template_kwargs or {})
++    if "thinking" not in kwargs and "enable_thinking" not in kwargs:
++        # both keys: build_chat_params derives enable_thinking from
++        # reasoning_effort unless it is present, and the V4 tokenizer ORs them
++        kwargs["thinking"] = kwargs["enable_thinking"] = _TYPES[kind]
++        request.chat_template_kwargs = kwargs
++    return None
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 06e7315..e0d2b33 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -42,6 +42,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionStreamResponse,
+     ChatMessage,
+ )
++from vllm.entrypoints.openai.chat_completion.deepseek_v4_thinking import (
++    apply_deepseek_v4_thinking,
++)
+ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+ from vllm.entrypoints.serve.engine.protocol import (
+     CompletionTokenUsageInfo,
+@@ -263,6 +266,17 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        # DeepSeek V4: top-level thinking {type} -> chat_template_kwargs, before
++        # the parser and the renderer read them
++        thinking_error = apply_deepseek_v4_thinking(
++            request,
++            [
++                *(getattr(self.model_config, "architectures", None) or ()),
++                *(getattr(self.model_config.hf_config, "architectures", None) or ()),
++            ],
++        )
++        if thinking_error is not None:
++            return self.create_error_response(thinking_error, param="thinking")
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+         parser: Parser | None = None
+         if self.parser_cls is not None:
+-- 
+2.47.3
+

@@ -80,6 +80,16 @@ Greedy counting outputs are token-identical to the single engine at c1/c8/c32;
 code and prose differ only at the known near-ties (code token 3, prose token 0,
 which also flip between single-engine runs).
 
+## Request-level thinking switch (patch 0013)
+
+DeepSeek API clients send `"thinking": {"type": "enabled" | "disabled"}` at the
+top level of a chat request. For `DeepseekV4ForCausalLM` (Vision-Exp resolves to
+`DeepseekV4ForConditionalGeneration`, also covered) the chat serving maps
+it to `chat_template_kwargs.thinking` / `enable_thinking` before the
+tokenizer and the output parser read them (so PD prefill and decode render the
+same prompt); explicit `chat_template_kwargs` win, other values return 400.
+Always on; other architectures (including V4.1) are unchanged.
+
 ## DSpark speculative decoding (opt-in)
 
 The image built by `scripts/build-deepseek-v4-flash-image.sh` carries
