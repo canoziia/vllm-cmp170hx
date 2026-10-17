@@ -1,0 +1,189 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: narrower DSpark drafts for large PP cohorts
+
+VLLM_DSV4_NARROW_DRAFT="W:N" (default unset = unchanged). A PP cohort of at
+least N requests drafts only the first W positions of the DSpark block (W
+query tokens per request, its own FULL draft graphs captured next to the K=5
+ones) and the CPU verification policy caps that cohort's width at W. Draft
+ids past W stay stale with confidence 0; the target verifies whatever it is
+given, so outputs are unchanged and only acceptance and draft cost move.
+
+At max-num-seqs 32 over PP3 (cohorts of ~11), the K=5 drafter computed 55
+query tokens per cohort where a K=3 engine computes 33, and the adaptive
+widths fell behind fixed ones (code c32 1423 tok/s vs 1572 at spec_k=4).
+Measured at c32 (tok/s, full batch): K=3 engine 1588 / 1382 / 896 (code /
+counting / prose); no narrowing 1423-1531 / 1377 / 850-859; W:N = 3:9
+1572 / 1284-1304 / 894-913; 4:9 1598 / 1350 / 918. The dsv4-flash profile
+sets 4:9; cohorts below 9 requests (c <= 16) are unaffected.
+
+---
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -67,6 +67,8 @@
+     "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
+     # uniform verification graphs for 12/24-request PP cohorts (0008)
+     "VLLM_DSV4_VERIFICATION_COHORTS": "1",
++    # cohorts of >= 9 requests draft and verify at most 4 positions (0009)
++    "VLLM_DSV4_NARROW_DRAFT": "4:9",
+     # target decode kernels
+     "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
+     "VLLM_DSV4_CUDA_DET_ALIGN": "1",
+diff --git a/vllm/v1/core/sched/dsv41_fixed_policy.py b/vllm/v1/core/sched/dsv41_fixed_policy.py
+--- a/vllm/v1/core/sched/dsv41_fixed_policy.py
++++ b/vllm/v1/core/sched/dsv41_fixed_policy.py
+@@ -7,11 +7,22 @@
+ """
+ 
+ import math
++import os
+ import time
+ from types import SimpleNamespace
+ from .dsv41_measured_policy import Policy
+ 
+ 
++
++
++def _narrow_draft():
++    """(width, min cohort) from VLLM_DSV4_NARROW_DRAFT="W:N", or None."""
++    v = os.environ.get("VLLM_DSV4_NARROW_DRAFT", "")
++    if not v:
++        return None
++    w, n = (int(x) for x in v.split(":"))
++    return w, n
++
+ class FixedHistoryPolicy:
+     def __init__(self, logger, decay=0.95, cost_ms=None, uniform=False):
+         if isinstance(decay, bool) or not math.isfinite(decay) or not 0 <= decay < 1:
+@@ -113,6 +124,15 @@
+             result[r.request_id] = entry.k
+         if self.uniform and len(result) > 1:
+             self.unify(result)
++        narrow = _narrow_draft()
++        if narrow is not None and len(requests) >= narrow[1]:
++            # VLLM_DSV4_NARROW_DRAFT: the drafter only drafts narrow[0]
++            # positions for cohorts this large; never verify past them.
++            for rid in result:
++                result[rid] = min(result[rid], narrow[0])
++                entry = self.active.get(rid)
++                if entry is not None:
++                    entry.k = min(entry.k, narrow[0])
+         return result
+ 
+     def unify(self, result):
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -97,6 +97,24 @@
+         # load_draft_model once the head's weights and shard geometry exist.
+         self._fused_markov: FusedMarkovSampler | None = None
+ 
++        # VLLM_DSV4_NARROW_DRAFT="W:N" (default off): cohorts of at least N
++        # requests draft only the first W block positions (W query tokens per
++        # request, its own FULL graphs); the scheduler caps their verification
++        # width at W (dsv41_fixed_policy). Positions >= W keep stale ids with
++        # confidence 0. Only the drafted block shrinks; the target still
++        # verifies every token it is given, so outputs are unchanged.
++        self._narrow: tuple[int, int] | None = None
++        v = os.environ.get("VLLM_DSV4_NARROW_DRAFT", "")
++        if v and self.sample_from_anchor:
++            w, n = (int(x) for x in v.split(":"))
++            if 1 <= w < self.num_speculative_steps and n >= 1:
++                self._narrow = (w, n)
++                self._narrow_anchor_idx = (
++                    torch.arange(self.max_num_reqs, dtype=torch.int64, device=device) * w
++                )
++                self._narrow_step_cols = torch.arange(w, dtype=torch.int32, device=device)
++                self._narrow_cg_manager = None
++
+     def load_draft_model(
+         self,
+         target_model: torch.nn.Module,
+@@ -261,7 +279,7 @@
+                 confidence = self.model.compute_confidence(
+                     sample_hidden, markov_embeds
+                 )
+-                self.draft_token_confidence_probs[:num_reqs] = confidence.view(
++                self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
+                     num_reqs, n_spec
+                 )
+             return
+@@ -294,7 +312,7 @@
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+             )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
++            self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
+                 num_reqs, n_spec
+             )
+ 
+@@ -343,7 +361,7 @@
+                 sample_hidden,
+                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+             )
+-            self.draft_token_confidence_probs[:num_reqs] = confidence.view(
++            self.draft_token_confidence_probs[:num_reqs, :n_spec] = confidence.view(
+                 num_reqs, n_spec
+             )
+ 
+@@ -371,3 +389,60 @@
+             )
+         with record_function("dspark::markov_sampling"):
+             self._sample_sequential(num_reqs, head_hidden)
++
++    # ---- VLLM_DSV4_NARROW_DRAFT -------------------------------------------
++    def _swap_narrow(self):
++        w = self._narrow[0]
++        saved = (self.num_speculative_steps, self.num_query_per_req,
++                 self.query_cudagraph_manager, self._anchor_idx, self._step_cols,
++                 self._fused_markov.n_spec if self._fused_markov is not None else None)
++        self.num_speculative_steps = w
++        self.num_query_per_req = w
++        self.query_cudagraph_manager = self._narrow_cg_manager
++        self._anchor_idx = self._narrow_anchor_idx
++        self._step_cols = self._narrow_step_cols
++        if self._fused_markov is not None:
++            self._fused_markov.n_spec = w
++        return saved
++
++    def _restore(self, saved):
++        (self.num_speculative_steps, self.num_query_per_req,
++         self.query_cudagraph_manager, self._anchor_idx, self._step_cols, n) = saved
++        if self._fused_markov is not None:
++            self._fused_markov.n_spec = n
++
++    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
++        super().init_cudagraph_manager(cudagraph_mode)
++        if self._narrow is not None:
++            from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
++                DFlashCudaGraphManager,
++            )
++            full = self.query_cudagraph_manager
++            self._narrow_cg_manager = DFlashCudaGraphManager(
++                self.vllm_config, self.device, full.cudagraph_mode,
++                decode_query_len=self._narrow[0],
++            )
++
++    def capture(self) -> None:
++        super().capture()
++        if self._narrow is not None and self._narrow_cg_manager is not None:
++            saved = self._swap_narrow()
++            try:
++                super().capture()
++            finally:
++                self._restore(saved)
++
++    def propose(self, input_batch, *args, **kwargs):
++        if (self._narrow is None or self._narrow_cg_manager is None
++                or input_batch.num_reqs < self._narrow[1]):
++            return super().propose(input_batch, *args, **kwargs)
++        w = self._narrow[0]
++        num_reqs = input_batch.num_reqs
++        saved = self._swap_narrow()
++        try:
++            super().propose(input_batch, *args, **kwargs)
++        finally:
++            self._restore(saved)
++        if self.enable_adaptive_verification:
++            self.draft_token_confidence_probs[:num_reqs, w:] = 0.0
++        return self.draft_tokens[:num_reqs]
