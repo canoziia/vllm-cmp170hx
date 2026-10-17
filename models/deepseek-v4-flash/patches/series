@@ -13,3 +13,4 @@
 0010-dsv4-memory-woa-fp8-compress-chunked.patch
 0011-dsv4-moe-prefill-split.patch
 0012-dsv4-sparse-prefill-tile-workspace.patch
+0013-dsv4-top-level-thinking-switch.patch
