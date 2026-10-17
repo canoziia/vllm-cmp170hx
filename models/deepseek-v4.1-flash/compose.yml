@@ -71,7 +71,7 @@ services:
       - ${VLLM_CACHE:-/root/app/deepseek-v41/cache}:/root/.cache
 
     command:
-      - /models/DeepSeek-V4.1-Flash
+      - /models/${DSV41_MODEL_DIR:-DeepSeek-V4.1-Flash-1017}
       - --host=0.0.0.0
       - --port=8000
       - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
