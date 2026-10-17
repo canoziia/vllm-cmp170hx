@@ -20,7 +20,8 @@ assert not prof.uses_dsv4_verification_widths(None)
 # switches and never selects adaptive width by itself (that is the
 # speculative-config's enable_adaptive_verification).
 keys = ("VLLM_DSV41_VERIFICATION", "VLLM_DSV41_FAST_METADATA", "VLLM_DSV41_METADATA_GRAPHS",
-        "VLLM_DSPARK_DRAFT_HEAD_FP8")
+        "VLLM_DSPARK_DRAFT_HEAD_FP8", "VLLM_DSV41_MOE_PREFILL_SPLIT", "VLLM_DSV4_SPARSE_PREFILL_H32",
+        "VLLM_DSV4_SPARSE_PREFILL_REQS")
 assert "v4-spec" not in prof.PROFILES
 saved = dict(os.environ)
 try:
@@ -32,6 +33,9 @@ try:
             assert set(os.environ) == {"VLLM_DSV41_OPT_PROFILE"}, sorted(os.environ)
 finally:
     os.environ.clear(); os.environ.update(saved)
+
+# Prefill: the MoE split accepts V4's expert shapes.
+assert "(256,4096,2048)" in (root / "model_executor/layers/fused_moe/moe_prefill.py").read_text()
 
 # Native DSpark block: V4 drafts dspark_block_size tokens, not 3 MTP stages.
 assert 'getattr(draft_hf_config, "dspark_block_size", None)' in (root / "config/speculative.py").read_text()

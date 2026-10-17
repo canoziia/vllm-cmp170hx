@@ -1,0 +1,84 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: MXFP4 MoE prefill split for V4 shapes
+
+VLLM_DSV41_MOE_PREFILL_SPLIT (V4.1 0011) only matched V4.1's 384x5120x2304
+experts. Accept DeepSeek V4's 256x4096x2048 as well and pass the expert
+count to the split alignment. PP3, 1024-token chunks: cold prefill 107k
+28.97 -> about 27.6 s; first-token logprobs within run-to-run noise. In the
+dsv4-flash profile; default off.
+---
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index aa1cff9..89c6726 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -72,6 +72,8 @@ PROFILES["dsv4-flash"] = {
+     # FP8 wo_a without the bf16 copy; chunked ratio-128 KV compressor (0010)
+     "VLLM_DSV4_WOA_FP8": "1",
+     "VLLM_DSV4_COMPRESS_CHUNKED": "1",
++    # MXFP4 MoE prefill split lists for V4's 256x4096x2048 experts (0011)
++    "VLLM_DSV41_MOE_PREFILL_SPLIT": "1",
+     # target decode kernels
+     "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
+     "VLLM_DSV4_CUDA_DET_ALIGN": "1",
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index c972726..db2bb3d 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -140,7 +140,7 @@ def _fused_marlin_moe(
+                        global_scale1, global_scale2, input_global_scale1,
+                        input_global_scale2, w1_zeros, w2_zeros,
+                        apply_router_weight_on_input):
+-            block_lists = pp.lists(topk_ids)
++            block_lists = pp.lists(topk_ids, w1.shape[0])
+             if block_lists is not None:
+                 gemm = partial(pp.split_gemm, block_lists)
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/moe_prefill.py b/vllm/model_executor/layers/fused_moe/moe_prefill.py
+index 5a7eb5d..dfb7f30 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_prefill.py
++++ b/vllm/model_executor/layers/fused_moe/moe_prefill.py
+@@ -9,23 +9,31 @@ import torch
+ from . import moe_split_align as split
+ _TABLES={}
+ 
++# (experts, hidden K, intermediate N): DeepSeek V4.1 and DeepSeek V4.
++SHAPES=((384,5120,2304),(256,4096,2048))
++
++def _shape(k,w1,w2,sc1,sc2):
++ for E,K,N in SHAPES:
++  if k==K and (tuple(w1.shape),tuple(w2.shape),tuple(sc1.shape),tuple(sc2.shape))==(
++    (E,K//16,4*N),(E,N//16,2*K),(E,K//32,2*N),(E,N//32,K)):
++   return True
++ return False
++
+ def eligible(x,w1,w2,sc1,sc2,ids,qt,bias1,bias2,expert_map,input_dtype,
+              global_scale1,global_scale2,input_global_scale1,input_global_scale2,
+              w1_zeros,w2_zeros,apply_router_weight_on_input):
+  from vllm.scalar_type import scalar_types
+  return (x.is_cuda and x.dtype==torch.bfloat16 and x.is_contiguous()
+-  and 512<=x.shape[0]<=4096 and x.shape[1]==5120
+-  and tuple(w1.shape)==(384,320,9216) and tuple(w2.shape)==(384,144,10240)
++  and 512<=x.shape[0]<=4096 and _shape(x.shape[1],w1,w2,sc1,sc2)
+   and ids.shape==(x.shape[0],6) and ids.dtype==torch.int32
+   and qt==scalar_types.float4_e2m1f
+   and sc1.dtype==torch.float8_e8m0fnu and sc2.dtype==torch.float8_e8m0fnu
+-  and tuple(sc1.shape)==(384,160,4608) and tuple(sc2.shape)==(384,72,5120)
+   and all(v is None for v in (bias1,bias2,expert_map,input_dtype,global_scale1,
+     global_scale2,input_global_scale1,input_global_scale2,w1_zeros,w2_zeros))
+   and not apply_router_weight_on_input and w1.is_contiguous() and w2.is_contiguous()
+   and torch.cuda.get_device_capability(x.device)==(8,0))
+ 
+-def lists(ids):
++def lists(ids,E=384):
+  key=(ids.device,ids.numel())
+  entry=_TABLES.get(key)
+  if entry is None:
+@@ -38,7 +46,7 @@ def lists(ids):
+   _TABLES[key]=table
+  else:
+   table=entry
+- T,E=ids.numel(),384
++ T=ids.numel()
+  def empty(n):return torch.empty(n,device=ids.device,dtype=torch.int32)
+  buf={'t_max':T,'E':E,'tab':table,
+       'hist':empty(((T+split.CHUNK-1)//split.CHUNK)*E),

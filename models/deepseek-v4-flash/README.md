@@ -275,3 +275,33 @@ draft block (both now match K=3 shapes: 44 rows -> 48-row graph, 4-position
 drafts); at the same verification width a K=5 engine still steps ~4-6 ms
 slower at c32 (code 73.5 vs 70 ms, counting 84 vs 78 ms), which points at the
 K=5 decode metadata bounds (`decode_query_len` 6) inside the graphs.
+
+## Prefill switches in `dsv4-flash` (patches `0011`, `0012`)
+
+- `VLLM_DSV41_MOE_PREFILL_SPLIT=1`: MXFP4 MoE prefill split lists, extended to
+  V4's 256x4096x2048 experts.
+- `VLLM_DSV4_SPARSE_PREFILL_H32=1`: 32-head sparse prefill attention tile,
+  bitwise identical to the 64-head tile and ~27 % faster per kernel.
+- `VLLM_DSV4_SPARSE_PREFILL_REQS=1`: the sparse prefill gathers one request's
+  compressed + SWA KV at a time; the warmup-sized bf16 workspace shrinks from
+  1028.5 to 293 MiB (-0.71 GiB per card at 1M context).
+
+None adds resident memory. PP3, MBT 1024, cold prefill: 6.7k 1.91 -> 1.72 s,
+26.7k 6.71 -> 6.11 s, 107k 28.97 -> 26.28 s, 859k 438 -> 397 s.
+
+**Warm up after start.** The first long prompt after an engine start pays the
+Triton JIT for new prefill shapes (107k: ~33 s first vs ~27 s after; 6.7k:
+~5 s vs 1.8 s). Once `/health` returns 200, send one ~32k-token request
+(unique `cache_salt`, `max_tokens=1`) before taking traffic:
+
+```bash
+python3 - <<'PY'
+import json, os, urllib.request, uuid
+body = {"model": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp", "max_tokens": 1,
+        "prompt": "warm up " * 24000, "cache_salt": str(uuid.uuid4())}
+req = urllib.request.Request(f"http://127.0.0.1:{os.environ.get('DSFLASH_PORT', '8501')}/v1/completions",
+      json.dumps(body).encode(), {"Content-Type": "application/json",
+      "Authorization": "Bearer " + os.environ["VLLM_API_KEY"]})
+urllib.request.urlopen(req, timeout=600).read()
+PY
+```

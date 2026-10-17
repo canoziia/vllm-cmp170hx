@@ -11,3 +11,5 @@
 0008-dsv4-verification-cohort-graphs.patch
 0009-dsv4-narrow-dspark-draft.patch
 0010-dsv4-memory-woa-fp8-compress-chunked.patch
+0011-dsv4-moe-prefill-split.patch
+0012-dsv4-sparse-prefill-tile-workspace.patch

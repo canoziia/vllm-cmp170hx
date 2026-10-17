@@ -1,0 +1,108 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] deepseek-v4-flash: 32-head sparse prefill tile and one-request gather workspace
+
+VLLM_DSV4_SPARSE_PREFILL_H32 launches the ragged sparse prefill kernel with
+32-head tiles, 4 warps and 2 stages for V4's 64x512 heads on SM80: 2.26 ->
+1.66 ms at 1024 queries x 640 rows, bitwise identical to the 64-head tile.
+
+VLLM_DSV4_SPARSE_PREFILL_REQS=N (V4 Ampere attention only) gathers the
+compressed + SWA KV of N prefill requests at a time instead of 4. The bf16
+gather workspace is sized at warmup for max_model_len, so N=1 shrinks it
+from 1028.5 to 293 MiB: -0.71 GiB per card on PP3 at 1M context; single and
+4-way concurrent prefill unchanged.
+
+PP3, MBT 1024 with the MoE split: cold prefill 6.7k 1.76 -> 1.72 s, 107k
+26.99 -> 26.28 s, 859k 438 -> 397 s. Both in the dsv4-flash profile;
+default off.
+---
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 89c6726..bf083f4 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -37,6 +37,9 @@ PROFILES: dict[str, dict[str, str]] = {
+         "VLLM_DSV41_THIN_WOA": "1",
+         # 0011 MXFP4 MoE prefill split-list
+         "VLLM_DSV41_MOE_PREFILL_SPLIT": "1",
++    # 32-head sparse prefill tile; one-request prefill gather workspace (0012)
++    "VLLM_DSV4_SPARSE_PREFILL_H32": "1",
++    "VLLM_DSV4_SPARSE_PREFILL_REQS": "1",
+         # 0012 fast prefill indexer
+         "VLLM_DSV41_INDEXER_PREFILL_FAST": "1",
+         # 0013 dense MXFP8 decode GEMM
+@@ -74,6 +77,9 @@ PROFILES["dsv4-flash"] = {
+     "VLLM_DSV4_COMPRESS_CHUNKED": "1",
+     # MXFP4 MoE prefill split lists for V4's 256x4096x2048 experts (0011)
+     "VLLM_DSV41_MOE_PREFILL_SPLIT": "1",
++    # 32-head sparse prefill tile; one-request prefill gather workspace (0012)
++    "VLLM_DSV4_SPARSE_PREFILL_H32": "1",
++    "VLLM_DSV4_SPARSE_PREFILL_REQS": "1",
+     # target decode kernels
+     "VLLM_DSV4_FAST_DET_MOE_ALIGN": "1",
+     "VLLM_DSV4_CUDA_DET_ALIGN": "1",
+diff --git a/vllm/models/deepseek_v4/ampere/ampere_sparse.py b/vllm/models/deepseek_v4/ampere/ampere_sparse.py
+index f9806a3..84493d7 100644
+--- a/vllm/models/deepseek_v4/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v4/ampere/ampere_sparse.py
+@@ -7,14 +7,26 @@ ragged metadata builders, and bf16 o_proj reference path are plain
+ Triton/torch (the aiter-only preshuffle GEMMs self-disable off ROCm), and
+ ``vllm.v1.attention.ops.fp8_sm80`` supplies e4m3 encode/decode below SM89
+ where Triton refuses native fp8 converts.
++
++VLLM_DSV4_SPARSE_PREFILL_REQS=N (default unset = 4, unchanged): number of
++prefill requests whose compressed + SWA KV the sparse prefill gathers into
++the shared bf16 workspace at once. The workspace is
++[N, max_model_len/ratio + window + max_num_batched_tokens, head_dim] bf16 and
++is sized for the worst case at warmup, so N=1 cuts it by 3/4 (~0.75 GiB per
++card at 1M context); more requests in one step are then gathered one after
++another.
+ """
+ 
++import os
++
+ from vllm.models.deepseek_v4.amd.rocm import (
+     DeepseekV4ROCMAiterMLAAttention,
+     DeepseekV4ROCMAiterMLASparseBackend,
+ )
+ from vllm.platforms.interface import DeviceCapability
+ 
++_PREFILL_REQS = int(os.environ.get("VLLM_DSV4_SPARSE_PREFILL_REQS", "0"))
++
+ 
+ class DeepseekV4AmpereMLASparseBackend(DeepseekV4ROCMAiterMLASparseBackend):
+     @staticmethod
+@@ -30,3 +42,5 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
+     """SM8x DeepSeek V4 attention: ROCm Triton path on CUDA Ampere."""
+ 
+     backend_cls = DeepseekV4AmpereMLASparseBackend
++    if _PREFILL_REQS > 0:
++        PREFILL_CHUNK_SIZE = _PREFILL_REQS
+diff --git a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+index 7767127..4fbe0cc 100644
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -3121,6 +3121,17 @@ def _rocm_sparse_attn_prefill_ragged_triton(
+             and head_dim == 512 and nope_head_dim == 448 and rope_head_dim == 64
+             and q.dtype == kv.dtype == torch.bfloat16 and block_k == 32):
+         block_h, num_warps = 64, 8
++    num_stages = None
++    # DeepSeek V4 on SM80: 32-head tiles, 4 warps, 2 stages (two CTAs per
++    # query; 1.66 vs 2.26 ms for the 64-head tile at 1024 queries x 640 rows,
++    # bitwise identical: per-head softmax is independent of the head split).
++    if (os.getenv("VLLM_DSV4_SPARSE_PREFILL_H32", "0") == "1"
++            and current_platform.is_cuda()
++            and torch.cuda.get_device_capability(q.device) == (8, 0)
++            and num_heads == 64 and head_dim == 512 and nope_head_dim == 448
++            and rope_head_dim == 64 and q.dtype == kv.dtype == torch.bfloat16
++            and block_k == 32):
++        block_h, num_warps, num_stages = 32, 4, 2
+     # When the tile covers the data exactly, every head/dim mask in the kernel
+     # is all-true and buys nothing but predication on its hottest instructions.
+     # Specialize rather than delete: ranks whose head count is not the tile
+@@ -3156,6 +3167,7 @@ def _rocm_sparse_attn_prefill_ragged_triton(
+         BLOCK_K=block_k,
+         EXACT_TILE=exact_tile,
+         num_warps=num_warps,
++        **({} if num_stages is None else {"num_stages": num_stages}),
+     )
+     return out
+ 
