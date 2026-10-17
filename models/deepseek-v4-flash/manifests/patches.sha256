@@ -10,4 +10,3 @@ d2aa043be2220d8fb4bade3f74ce69442c342deb97dc14c1fc903f81061c79b7  models/deepsee
 5ad1d7bd8329641e3d1168ccec44f44fc7d4f0805501cdfde26b689c713c4bcd  models/deepseek-v4-flash/patches/0010-dsv4-memory-woa-fp8-compress-chunked.patch
 5b9ed5358b99d65a8d6dfcdfd63218464efd94c5d5412b250e8a232754293cf2  models/deepseek-v4-flash/patches/0011-dsv4-moe-prefill-split.patch
 fb03774fa700f372498e47e332a8f01e3f680af14c873796fa430b28c2a0f73d  models/deepseek-v4-flash/patches/0012-dsv4-sparse-prefill-tile-workspace.patch
-9fb9ad5b1f6980f79313f7f063939ce66070b4fa6bb84ef0d920cf09198fcc32  models/deepseek-v4-flash/patches/0013-dsv4-top-level-thinking-switch.patch
