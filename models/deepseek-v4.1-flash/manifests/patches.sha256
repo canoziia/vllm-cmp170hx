@@ -26,3 +26,4 @@ ffc874a807af15522069841b796494fc76b9b4794496b474d7926603adaf0b95  models/deepsee
 9b78cfd43e3edb778164f9d81f9f752b41de353c9833adcd916e908faaf79cf8  models/deepseek-v4.1-flash/patches/optional/series.perf-debug
 de3a6f5592045be6f2037b94d754bba54f7fb7e17731d5349a90577a6e8f3a40  models/deepseek-v4.1-flash/patches/adaptive/0009-measured-verification-policy.patch
 a6b8b8c9bb416e8287882218629bed92ffd0c74462c6aeedd59bf3096a0bdd96  models/deepseek-v4.1-flash/patches/0015-dsv41-encoding-1017.patch
+71b94f93e70b841978d505e54e352600b020003c564da9bfe569c32e94205524  models/deepseek-v4.1-flash/patches/0016-deepseek-top-level-thinking-switch.patch

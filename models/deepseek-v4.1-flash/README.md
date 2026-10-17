@@ -628,6 +628,19 @@ character-for-character with the checkpoint goldens and the reference encoder
 vendored in `tests/fixtures/deepseek-v4.1-flash-1017-encoding/` (MIT); it runs
 during the image build.
 
+## Request-level thinking switch (patch 0016)
+
+DeepSeek API clients (e.g. pi in DeepSeek format) send
+`"thinking": {"type": "enabled" | "disabled"}` at the top level of a chat
+request. Patch 0016 maps it to `chat_template_kwargs.thinking` /
+`enable_thinking` for `DeepseekV41ForCausalLM` (and the V4 architectures; one
+shared implementation `vllm/entrypoints/openai/chat_completion/deepseek_thinking.py`,
+also used by the V4-Flash image that stacks its series on this one) before the
+tokenizer and the reasoning parser read them. Both keys are set so
+`reasoning_effort` cannot re-enable a disabled request; explicit
+`chat_template_kwargs.thinking` / `enable_thinking` win; any other value returns
+400. `tests/test_deepseek_thinking.py SOURCE_TREE` runs during the build.
+
 ## Optimisation switches (patch 0014 profile)
 
 `compose.yml` enables all optimisation patches with one variable,
