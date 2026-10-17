@@ -1,135 +1,84 @@
-# DeepSeek-V4-Flash PD (prefill/decode disaggregated) on six CMP 170HX GPUs
+# DeepSeek-V4-Flash-Vision-Exp on CMP 170HX: PD pair (`compose.pd.yml`) and single engine (`compose.yml`)
 
-Model: `deepseek-ai/DeepSeek-V4-Flash` - `model_type: deepseek_v4`,
-`DeepseekV4ForCausalLM`, 43 transformer layers, `num_nextn_predict_layers: 1`,
-fp8 e4m3 weights (`weight_block_size [128,128]`) with fp4 experts,
-`vocab_size 129280`, `hidden_size 4096`, 1M context.
+Model: `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` - `model_type: deepseek_v4`,
+43 transformer layers plus a 3-layer DSpark drafter (`mtp.*`), fp8 e4m3
+weights with fp4 experts, `hidden_size 4096`, 1M context. This is **not**
+DeepSeek-V4.1 (`deepseek_v41`, 40 layers).
 
-This is **not** DeepSeek-V4.1 (`deepseek_v41`, 40 layers, block size [32,32]).
-Non-model settings follow the V4.1 deployment; the model-specific runtime names
-(tokenizer mode, tool-call/reasoning parser, KV cache dtype, speculative method)
-are exposed as `.env` overrides because they must be confirmed against the image
-actually used.
+## PD (prefill/decode disaggregated), node2
 
-## Roles
+| role | GPUs | port | PP3 partition | MBT | max-num-seqs | KV (`--kv-cache-memory`) | KV tokens |
+|---|---|---|---|---|---|---|---|
+| router (public) | - | 8401 | - | - | - | - | - |
+| prefill | 5,6,7 | 8412 | `15,16,12` | 2048 (long-prefill threshold 2048) | 4 | 3.5 GiB | 1,382,994 |
+| decode | 1,2,3 | 8413 | `15,16,12` | 512 | 32 | 3.75 GiB | 2,228,171 |
+| LMCache MP server | sees 1-3, 5-7 | 5571 / http 18571 | - | chunk 1024 | - | L1 12 GiB host RAM, L2 200 GiB fs_native | - |
 
-| role | GPUs | PP3 partition | speculative |
-|---|---|---|---|
-| prefill | 4,5,6 | `15,14,14` (even) | none |
-| decode | 7,8,9 | `15,15,13` (even layers, nextn on the last rank) | `mtp` |
-| lmcache | sees 4..9 | - | - |
+Both engines: image `localhost/vllm-backport:deepseek-v4-flash-f5c9c8d`
+(`scripts/build-deepseek-v4-flash-image.sh`; carries the patched LMCache
+payload of `localhost/lmcache-server:latest`, incl. LMCache 0008
+`mp_worker_rank`), profile `dsv4-flash` (prefill switches 0011/0012, live-load
+PP cohorts), DSpark K=5 + adaptive verification, FULL_AND_PIECEWISE graphs,
+`--prefix-cache-retention-interval` = LMCache chunk (SWA groups use the
+default window path; LMCache 0010 is gone), `--shutdown-timeout=30`,
+`--sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}`.
+Router: `localhost/vllm-router:latest` (patches/router 0001-0004: usage merge,
+client API key, cancel on disconnect, streamed prefill + keep-alive),
+`--routing-logic=disaggregated_prefill`.
 
-Disaggregation uses the shared LMCache server as the KV medium: prefill stores,
-decode retrieves, then decodes with the speculative decoder.
+```bash
+cp .env.pd.example .env.pd && chmod 600 .env.pd   # set VLLM_API_KEY
+podman compose -f compose.pd.yml --env-file .env.pd \
+  --podman-run-args="--ipc=host --pid=host" up -d
+podman compose -f compose.pd.yml --env-file .env.pd down   # before every restart
+```
 
-## Verified behaviour
+Then warm up once (see "Warm up after start" below, port 8401): the first
+107k prompt after start takes ~39 s instead of ~25 s.
 
-| step | request | result |
+Rules that matter:
+
+- **Same partition and same speculative config on both roles.** The drafter's
+  three SWA layers (global 43-45) are packed into the target's SWA KV groups
+  on rank 2, so a prefill engine without DSpark registers 6-layer instead of
+  7/8-layer objects under the same LMCache key (the key has no size): every
+  rank-2 lookup then fails or misreads. The prefill engine computes the
+  drafter's prompt KV, which the decode drafter reads back.
+- **`pid: host` on every container** (plus `--ipc=host --pid=host` on the
+  command line; podman-compose 1.3 ignores `ipc`): CUDA IPC event pools live in
+  `/dev/shm/cuda.shm.0.<pid>`; private PID namespaces reuse PIDs and the
+  LMCache server waits on the other engine's events (commit 901b42d).
+- **Small L1.** node2's Qwen LMCache already holds 64 GiB; 64 GiB here got the
+  host OOM-killed while this 149 GiB model loaded. A ~960k-token context is
+  ~21 GiB of LMCache objects, so L1 holds about half of one; L2 (200 GiB, ~9
+  such contexts) serves the rest.
+- The router builds the backend `Authorization` from `OPENAI_API_KEY` and
+  requires the same key from clients (0002); `/health` stays open.
+  `prompt_tokens_details.cached_tokens` in a PD response is the prefill hop's
+  count (0 on a cold prompt); the decode hop's LMCache hit is in
+  `usage.router_hops.decode_usage`.
+
+Measured on node2 (`/root/app/dsv4-work/PD-REPORT.md`), through the router:
+decode tok/s (c1 per request, c8/c32 full batch; 2 warm-up + 3 rounds) and
+cold TTFT, against the single engine (same image, MBT 2048, max-num-seqs 32):
+
+| | PD | single engine |
 |---|---|---|
-| prefill role (GPU 4,5,6), first time | prompt (1890 tok) | server A logs `Stored 1024 tokens` per rank; objects land in the L2 directory |
-| decode role (GPU 7,8,9), first time | same prompt, after prefill | server B logs `Retrieved 1024 tokens`; `cached_tokens = 1024` (the remaining 512 tokens were computed and stored) |
-| decode role output | same prompt | answer echoes the injected marker, so the context came from the transferred KV |
+| counting c1 / c8 / c32 | 174.1 / 788 / 1317 | 173.4 / 753 / 1408 |
+| code c1 / c8 / c32 | 207.7 / 858 / 1456 | 206.6 / 852 / 1495 |
+| prose c1 / c8 / c32 | 100.6 / 452 / 851 | 100.8 / 444 / 933 |
+| TTFT 6.7k / 26.7k / 107k (s) | 2.23 / 6.24 / 25.48 | 1.81 / 5.99 / 24.71 |
+| TTFT 107k, second turn (cached 107,008) | 1.40 s | - |
+| c4 decode during a 107k cold prefill | 476 tok/s (501 before) | not measured |
+| two ~960k requests (A decodes while B prefills) | A 95.2 tok/s during B, 94.9 after; TTFT 462 / 465 s | - |
 
-Evidence: `/root/app/pd-validation/`.
+Peak GPU memory: decode 59.1 / 61.9 / 61.0 GiB, prefill 58.5 / 61.3 / 60.2 GiB
+(GPUs 1-3 / 5-7, after the 960k runs); GPU 2 (decode rank 1) has ~1 GiB left,
+so do not raise the decode KV further.
 
-## Both roles must declare the same speculative depth
-
-The L2 key is `(model, rank, object group)` — it does **not** include the size of
-the object. The size follows from the KV geometry, and that geometry is resolved
-from `num_speculative_tokens`. So if one role declares `--speculative-config` and
-the other does not, both agree on the key but disagree on the byte count, and
-every lookup fails with:
-
-```
-[LMCache GET] key /models/DeepSeek-V4-Flash@03020302@0@<hash> failed: incomplete read for
-  <hash>.data: expected 4765696, got 4690944
-```
-
-The visible symptom on the engine is `cached_tokens = 0` together with
-`created_cache_tokens > 0`, even though the other role clearly stored the chunk.
-A prefill role therefore declares the same `--speculative-config` as the decode
-role purely so both resolve one geometry; it does not sample draft tokens.
-
-## Fitting PP3 on 63 GiB cards
-
-This model is 148.7 GiB, so PP3 puts ~50 GiB of weights on each card. Measured on
-node2 (CMP 170HX, 63.4 GiB usable per card):
-
-- weights: 49.3-51.5 GiB per rank;
-- KV budget is therefore **4 GiB**, not the 6 GiB used by node1's PP6 V4.1
-  deployment: at 6 GiB the engine OOM'd during kernel warmup, and at 4 GiB the
-  KV cache still holds ~1.24M tokens (enough for one 1M-token request);
-- **CUDA graphs are PIECEWISE**: with FULL graphs the capture OOM'd in the
-  ~8 GiB that remained at the 6 GiB KV setting (the committed 4 GiB setting was
-  not re-tested with FULL graphs);
-- `--max-num-seqs` is reduced (4 prefill / 8 decode) to keep graph buffers small;
-- the two LMCache servers must use a small L1 (`LMCACHE_L1_SIZE_GB=8`): the L1
-  tier is host RAM, and 64 GiB per server got both servers OOM-killed while this
-  model was loading on a 251 GiB host.
-
-## Run
-
-```bash
-# from this directory
-cp .env.example .env               # set VLLM_API_KEY / machine paths, merge .env.pd.example
-podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
-podman compose -f compose.pd.yml ps
-podman compose -f compose.pd.yml down
-```
-
-`--podman-run-args=--ipc=host` is required: the connector moves KV over CUDA IPC,
-and podman-compose 1.3.0 ignores the compose `ipc` key. node1 starts its
-deployments with the same flag.
-
-### Two-step PD request
-
-```bash
-KEY=$(grep '^VLLM_API_KEY=' .env | cut -d= -f2)
-PF=http://127.0.0.1:8201   # prefill role
-DC=http://127.0.0.1:8202   # decode role
-BODY='{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"your prompt"}],"max_tokens":64}'
-# 1) prefill the prompt so its KV lands in the shared L2 tier
-curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
-  -d "${BODY/\"max_tokens\":64/\"max_tokens\":1}" $PF/v1/chat/completions
-# 2) decode the same prompt; the response reports prompt_tokens_details.cached_tokens
-curl -sS -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' -d "$BODY" $DC/v1/chat/completions
-```
-
-### Single endpoint in front of the pair (`-pd-router`)
-
-Each pair is fronted by the **vLLM production-stack router** - community-maintained,
-actively released (pinned here to `vllm-stack-0.1.13`) - running as an ordinary compose
-service on a stock python image, so there is no custom image to build and no Kubernetes:
-
-| model | single endpoint | prefill | decode |
-|---|---|---|---|
-| qwen | `:9101` | `:8101` | `:8102` |
-| deepseek | `:9102` | `:8201` | `:8202` |
-
-`--routing-logic disaggregated_prefill` makes the router perform both hops itself
-(request -> prefill with `max_tokens=1` -> decode with the original request) and stream
-the decode response back to the caller.
-
-Measured through the router: a 5119-token prompt returned
-`prompt_tokens_details.cached_tokens = 4800` while the prefill server logged
-`Stored 1600 tokens` twice and the decode server `Retrieved 4800 tokens`.
-
-Things worth knowing:
-
-* the router does **not** forward the caller's `Authorization` header - it builds its
-  own from `OPENAI_API_KEY`, which the compose service wires to `VLLM_API_KEY`;
-* use `disaggregated_prefill`, **not** `disaggregated_prefill_orchestrated`: the
-  orchestrated variant injects `kv_transfer_params` but sends **no** Authorization
-  header to the backends (`request.py:833` in 0.1.13 and in main), so it returns 401
-  against engines started with `--api-key`. We do not need `kv_transfer_params` because
-  our KV moves through the shared LMCache tier;
-* other policies shipped by the router: `roundrobin`, `session` (add `--session-key`
-  for session affinity), `prefixaware`, `kvaware`, `loadaware`, `priority`;
-* `--static-backend-health-checks` exists but is currently incompatible with
-  authenticated backends (upstream vllm-project/production-stack issue #631).
-
-The earlier vendored copy of vLLM's example `disagg_proxy_server.py` was removed in
-favour of this router.
+Greedy counting outputs are token-identical to the single engine at c1/c8/c32;
+code and prose differ only at the known near-ties (code token 3, prose token 0,
+which also flip between single-engine runs).
 
 ## DSpark speculative decoding (opt-in)
 
