@@ -255,3 +255,23 @@ at spec_k=3 costs 101.8 ms/step against ~78 ms with a K=3 engine, and spec_k=4
 `COST_MS_DSV4_PP3` (patch 0001) was re-swept with the target kernels on
 (`spec_k` 1-5, counting, c = 1-32; the old table was measured with the default
 kernels and is 6-8 ms/step higher at c1).
+
+### Final stack (image `deepseek-v4-flash-3418e57`, patches 0001-0009, `dsv4-flash`)
+
+dspark K=5 + adaptive verification, max-num-seqs 32, KV 2.5 GiB; host-b GPUs
+1-3 while another engine ran on GPUs 5-8 (c32 rounds vary by up to ~10 %).
+
+| tok/s | c1 | c4 | c8 | c16 | c32 |
+|---|---|---|---|---|---|
+| code | 197.1 | 563 | 847 | 1356 | 1482 (1377-1598 over runs) |
+| counting | 167.5 | 494 | 754 | 1145 | 1288 (1288-1350) |
+| prose | 101.3 | 284 | 439 | 642 | 919 (894-919) |
+
+Same image and profile with fixed dspark K=3, measured right after: c16
+1246 / 1065 / 687, c32 1646 / 1384 / 892 (code / counting / prose). K=5 wins
+at c1-c16 except prose c16 (-6.5 %); at c32 K=3 is still ahead on code and
+counting. With 0008 and 0009 the c32 gap is no longer cohort padding or the
+draft block (both now match K=3 shapes: 44 rows -> 48-row graph, 4-position
+drafts); at the same verification width a K=5 engine still steps ~4-6 ms
+slower at c32 (code 73.5 vs 70 ms, counting 84 vs 78 ms), which points at the
+K=5 decode metadata bounds (`decode_query_len` 6) inside the graphs.
