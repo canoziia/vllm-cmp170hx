@@ -296,6 +296,28 @@ tok/s, mean (sd).
   32k 9.3 s vs 5.6 s, 131k 42 s vs 27 s); decode only sees chunks whose store
   completed (an 8k prompt is fully visible about 0.5 s after prefill returns).
 
+### Through the router (go-live, before 0011)
+
+host-b, 2026-10-12, PD as deployed (LIVE_LOAD on both engines, LMCache
+connector, 0001-0010), `scripts/benchmark-vllm.mjs` against the router on
+8401, 500 tokens, `enable_thinking=false`, 2 warm-up + 3 rounds, median
+(raw data `/srv/mimo-work/bench/pd-final/`). Per-request tok/s,
+full-batch tok/s (mean of the rounds) in brackets:
+
+| | c1 | c8 | c32 |
+|---|---|---|---|
+| counting | 179.7 | 103.7 (850) | 71.4 (2382) |
+| code | 174.7 | 102.3 (841) | 64.3 (2225) |
+| prose | 111.9 | 68.0 (549) | 35.9 (1150) |
+
+c1 equals the single engine. With 0011 (decode
+restarted 2026-10-12 13:25) only the decode-port c8/c32 comparison and the
+long-context step times in the 0011 section were measured; c2/c4/c16 were
+not measured for the PD pair.
+
+Status: the PD pair on 8401 was stopped on 2026-10-17 (GPUs handed to
+DeepSeek-V4-Flash); `compose.pd.yml` is unchanged.
+
 ## DFlash drafter (0006, experimental)
 
 `--speculative-config={"method":"dflash","model":"/models/MiMo-V2.6-Flash-MOPD/dflash","num_speculative_tokens":7}`

@@ -114,6 +114,23 @@ for prose).
 Cold prefill (c1, default profile, MTP5): 7k 1.46 s, 28k 4.24 s, 114k 16.3 s,
 456k 78.7 s, 912k 200-286 s (run-to-run).
 
+The c1-c32 matrix and cold prefill above are host-a development runs; the
+host-b production deployment (`compose.yml`, PP2 on GPUs 0/9, port 8001,
+default profile MTP5 + RecoverSSM) has no c1-c32 matrix of its own. Go-live
+check on host-b, 2026-10-11 (image `qwen3.8-flash-next-nvfp4` = `ea5b7a2f`,
+main `32c370c`), `scripts/benchmark-vllm.mjs`, 500 tokens, thinking off, 3
+rounds without warm-up, median [range]; c1 per request, c8 full batch:
+
+| prompt | c1 | c8 |
+|---|---|---|
+| counting | 220.7 [166.4-230.2] | 1214 [1174-1260] |
+| code | 217.8 [212.1-221.0] | 968 [956-972] |
+| prose | 108.5 [106.9-109.2] | 511 [508-514] |
+
+(The counting c1 low is the first, cold round.) These agree with the host-a
+matrix. The service has since been rebuilt for `pid: host` (image
+`61ad9bf`, main `901b42d`) without a new speed measurement.
+
 ## Build
 
 From the repository root:

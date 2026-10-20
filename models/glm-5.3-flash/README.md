@@ -1,16 +1,21 @@
 # GLM-5.3-Flash on CMP 170HX
 
+**Status: retired.** The W4A16 + DFlash2 PD pair on host-b was stopped on
+2026-10-11 17:26 CST (containers and the L2 directory kept; restore notes in
+`/srv/glm-pd-work/RESTORE-GLM-PD.md`). The numbers below are the last
+measurements of that deployment; there is no later data.
+
 Two prefill/decode pairs share container names and ports; run one of them:
 
 | compose | target | speculative | image |
 |---|---|---|---|
-| `compose.pd.w4a16-dflash2.yml` (**production**) | `canada-quant/GLM-5.3-Flash-W4A16-MTP` | DFlash2 | `glm-5.3-flash-w4a16-dflash2` |
+| `compose.pd.w4a16-dflash2.yml` (last production, retired) | `canada-quant/GLM-5.3-Flash-W4A16-MTP` | DFlash2 | `glm-5.3-flash-w4a16-dflash2` |
 | `compose.pd.yml` | `nvidia/GLM-5.3-Flash-NVFP4` | MTP-3 | `deepseek-v4.1-flash` |
 
 `compose.w4a16-dflash2.yml` runs the W4A16 + DFlash2 engine alone (PP4, one
 role), see [below](#w4a16--dflash2pp4单引擎).
 
-## W4A16 + DFlash2 PD（生产）
+## W4A16 + DFlash2 PD（最后的生产配置，已退役）
 
 prefill PP4 用 GPU1–4（:8301），decode PP4 用 GPU5–8（:8302），一个 LMCache
 server（:5559，HTTP :18559），PD router 入口 **:9103**；模型名

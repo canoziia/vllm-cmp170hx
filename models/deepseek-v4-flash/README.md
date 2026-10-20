@@ -58,7 +58,9 @@ Rules that matter:
   count (0 on a cold prompt); the decode hop's LMCache hit is in
   `usage.router_hops.decode_usage`.
 
-Measured on host-b (`/srv/dsv4-work/PD-REPORT.md`), through the router:
+Measured on host-b on 2026-10-17 (image `deepseek-v4-flash-f5c9c8d`,
+`/srv/dsv4-work/PD-REPORT.md`, raw data in `/srv/dsv4-work/pd/`),
+`scripts/benchmark-vllm.mjs`, 500 tokens, thinking off, through the router:
 decode tok/s (c1 per request, c8/c32 full batch; 2 warm-up + 3 rounds) and
 cold TTFT, against the single engine (same image, MBT 2048, max-num-seqs 32):
 
@@ -79,6 +81,12 @@ so do not raise the decode KV further.
 Greedy counting outputs are token-identical to the single engine at c1/c8/c32;
 code and prose differ only at the known near-ties (code token 3, prose token 0,
 which also flip between single-engine runs).
+
+The PD pair was measured at c1/c8/c32 only; c2/c4/c16 were not run through
+the router (single-engine c4/c16 are in "Final single engine" below). The
+running pair was later restarted on `deepseek-v4-flash-be2110d` (adds the
+request-level thinking switch, no kernel change); decode speed was not
+re-measured on that image.
 
 ## Request-level thinking switch (shared V4.1 patch 0016)
 
