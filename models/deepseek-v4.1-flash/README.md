@@ -628,6 +628,22 @@ character-for-character with the checkpoint goldens and the reference encoder
 vendored in `tests/fixtures/deepseek-v4.1-flash-1017-encoding/` (MIT); it runs
 during the image build.
 
+### Production decode matrix (previous checkpoint, image `f3b0dc8`)
+
+host-a PP6, production compose with adaptive verification (fixed measured
+policy), measured 2026-10-10; `scripts/benchmark-vllm.mjs`, 500 tokens (code
+may stop at EOS), temperature 0, fresh cache salt, 2 warm-up + 5 rounds, median;
+c1 per request, c>=2 full batch, tok/s:
+
+| load | c1 | c2 | c4 | c8 | c16 | c32 |
+|---|---|---|---|---|---|---|
+| counting | 198.05 | 385.07 | 724.37 | 1155.82 | 1554.00 | 2406.08 |
+| code | 166.04 | 327.66 | 603.89 | 887.98 | 1205.34 | 1948.46 |
+| prose | 82.81 | 157.69 | 288.27 | 460.02 | 593.08 | 937.53 |
+
+Checkpoint 1017 has the same architecture and step times, so this matrix is
+expected to carry over; only c1 was re-measured below.
+
 ### Performance with checkpoint 1017
 
 host-a PP6, production compose (`verification` profile, dspark K=5 + adaptive
