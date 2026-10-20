@@ -241,6 +241,72 @@ drafts); at the same verification width a K=5 engine still steps ~4-6 ms
 slower at c32 (code 73.5 vs 70 ms, counting 84 vs 78 ms), which points at the
 K=5 decode metadata bounds (`decode_query_len` 6) inside the graphs.
 
+### Memory (patch 0010, in `dsv4-flash`)
+
+PP3 rank 1 (16 layers, 54.6 GiB of weights) is the tightest card. Two
+changes free ~3 GiB per card without resident copies:
+
+- `VLLM_DSV4_WOA_FP8=1`: `wo_a` is read as FP8 by a grouped thin GEMM
+  (M <= 128) instead of a resident bf16 copy (-0.75 to -1.0 GiB per card);
+  M > 128 dequantises one 64 MB tile at a time and stays bitwise equal to the
+  bf16 path.
+- `VLLM_DSV4_COMPRESS_CHUNKED=1`: the ratio-128 KV compressor kernel loops
+  over 8-row chunks; its 10-22 KB per-thread stack (~1.3 GiB of driver local
+  memory outside the allocator) drops to 0. One byte in 9321 differs on
+  ratio-128 overlap rows (summation order); ratio-4 and non-overlap rows are
+  bitwise equal.
+
+At KV 2.5 GiB the cards went from 61.8 / 64.5 / 63.9 GB to 58.8 / 61.4 /
+60.8 GB, which pays for the committed defaults KV 3.5 GiB + MBT 2048 (rank 1
+peak 63.6 GB after c32 and a 107k prefill). The `GPU KV cache size` log line
+is a worst-case estimate that reserves one MBT chunk per request in the SWA
+groups: the same 3.5 GiB pool reports 2,079,795 tokens at MBT 512 and
+1,382,994 at MBT 2048.
+
+### Final single engine (image `deepseek-v4-flash-f5c9c8d`, patches 0001-0012)
+
+`compose.yml` defaults: PP3 `15,16,12`, `dsv4-flash`, dspark K=5 + adaptive
+verification, MBT 2048, max-num-seqs 32, KV 3.5 GiB, 1M context; host-b GPUs
+5-7; 2 warm-up + 3 rounds, median; c1 per request, c>=4 full batch.
+
+| tok/s | c1 | c4 | c8 | c16 | c32 |
+|---|---|---|---|---|---|
+| counting | 173.4 (baseline 114.6) | 504 | 753 (436.2) | 1150 | 1408 |
+| code | 206.6 (123.8) | 564 | 852 (485.1) | 1346 | 1495 |
+| prose | 100.8 (73.1) | 291 | 444 (291.6) | 642 | 933 |
+
+Baseline = same model with every optimisation off and K=3 (the first PP3 run).
+c1 accepted tokens/step: counting 3.82, code 5.04, prose 2.05 (prose c1 moves
+between ~101 and ~107 tok/s with the output trajectory: 2.05-2.16
+tokens/step at the same ~20.4 ms step).
+
+Cold prefill (unique `cache_salt`, after the warm-up request):
+
+| prompt tokens | baseline (MBT 512) | final |
+|---|---|---|
+| 6,690 | 2.23 s | 1.81 s |
+| 26,738 | 8.14 s | 5.99 s |
+| 107,592 | 34.3 s | 24.71 s |
+| 429,533 | - | 137.7 s |
+
+Long-context decode (c1, prefix cached, 400 tokens):
+
+| context | prose steps/s | prose tok/s | code steps/s | code tok/s |
+|---|---|---|---|---|
+| 54k | 42.6 | 88.2 | 34.4 | 163.6 |
+| 161k | 39.5 | 90.0 | 31.6 | 146.4 |
+| 403k | 34.1 | 75.5 | 27.3 | 149.1 |
+
+The extra ~8 ms/step at 403k is the indexer logits and the ratio-128 sparse
+attention; a stacked 6-row ratio-128 decode kernel (1.6x slower) and a fused
+next_n indexer logits kernel (<2 % end to end, not bitwise) were tried and not
+kept.
+
+Memory after all tests: 60.6 / 63.6 / 62.8 GB (weights incl. the drafter
+52.5 / 54.6 / 54.2 GiB). Greedy counting is token-identical to the K=3
+baseline at c1/c4/c8; code and prose differ only at the batch-shape near-ties
+the baseline shows between identical requests.
+
 ## Prefill switches in `dsv4-flash` (patches `0011`, `0012`)
 
 - `VLLM_DSV41_MOE_PREFILL_SPLIT=1`: MXFP4 MoE prefill split lists, extended to

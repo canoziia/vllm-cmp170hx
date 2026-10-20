@@ -628,6 +628,27 @@ character-for-character with the checkpoint goldens and the reference encoder
 vendored in `tests/fixtures/deepseek-v4.1-flash-1017-encoding/` (MIT); it runs
 during the image build.
 
+### Performance with checkpoint 1017
+
+host-a PP6, production compose (`verification` profile, dspark K=5 + adaptive
+verification), image with 0001-0016; `scripts/benchmark-vllm.mjs`, c1, 500
+tokens, 2 warm-up + 5 rounds:
+
+| load | 1017 tok/s | tokens/step | ms/step | previous checkpoint |
+|---|---|---|---|---|
+| counting | 200.9 | 5.88 | 29.9 | 199.4 |
+| code | 170.3 | 5.43 | 32.7 | 168.5 |
+| prose | 78.7 | 2.09 | 27.2 | 85.2 |
+
+Step times at a fixed width match the previous checkpoint (k2 24.9 vs 25.3 ms,
+k3 26.8 vs 26.4, k5 30.2 vs 30.0); the prose difference is acceptance on the
+benchmark prompt: k2 1.97 vs ~2.16 tokens/step, k3 2.23 vs 2.25, k5 2.33 vs
+2.14. Over four prose prompts the adaptive policy averages 78.3 tok/s against
+76.3 / 77.7 / 73.2 for fixed k2 / k3 / k5, so the policy is kept; the old 85
+tok/s was a single-prompt figure of the previous weights.
+c8 (development script, image before 0016): counting / code / prose 1157 /
+894 / 400 tok/s. Cold TTFT: 7.9k 3.41 s, 34.4k 7.56 s.
+
 ## Request-level thinking switch (patch 0016)
 
 DeepSeek API clients (e.g. pi in DeepSeek format) send
