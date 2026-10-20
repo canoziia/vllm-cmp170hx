@@ -106,8 +106,12 @@ L2 paths are intentionally unchanged. Old Podman containers keep their former
 names/commands until explicitly replaced; changing Compose alone does not
 upgrade or remove them.
 
-Never commit `.env`, API keys, model weights, benchmark results, or host disk
-UUIDs.
+Host paths in `.env.example` files and Compose defaults (`/srv/models`,
+`/srv/vllm-cache`, `/srv/lmcache`, ...) are generic examples; set the real
+paths for your host in `.env`. Variables marked `${VAR:?...}` have no default.
+
+Never commit `.env`, API keys, model weights, benchmark results, host
+addresses or host disk UUIDs.
 
 ## Qwen3.8 Flash Next
 

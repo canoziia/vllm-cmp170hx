@@ -20,7 +20,7 @@ c07c727af9b9f7c27c4e0bb48af770d0ec3f92234239694f7e6203ac7b28895f  models/deepsee
 f17396c8c768a138c955e3d1aadf75c7c86a1221f0826191bf6df0ecaf82455d  models/deepseek-v4.1-flash/patches/0011-dsv41-moe-prefill-split.patch
 a74e0a191cec239f92189b414889051461d92c340af97919c720f378478b25c0  models/deepseek-v4.1-flash/patches/0012-dsv41-indexer-prefill-fast.patch
 ebe791970e10f9f97bbb0d7a50358b8adea2344ab6b49c7ece78cdd014280c75  models/deepseek-v4.1-flash/patches/0010-dsv41-thin-woa.patch
-ffc874a807af15522069841b796494fc76b9b4794496b474d7926603adaf0b95  models/deepseek-v4.1-flash/patches/0013-dsv41-dense-mxfp8-decode.patch
+c281a153c95ad2177d5ac6d47624f3f6a5edd1db1a1e991396ec11b10f3ff583  models/deepseek-v4.1-flash/patches/0013-dsv41-dense-mxfp8-decode.patch
 03f12ad6892ef6d340dfcfba3b5676ca15d477d229024d286f5c8bb4e7e28c02  models/deepseek-v4.1-flash/patches/0014-dsv41-opt-profile.patch
 481395fecc96d05f99488ce6b702680abc1d14ea1e07a95d4350413f949aec05  models/deepseek-v4.1-flash/patches/optional/0003-hot-cpu-policy-debug.patch
 9b78cfd43e3edb778164f9d81f9f752b41de353c9833adcd916e908faaf79cf8  models/deepseek-v4.1-flash/patches/optional/series.perf-debug

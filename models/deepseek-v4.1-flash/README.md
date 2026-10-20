@@ -338,7 +338,7 @@ allocations can change the runtime headroom.
 
 ## Decode optimisation: single-kernel deterministic MoE align (patch 0003)
 
-Profiling one DSpark request (PP6, CUDA graphs, host-a) showed every MoE layer
+Profiling one DSpark request (PP6, CUDA graphs) showed every MoE layer
 spending ~100 us on `VLLM_DETERMINISTIC_MOE_ALIGN`'s torch implementation
 (stable argsort, scatter_add, two cumsums, searchsorted, ~25 small kernels),
 about 12% of each stage's per-step GPU time. Patch 0003 computes the same
@@ -361,7 +361,7 @@ podman run --rm --device nvidia.com/gpu=0 --security-opt label=disable \
   localhost/vllm-backport:deepseek-v4.1-flash test_fast_det_align_gpu.py
 ```
 
-Measured on host-a (PP6, 2 warm-up + 5 timed rounds, medians, 500 tokens).
+Measured on a CMP 170HX host (PP6, 2 warm-up + 5 timed rounds, medians, 500 tokens).
 "before" is the deployed debug image without this patch; "after" is the
 rebuilt default image with `compose.yml` as committed, nothing mounted:
 
@@ -403,7 +403,7 @@ Hardware facts that shape every kernel on this box (CMP 170HX, measured):
 
 Correction (later measurements): an earlier version of this table listed
 FP32/bf16 FMA-class instructions at ~42 / SM / clk and called them
-throttled, and the L2 as 40 MB. Clean microbenchmarks on host-a/host-b (dense MXFP8 decode
+throttled, and the L2 as 40 MB. Clean microbenchmarks on two identical CMP 170HX hosts (dense MXFP8 decode
 and prefill-indexer lab runs) measure ~64 / SM / clk for FP32, bf16 HFMA2 and integer ops
 alike, i.e. no ALU throttling, and the device reports 32 MiB of L2. The real
 limit on sustained decode is the 180 W power cap: under load every card sits
@@ -446,7 +446,7 @@ Error against an fp64 reference equals Marlin's (mean 4.3-4.7e-3 relative in
 every case); CUDA-graph replay equals eager; repeated calls are bitwise
 identical.
 
-Engine (host-a PP6, rebuilt image + 0004 mounted for development, 2 warm-up +
+Engine (PP6, rebuilt image + 0004 mounted for development, 2 warm-up +
 5 timed rounds, medians):
 
 | load | 0003 tok/s (steps/s) | 0003+0004 tok/s (steps/s) | accepted/step |
@@ -491,7 +491,7 @@ off (1-48 queries, padded top-k, NaN K codes, scale byte 0). Kernel time
 (synthetic cache, SWA 128 + top-512): 6 queries 127 -> 88 us, 16 queries
 307 -> 213 us, 48 queries 854 -> 347 us.
 
-Engine (host-a PP6, 0003+0004 image + 0005 mounted for development, 2 warm-up
+Engine (PP6, 0003+0004 image + 0005 mounted for development, 2 warm-up
 + 5 timed rounds): c1 counting/code/prose 178.0/150.9/69.8 tok/s (steps/s
 29.96/28.12/29.93, from 28.44/26.34/28.30), prose acceptance unchanged
 (2.33). Greedy self-scoring: only near ties (gap <= 0.5).
@@ -509,7 +509,7 @@ call, error at the scalar GEMV's level) changed engine step rate by only
 ## Decode optimisation round 2 (patches 0006-0008)
 
 Written in parallel by subagents from a shared profile/hardware brief and
-verified on host-a by the main session.
+verified on the test host.
 
 | patch | switches (compose sets 1) | what | numerics |
 |---|---|---|---|
@@ -521,7 +521,7 @@ verified on host-a by the main session.
 passes its tests but measured slower end to end (c1 counting steps/s 31.45 vs
 31.96 with DQ=0) with lower prose acceptance in that run, so it stays off.
 
-Development measurements (host-a PP6, 2 warm-up + 5 timed rounds, medians;
+Development measurements (PP6, 2 warm-up + 5 timed rounds, medians;
 0001-0005 image + 0006-0008 mounted):
 
 | load | 0001-0005 image tok/s (steps/s) | + 0006-0008 tok/s (steps/s) |
@@ -563,7 +563,7 @@ c8 925.6/750.4/347.6; cold prefill (same warm instance, median of 2)
 | 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` (`VLLM_DSV41_SPARSE_PREFILL_64H` included, off) | MXFP4 MoE prefill split expert lists (27.4 -> 23.0 ms per 4096-token chunk) |
 | 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | prefill indexer logits + top-512 as two CUDA kernels (`native/dsv41_indexer`, built into the image): logits bitwise, same top-512 set (sorted by column); 80.2 -> 38.6 ms per 4096-row chunk at 114K KV |
 
-Cold prefill on host-a PP6 (180 W cap, warm instance, unique prompts, actual
+Cold prefill on PP6 (180 W cap, warm instance, unique prompts, actual
 prompt length shown, tok/s):
 
 | prompt tokens | 0001-0009 image | + 0011/0012 (development tree) |
@@ -593,7 +593,7 @@ per-shape dispatch table shows them faster than Marlin, Marlin elsewhere:
 - fp64 error at Marlin's level (mean ratio 1.00000-1.00001, max <= 1.0024),
   not bitwise; deterministic, CUDA-graph safe; `tests/test_dense_mxfp8_decode_gpu.py`.
 
-Engine (host-a PP6, development tree): c1 steps/s +2.6 % on all three loads
+Engine (PP6, development tree): c1 steps/s +2.6 % on all three loads
 (32.18/29.56/32.13 -> 33.01/30.34/32.96 with the M <= 8 kernel), acceptance
 and greedy self-scoring unchanged. c8 shows no measurable change: PP6
 schedules the c8 requests in micro-batches of 1-2 requests per stage step
@@ -630,7 +630,7 @@ during the image build.
 
 ### Production decode matrix (previous checkpoint, image `f3b0dc8`)
 
-host-a PP6, production compose with adaptive verification (fixed measured
+PP6, production compose with adaptive verification (fixed measured
 policy), measured 2026-10-10; `scripts/benchmark-vllm.mjs`, 500 tokens (code
 may stop at EOS), temperature 0, fresh cache salt, 2 warm-up + 5 rounds, median;
 c1 per request, c>=2 full batch, tok/s:
@@ -646,7 +646,7 @@ expected to carry over; only c1 was re-measured below.
 
 ### Performance with checkpoint 1017
 
-host-a PP6, production compose (`verification` profile, dspark K=5 + adaptive
+PP6, production compose (`verification` profile, dspark K=5 + adaptive
 verification), image with 0001-0016; `scripts/benchmark-vllm.mjs`, c1, 500
 tokens, 2 warm-up + 5 rounds:
 

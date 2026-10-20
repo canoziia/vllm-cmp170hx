@@ -2,8 +2,8 @@
 
 Standalone Prometheus + Grafana for all vLLM engines (plus optional
 vllm-router, LMCache server and GPU exporter). It only scrapes HTTP `/metrics`
-and never touches the engines; run it on one node (host-b, which has disk
-space) and point it at every node.
+and never touches the engines; run it on one host (one with enough disk
+space) and point it at every host.
 
 ```text
 monitoring/
@@ -22,8 +22,8 @@ monitoring/
 
 ## Run
 
-Run from the repository checkout, like the model compose files (on host-b:
-`/path/to/vllm-cmp170hx/monitoring`, `.env` there with mode 0600). Data lives
+Run from the repository checkout, like the model compose files (`monitoring/`,
+`.env` there with mode 0600). Data lives
 outside the checkout in `MONITORING_DATA_DIR` (default `/srv/monitoring-data`).
 
 ```bash
@@ -111,12 +111,12 @@ podman compose -f compose.gpu-exporter.yml up -d
 ```
 
 and are added to `GPU_METRICS_TARGETS` on the Prometheus node. The exporter
-has no auth; bind it to a LAN address and restrict the source (host-a:
-nftables table `vllm_monitoring`, only <host-ip> and loopback may reach
+has no auth; bind it to a LAN address and restrict the source (e.g. an
+nftables rule allowing only the Prometheus host and loopback to reach
 19835).
 
 Cost: each scrape runs one `nvidia-smi --query-gpu` (NVML, persistence mode on,
-no CUDA context, no kernel launches on the GPUs). Measured on host-a (10 GPUs):
+no CUDA context, no kernel launches on the GPUs). Measured on a 10-GPU CMP 170HX host:
 all fields ~1.8 s of driver/sys time, the default `GPU_QUERY_FIELDS` ~0.35 s;
 with the 30 s `GPU_SCRAPE_INTERVAL` that is ~1% of one CPU core.
 

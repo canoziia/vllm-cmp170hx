@@ -178,7 +178,7 @@ index 0000000..2b1ecbc
 +++ b/vllm/model_executor/kernels/linear/mxfp8/dsv4_dense_fp8_table.py
 @@ -0,0 +1,11 @@
 +# (K, N) -> {M tier: (kind, cfg, arg) | None}; a call with M uses the smallest
-+# tier >= M. Generated from a cold-L2 per-M scan on host-b (CMP 170HX) against
++# tier >= M. Generated from a cold-L2 per-M scan on a CMP 170HX host against
 +# Marlin FP8 block-128; an entry exists only where it was >= 1.03x Marlin.
 +TIERS = {
 +    (1024, 8192): {1: ('streamk', 3, 64), 2: ('streamk', 3, 64), 4: ('streamk', 3, 64), 6: ('streamk', 3, 64), 8: ('streamk', 3, 64), 12: ('splitk', 20, 2), 16: ('splitk', 20, 2), 20: ('splitk', 30, 2), 24: ('splitk', 30, 2), 32: None, 40: ('splitk', 60, 2), 48: None, 64: None},

@@ -32,12 +32,12 @@
 | 0026 | 0027 | `test_moe_sum_add_gpu.py`（第 3 项需 `vllm._ampere_marlin_C` 与 `marlin_decode_common.py`） | sm_80 | GPU 逐位 512/512（开发阶段） |
 | 0028 | 0026b | `bench_prenorm_bf16x3_gpu.py`（`--mm-file` 指向对方 `ampere_prefill/mhc_prenorm.py`） | sm_80 | T=2312 923 → 154 μs；T ≥ 384 与对方逐位、T < 384 与 0025 逐位（开发阶段） |
 | 0027 | 0028 | `bench_shared_reorder_gpu.py`（+ `marlin_decode_common.py`） | sm_80 + `vllm._ampere_marlin_C` | 逐位（开发阶段） |
-| 0029 | — | `test_idx_dual_gemm_gpu.py`（k 列逐位、weights 误差 ≤ 1.5× sgemm、op 回退逐位、graph、双流、微基准）；纯 CPU 部分在 `test_thin_gemm_pure.py` | sm_80 | host-b 通过：每 MLA 层省 15.7 μs；weights mean 1.07×/1.24×（outlier/cancel），max 更低 |
+| 0029 | — | `test_idx_dual_gemm_gpu.py`（k 列逐位、weights 误差 ≤ 1.5× sgemm、op 回退逐位、graph、双流、微基准）；纯 CPU 部分在 `test_thin_gemm_pure.py` | sm_80 | 测试机通过：每 MLA 层省 15.7 μs；weights mean 1.07×/1.24×（outlier/cancel），max 更低 |
 | 0030 | 0025 | `test_pp_metadata_cache_cpu.py`（AST 提取打过补丁的 send/recv/reap 方法，5 项）、`test_pp_metadata_cache_gloo.py`（两进程真实 Gloo 160 步） | CPU torch；`GLM_DFLASH2_TREE` | 本地通过（对完整树 0001–0031） |
 | 0031 | 0029 | `test_pp_pack_hop_gloo.py`（两进程真实 Gloo：off/on 逐位、P2P 次数、源改写、开关不一致报错，4 项） | CPU torch；`GLM_DFLASH2_TREE` 或 `--tree` | 本地 4/4 通过（对完整树 0001–0031） |
-| 0031 | 0029 | `test_pp_pack_hop_gpu.py --no-bench`（两卡 NCCL，120 步 packed=False/True 设备上逐位比较；依赖同目录 gloo 测试） | 两张 GPU | host-b GPU 通过（开发阶段）；微基准部分在 host-b 上挂起，见下 |
+| 0031 | 0029 | `test_pp_pack_hop_gpu.py --no-bench`（两卡 NCCL，120 步 packed=False/True 设备上逐位比较；依赖同目录 gloo 测试） | 两张 GPU | 测试机 GPU 通过（开发阶段）；微基准部分在测试机上挂起，见下 |
 | —（诊断） | — | `trace_overlap_split.py`：把 profiler trace 中 `_thin_gemm_kernel` / `moe_dec_gemm` / `_post_update_num_computed_tokens_kernel` 每次调用按“单独运行 / 与 NCCL 重叠 / 与其他流重叠”分组统计 | 仅 python3（CPU） | 合成 trace 自测 |
-| —（诊断） | — | `bench_shared_contention_gpu.py`（+ `marlin_decode_common.py`）：一个 rank 的 MoE 层 graph，路由前奏 none/gate/tc × 侧流优先级 default/high + serial，输出逐位相同，us/层与重叠比例 | sm_80 + `vllm._ampere_marlin_C` | host-b M=8：none 363.8、gate 385.5、tc 375.9、tc+high 381.3 μs/层（据此 compose 改用 tc；0031 未纳入） |
+| —（诊断） | — | `bench_shared_contention_gpu.py`（+ `marlin_decode_common.py`）：一个 rank 的 MoE 层 graph，路由前奏 none/gate/tc × 侧流优先级 default/high + serial，输出逐位相同，us/层与重叠比例 | sm_80 + `vllm._ampere_marlin_C` | 测试机 M=8：none 363.8、gate 385.5、tc 375.9、tc+high 381.3 μs/层（据此 compose 改用 tc；0031 未纳入） |
 
 0007（融合 grouped conv）没有单独测试；它由整机 A/B 覆盖。0022（profile 占位收紧）与 0025（fp32 prenorm）
 没有单元测试：0022 由 KV 池大小与 243k/8×114k 压力测试覆盖，0025 由相同历史首块与对方逐位比较覆盖
@@ -155,8 +155,8 @@ podman run --rm -it --device nvidia.com/gpu=5 --device nvidia.com/gpu=6 --securi
   '
 ```
 
-- **必须加 `--no-bench`**：脚本中原有的微基准（raw NCCL：两次非 batched `isend` 走默认组）在 host-b 上挂起；
-  正确性部分不依赖它。`--no-bench` 只跑正确性（packed=False/True 各 120 步逐位比较），host-b 上通过。
+- **必须加 `--no-bench`**：脚本中原有的微基准（raw NCCL：两次非 batched `isend` 走默认组）在测试机上挂起；
+  正确性部分不依赖它。`--no-bench` 只跑正确性（packed=False/True 各 120 步逐位比较），测试机上通过。
 - 两项开关（`VLLM_PP_METADATA_CACHE`、`VLLM_PP_PACK_TENSORS`）由 profile（0033）打开；所有 PP rank 必须一致设置。
 
 - 所有脚本默认从镜像 site-packages 读取被测文件；要测另一份源码树，设 `GLM_DFLASH2_TREE=<树根>`

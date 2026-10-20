@@ -32,7 +32,7 @@ new file mode 100644
 +if the op is not in an already-loaded extension).
 +
 +Dispatch (tables in dispatch_table.py, generated from the final per-M cold-L2
-+A/B scan on host-b GPU8 by gen_dispatch.py):
++A/B scan on one GPU by gen_dispatch.py):
 +  * M <= 8      : stream-K  (warp stream-K, per-warp activations)  -- unchanged since v1
 +  * 9 .. 64     : split-K  (CTA-shared activations, static split-K + fixed-order reduce)
 +  * 65 .. 192   : wide split-K  (two warps per 64-col tile -> one dequantisation serves up

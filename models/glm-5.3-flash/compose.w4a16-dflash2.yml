@@ -33,8 +33,8 @@ services:
     volumes:
       # target (canada-quant/GLM-5.3-Flash-W4A16-MTP@5723f4d0) and drafter
       # (incoai/GLM-5.3-Flash-DFlash2@bf582e4e), both read-only
-      - /srv/models/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
-      - /srv/models/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
       # vLLM compile cache, Triton/Gluon and Inductor caches, tmp
       - ${GLM_DFLASH2_CACHE:?set GLM_DFLASH2_CACHE}:/root/.cache
     environment:

@@ -181,7 +181,7 @@ if __name__ == "__main__":
     ap.add_argument("--tree")
     ap.add_argument("--iters", type=int, default=300)
     ap.add_argument("--rows", default="1,8,16,32,64,128,256,512")
-    # The raw-NCCL micro-benchmark hung on host-b (two unbatched isends on the
+    # The raw-NCCL micro-benchmark hung on the test host (two unbatched isends on the
     # default group); the correctness phase does not depend on it.
     ap.add_argument("--no-bench", action="store_true")
     a = ap.parse_args()

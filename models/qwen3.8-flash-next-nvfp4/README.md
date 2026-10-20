@@ -91,7 +91,7 @@ runs without preemption at unchanged speed.
 GPU checks for `0011`: `python3 /opt/qwen-cache-tests/test_gdn_recover_gpu.py`
 and `python3 /opt/qwen-cache-tests/test_gdn_mtp_record_native.py` (native kernel
 vs the image's fused CUDA kernel, bit-identical).
-Measured on host-a (2x CMP 170HX, 180 W stock, PP2, same 16 GiB/GPU KV budget
+Measured on 2x CMP 170HX (180 W stock, PP2, same 16 GiB/GPU KV budget
 and 1M context), full-batch decode tok/s, mean of the measured rounds, 500
 output tokens, fresh cache salt, thinking off. Baseline = previous image
 (profile off, MTP3); optimised = default profile with MTP5
@@ -114,10 +114,10 @@ for prose).
 Cold prefill (c1, default profile, MTP5): 7k 1.46 s, 28k 4.24 s, 114k 16.3 s,
 456k 78.7 s, 912k 200-286 s (run-to-run).
 
-The c1-c32 matrix and cold prefill above are host-a development runs; the
-host-b production deployment (`compose.yml`, PP2 on GPUs 0/9, port 8001,
+The c1-c32 matrix and cold prefill above are development runs; the
+production deployment (`compose.yml`, PP2 on GPUs 0/9, port 8001,
 default profile MTP5 + RecoverSSM) has no c1-c32 matrix of its own. Go-live
-check on host-b, 2026-10-11 (image `qwen3.8-flash-next-nvfp4` = `ea5b7a2f`,
+check, 2026-10-11 (image `qwen3.8-flash-next-nvfp4` = `ea5b7a2f`,
 main `32c370c`), `scripts/benchmark-vllm.mjs`, 500 tokens, thinking off, 3
 rounds without warm-up, median [range]; c1 per request, c8 full batch:
 
@@ -127,7 +127,7 @@ rounds without warm-up, median [range]; c1 per request, c8 full batch:
 | code | 217.8 [212.1-221.0] | 968 [956-972] |
 | prose | 108.5 [106.9-109.2] | 511 [508-514] |
 
-(The counting c1 low is the first, cold round.) These agree with the host-a
+(The counting c1 low is the first, cold round.) These agree with the development
 matrix. The service has since been rebuilt for `pid: host` (image
 `61ad9bf`, main `901b42d`) without a new speed measurement.
 
@@ -240,7 +240,7 @@ of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
   resolve different block sizes (1568 vs 1600) and the shared L2 cannot hold both
   layouts. Similarly the prefill role uses the same `VLLM_PP_LAYER_PARTITION`
   (`26,22`), because the mamba/attention page geometry depends on it.
-- **The decode role keeps host-a's production values** (`--max-num-seqs=32`,
+- **The decode role keeps the single-engine production values** (`--max-num-seqs=32`,
   `--max-num-batched-tokens=4096`, `FULL_AND_PIECEWISE`). What has to agree
   between the two roles is the *block geometry* (previous bullet), not the step
   size. Cold cache misses on the decode role — the decode engine prefilling on
@@ -258,7 +258,7 @@ of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
 - **`--ipc=host` is required.** The connector moves KV through CUDA IPC;
   `podman-compose` 1.3.0 silently ignores the `ipc` key, so start the stack with
   `podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d`, the same
-  flag host-a uses. Without it the server never answers `register_kv_caches` and
+  flag the single-engine deployment uses. Without it the server never answers `register_kv_caches` and
   the engines time out after 300 s.
 
 ### Verified behaviour
@@ -271,8 +271,7 @@ of recomputing. Verified: prefill logs `Stored 1600 tokens`, decode logs
 
 A cross-role check with a nonce-bearing prompt (created seconds before, delivered
 only to the prefill role) showed the same result, and the decode answer echoed the
-nonce, so the context came from the transferred KV. Evidence logs:
-`/srv/pd-validation/`.
+nonce, so the context came from the transferred KV.
 
 ### Run
 
@@ -285,7 +284,7 @@ podman compose -f compose.pd.yml down
 ```
 
 `--podman-run-args=--ipc=host` is required: the connector moves KV over CUDA IPC,
-and podman-compose 1.3.0 ignores the compose `ipc` key. host-a starts its
+and podman-compose 1.3.0 ignores the compose `ipc` key. The single-engine deployment starts its
 deployments with the same flag.
 
 ### Two-step PD request
@@ -369,9 +368,9 @@ the server in this build, so the rank fold is the path that actually runs.
 Both engine services are deliberately **not** `depends_on` the LMCache service:
 restarting LMCache must not restart vLLM.
 
-### Role configuration relative to host-a
+### Role configuration relative to the single-engine deployment
 
-Both roles mirror the host-a production instance (PP2/TP1, modelopt, MTP-3,
+Both roles mirror the single-engine production instance (PP2/TP1, modelopt, MTP-3,
 `--max-num-seqs=32`, `--max-num-batched-tokens=4096`, `kv-cache-memory=16 GiB`,
 cudagraph `FULL_AND_PIECEWISE`, prefix cache `--prefix-match-unit=32`,
 `--prefix-cache-retention-interval=1600`, `--enable-auto-tool-choice` with the

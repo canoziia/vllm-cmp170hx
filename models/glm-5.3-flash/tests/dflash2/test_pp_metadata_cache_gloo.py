@@ -1,4 +1,4 @@
-"""Patch 0030 (dev 0025): two local CPU processes, real Gloo, finite timeout; no GPU/host-b."""
+"""Patch 0030 (dev 0025): two local CPU processes, real Gloo, finite timeout; no GPU."""
 import datetime
 import importlib.util
 import os

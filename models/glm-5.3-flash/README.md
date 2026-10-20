@@ -1,8 +1,7 @@
 # GLM-5.3-Flash on CMP 170HX
 
-**Status: retired.** The W4A16 + DFlash2 PD pair on host-b was stopped on
-2026-10-11 17:26 CST (containers and the L2 directory kept; restore notes in
-`/srv/glm-pd-work/RESTORE-GLM-PD.md`). The numbers below are the last
+**Status: retired.** The W4A16 + DFlash2 PD pair was stopped on
+2026-10-11. The numbers below are the last
 measurements of that deployment; there is no later data.
 
 Two prefill/decode pairs share container names and ports; run one of them:
@@ -123,7 +122,7 @@ hash1024/target5120/draft1024 几何下，为实际 KDA partial checkpoint
 `enable_thinking=false`。其他请求（默认、`low`/`high`、`enable_thinking=true`）渲染结果
 与原模板逐字相同，思考在 `message.reasoning`。
 
-### 实测（host-b，出厂设置）
+### 实测（测试机，出厂设置）
 
 | 模式 | c1 tok/s | c8 tok/s |
 |---|---:|---:|
@@ -405,7 +404,7 @@ podman compose -f compose.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
 “实测性能”一节第一张表是 0001–0016 镜像的数据（不挂载源码）；0017–0031 见“本轮实测”，
 其中包含新镜像（不挂载源码）的复测。
 
-### 实测性能（host-b，GPU5–8，PP4）
+### 实测性能（测试机，GPU5–8，PP4）
 
 测试方法：2 轮预热，5 轮正式，取中位数，每次 500 token。“对方”指 Morrowmake 引擎在同一组卡上的结果。
 
@@ -425,7 +424,7 @@ podman compose -f compose.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
   114k 5,698 tok/s（TTFT 20.0 s；对方 5,862 tok/s）。0015 之前，重启后首个 110k 请求需 28.9 s，
   原因是 indexer logits kernel 在长上下文才首次编译。
 - KV 池 1,678,534 token（对方 1,917,988）。
-- 卡组差异：host-b 的 GPU1 最高 SM 1410 MHz、HBM 1458 MHz，其余卡为 1695/1728 MHz。
+- 卡组差异：测试机的 GPU1 最高 SM 1410 MHz、HBM 1458 MHz，其余卡为 1695/1728 MHz。
   GPU1–4 这组比 GPU5–8 单用户慢约 4%，跨卡组的数字不能直接比较；上表两边都在 GPU5–8 上测得。
 - 层切分：默认 `13,11,11,10`。`12,12,12,9` 让 c8 counting 提高约 10%（在 GPU1–4 上 660 → 720），
   但 KV 池降到约 1.24M；`12,11,11,11` 更差（c8 625，KV 1.11M），因为最后一段还承担 drafter。
@@ -433,7 +432,7 @@ podman compose -f compose.w4a16-dflash2.yml --podman-run-args=--ipc=host up -d
 
 ### 本轮实测（0017–0031）
 
-0030 + 0031（PP 元数据缓存 + 张量打包）实测：host-b GPU5–8，2 轮预热、5 轮正式取中位数；基础为 0001–0029 全开 +
+0030 + 0031（PP 元数据缓存 + 张量打包）实测：测试机 GPU5–8，2 轮预热、5 轮正式取中位数；基础为 0001–0029 全开 +
 tc 路由（即下方“新镜像复测”的配置），两项同时打开：
 
 | 负载 | c1 | c8 合计 | 对方 c1 | 对方 c8 |
@@ -466,7 +465,7 @@ tc 路由（即下方“新镜像复测”的配置），两项同时打开：
 
 以下为 0030/0031 之前的结果。
 
-> 下面第一张表在 host-b 的**源码挂载开发部署**上测得（开发树按上表顺序应用，开关与本 compose 相同）；
+> 下面第一张表在测试机的**源码挂载开发部署**上测得（开发树按上表顺序应用，开关与本 compose 相同）；
 > 紧接着的“新镜像复测”是 0001–0029 镜像、本 compose 原样启动、**不挂载源码**的结果。
 
 新镜像复测（`localhost/vllm-backport:glm-5.3-flash-w4a16-dflash2`，0001–0029，本 compose 原样启动、不挂载源码，GPU5–8，同方法）：

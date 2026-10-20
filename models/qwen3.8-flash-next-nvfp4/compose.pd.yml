@@ -33,14 +33,14 @@ services:
 #   podman compose -f compose.pd.yml --podman-run-args=--ipc=host up -d
     # which is required because the connector moves KV over CUDA IPC.
     # start with: podman compose --podman-run-args=--ipc=host up -d
-    # (podman-compose 1.3.0 ignores this key; host-a uses the same flag)
+    # (podman-compose 1.3.0 ignores this key; the single-engine deployment uses the same flag)
     ipc: host
     # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
     # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
     # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
     pid: host
     # 单实例 LMCache 由两个引擎共用，必须能看到两个引擎的全部 GPU（1..4）；
-    # host-a 是单引擎，所以它那里只需要自己的两张卡。
+    # 单引擎部署只需要自己的两张卡。
     devices:
       - nvidia.com/gpu=1
       - nvidia.com/gpu=2
@@ -80,7 +80,7 @@ services:
     restart: "no"
     network_mode: host
     # start with: podman compose --podman-run-args=--ipc=host up -d
-    # (podman-compose 1.3.0 ignores this key; host-a uses the same flag)
+    # (podman-compose 1.3.0 ignores this key; the single-engine deployment uses the same flag)
     ipc: host
     # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
     # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
@@ -170,7 +170,7 @@ services:
     restart: "no"
     network_mode: host
     # start with: podman compose --podman-run-args=--ipc=host up -d
-    # (podman-compose 1.3.0 ignores this key; host-a uses the same flag)
+    # (podman-compose 1.3.0 ignores this key; the single-engine deployment uses the same flag)
     ipc: host
     # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
     # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same

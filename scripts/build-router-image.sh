@@ -17,7 +17,7 @@ ENGINE=${CONTAINER_ENGINE:-podman}
 REVISION=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_ROUTER_OUTPUT_IMAGE:$REVISION}
 SERIES="$REPO_ROOT/patches/router/series"
-CACHE=${ROUTER_TARBALL_CACHE:-/srv/.cmp-build/router}
+CACHE=${ROUTER_TARBALL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/cmp-build/router}
 TARBALL="$CACHE/production-stack-$ROUTER_VERSION.tar.gz"
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/router-image-build.XXXXXX")
 cleanup() { [[ ${KEEP_WORKDIR:-0} == 1 ]] && echo "Keeping $WORKDIR" || rm -rf "$WORKDIR"; }

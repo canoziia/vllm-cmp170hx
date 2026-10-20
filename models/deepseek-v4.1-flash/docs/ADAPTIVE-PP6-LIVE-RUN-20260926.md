@@ -91,8 +91,8 @@ c1/c2/c4/c8 for prose.
 
 ## Recovered 09-24 raw data (cohort balancing did not exist yet)
 
-Raw per-category results are on the server under
-`/srv/dspark-adaptive-dev/results/bench-{original,adaptive}-v{2,3}-c12461632.{json,md}`
+Raw per-category results (not in this repository):
+`results/bench-{original,adaptive}-v{2,3}-c12461632.{json,md}`
 (concurrencies 1/2/4/6/16/32, nine categories, `temperature=0`, thinking off,
 identical prompt set across boots, `cached_tokens=0`). The pooled `C1..C32` table
 quoted in `ADAPTIVE-PP6-RUNTIME-VALIDATION.md` averages eight of them and excludes

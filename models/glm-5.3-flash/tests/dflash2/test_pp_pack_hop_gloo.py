@@ -5,7 +5,7 @@ The *real* ``isend_tensor_dict`` / ``irecv_tensor_dict`` / ``isend_object`` /
 ``recv_object`` / ``_reap_completed_isends`` / ``_should_use_all_gather`` are
 AST-extracted from the patched ``parallel_state.py`` and bound to a stand-in
 coordinator; ``pp_pack.py`` is imported from the patched tree.
-vLLM itself need not be importable (no GPU, no host-b).
+vLLM itself need not be importable (no GPU).
 
 Checks
   1. off and on: every received tensor is bit-identical to the sent one

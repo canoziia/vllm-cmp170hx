@@ -128,7 +128,7 @@ launch leaves SMs to the shared experts (c1 29.05 -> 29.21 steps/s).
 0030 and 0031 are the development PP patches 0025
 (`patches-pp/0025-pp-metadata-cache-experimental.patch`, `PP-HOP-FULL.md`) and
 0029 (`patches-pp/0029-pp-pack-hop-tensors.patch`, `PP-PACK.md`). Both applied
-on host-b with `patch -p1` (offsets only) on the image tree (0001-0028) + 0029;
+on the test host with `patch -p1` (offsets only) on the image tree (0001-0028) + 0029;
 here they were regenerated as clean git diffs against the tree that
 `check-dflash2-series.sh` builds (0030 on 0001-0029, 0031 on 0001-0030). The
 env names keep their development suffixes (`VLLM_PP_METADATA_CACHE`,

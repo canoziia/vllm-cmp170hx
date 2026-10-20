@@ -298,10 +298,9 @@ tok/s, mean (sd).
 
 ### Through the router (go-live, before 0011)
 
-host-b, 2026-10-12, PD as deployed (LIVE_LOAD on both engines, LMCache
+2026-10-12, PD as deployed (LIVE_LOAD on both engines, LMCache
 connector, 0001-0010), `scripts/benchmark-vllm.mjs` against the router on
-8401, 500 tokens, `enable_thinking=false`, 2 warm-up + 3 rounds, median
-(raw data `/srv/mimo-work/bench/pd-final/`). Per-request tok/s,
+8401, 500 tokens, `enable_thinking=false`, 2 warm-up + 3 rounds, median. Per-request tok/s,
 full-batch tok/s (mean of the rounds) in brackets:
 
 | | c1 | c8 | c32 |

@@ -131,7 +131,7 @@ def check_numerics(ms, dev, report):
               f"{agg['sgemm_max']:.3e} ({row['max_ratio']:.2f}x)")
         # Same order of magnitude as the incumbent fp32 sgemm vs fp64. On the
         # adversarial outlier/cancellation inputs the mean error measured
-        # 1.07x/1.24x the sgemm's with a lower max (host-b, CMP 170HX); this is
+        # 1.07x/1.24x the sgemm's with a lower max (CMP 170HX); this is
         # a different-summation-order rounding difference, not a regression.
         if row["mean_ratio"] > 1.5 or row["max_ratio"] > 1.5:
             fail(f"weights error above the sgemm bound ({regime})")

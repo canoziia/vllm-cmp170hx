@@ -95,8 +95,8 @@ services:
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
-      - /srv/models/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
-      - /srv/models/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
       - ${VLLM_CACHE_PREFILL:?set VLLM_CACHE_PREFILL}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID
@@ -174,8 +174,8 @@ services:
     ulimits:
       nofile: {soft: 1048576, hard: 1048576}
     volumes:
-      - /srv/models/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
-      - /srv/models/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-W4A16-MTP:/srv/models/GLM-5.3-Flash-W4A16-MTP:ro
+      - ${GLM_MODEL_ROOT:-/srv/models}/GLM-5.3-Flash-DFlash2:/srv/models/GLM-5.3-Flash-DFlash2:ro
       - ${VLLM_CACHE_DECODE:?set VLLM_CACHE_DECODE}:/root/.cache
     environment:
       CUDA_DEVICE_ORDER: PCI_BUS_ID

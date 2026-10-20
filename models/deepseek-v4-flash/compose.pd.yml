@@ -1,4 +1,4 @@
-# DeepSeek-V4-Flash-Vision-Exp prefill/decode pair on host-b: PP3 prefill on
+# DeepSeek-V4-Flash-Vision-Exp prefill/decode pair on one host: PP3 prefill on
 # three CMP 170HX GPUs, PP3 decode on three more, one shared LMCache MP server,
 # production-stack PD router in front.
 #
@@ -54,7 +54,7 @@ services:
       - --http-port=${DSFLASH_LMCACHE_HTTP_PORT:?set DSFLASH_LMCACHE_HTTP_PORT}
       - --chunk-size=${LMCACHE_CHUNK_SIZE:?set LMCACHE_CHUNK_SIZE}
       - --separate-object-groups
-      # host RAM; host-b is tight (Qwen's server already holds 64 GiB) and 64 GiB
+      # host RAM; the host is tight (a co-located Qwen server already holds 64 GiB) and 64 GiB
       # here OOM-killed the host while this model was loading
       - --l1-size-gb=${LMCACHE_L1_SIZE_GB:?set LMCACHE_L1_SIZE_GB}
       - --eviction-policy=LRU

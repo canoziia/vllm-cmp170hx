@@ -5,7 +5,7 @@ Model: `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` - `model_type: deepseek_v4`,
 weights with fp4 experts, `hidden_size 4096`, 1M context. This is **not**
 DeepSeek-V4.1 (`deepseek_v41`, 40 layers).
 
-## PD (prefill/decode disaggregated), host-b
+## PD (prefill/decode disaggregated)
 
 | role | GPUs | port | PP3 partition | MBT | max-num-seqs | KV (`--kv-cache-memory`) | KV tokens |
 |---|---|---|---|---|---|---|---|
@@ -48,7 +48,7 @@ Rules that matter:
   command line; podman-compose 1.3 ignores `ipc`): CUDA IPC event pools live in
   `/dev/shm/cuda.shm.0.<pid>`; private PID namespaces reuse PIDs and the
   LMCache server waits on the other engine's events (commit 901b42d).
-- **Small L1.** host-b's Qwen LMCache already holds 64 GiB; 64 GiB here got the
+- **Small L1.** On the test host the co-located Qwen LMCache already holds 64 GiB; 64 GiB here got the
   host OOM-killed while this 149 GiB model loaded. A ~960k-token context is
   ~21 GiB of LMCache objects, so L1 holds about half of one; L2 (200 GiB, ~9
   such contexts) serves the rest.
@@ -58,8 +58,7 @@ Rules that matter:
   count (0 on a cold prompt); the decode hop's LMCache hit is in
   `usage.router_hops.decode_usage`.
 
-Measured on host-b on 2026-10-17 (image `deepseek-v4-flash-f5c9c8d`,
-`/srv/dsv4-work/PD-REPORT.md`, raw data in `/srv/dsv4-work/pd/`),
+Measured on 2026-10-17 (image `deepseek-v4-flash-f5c9c8d`),
 `scripts/benchmark-vllm.mjs`, 500 tokens, thinking off, through the router:
 decode tok/s (c1 per request, c8/c32 full batch; 2 warm-up + 3 rounds) and
 cold TTFT, against the single engine (same image, MBT 2048, max-num-seqs 32):
@@ -136,7 +135,7 @@ K=5, PP3, greedy drafting and CUDA graphs. Requests may pin a width with
 `"vllm_xargs":{"spec_k":N}` (0..5). For PD, both roles must declare the same
 `num_speculative_tokens` (see above).
 
-Measured on host-b (CMP 170HX, tok/s; c1 per request, c4/c8 full batch; image
+Measured on a CMP 170HX host (tok/s; c1 per request, c4/c8 full batch; image
 `deepseek-v4-flash-87b407e`, target kernels at their defaults):
 
 | load | fixed K3 (old default) | fixed K5 | fixed K6 | K5 + spec switches + adaptive |
@@ -169,7 +168,7 @@ The checkpoint's `mtp.*` layers are a 3-layer DSpark drafter (`main_proj`,
 `markov_head`, `confidence_head`), so `method=mtp` does not load it;
 `dspark` requires `num_speculative_tokens` divisible by 3.
 
-Measured on host-b GPUs 1-3 (CMP 170HX), `benchmark-vllm.mjs`, 500 tokens, 2
+Measured on GPUs 1-3 (CMP 170HX), `benchmark-vllm.mjs`, 500 tokens, 2
 warm-up + 3 rounds (median), max-num-seqs 8 unless noted; restart-to-restart
 noise is about +-3 %.
 
@@ -212,7 +211,7 @@ compressed keys).
 ### Merged stack (dsv4-flash profile, dspark K=5 + adaptive verification)
 
 Image `deepseek-v4-flash-0e1b0ad` (+ re-swept cost table), max-num-seqs 32,
-host-b GPUs 1-3, tok/s (c1 per request, others full batch):
+GPUs 1-3, tok/s (c1 per request, others full batch):
 
 | load | c1 | c4 | c8 | c16 | c32 |
 |---|---|---|---|---|---|
@@ -231,7 +230,7 @@ kernels and is 6-8 ms/step higher at c1).
 
 ### Final stack (image `deepseek-v4-flash-3418e57`, patches 0001-0009, `dsv4-flash`)
 
-dspark K=5 + adaptive verification, max-num-seqs 32, KV 2.5 GiB; host-b GPUs
+dspark K=5 + adaptive verification, max-num-seqs 32, KV 2.5 GiB; GPUs
 1-3 while another engine ran on GPUs 5-8 (c32 rounds vary by up to ~10 %).
 
 | tok/s | c1 | c4 | c8 | c16 | c32 |
@@ -274,7 +273,7 @@ groups: the same 3.5 GiB pool reports 2,079,795 tokens at MBT 512 and
 ### Final single engine (image `deepseek-v4-flash-f5c9c8d`, patches 0001-0012)
 
 `compose.yml` defaults: PP3 `15,16,12`, `dsv4-flash`, dspark K=5 + adaptive
-verification, MBT 2048, max-num-seqs 32, KV 3.5 GiB, 1M context; host-b GPUs
+verification, MBT 2048, max-num-seqs 32, KV 3.5 GiB, 1M context; GPUs
 5-7; 2 warm-up + 3 rounds, median; c1 per request, c>=4 full batch.
 
 | tok/s | c1 | c4 | c8 | c16 | c32 |

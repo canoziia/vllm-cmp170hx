@@ -13,15 +13,15 @@ Each layer, as the runner enqueues it with VLLM_GLM5_SHARED_EXPERT_REORDER=1:
     aux : wait(mark) ; gate_up thin ; silu*mul ; down thin ; record
 
 Variants (all with the same fork/join edges):
-  prelude  none   no router kernels (host-b: 363.8 us/layer at M=8)
+  prelude  none   no router kernels (363.8 us/layer at M=8)
            gate   our gate mode: _bf16_gemv_kernel (288 CTAs x 8 warps) +
-                  _route_v2_kernel  (old compose; host-b 385.5 us/layer)
+                  _route_v2_kernel  (old compose; 385.5 us/layer)
            tc     route v2 tc mode: one launch, 72 GEMV CTAs + M routing CTAs
-                  (MM's _moe_route_kernel structure; compose now; host-b
+                  (MM's _moe_route_kernel structure; compose now;
                   375.9 us/layer)
   aux      default  torch.cuda.Stream()            (both trees today)
            high     greatest stream priority (evaluated as 0031, dropped:
-                    tc+high 381.3 vs tc+default 375.9 us/layer on host-b)
+                    tc+high 381.3 vs tc+default 375.9 us/layer)
   serial   reference: everything on main (no overlap)
 
 Reports per variant: us per layer (graph replay), and from torch.profiler the
