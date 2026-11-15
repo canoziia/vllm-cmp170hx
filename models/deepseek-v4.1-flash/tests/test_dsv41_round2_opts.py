@@ -81,6 +81,15 @@ def main() -> None:
             "VLLM_DSV41_ENGRAM_ASYNC_PREFETCH",
         ):
             assert sw in profile_src, f"Missing switch in dsv41_opt_profile.py: {sw}"
+        mr_src = (root / "vllm/v1/worker/gpu/model_runner.py").read_text()
+        assert "cu_num_logits_np[-1]" not in mr_src, (
+            "YoCo prefill check must not gate on cu_num_logits_np[-1] == 0 in V1 GPUModelRunner"
+        )
+        assert "_needs_dsv41_yoco_eager" in mr_src
+        sp_src = (
+            root / "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+        ).read_text()
+        assert "cu_num_logits_np[-1]" not in sp_src
     finally:
         os.environ.clear()
         os.environ.update(orig_env)
