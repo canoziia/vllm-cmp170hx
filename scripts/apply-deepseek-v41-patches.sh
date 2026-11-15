@@ -79,8 +79,18 @@ grep -q 'handler.broadcast_group' \
 python3 "$MODEL_DIR/tests/test_triton_logits_workspace.py" "$SOURCE_TREE"
 python3 "$MODEL_DIR/tests/test_dsv41_encoding_1017.py" "$SOURCE_TREE"
 python3 "$MODEL_DIR/tests/test_deepseek_thinking.py" "$SOURCE_TREE"
+python3 "$MODEL_DIR/tests/test_dsv41_round2_opts.py" "$SOURCE_TREE"
 
 compile_files=(
+  "$SOURCE_TREE/vllm/dsv41_memory.py"
+  "$SOURCE_TREE/vllm/dsv41_opt_profile.py"
+  "$SOURCE_TREE/vllm/v1/core/sched/dsv41_prefill_sched.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v4_1/common/engram.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v4_1/attention.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v4_1/shadow_source.py"
+  "$SOURCE_TREE/vllm/model_executor/kernels/linear/mxfp8/dsv41_dense_mxfp8.py"
+  "$SOURCE_TREE/vllm/v1/attention/ops/dsv41_indexer_prefill.py"
+  "$SOURCE_TREE/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
   "$SOURCE_TREE/vllm/model_executor/layers/sparse_attn_indexer.py"
   "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
   "$SOURCE_TREE/vllm/v1/attention/ops/mqa_logits_triton.py"

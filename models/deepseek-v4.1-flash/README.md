@@ -74,8 +74,10 @@ GPU selection is done only through numeric NVIDIA CDI devices. The redundant
 - `VLLM_DSV41_FAST_METADATA=1`: compute a persistent device token-owner map once
   per small decode batch and share it across KV groups (not enabled with DBO);
 - `VLLM_DSV41_METADATA_GRAPHS=1`: on SM80, replay metadata preparation for exact
-  CPU-known uniform batches, including CPU-selected adaptive widths. Prefill,
-  ragged, padded, dummy and GPU-allocated adaptive batches keep the original builder. No new PP messages or communicators are introduced.
+  CPU-known uniform batches, including CPU-selected adaptive widths;
+- `VLLM_DSV41_MIXED_SPEC_FULL_GRAPH=1` (`adaptive/0010`): keep `FULL` CUDA graphs
+  and static-buffer metadata graph replay for CPU-known heterogeneous `spec_k`
+  batches rather than dropping to `PIECEWISE`/eager. No new PP messages or communicators are introduced.
 
 Automatic depth is controlled only by
 `--speculative-config '{"method":"dspark", "num_speculative_tokens":5,
@@ -707,10 +709,28 @@ switch defaults to off (original code path). The profile is applied from
 | 0009 | `VLLM_DSPARK_DRAFT_HEAD_FP8` | 1 | fp8 copy of lm_head for draft logits (target stays bf16) |
 | 0010 | `VLLM_DSV41_THIN_WOA` | 1 | thin-M grouped wo_a GEMM (decode) |
 | 0011 | `VLLM_DSV41_MOE_PREFILL_SPLIT` | 1 | MXFP4 MoE prefill split-list |
-| 0011 | `VLLM_DSV41_SPARSE_PREFILL_64H` | (off) | 64-head sparse prefill tile; no stable gain, not enabled |
 | 0012 | `VLLM_DSV41_INDEXER_PREFILL_FAST` | 1 | fast prefill indexer (logits bitwise, same top-512 set) |
 | 0013 | `VLLM_DSV41_DENSE_MXFP8_DECODE` | 1 | dense MXFP8 decode GEMM for M 1-192 (Marlin elsewhere) |
 | 0013 | `VLLM_DSV41_DENSE_MXFP8_LIB` | `vllm/_dsv41_dense_mxfp8.so` | path of the 0013 kernel library (built into the image) |
+| 0017 | `VLLM_DSV41_EXPANDABLE_AFTER_KV` | 1 | enable PyTorch `expandable_segments` after KV IPC export |
+| 0018 | `VLLM_DSV41_DECODE_LOGITS_CHUNK` | 1 | bounded 128 MiB decode indexer workspace via sequence chunking |
+| 0018 | `VLLM_DSV41_INDEXER_DECODE_SPARSE` | 1 | candidate-sparse decode indexer scoring on reader layers (bitwise) |
+| 0019 | `VLLM_DSV41_ENGRAM_NUMA_BIND` | 1 | bind pinned Engram shard allocation to local PCIe NUMA socket |
+| 0019 | `VLLM_DSV41_ENGRAM_PACKED_HOST` | 1 | single-allocation 264B packed FP8+UE8M0 host rows (no RAM bloat) |
+| 0019 | `VLLM_DSV41_ENGRAM_ASYNC_PREFETCH` | 1 | overlap Engram lookup with preceding layer on dedicated stream |
+| 0019 | `VLLM_DSV41_ENGRAM_PREFETCH_SMS` | 4 | cap UVA prefetch CTAs to avoid starving concurrent GEMMs |
+| 0019 | `VLLM_DSV41_ENGRAM_CPU_PREFETCH` | 1 | OpenMP+AVX2 CPU gather + compact Copy-Engine H2D (0 GPU SMs) |
+| 0019 | `VLLM_DSV41_ENGRAM_CPU_COMPACT_H2D` | 1 | stage compact FP8+scale rows over DMA and decode on GPU |
+| 0019 | `VLLM_DSV41_ENGRAM_GPU_SCALES` | (off) | mirror 2.86 GiB UE8M0 scales in HBM (opt-in for >=80 GiB cards) |
+| 0020 | `VLLM_DSV41_FUSED_WQB_IDX` | 1 | post-repack zero-HBM fusion of `wq_b + indexer.wq_b` + split epilogue |
+| 0020 | `VLLM_DSV41_FAST_GATE_TOPK` | 1 | bitwise-identical SM80 MoE router GEMV + warp top-6 |
+| 0021 | `VLLM_DSV41_SPARSE_PREFILL_64H` | 1 | 32-head (`warps=4, stages=2, exact_tile`) sparse MLA prefill tile (bitwise) |
+| 0021 | `VLLM_DSV41_INDEXER_WRITER_FAST` | 1 | fused epilogue 8-col block keys + register radix top-2048 writer |
+| 0021 | `VLLM_DSV41_INDEXER_READER_COMPACT` | 1 | active candidate compaction + gathered tensor-core reader (`N>=32k`) |
+| 0022 | `VLLM_DSV41_YOCO_PREFILL_TRUNC` | 1 | exact YoCo consumer-layer (`21..39`) whole-chunk prefill truncation + prefix-cache SWA guard |
+| 0022 | `VLLM_DSV41_RELAY_SHADOW_CANDIDATES` | 1 | relay Layer-20 shadow `topk`/`candidate_blocks` across PP2->PP5 |
+| 0022 | `VLLM_DSV41_COST_PREFILL_CHUNK` | 1 | quadratic cost-budget chunk sizing at long context (`>=64k`) |
+| adaptive/0010 | `VLLM_DSV41_MIXED_SPEC_FULL_GRAPH` | 1 (`verification`) | `FULL` CUDA graphs + ragged metadata replay for mixed `spec_k` |
 
 Requirements: patch 0003/0008 align switches act only with
 `VLLM_DETERMINISTIC_MOE_ALIGN` (on by default in this tree).

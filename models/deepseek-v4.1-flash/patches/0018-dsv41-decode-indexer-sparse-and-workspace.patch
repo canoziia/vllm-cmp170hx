@@ -1,0 +1,1232 @@
+From bf26102584e6931f3863b58cbe700154475c925a Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:30:29 +0000
+Subject: [PATCH] dsv41: candidate-sparse decode indexer and bounded workspace
+ chunking
+
+---
+ .../layers/sparse_attn_indexer.py             | 514 +++++++++++++---
+ vllm/v1/attention/ops/mqa_logits_triton.py    | 565 +++++++++++++++++-
+ 2 files changed, 984 insertions(+), 95 deletions(-)
+
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
+index 7219f8f..5840b73 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Custom Sparse Attention Indexer layers."""
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -49,7 +51,9 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+ from vllm.v1.attention.ops import dsv41_indexer_prefill as _dsv41_prefill
+ from vllm.v1.attention.ops.mqa_logits_triton import (
+     fp8_mqa_logits_triton,
++    fp8_paged_mqa_logits_candidates_triton,
+     fp8_paged_mqa_logits_triton,
++    remap_paged_mqa_candidates_topk_triton,
+ )
+ from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
+ from vllm.v1.worker.workspace import current_workspace_manager
+@@ -396,6 +400,275 @@ def _apply_prefill_candidates(
+         )
+ 
+ 
++def _decode_chunk_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_DECODE_LOGITS_CHUNK", "0") == "1"
++
++
++def _has_filtered_topk_smem(device: torch.device) -> bool:
++    return (
++        torch.cuda.get_device_properties(device).shared_memory_per_block_optin
++        >= 128 * 1024
++    )
++
++
++def _decode_sparse_enabled() -> bool:
++    return os.environ.get("VLLM_DSV41_INDEXER_DECODE_SPARSE", "0") == "1"
++
++
++def _decode_chunk_plan(
++    batch_size: int, next_n: int, width: int, cap_elems: int
++) -> list[tuple[int, int]] | None:
++    """Split ``batch_size`` requests into groups whose ``rows x width`` fp32
++    logits fit ``cap_elems``. ``None`` when one request alone does not fit."""
++    rows_per_req = next_n * width
++    if batch_size <= 0 or rows_per_req <= 0:
++        return None
++    reqs = cap_elems // rows_per_req
++    if reqs < 1:
++        return None
++    return [(b0, min(b0 + reqs, batch_size)) for b0 in range(0, batch_size, reqs)]
++
++
++def _maybe_decode_sparse_candidates(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    seq_lens: torch.Tensor,
++    block_table: torch.Tensor,
++    decode_metadata,
++    topk_indices_buffer: torch.Tensor,
++    topk_tokens: int,
++    next_n: int,
++    row_lo: int,
++    num_padded_tokens: int,
++    candidate_blocks: torch.Tensor | None,
++    candidate_block_size: int,
++    candidate_write: bool,
++    use_sparse: bool,
++) -> bool:
++    """Score only candidate blocks on v4.1 reader layers (opt-in)."""
++    if not (use_sparse and _decode_sparse_enabled()):
++        return False
++    if not current_platform.is_cuda():
++        return False
++    if candidate_blocks is None or candidate_write:
++        return False
++    if (
++        candidate_block_size <= 0
++        or (candidate_block_size & (candidate_block_size - 1)) != 0
++        or candidate_block_size > 64
++    ):
++        return False
++    if topk_tokens not in (512, 1024, 2048):
++        return False
++    if (
++        num_padded_tokens <= 64
++        and current_platform.has_device_capability(90)
++        and not current_platform.is_device_capability_family(120)
++    ):
++        return False
++
++    batch_size = q.shape[0]
++    num_rows = batch_size * next_n
++    if batch_size <= 0 or seq_lens.numel() != num_rows:
++        return False
++
++    k_cand = candidate_blocks.shape[1]
++    cand_width = k_cand * candidate_block_size
++    fallback_blks = topk_tokens // candidate_block_size + 1
++    if k_cand < 2 * fallback_blks:
++        return False
++
++    width = int(decode_metadata.max_seq_len)
++    if width <= cand_width:
++        return False
++
++    block_k = max(
++        triton.next_power_of_2(k_cand), triton.next_power_of_2(2 * fallback_blks)
++    )
++    ws_mgr = current_workspace_manager()
++    capturing = torch.cuda.is_current_stream_capturing()
++    _, _, num_heads, head_dim = q.shape
++    q_elems_f32 = (num_heads * head_dim + 1) // 2
++    if capturing and not ws_mgr.is_locked():
++        try:
++            (topk_workspace,) = ws_mgr.get_simultaneous(
++                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++            )
++        except AssertionError:
++            return False
++        logits_workspace = None
++        cands_workspace = None
++        lens_workspace = None
++        q_bf16_workspace = None
++        plan = [(0, batch_size)]
++    else:
++        cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
++        elems_per_col = cand_width + block_k + 1 + q_elems_f32
++        plan = _decode_chunk_plan(batch_size, next_n, elems_per_col, cap_elems)
++        if plan is None:
++            return False
++        chunk_rows = (plan[0][1] - plan[0][0]) * next_n
++        try:
++            (
++                topk_workspace,
++                logits_workspace,
++                cands_workspace,
++                lens_workspace,
++                q_bf16_workspace,
++            ) = ws_mgr.get_simultaneous(
++                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++                ((chunk_rows * cand_width,), torch.float32),
++                ((chunk_rows * block_k,), torch.int32),
++                ((chunk_rows,), torch.int32),
++                ((chunk_rows * num_heads * head_dim,), torch.bfloat16),
++            )
++        except AssertionError:
++            return False
++
++    for b0, b1 in plan:
++        r0, r1 = b0 * next_n, b1 * next_n
++        seq_chunk = seq_lens[b0:b1]
++        cand_chunk = candidate_blocks[row_lo + r0 : row_lo + r1]
++        topk_chunk = topk_indices_buffer[row_lo + r0 : row_lo + r1, :topk_tokens]
++        compact_logits, sorted_cands, compact_lens = (
++            fp8_paged_mqa_logits_candidates_triton(
++                q[b0:b1],
++                kv_cache,
++                weights[r0:r1],
++                seq_chunk,
++                block_table[b0:b1],
++                cand_chunk,
++                max_model_len=width,
++                candidate_block_size=candidate_block_size,
++                topk_tokens=topk_tokens,
++                clean_logits=False,
++                out=logits_workspace,
++                sorted_cands_out=cands_workspace,
++                compact_lens_out=lens_workspace,
++                q_bf16_out=q_bf16_workspace,
++            )
++        )
++        torch.ops._C.persistent_topk(
++            compact_logits,
++            compact_lens,
++            topk_chunk,
++            topk_workspace,
++            topk_tokens,
++            cand_width,
++        )
++        remap_paged_mqa_candidates_topk_triton(
++            topk_chunk,
++            sorted_cands,
++            compact_lens,
++            candidate_block_size=candidate_block_size,
++            topk_tokens=topk_tokens,
++        )
++    return True
++
++
++def _maybe_decode_chunked(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    seq_lens: torch.Tensor,
++    block_table: torch.Tensor,
++    decode_metadata,
++    topk_indices_buffer: torch.Tensor,
++    topk_tokens: int,
++    next_n: int,
++    row_lo: int,
++    candidate_blocks: torch.Tensor | None,
++    candidate_block_size: int,
++    candidate_write: bool,
++    use_chunk: bool,
++) -> bool:
++    """Decode logits/candidates/top-k in the fixed workspace (opt-in).
++
++    Returns False (caller runs the original path) unless enabled, eager, on
++    the SM80 Triton fallback with the portable persistent top-k, and the
++    bounded workspace is available. Rows are processed in groups of whole
++    requests; each row's logits, candidate selection and top-k depend only on
++    that row, so results are unchanged (validated by the GPU test).
++    """
++    if not (use_chunk and _decode_chunk_enabled()):
++        return False
++    if not current_platform.is_cuda() or torch.cuda.is_current_stream_capturing():
++        return False
++    if topk_tokens not in (512, 1024, 2048):
++        return False  # persistent_topk is the only kernel reproduced here
++    batch_size = q.shape[0]
++    num_rows = batch_size * next_n
++    if seq_lens.numel() != num_rows:
++        return False
++    if (
++        num_rows <= 64
++        and current_platform.has_device_capability(90)
++        and not current_platform.is_device_capability_family(120)
++    ):
++        return False  # the original would pick cooperative_topk
++    width = int(decode_metadata.max_seq_len)
++    cap_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
++    plan = _decode_chunk_plan(batch_size, next_n, width, cap_elems)
++    if plan is None:
++        return False
++    chunk_elems = (plan[0][1] - plan[0][0]) * next_n * width
++    try:
++        topk_workspace, logits_workspace = current_workspace_manager().get_simultaneous(
++            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++            ((chunk_elems,), torch.float32),
++        )
++    except AssertionError:
++        return False  # locked workspace too small: keep the original path
++    for b0, b1 in plan:
++        r0, r1 = b0 * next_n, b1 * next_n
++        seq_chunk = seq_lens[b0:b1]
++        logits = fp8_paged_mqa_logits_triton(
++            q[b0:b1],
++            kv_cache,
++            weights[r0:r1],
++            seq_chunk,
++            block_table[b0:b1],
++            max_model_len=width,
++            clean_logits=False,
++            out=logits_workspace,
++        )
++        rows = logits.shape[0]
++        if candidate_blocks is not None:
++            vis = seq_chunk.reshape(-1)
++            row_repeat = next_n if vis.numel() != rows else 1
++            vis = vis[:rows]
++            cand = candidate_blocks[row_lo + r0 : row_lo + r1]
++            if candidate_write:
++                _select_candidate_blocks(
++                    logits,
++                    None,
++                    vis,
++                    cand.shape[1],
++                    candidate_block_size,
++                    cand,
++                    row_repeat,
++                )
++            else:
++                _apply_candidate_mask(
++                    logits, None, vis, cand, candidate_block_size, row_repeat
++                )
++        topk_max_len = (
++            topk_tokens
++            if num_rows > 32 and _has_filtered_topk_smem(q.device)
++            else logits.shape[1]
++        )
++        torch.ops._C.persistent_topk(
++            logits,
++            seq_chunk,
++            topk_indices_buffer[row_lo + r0 : row_lo + r1, :topk_tokens],
++            topk_workspace,
++            topk_tokens,
++            topk_max_len,
++        )
++    return True
++
++
+ @eager_break_during_capture
+ def sparse_attn_indexer(
+     hidden_states: torch.Tensor,
+@@ -870,7 +1143,57 @@ def sparse_attn_indexer(
+             if use_fp4_cache
+             else padded_q_quant_decode_tokens[group_lo:group_hi]
+         )
+-        if current_platform.is_xpu():
++        triton_decode_eligible = (
++            not current_platform.is_xpu()
++            and not use_deep_gemm
++            and padded_q_scale is None
++            and decode_metadata.global_seq_lens is None
++            and dcp_world_size <= 1
++        )
++        # VLLM_DSV41_INDEXER_DECODE_SPARSE (default off): on v4.1 reader layers
++        # above K_cand * candidate_block_size, score only candidate blocks
++        # directly inside the fixed workspace.
++        handled = _maybe_decode_sparse_candidates(
++            padded_q_quant_cast,
++            kv_cache,
++            shard_weights,
++            seq_lens,
++            block_table,
++            decode_metadata,
++            topk_indices_buffer,
++            topk_tokens,
++            next_n,
++            row_lo,
++            num_padded_tokens,
++            candidate_blocks,
++            candidate_block_size,
++            candidate_write,
++            use_sparse=triton_decode_eligible,
++        )
++        # VLLM_DSV41_DECODE_LOGITS_CHUNK (default off): bound the decode
++        # logits transient by computing logits + candidates + top-k for groups
++        # of whole requests inside the fixed workspace. Rows are independent,
++        # so every row's logits, candidate blocks and top-k are unchanged.
++        if not handled:
++            handled = _maybe_decode_chunked(
++                padded_q_quant_cast,
++                kv_cache,
++                shard_weights,
++                seq_lens,
++                block_table,
++                decode_metadata,
++                topk_indices_buffer,
++                topk_tokens,
++                next_n,
++                row_lo,
++                candidate_blocks,
++                candidate_block_size,
++                candidate_write,
++                use_chunk=triton_decode_eligible and shard_bounds is None,
++            )
++        if handled:
++            topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
++        elif current_platform.is_xpu():
+             if padded_q_scale is not None:
+                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
+             seq_lens_xpu = (
+@@ -910,96 +1233,97 @@ def sparse_attn_indexer(
+                 max_model_len=decode_metadata.max_seq_len,
+                 clean_logits=False,
+             )
+-        num_rows = logits.shape[0]
+-        if candidate_blocks is not None:
+-            # Two-level selection (v4.1) on the decode logits; columns are
+-            # request-local compressed positions. seq_lens is (B, next_n)
+-            # for native spec decode (per-row effective lens) and (B, 1)
+-            # otherwise. Under TP decode-sharding the logits hold only this
+-            # rank's rows [row_lo, row_hi), and seq_lens was sliced to match.
+-            vis = seq_lens.reshape(-1)
+-            row_repeat = next_n if vis.numel() != num_rows else 1
+-            vis = vis[:num_rows]
+-            decode_candidates = candidate_blocks[row_lo:row_hi]
+-            if candidate_write:
+-                _select_candidate_blocks(
++        if not handled:
++            num_rows = logits.shape[0]
++            if candidate_blocks is not None:
++                # Two-level selection (v4.1) on the decode logits; columns are
++                # request-local compressed positions. seq_lens is (B, next_n)
++                # for native spec decode (per-row effective lens) and (B, 1)
++                # otherwise. Under TP decode-sharding the logits hold only this
++                # rank's rows [row_lo, row_hi), and seq_lens was sliced to match.
++                vis = seq_lens.reshape(-1)
++                row_repeat = next_n if vis.numel() != num_rows else 1
++                vis = vis[:num_rows]
++                decode_candidates = candidate_blocks[row_lo:row_hi]
++                if candidate_write:
++                    _select_candidate_blocks(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates.shape[1],
++                        candidate_block_size,
++                        decode_candidates,
++                        row_repeat,
++                    )
++                else:
++                    _apply_candidate_mask(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates,
++                        candidate_block_size,
++                        row_repeat,
++                    )
++            topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
++
++            # Keyed on the batch's row count, not this rank's: a shard must not
++            # pick a different top-k kernel than the replicated path would, and a
++            # batch that fits the cooperative kernel fits it on any shard of itself.
++            use_cooperative_topk = (
++                current_platform.is_cuda()
++                and topk_tokens in (512, 1024, 2048)
++                and num_padded_tokens <= 64
++                and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
++                and current_platform.has_device_capability(90)
++                and not current_platform.is_device_capability_family(120)
++            )
++            # Deliberately NOT capability-gated, unlike the cooperative path
++            # above: persistent_topk is the portable non-cluster kernel. An SM8x
++            # corruption report (#50576) traced to a third-party vendored kernel,
++            # not this tree's topk.cu; regression coverage:
++            # tests/kernels/test_persistent_topk_band.py.
++            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
++                512,
++                1024,
++                2048,
++            )
++            if use_cooperative_topk:
++                workspace_manager = current_workspace_manager()
++                (topk_workspace,) = workspace_manager.get_simultaneous(
++                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++                )
++                torch.ops._C.cooperative_topk(
+                     logits,
+-                    None,
+-                    vis,
+-                    decode_candidates.shape[1],
+-                    candidate_block_size,
+-                    decode_candidates,
+-                    row_repeat,
++                    seq_lens,
++                    topk_indices,
++                    topk_workspace,
++                    topk_tokens,
++                    attn_metadata_narrowed.max_seq_len,
++                )
++            elif use_persistent_topk:
++                workspace_manager = current_workspace_manager()
++                (topk_workspace,) = workspace_manager.get_simultaneous(
++                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
++                )
++                torch.ops._C.persistent_topk(
++                    logits,
++                    seq_lens,
++                    topk_indices,
++                    topk_workspace,
++                    topk_tokens,
++                    logits.shape[1],
+                 )
+             else:
+-                _apply_candidate_mask(
++                ops.top_k_per_row_decode(
+                     logits,
+-                    None,
+-                    vis,
+-                    decode_candidates,
+-                    candidate_block_size,
+-                    row_repeat,
++                    next_n,
++                    seq_lens,
++                    topk_indices,
++                    num_rows,
++                    logits.stride(0),
++                    logits.stride(1),
++                    topk_tokens,
+                 )
+-        topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
+-
+-        # Keyed on the batch's row count, not this rank's: a shard must not
+-        # pick a different top-k kernel than the replicated path would, and a
+-        # batch that fits the cooperative kernel fits it on any shard of itself.
+-        use_cooperative_topk = (
+-            current_platform.is_cuda()
+-            and topk_tokens in (512, 1024, 2048)
+-            and num_padded_tokens <= 64
+-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+-            and current_platform.has_device_capability(90)
+-            and not current_platform.is_device_capability_family(120)
+-        )
+-        # Deliberately NOT capability-gated, unlike the cooperative path
+-        # above: persistent_topk is the portable non-cluster kernel. An SM8x
+-        # corruption report (#50576) traced to a third-party vendored kernel,
+-        # not this tree's topk.cu; regression coverage:
+-        # tests/kernels/test_persistent_topk_band.py.
+-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+-            512,
+-            1024,
+-            2048,
+-        )
+-        if use_cooperative_topk:
+-            workspace_manager = current_workspace_manager()
+-            (topk_workspace,) = workspace_manager.get_simultaneous(
+-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+-            )
+-            torch.ops._C.cooperative_topk(
+-                logits,
+-                seq_lens,
+-                topk_indices,
+-                topk_workspace,
+-                topk_tokens,
+-                attn_metadata_narrowed.max_seq_len,
+-            )
+-        elif use_persistent_topk:
+-            workspace_manager = current_workspace_manager()
+-            (topk_workspace,) = workspace_manager.get_simultaneous(
+-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+-            )
+-            torch.ops._C.persistent_topk(
+-                logits,
+-                seq_lens,
+-                topk_indices,
+-                topk_workspace,
+-                topk_tokens,
+-                logits.shape[1],
+-            )
+-        else:
+-            ops.top_k_per_row_decode(
+-                logits,
+-                next_n,
+-                seq_lens,
+-                topk_indices,
+-                num_rows,
+-                logits.stride(0),
+-                logits.stride(1),
+-                topk_tokens,
+-            )
+ 
+         if decode_metadata.global_seq_lens is not None:
+             _merge_dcp_topk_global(
+@@ -1161,6 +1485,7 @@ class SparseAttnIndexer(CustomOp):
+             # capture.
+             from vllm.v1.attention.ops.mqa_logits_triton import (
+                 warmup_fp8_mqa_logits_triton,
++                warmup_fp8_paged_mqa_logits_candidates_triton,
+                 warmup_fp8_paged_mqa_logits_triton,
+             )
+ 
+@@ -1190,6 +1515,23 @@ class SparseAttnIndexer(CustomOp):
+                     warmup_fp8_paged_mqa_logits_triton(
+                         num_heads, head_dim, kernel_block_size, device
+                     )
++                    if (
++                        _decode_sparse_enabled()
++                        and candidate_blocks is not None
++                        and not candidate_write
++                        and candidate_block_size > 0
++                        and (candidate_block_size & (candidate_block_size - 1)) == 0
++                        and candidate_block_size <= 64
++                    ):
++                        warmup_fp8_paged_mqa_logits_candidates_triton(
++                            num_heads,
++                            head_dim,
++                            kernel_block_size,
++                            candidate_blocks.shape[1],
++                            candidate_block_size,
++                            topk_tokens,
++                            device,
++                        )
+ 
+         if vllm_config.kernel_config.enable_jit_warmup:
+             from vllm.v1.attention.ops.common import (
+diff --git a/vllm/v1/attention/ops/mqa_logits_triton.py b/vllm/v1/attention/ops/mqa_logits_triton.py
+index d7cbd9c..eef13c3 100644
+--- a/vllm/v1/attention/ops/mqa_logits_triton.py
++++ b/vllm/v1/attention/ops/mqa_logits_triton.py
+@@ -146,15 +146,29 @@ def _paged_q_lut_decode_kernel(src_ptr, lut_ptr, dst_ptr, n, BLOCK: tl.constexpr
+     tl.store(dst_ptr + offs, v, mask=mask)
+ 
+ 
+-def paged_q_lut_decode(q_byte: torch.Tensor, lut: torch.Tensor) -> torch.Tensor:
++def paged_q_lut_decode(
++    q_byte: torch.Tensor,
++    lut: torch.Tensor,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
+     """``lut[q_byte]`` (uint8 -> lut.dtype) as a single gather launch.
+ 
+     Bit-identical to ``lut.index_select(0, q_byte.reshape(-1).to(int32))``.
+     """
+     assert q_byte.dtype == torch.uint8 and q_byte.is_contiguous()
+     assert lut.numel() == 256 and lut.is_contiguous()
+-    out = torch.empty(q_byte.shape, dtype=lut.dtype, device=q_byte.device)
+     n = q_byte.numel()
++    if out is None:
++        out = torch.empty(q_byte.shape, dtype=lut.dtype, device=q_byte.device)
++    else:
++        if (
++            out.dtype != lut.dtype
++            or out.device != q_byte.device
++            or not out.is_contiguous()
++            or out.numel() < n
++        ):
++            raise ValueError("Invalid q_bf16 decode workspace")
++        out = out.view(-1)[:n].view(q_byte.shape)
+     if n:
+         block = 1024
+         _paged_q_lut_decode_kernel[(triton.cdiv(n, block),)](
+@@ -205,6 +219,9 @@ def _fp8_paged_mqa_logits_kernel(
+     BLOCK_D: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     Q_IS_BF16: tl.constexpr,
++    stride_cl_b=1,
++    stride_cl_n=0,
++    IS_2D_LENS: tl.constexpr = False,
+ ):
+     token_id = tl.program_id(0)
+     block_rk = tl.program_id(1)
+@@ -212,11 +229,18 @@ def _fp8_paged_mqa_logits_kernel(
+     batch_id = token_id // next_n
+     next_n_id = token_id % next_n
+ 
+-    context_len = tl.load(context_lens_ptr + batch_id)
+-    if block_rk * block_size >= context_len:
+-        return
+-
+-    q_offset = context_len - next_n + next_n_id
++    if IS_2D_LENS:
++        context_len = tl.load(
++            context_lens_ptr + batch_id * stride_cl_b + next_n_id * stride_cl_n
++        )
++        if block_rk * block_size >= context_len:
++            return
++        q_offset = context_len - 1
++    else:
++        context_len = tl.load(context_lens_ptr + batch_id * stride_cl_b)
++        if block_rk * block_size >= context_len:
++            return
++        q_offset = context_len - next_n + next_n_id
+ 
+     # int64: unified-KV-pool layer views carry a large block stride (~1e6
+     # elements), so int32 `block_idx * stride` wraps once a batch touches
+@@ -292,6 +316,7 @@ def fp8_paged_mqa_logits_triton(
+     block_tables: torch.Tensor,
+     max_model_len: int,
+     clean_logits: bool = True,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Triton implementation of DeepGEMM's fp8_paged_mqa_logits.
+ 
+@@ -299,12 +324,16 @@ def fp8_paged_mqa_logits_triton(
+         q:             [B, next_n, H, D] fp8_e4m3fn
+         kv_cache:      [num_blocks, block_size, 1, D+4] uint8 (FP8 + fp32 scale)
+         weights:       [B*next_n, H] float32
+-        context_lens:  [B] int32
++        context_lens:  [B] or [B, next_n] int32
+         block_tables:  [B, max_blocks] int32
+         max_model_len: output width. Caller passes the active batch max so
+             the logits buffer and grid stay tight.
+         clean_logits: when False, skip the -inf pre-fill of the output
+             (indexer top-k reads only `[:context_len]` per row).
++        out: optional flat float32 workspace with room for
++            ``B * next_n * max_model_len`` values; the returned logits are a
++            contiguous view of its prefix (same shape/strides as a fresh
++            allocation, so the kernel output is identical).
+     Returns:
+         logits:        [B*next_n, max_model_len] float32
+     """
+@@ -328,7 +357,19 @@ def fp8_paged_mqa_logits_triton(
+     q_byte = q.view(torch.uint8)
+     q_is_bf16 = _paged_q_bf16_default(q.device)
+ 
+-    if clean_logits:
++    if out is not None:
++        n = B * next_n * max_model_len
++        if (
++            out.dtype != torch.float32
++            or out.device != q.device
++            or not out.is_contiguous()
++            or out.numel() < n
++        ):
++            raise ValueError("Invalid paged-indexer logits workspace")
++        logits = out.view(-1)[:n].view(B * next_n, max_model_len)
++        if clean_logits:
++            logits.fill_(float("-inf"))
++    elif clean_logits:
+         logits = torch.full(
+             (B * next_n, max_model_len),
+             float("-inf"),
+@@ -363,6 +404,9 @@ def fp8_paged_mqa_logits_triton(
+     # narrowed along dim 0, so sizing the grid by it launches a CTA per
+     # possible block rather than per live one; each surplus CTA loads
+     # context_lens and returns. max_model_len here is the active batch max.
++    is_2d_lens = (
++        context_lens.ndim == 2 and next_n > 1 and context_lens.shape == (B, next_n)
++    )
+     num_block_cols = min(block_tables.shape[1], triton.cdiv(max_model_len, block_size))
+     grid = (B * next_n, num_block_cols)
+     _fp8_paged_mqa_logits_kernel[grid](
+@@ -397,10 +441,469 @@ def fp8_paged_mqa_logits_triton(
+         BLOCK_D=BLOCK_D,
+         BLOCK_N=BLOCK_N,
+         Q_IS_BF16=q_is_bf16,
++        stride_cl_b=context_lens.stride(0),
++        stride_cl_n=context_lens.stride(1) if is_2d_lens else 0,
++        IS_2D_LENS=is_2d_lens,
+     )
+     return logits
+ 
+ 
++@triton.jit(do_not_specialize=["max_model_len", "topk_tokens"])
++def _prepare_decode_candidates_kernel(
++    cands_ptr,
++    out_ptr,
++    lens_ptr,
++    context_lens_ptr,
++    stride_cr,
++    stride_ck,
++    stride_or,
++    stride_cl_b,
++    stride_cl_n,
++    max_model_len,
++    topk_tokens,
++    next_n: tl.constexpr,
++    K_CAND: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++    CAND_BLK: tl.constexpr,
++    FALLBACK_BLKS: tl.constexpr,
++    IS_2D_LENS: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    batch_id = row // next_n
++    next_n_id = row % next_n
++
++    if IS_2D_LENS:
++        raw_len = tl.load(
++            context_lens_ptr + batch_id * stride_cl_b + next_n_id * stride_cl_n
++        )
++    else:
++        ctx_len = tl.load(context_lens_ptr + batch_id * stride_cl_b)
++        raw_len = ctx_len - next_n + next_n_id.to(tl.int32) + 1
++
++    L = tl.minimum(tl.maximum(raw_len, 0), max_model_len)
++    if L <= topk_tokens:
++        tl.store(lens_ptr + row, L)
++        tl.store(out_ptr + row * stride_or, -1)
++        return
++
++    cols = tl.arange(0, BLOCK_K)
++    raw = tl.load(
++        cands_ptr + row * stride_cr + cols * stride_ck,
++        mask=cols < K_CAND,
++        other=-1,
++    )
++    SENTINEL: tl.constexpr = 0x7FFFFFFF
++    is_edge = (cols < K_CAND) & (raw >= 0) & (raw.to(tl.int64) * CAND_BLK >= max_model_len)
++    in_range = (cols < K_CAND) & (raw >= 0) & (raw.to(tl.int64) * CAND_BLK < L)
++    last_blk = (max_model_len - 1) // CAND_BLK
++    edge_key = tl.where(L >= max_model_len, (last_blk << 2) | 1, SENTINEL)
++    keys = tl.where(in_range, raw << 2, tl.where(is_edge, edge_key, SENTINEL))
++    s_keys = tl.sort(keys)
++
++    tl.store(out_ptr + row * stride_or + cols, s_keys)
++    tl.debug_barrier()
++    prev = tl.load(out_ptr + row * stride_or + cols - 1, mask=cols > 0, other=-4)
++    blk = s_keys >> 2
++    prev_blk = prev >> 2
++    is_uniq = (s_keys < SENTINEL) & ((cols == 0) | (blk != prev_blk))
++    n_uniq = tl.sum(is_uniq.to(tl.int32), axis=0)
++
++    if n_uniq > FALLBACK_BLKS:
++        dst = tl.cumsum(is_uniq.to(tl.int32), axis=0) - 1
++        tl.store(out_ptr + row * stride_or + cols, -1, mask=cols >= n_uniq)
++        tl.debug_barrier()
++        tl.store(out_ptr + row * stride_or + dst, s_keys, mask=is_uniq)
++        last_b = tl.max(tl.where(is_uniq, blk, 0), axis=0)
++        tail = tl.minimum(CAND_BLK, L - last_b * CAND_BLK)
++        c_len = (n_uniq - 1) * CAND_BLK + tail
++        tl.store(lens_ptr + row, c_len)
++    else:
++        # Fewer than FALLBACK_BLKS kept blocks on a row with L > topk_tokens:
++        # include fallback blocks 0..FALLBACK_BLKS-1 with tag=2 (-inf) so
++        # persistent_topk breaks ties among -inf columns identically to full width.
++        is_hi = is_uniq & (blk >= FALLBACK_BLKS)
++        dst_hi = tl.cumsum(is_hi.to(tl.int32), axis=0) - 1
++        n_hi = tl.sum(is_hi.to(tl.int32), axis=0)
++        total_out = FALLBACK_BLKS + n_hi
++        fb_val = tl.where(cols < FALLBACK_BLKS, (cols << 2) | 2, -1)
++        tl.store(out_ptr + row * stride_or + cols, fb_val)
++        tl.debug_barrier()
++        is_lo = is_uniq & (blk < FALLBACK_BLKS)
++        tl.store(out_ptr + row * stride_or + blk, s_keys, mask=is_lo)
++        tl.store(out_ptr + row * stride_or + FALLBACK_BLKS + dst_hi, s_keys, mask=is_hi)
++        last_b = tl.maximum(
++            FALLBACK_BLKS - 1, tl.max(tl.where(is_uniq, blk, 0), axis=0)
++        )
++        tail = tl.minimum(CAND_BLK, L - last_b * CAND_BLK)
++        c_len = (total_out - 1) * CAND_BLK + tail
++        tl.store(lens_ptr + row, c_len)
++
++
++@triton.jit(do_not_specialize=["max_model_len", "topk_tokens"])
++def _fp8_paged_mqa_logits_candidates_kernel(
++    q_ptr,
++    kv_fp8_ptr,
++    kv_scale_ptr,
++    weights_ptr,
++    fp8_lut_ptr,
++    sorted_cands_ptr,
++    compact_lens_ptr,
++    block_tables_ptr,
++    logits_ptr,
++    stride_q_b,
++    stride_q_n,
++    stride_q_h,
++    stride_q_d,
++    stride_kvf_block,
++    stride_kvf_s,
++    stride_kvf_d,
++    stride_kvs_block,
++    stride_kvs_s,
++    stride_w_t,
++    stride_w_h,
++    stride_sc_r,
++    stride_bt_b,
++    stride_bt_k,
++    stride_l_t,
++    stride_l_n,
++    max_model_len,
++    topk_tokens,
++    next_n: tl.constexpr,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
++    page_block_size: tl.constexpr,
++    CAND_BLK: tl.constexpr,
++    BLOCK_H: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    Q_IS_BF16: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    tile_id = tl.program_id(1)
++
++    compact_len = tl.load(compact_lens_ptr + token_id)
++    if (compact_len <= topk_tokens) | (tile_id * BLOCK_N >= compact_len):
++        return
++
++    batch_id = token_id // next_n
++    next_n_id = token_id % next_n
++
++    offs_n = tl.arange(0, BLOCK_N)
++    col_idx = tile_id * BLOCK_N + offs_n
++    cand_slot = col_idx // CAND_BLK
++    in_cand = col_idx % CAND_BLK
++
++    cand_enc = tl.load(
++        sorted_cands_ptr + token_id * stride_sc_r + cand_slot,
++        mask=col_idx < compact_len,
++        other=-1,
++    )
++    cand_tag = cand_enc & 3
++    cand_blk = cand_enc >> 2
++    k_pos = cand_blk * CAND_BLK + in_cand
++    need_score = (
++        (col_idx < compact_len)
++        & (cand_enc >= 0)
++        & ((cand_tag == 0) | ((cand_tag == 1) & (k_pos == max_model_len - 1)))
++    )
++
++    safe_k_pos = tl.where(need_score, k_pos, 0)
++    page_rk = safe_k_pos // page_block_size
++    page_off = safe_k_pos % page_block_size
++    phys_block = tl.load(
++        block_tables_ptr + batch_id * stride_bt_b + page_rk * stride_bt_k,
++        mask=need_score,
++        other=0,
++    ).to(tl.int64)
++
++    offs_h = tl.arange(0, BLOCK_H)
++    offs_d = tl.arange(0, BLOCK_D)
++    mask_h = offs_h < num_heads
++    mask_d = offs_d < head_dim
++
++    q_base = q_ptr + batch_id * stride_q_b + next_n_id * stride_q_n
++    q_offs = offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
++    q_mask = mask_h[:, None] & mask_d[None, :]
++    if Q_IS_BF16:
++        q = tl.load(q_base + q_offs, mask=q_mask, other=0.0)
++    else:
++        q = _decode_e4m3fn_bf16_lut(
++            tl.load(q_base + q_offs, mask=q_mask, other=0), fp8_lut_ptr
++        )
++
++    k_byte = tl.load(
++        kv_fp8_ptr
++        + phys_block[:, None] * stride_kvf_block
++        + page_off[:, None] * stride_kvf_s
++        + offs_d[None, :] * stride_kvf_d,
++        mask=need_score[:, None] & mask_d[None, :],
++        other=0,
++    )
++    k_scale = tl.load(
++        kv_scale_ptr + phys_block * stride_kvs_block + page_off * stride_kvs_s,
++        mask=need_score,
++        other=0.0,
++    )
++    k = _decode_e4m3fn_bf16_lut(k_byte, fp8_lut_ptr)
++    s = tl.dot(q, tl.trans(k)) * k_scale[None, :]
++
++    w = tl.load(
++        weights_ptr + token_id * stride_w_t + offs_h * stride_w_h,
++        mask=mask_h,
++        other=0.0,
++    )
++    s = tl.where(s > 0, s, 0.0) * w[:, None]
++    out = tl.sum(s, axis=0)
++    out = tl.where(need_score, out, float("-inf"))
++
++    tl.store(
++        logits_ptr + token_id * stride_l_t + col_idx * stride_l_n,
++        out,
++        mask=col_idx < compact_len,
++    )
++
++
++@triton.jit(do_not_specialize=["topk_tokens"])
++def _remap_compact_topk_kernel(
++    topk_ptr,
++    sorted_cands_ptr,
++    compact_lens_ptr,
++    stride_tr,
++    stride_tk,
++    stride_scr,
++    topk_tokens,
++    CAND_BLK: tl.constexpr,
++    BLOCK_TOPK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    compact_len = tl.load(compact_lens_ptr + row)
++    if compact_len <= topk_tokens:
++        return
++
++    offs = tl.arange(0, BLOCK_TOPK)
++    mask = offs < topk_tokens
++    c_idx = tl.load(topk_ptr + row * stride_tr + offs * stride_tk, mask=mask, other=-1)
++    valid = mask & (c_idx >= 0)
++    cand_slot = tl.where(valid, c_idx // CAND_BLK, 0)
++    in_cand = c_idx % CAND_BLK
++    cand_enc = tl.load(
++        sorted_cands_ptr + row * stride_scr + cand_slot, mask=valid, other=-1
++    )
++    cand_blk = cand_enc >> 2
++    k_pos = tl.where(valid & (cand_enc >= 0), cand_blk * CAND_BLK + in_cand, -1)
++    tl.store(topk_ptr + row * stride_tr + offs * stride_tk, k_pos, mask=mask)
++
++
++def fp8_paged_mqa_logits_candidates_triton(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    weights: torch.Tensor,
++    context_lens: torch.Tensor,
++    block_tables: torch.Tensor,
++    candidate_blocks: torch.Tensor,
++    max_model_len: int,
++    candidate_block_size: int = 8,
++    topk_tokens: int = 512,
++    clean_logits: bool = False,
++    out: torch.Tensor | None = None,
++    sorted_cands_out: torch.Tensor | None = None,
++    compact_lens_out: torch.Tensor | None = None,
++    q_bf16_out: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Candidate-block sparse paged MQA logits for DeepSeek V4.1 decode.
++
++    Scores only the ``K_cand = candidate_blocks.shape[1]`` candidate blocks of
++    size ``candidate_block_size`` into a compact ``[B * next_n, K_cand *
++    candidate_block_size]`` fp32 buffer with bit-identical operands and
++    reduction tree to :func:`fp8_paged_mqa_logits_triton`. Candidate blocks are
++    canonicalized (sorted by ascending block ID, deduplicated, and edge-clamped
++    identically to ``apply_candidate_mask``) so ``persistent_topk`` on the
++    compact buffer produces exact tie-breaking and ascending index order.
++    """
++    B, next_n, num_heads, head_dim = q.shape
++    rows = B * next_n
++    _, page_block_size, one, d_plus_4 = kv_cache.shape
++    assert one == 1
++    assert d_plus_4 == head_dim + 4
++    assert candidate_blocks.shape[0] == rows
++    k_cand = candidate_blocks.shape[1]
++    fallback_blks = topk_tokens // candidate_block_size + 1
++    block_k = max(
++        triton.next_power_of_2(k_cand), triton.next_power_of_2(2 * fallback_blks)
++    )
++    cand_width = k_cand * candidate_block_size
++    assert k_cand >= 2 * fallback_blks
++
++    num_blocks = kv_cache.shape[0]
++    kv_flat = kv_cache.view(num_blocks, -1)
++    k_end = page_block_size * head_dim
++    kv_byte = kv_flat[:, :k_end].as_strided(
++        (num_blocks, page_block_size, head_dim),
++        (kv_flat.stride(0), head_dim, 1),
++    )
++    kv_scale = kv_flat[:, k_end:].view(torch.float32)
++    q_byte = q.view(torch.uint8)
++    q_is_bf16 = _paged_q_bf16_default(q.device)
++
++    n_logits = rows * cand_width
++    if out is not None:
++        if (
++            out.dtype != torch.float32
++            or out.device != q.device
++            or not out.is_contiguous()
++            or out.numel() < n_logits
++        ):
++            raise ValueError("Invalid sparse-candidates logits workspace")
++        logits = out.view(-1)[:n_logits].view(rows, cand_width)
++        if clean_logits:
++            logits.fill_(float("-inf"))
++    elif clean_logits:
++        logits = torch.full(
++            (rows, cand_width), float("-inf"), dtype=torch.float32, device=q.device
++        )
++    else:
++        logits = torch.empty((rows, cand_width), dtype=torch.float32, device=q.device)
++
++    n_cands = rows * block_k
++    if sorted_cands_out is not None:
++        if (
++            sorted_cands_out.dtype != torch.int32
++            or sorted_cands_out.device != q.device
++            or not sorted_cands_out.is_contiguous()
++            or sorted_cands_out.numel() < n_cands
++        ):
++            raise ValueError("Invalid sorted_cands workspace")
++        sorted_cands = sorted_cands_out.view(-1)[:n_cands].view(rows, block_k)
++    else:
++        sorted_cands = torch.empty((rows, block_k), dtype=torch.int32, device=q.device)
++
++    if compact_lens_out is not None:
++        if (
++            compact_lens_out.dtype != torch.int32
++            or compact_lens_out.device != q.device
++            or not compact_lens_out.is_contiguous()
++            or compact_lens_out.numel() < rows
++        ):
++            raise ValueError("Invalid compact_lens workspace")
++        compact_lens = compact_lens_out.view(-1)[:rows]
++    else:
++        compact_lens = torch.empty((rows,), dtype=torch.int32, device=q.device)
++
++    if rows == 0:
++        return logits, sorted_cands, compact_lens
++
++    is_2d_lens = (
++        context_lens.ndim == 2 and next_n > 1 and context_lens.shape == (B, next_n)
++    )
++    prep_warps = 8 if block_k >= 1024 else 4
++    _prepare_decode_candidates_kernel[(rows,)](
++        candidate_blocks,
++        sorted_cands,
++        compact_lens,
++        context_lens,
++        candidate_blocks.stride(0),
++        candidate_blocks.stride(1),
++        sorted_cands.stride(0),
++        context_lens.stride(0),
++        context_lens.stride(1) if is_2d_lens else 0,
++        max_model_len,
++        topk_tokens,
++        next_n=next_n,
++        K_CAND=k_cand,
++        BLOCK_K=block_k,
++        CAND_BLK=candidate_block_size,
++        FALLBACK_BLKS=fallback_blks,
++        IS_2D_LENS=is_2d_lens,
++        num_warps=prep_warps,
++    )
++
++    BLOCK_H = max(16, triton.next_power_of_2(num_heads))
++    BLOCK_D = triton.next_power_of_2(head_dim)
++    BLOCK_N = 128 if cand_width >= 128 and candidate_block_size <= 128 else 64
++
++    fp8_lut = _get_e4m3fn_bf16_lut(q.device)
++    if q_is_bf16 and q_byte.is_contiguous():
++        q_in = paged_q_lut_decode(q_byte, fp8_lut, out=q_bf16_out)
++    elif q_is_bf16:
++        q_in = fp8_lut.index_select(0, q_byte.reshape(-1).to(torch.int32)).view(
++            q_byte.shape
++        )
++    else:
++        q_in = q_byte
++
++    grid = (rows, triton.cdiv(cand_width, BLOCK_N))
++    _fp8_paged_mqa_logits_candidates_kernel[grid](
++        q_in,
++        kv_byte,
++        kv_scale,
++        weights,
++        fp8_lut,
++        sorted_cands,
++        compact_lens,
++        block_tables,
++        logits,
++        q_in.stride(0),
++        q_in.stride(1),
++        q_in.stride(2),
++        q_in.stride(3),
++        kv_byte.stride(0),
++        kv_byte.stride(1),
++        kv_byte.stride(2),
++        kv_scale.stride(0),
++        kv_scale.stride(1),
++        weights.stride(0),
++        weights.stride(1),
++        sorted_cands.stride(0),
++        block_tables.stride(0),
++        block_tables.stride(1),
++        logits.stride(0),
++        logits.stride(1),
++        max_model_len,
++        topk_tokens,
++        next_n=next_n,
++        num_heads=num_heads,
++        head_dim=head_dim,
++        page_block_size=page_block_size,
++        CAND_BLK=candidate_block_size,
++        BLOCK_H=BLOCK_H,
++        BLOCK_D=BLOCK_D,
++        BLOCK_N=BLOCK_N,
++        Q_IS_BF16=q_is_bf16,
++        num_warps=4,
++        num_stages=4,
++    )
++    return logits, sorted_cands, compact_lens
++
++
++def remap_paged_mqa_candidates_topk_triton(
++    topk_indices: torch.Tensor,
++    sorted_cands: torch.Tensor,
++    compact_lens: torch.Tensor,
++    candidate_block_size: int = 8,
++    topk_tokens: int | None = None,
++) -> torch.Tensor:
++    """Remap compact candidate column indices back to compressed KV positions."""
++    rows, k = topk_indices.shape
++    if topk_tokens is None:
++        topk_tokens = k
++    if rows == 0 or topk_tokens == 0:
++        return topk_indices
++    block_topk = triton.next_power_of_2(topk_tokens)
++    _remap_compact_topk_kernel[(rows,)](
++        topk_indices,
++        sorted_cands,
++        compact_lens,
++        topk_indices.stride(0),
++        topk_indices.stride(1),
++        sorted_cands.stride(0),
++        topk_tokens,
++        CAND_BLK=candidate_block_size,
++        BLOCK_TOPK=block_topk,
++        num_warps=4,
++    )
++    return topk_indices
++
++
+ @triton.autotune(
+     configs=_PREFILL_AUTOTUNE_CONFIGS,
+     # Per-program work is N-independent; key on (heads, dim) only so chunked
+@@ -731,3 +1234,47 @@ def warmup_fp8_paged_mqa_logits_triton(
+     fp8_paged_mqa_logits_triton(
+         q, kv_cache, weights, context_lens, block_tables, max_model_len=block_size
+     )
++
++
++def warmup_fp8_paged_mqa_logits_candidates_triton(
++    num_heads: int,
++    head_dim: int,
++    block_size: int,
++    candidate_topk_blocks: int,
++    candidate_block_size: int,
++    topk_tokens: int,
++    device: torch.device,
++) -> None:
++    """Prime Triton JIT for the candidate-block sparse paged decode kernels."""
++    cand_width = candidate_topk_blocks * candidate_block_size
++    max_len = cand_width + block_size
++    num_blocks = triton.cdiv(max_len, block_size)
++    q = torch.zeros(1, 1, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
++    kv_cache = torch.zeros(
++        1, block_size, 1, head_dim + 4, dtype=torch.uint8, device=device
++    )
++    weights = torch.zeros(1, num_heads, dtype=torch.float32, device=device)
++    context_lens = torch.tensor([[max_len]], dtype=torch.int32, device=device)
++    block_tables = torch.zeros(1, num_blocks, dtype=torch.int32, device=device)
++    candidate_blocks = torch.arange(
++        candidate_topk_blocks, dtype=torch.int32, device=device
++    ).unsqueeze(0)
++    _, sorted_cands, compact_lens = fp8_paged_mqa_logits_candidates_triton(
++        q,
++        kv_cache,
++        weights,
++        context_lens,
++        block_tables,
++        candidate_blocks,
++        max_model_len=max_len,
++        candidate_block_size=candidate_block_size,
++        topk_tokens=topk_tokens,
++    )
++    topk_buf = torch.zeros(1, topk_tokens, dtype=torch.int32, device=device)
++    remap_paged_mqa_candidates_topk_triton(
++        topk_buf,
++        sorted_cands,
++        compact_lens,
++        candidate_block_size=candidate_block_size,
++        topk_tokens=topk_tokens,
++    )
+-- 
+2.55.0
+

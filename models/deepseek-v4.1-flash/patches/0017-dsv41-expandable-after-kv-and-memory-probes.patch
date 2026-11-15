@@ -1,0 +1,216 @@
+From cdc0b70808ed94adf39126d6af9189278ddbc05d Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:30:29 +0000
+Subject: [PATCH] dsv41: opt-in expandable segments after KV allocation and
+ memory probes
+
+---
+ vllm/dsv41_memory.py         | 156 +++++++++++++++++++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py |  14 ++++
+ 2 files changed, 170 insertions(+)
+ create mode 100644 vllm/dsv41_memory.py
+
+diff --git a/vllm/dsv41_memory.py b/vllm/dsv41_memory.py
+new file mode 100644
+index 0000000..a85acb8
+--- /dev/null
++++ b/vllm/dsv41_memory.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DeepSeek V4.1 Flash (CMP 170HX, PP6): opt-in allocator controls and probes.
++
++Every switch here is off by default and changes only *where* tensors live,
++never what any kernel computes, so outputs stay bitwise identical.
++
++``VLLM_DSV41_EXPANDABLE_AFTER_KV=1``
++    The deployment keeps ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False``
++    because the KV cache is exported to the LMCache server with
++    ``UntypedStorage._share_cuda_()`` (legacy CUDA IPC), which needs ordinary
++    ``cudaMalloc`` segments, and vLLM rejects ``expandable_segments:True`` in
++    the environment whenever a KV connector is configured.  This switch keeps
++    the KV cache (and everything allocated before it: weights, workspaces,
++    PP communicators) in ordinary segments and turns expandable segments on
++    only *after* the KV cache has been allocated and registered with the
++    connector.  Prefill/decode transients and CUDA-graph pools allocated
++    afterwards then come from one growing VMM segment per stream, which
++    removes the cross-size fragmentation that otherwise leaves gigabytes of
++    reserved-but-unused blocks.  vLLM's own ``CuMemAllocator`` toggles the same
++    setting at runtime around its pool, so runtime toggling is supported.
++
++``VLLM_DSV41_MEM_HISTORY=<dir>``
++    Start ``torch.cuda.memory._record_memory_history`` at device init and dump
++    a snapshot to ``<dir>/pp<rank>-<pid>-<n>.pickle`` on ``SIGUSR1`` and at
++    the step given by ``VLLM_DSV41_MEM_HISTORY_DUMP_STEP`` (default: never).
++    Diagnostic only (CPU overhead per allocation); never enable in
++    production.
++
++``VLLM_DSV41_MEM_STATS_EVERY=<n>``
++    Every ``n`` worker steps, log allocated / reserved / peak / inactive-split
++    bytes, segment count and allocation retries (``torch.cuda.memory_stats``,
++    no device sync).  Cheap; intended for non-production validation runs.
++"""
++
++from __future__ import annotations
++
++import os
++import signal
++import time
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_GiB = float(1 << 30)
++_state = {"steps": 0, "dumps": 0, "history": None, "rank": 0}
++
++
++def _env_flag(name: str) -> bool:
++    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def expandable_after_kv_enabled() -> bool:
++    return _env_flag("VLLM_DSV41_EXPANDABLE_AFTER_KV")
++
++
++def _env_requests_expandable() -> bool:
++    return "expandable_segments:true" in os.environ.get(
++        "PYTORCH_CUDA_ALLOC_CONF", ""
++    ).replace(" ", "").lower()
++
++
++def maybe_enable_expandable_after_kv() -> bool:
++    """Call once the KV cache is allocated and registered with the connector.
++
++    Returns True when expandable segments were switched on.
++    """
++    if not expandable_after_kv_enabled() or not torch.cuda.is_available():
++        return False
++    if _env_requests_expandable():
++        # Already expandable for every allocation; nothing to do (and vLLM
++        # would have rejected this together with a KV connector anyway).
++        return False
++    before = torch.cuda.memory_reserved()
++    # Release the cached free blocks the profile/warmup runs left in ordinary
++    # segments; the KV cache, weights and workspaces are live and unaffected.
++    torch.cuda.empty_cache()
++    setter = getattr(
++        torch._C,
++        "_accelerator_setAllocatorSettings",
++        torch.cuda.memory._set_allocator_settings,
++    )
++    setter("expandable_segments:True")
++    logger.info(
++        "DSV41 memory: expandable segments enabled after KV allocation "
++        "(reserved %.2f -> %.2f GiB; KV/weights stay in ordinary segments).",
++        before / _GiB,
++        torch.cuda.memory_reserved() / _GiB,
++    )
++    return True
++
++
++def _dump_history(reason: str) -> None:
++    out_dir = _state["history"]
++    if not out_dir:
++        return
++    _state["dumps"] += 1
++    path = os.path.join(
++        out_dir, f"pp{_state['rank']}-{os.getpid()}-{_state['dumps']}.pickle"
++    )
++    try:
++        torch.cuda.memory._dump_snapshot(path)
++        logger.info("DSV41 memory: snapshot (%s) written to %s", reason, path)
++    except Exception as e:  # diagnostics must never take the worker down
++        logger.warning("DSV41 memory: snapshot failed: %s", e)
++
++
++def maybe_start_history(rank: int) -> None:
++    out_dir = os.environ.get("VLLM_DSV41_MEM_HISTORY", "").strip()
++    _state["rank"] = rank
++    if not out_dir or not torch.cuda.is_available():
++        return
++    os.makedirs(out_dir, exist_ok=True)
++    max_entries = int(os.environ.get("VLLM_DSV41_MEM_HISTORY_ENTRIES", "200000"))
++    torch.cuda.memory._record_memory_history(
++        enabled="all", context="all", stacks="python", max_entries=max_entries
++    )
++    _state["history"] = out_dir
++    try:
++        signal.signal(signal.SIGUSR1, lambda *_: _dump_history("SIGUSR1"))
++    except ValueError:  # not the main thread
++        logger.warning("DSV41 memory: SIGUSR1 handler not installed")
++    logger.warning(
++        "DSV41 memory: recording allocation history to %s (diagnostic, slow)",
++        out_dir,
++    )
++
++
++def step_tick() -> None:
++    """Called once per worker step (execute_model)."""
++    _state["steps"] += 1
++    step = _state["steps"]
++    dump_step = int(os.environ.get("VLLM_DSV41_MEM_HISTORY_DUMP_STEP", "0") or 0)
++    if dump_step and step == dump_step:
++        _dump_history(f"step {step}")
++    every = int(os.environ.get("VLLM_DSV41_MEM_STATS_EVERY", "0") or 0)
++    if every <= 0 or step % every or not torch.cuda.is_available():
++        return
++    s = torch.cuda.memory_stats()
++    logger.info(
++        "DSV41 memory step=%d alloc=%.3f peak_alloc=%.3f reserved=%.3f "
++        "peak_reserved=%.3f inactive_split=%.3f GiB segments=%d "
++        "alloc_retries=%d ooms=%d t=%.0f",
++        step,
++        s.get("allocated_bytes.all.current", 0) / _GiB,
++        s.get("allocated_bytes.all.peak", 0) / _GiB,
++        s.get("reserved_bytes.all.current", 0) / _GiB,
++        s.get("reserved_bytes.all.peak", 0) / _GiB,
++        s.get("inactive_split_bytes.all.current", 0) / _GiB,
++        s.get("segment.all.current", 0),
++        s.get("num_alloc_retries", 0),
++        s.get("num_ooms", 0),
++        time.time(),
++    )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 6c8dda7..4fe43fa 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -434,6 +434,10 @@ class Worker(WorkerBase):
+             )
+             self.device = torch.device(f"cuda:{visible_device_index}")
+             torch.accelerator.set_device_index(self.device)
++            # DSV41 memory probes (default off): allocation history recording.
++            from vllm.dsv41_memory import maybe_start_history
++
++            maybe_start_history(self.rank)
+ 
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
+ 
+@@ -825,6 +829,13 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner._init_kv_zero_meta()
+ 
++        # VLLM_DSV41_EXPANDABLE_AFTER_KV (default off): the KV cache is now
++        # allocated and exported to the KV connector from ordinary segments;
++        # later transients and graph pools may use expandable segments.
++        from vllm.dsv41_memory import maybe_enable_expandable_after_kv
++
++        maybe_enable_expandable_after_kv()
++
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+         warmup_sizes: list[int] = []
+@@ -1211,6 +1222,9 @@ class Worker(WorkerBase):
+         all_gather_tensors = {}
+         compilation_config = self.vllm_config.compilation_config
+         parallel_config = self.vllm_config.parallel_config
++        from vllm.dsv41_memory import step_tick
++
++        step_tick()
+ 
+         if (
+             parallel_config.pipeline_parallel_size > 1
+-- 
+2.55.0
+

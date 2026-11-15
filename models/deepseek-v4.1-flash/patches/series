@@ -14,3 +14,9 @@
 0014-dsv41-opt-profile.patch
 0015-dsv41-encoding-1017.patch
 0016-deepseek-top-level-thinking-switch.patch
+0017-dsv41-expandable-after-kv-and-memory-probes.patch
+0018-dsv41-decode-indexer-sparse-and-workspace.patch
+0019-dsv41-engram-async-prefetch-and-cpu-gather.patch
+0020-dsv41-fused-wqb-idx-and-fast-router.patch
+0021-dsv41-prefill-mla-32h-and-indexer-compact.patch
+0022-dsv41-yoco-prefill-shadow-relay-and-cost-chunk.patch

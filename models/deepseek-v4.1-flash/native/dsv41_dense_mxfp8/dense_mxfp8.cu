@@ -107,6 +107,9 @@ struct Params {
   unsigned long long* dbg;  // optional per-warp timestamps [T][4] (ns)
   int sync;  // experiment: ticket synchronisation variant
   int64_t part_n;  // scratch floats available
+  __nv_bfloat16* out2 = nullptr;  // optional second contiguous output for cols >= n0
+  int64_t ldo2 = 0;
+  int n0 = 0;  // split column (multiple of 64) when SPLIT == true
 };
 
 // 32-bit stream-K index math (U*T < 2^31 checked on the host): 64-bit
@@ -125,7 +128,7 @@ __device__ __forceinline__ int owner_of(int u, int U, int T) {
 
 // MODE 0: full GEMM.  MODE 1: cp.async only (roofline).  MODE 2: + smem
 // reads + dequant (xor checksum, no mma).  MODE 3: full compute, no output.
-template <int TB, int W, int ST, int MODE, int GPU, int HIV>
+template <int TB, int W, int ST, int MODE, int GPU, int HIV, bool SPLIT = false>
 __global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
   constexpr int TOK = TB * 8;
   constexpr int SW = GPU * (132 + 32 * TB);  // uint4 per warp per stage
@@ -283,6 +286,14 @@ __global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
             // whole tile in one segment? (started at unit 0 and reached the tile end)
             const bool tile_end = (n == 0) ? ((ub - c_t * GU) == GU) : true;
             if (seg_from0 && tile_end) {
+              __nv_bfloat16* out_t = p.out + c_t * 64;
+              int64_t ldo_t = p.ldo;
+              if constexpr (SPLIT) {
+                if (c_t * 64 >= p.n0) {
+                  out_t = p.out2 + (c_t * 64 - p.n0);
+                  ldo_t = p.ldo2;
+                }
+              }
 #pragma unroll
               for (int bb = 0; bb < TB; bb++)
 #pragma unroll
@@ -291,7 +302,7 @@ __global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
                   for (int v = 0; v < 4; v++) {
                     const int col = 16 * jj + 8 * (v >> 1) + g, tok = bb * 8 + 2 * c4 + (v & 1);
                     if (tok < M)
-                      p.out[(int64_t)tok * p.ldo + c_t * 64 + col] = __float2bfloat16(acc[bb][jj][v]);
+                      out_t[(int64_t)tok * ldo_t + col] = __float2bfloat16(acc[bb][jj][v]);
                   }
             } else if (!seg_from0) {
               // head segment of a tile owned by an earlier warp: publish the raw
@@ -407,6 +418,14 @@ __global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
           for (int i = 0; i < F4; i++) __stcg(dst + i, make_uint4(~0u, ~0u, ~0u, ~0u));
         }
     }
+    __nv_bfloat16* out_t = p.out + t * 64;
+    int64_t ldo_t = p.ldo;
+    if constexpr (SPLIT) {
+      if (t * 64 >= p.n0) {
+        out_t = p.out2 + (t * 64 - p.n0);
+        ldo_t = p.ldo2;
+      }
+    }
 #pragma unroll
     for (int bb = 0; bb < TB; bb++)
 #pragma unroll
@@ -414,19 +433,19 @@ __global__ void __launch_bounds__(W * 32) streamk_gemm(const Params p) {
 #pragma unroll
         for (int v = 0; v < 4; v++) {
           const int col = 16 * jj + 8 * (v >> 1) + g, tok = bb * 8 + 2 * c4 + (v & 1);
-          if (tok < M) p.out[(int64_t)tok * p.ldo + t * 64 + col] = __float2bfloat16(acc[bb][jj][v]);
+          if (tok < M) out_t[(int64_t)tok * ldo_t + col] = __float2bfloat16(acc[bb][jj][v]);
         }
   }
   if (p.dbg && lane == 0) p.dbg[gw * 16 + 2] = gtime();
 }
 
-template <int TB, int W, int ST, int MODE, int GPU, int HIV>
+template <int TB, int W, int ST, int MODE, int GPU, int HIV, bool SPLIT = false>
 static void launch(const Params& p, int ctas, cudaStream_t stream) {
   constexpr int SW = GPU * (132 + 32 * TB);
   constexpr int SMEM0 = W * ST * SW * 16;
   constexpr int SMEMR = W * 2 * 64 * TB * 8 * 4 + W * 2 * 4 + 16;
   constexpr int SMEM = SMEM0;
-  auto kern = streamk_gemm<TB, W, ST, MODE, GPU, HIV>;
+  auto kern = streamk_gemm<TB, W, ST, MODE, GPU, HIV, SPLIT>;
   static int occ = [&] {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     int n = 0;
@@ -764,7 +783,7 @@ static void launch3(const Params& p, int ctas, cudaStream_t stream) {
 // fragment (lane-native, plain stores), and splitk_reduce sums the S slices in
 // slice order (deterministic, no atomics, no spinning, graph safe).
 // ============================================================================
-template <int TB, int W, int ST, int GPU, bool PART>
+template <int TB, int W, int ST, int GPU, bool PART, bool SPLIT = false>
 __global__ void __launch_bounds__(W * 32) splitk_gemm(const Params p, const int S, const int NCH) {
   constexpr int TOK = TB * 8;
   constexpr int WS = 128 * GPU, SS = 4 * GPU, XS = GPU * TB * 32;
@@ -928,20 +947,30 @@ __global__ void __launch_bounds__(W * 32) splitk_gemm(const Params p, const int 
         tw[tok * 68 + col] = acc[bb][jj][v];
       }
   __syncwarp();
+  __nv_bfloat16* out_t = p.out + tile * 64;
+  int64_t ldo_t = p.ldo;
+  if constexpr (!PART && SPLIT) {
+    if (tile * 64 >= p.n0) {
+      out_t = p.out2 + (tile * 64 - p.n0);
+      ldo_t = p.ldo2;
+    }
+  }
   for (int row = 0; row < M; row++) {
     const float2 v = *reinterpret_cast<const float2*>(tw + row * 68 + 2 * lane);
     if (PART) {
       __stcg(reinterpret_cast<float2*>(p.part + ((int64_t)s * p.M + ch * TOK + row) * N + tile * 64) + lane, v);
     } else {
-      *reinterpret_cast<__nv_bfloat162*>(p.out + (int64_t)(ch * TOK + row) * p.ldo + tile * 64 + 2 * lane) =
+      *reinterpret_cast<__nv_bfloat162*>(out_t + (int64_t)(ch * TOK + row) * ldo_t + 2 * lane) =
           __floats2bfloat162_rn(v.x, v.y);
     }
   }
 }
 
 // out[m][n] = bf16( sum_{s=0..S-1} part[s][m][n] ), fixed slice order (deterministic).
+template <bool SPLIT = false>
 __global__ void __launch_bounds__(256) splitk_reduce(const float4* __restrict__ part, __nv_bfloat16* __restrict__ out,
-                                                 int64_t ldo, int M, int N, int S) {
+                                                 int64_t ldo, __nv_bfloat16* __restrict__ out2, int64_t ldo2, int n0,
+                                                 int M, int N, int S) {
   const int n4 = N >> 2;
   const int64_t per = (int64_t)M * n4;
   const int64_t i = (int64_t)blockIdx.x * 256 + threadIdx.x;
@@ -954,10 +983,16 @@ __global__ void __launch_bounds__(256) splitk_reduce(const float4* __restrict__ 
   const int m = (int)(i / n4), c = (int)(i % n4) * 4;
   __nv_bfloat162 lo = __floats2bfloat162_rn(a.x, a.y), hi = __floats2bfloat162_rn(a.z, a.w);
   uint2 pk = make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+  if constexpr (SPLIT) {
+    if (c >= n0) {
+      *reinterpret_cast<uint2*>(out2 + (int64_t)m * ldo2 + (c - n0)) = pk;
+      return;
+    }
+  }
   *reinterpret_cast<uint2*>(out + (int64_t)m * ldo + c) = pk;
 }
 
-template <int TB, int W, int ST, int GPU>
+template <int TB, int W, int ST, int GPU, bool SPLIT = false>
 static void launch4(const Params& p, int S, cudaStream_t stream) {
   constexpr int STG = W * (128 * GPU + 4 * GPU) + GPU * TB * 32;
   constexpr int SMEMP = ST * STG * 16, SMEMT = W * TB * 8 * 68 * 4;
@@ -969,21 +1004,23 @@ static void launch4(const Params& p, int S, cudaStream_t stream) {
   const int NCH = (p.M + TB * 8 - 1) / (TB * 8);
   dim3 grid(S * NCH, TG);
   TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk: out alignment");
+  if constexpr (SPLIT) {
+    TORCH_CHECK(p.ldo2 % 4 == 0 && reinterpret_cast<uintptr_t>(p.out2) % 8 == 0, "splitk: out2 alignment");
+  }
   if (S == 1) {
-    auto kern = splitk_gemm<TB, W, ST, GPU, false>;
+    auto kern = splitk_gemm<TB, W, ST, GPU, false, SPLIT>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, W * 32, SMEM, stream>>>(p, S, NCH);
   } else {
     TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "splitk: scratch too small");
-    TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk: out alignment");
-    auto kern = splitk_gemm<TB, W, ST, GPU, true>;
+    auto kern = splitk_gemm<TB, W, ST, GPU, true, false>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, W * 32, SMEM, stream>>>(p, S, NCH);
     const int64_t per = (int64_t)p.M * (p.N / 4);
-    splitk_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
-        reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.M, p.N, S);
+    splitk_reduce<SPLIT><<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.out2, p.ldo2, p.n0, p.M, p.N, S);
   }
 }
 
@@ -995,7 +1032,7 @@ static void launch4(const Params& p, int S, cudaStream_t stream) {
 // covers TB*8 = up to 128 tokens with ONE dequantisation.  M is processed in
 // NCH balanced chunks of <= TB*8 rows (chunk index fastest in the grid).
 // ============================================================================
-template <int TB, int TW, int ST, int GPU, bool PART>
+template <int TB, int TW, int ST, int GPU, bool PART, bool SPLIT = false>
 __global__ void __launch_bounds__(TW * 64) splitk_wide_gemm(const Params p, const int S, const int NCH, const int CR) {
   constexpr int W = 2 * TW;  // warps
   constexpr int TOK = TB * 8;
@@ -1128,6 +1165,14 @@ __global__ void __launch_bounds__(TW * 64) splitk_wide_gemm(const Params p, cons
   // ---- epilogue: per 8-token block, transpose this warp's [8 x 32] through
   // smem and write 32-col row segments (128 B fp32 / 64 B bf16).
   __syncthreads();
+  __nv_bfloat16* out_t = p.out + (int64_t)tile * 64;
+  int64_t ldo_t = p.ldo;
+  if constexpr (!PART && SPLIT) {
+    if (tile * 64 >= p.n0) {
+      out_t = p.out2 + ((int64_t)tile * 64 - p.n0);
+      ldo_t = p.ldo2;
+    }
+  }
   float* tw = reinterpret_cast<float*>(smem) + warp * 8 * 36;
 #pragma unroll
   for (int bb = 0; bb < TB; bb++) {
@@ -1150,14 +1195,14 @@ __global__ void __launch_bounds__(TW * 64) splitk_wide_gemm(const Params p, cons
         if (PART)
           __stcg(reinterpret_cast<float2*>(p.part + ((int64_t)s * p.M + r0 + tok) * N + col), v);
         else
-          *reinterpret_cast<__nv_bfloat162*>(p.out + (int64_t)(r0 + tok) * p.ldo + col) = __floats2bfloat162_rn(v.x, v.y);
+          *reinterpret_cast<__nv_bfloat162*>(out_t + (int64_t)(r0 + tok) * ldo_t + h * 32 + cc) = __floats2bfloat162_rn(v.x, v.y);
       }
     }
     __syncwarp();
   }
 }
 
-template <int TB, int TW, int ST, int GPU>
+template <int TB, int TW, int ST, int GPU, bool SPLIT = false>
 static void launch5(const Params& p, int S, cudaStream_t stream) {
   constexpr int STG = TW * (128 * GPU + 4 * GPU) + GPU * TB * 32;
   constexpr int SMEMP = ST * STG * 16, SMEMT = TW * 2 * 8 * 36 * 4;
@@ -1166,23 +1211,26 @@ static void launch5(const Params& p, int S, cudaStream_t stream) {
   const int GU = p.K / 32 / GPU;
   TORCH_CHECK(S >= 1 && S <= GU, "splitk_wide: bad split");
   TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk_wide: out alignment");
+  if constexpr (SPLIT) {
+    TORCH_CHECK(p.ldo2 % 4 == 0 && reinterpret_cast<uintptr_t>(p.out2) % 8 == 0, "splitk_wide: out2 alignment");
+  }
   const int NCH = (p.M + TB * 8 - 1) / (TB * 8);
   const int CR = (((p.M + NCH - 1) / NCH) + 7) / 8 * 8;  // balanced chunk rows (multiple of 8)
   dim3 grid(S * NCH, p.N / 64 / TW);
   if (S == 1) {
-    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, false>;
+    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, false, SPLIT>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, TW * 64, SMEM, stream>>>(p, S, NCH, CR);
   } else {
     TORCH_CHECK(p.part_n >= (int64_t)S * p.M * p.N, "splitk_wide: scratch too small");
-    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, true>;
+    auto kern = splitk_wide_gemm<TB, TW, ST, GPU, true, false>;
     static bool init = [&] { cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); return true; }();
     (void)init;
     kern<<<grid, TW * 64, SMEM, stream>>>(p, S, NCH, CR);
     const int64_t per = (int64_t)p.M * (p.N / 4);
-    splitk_reduce<<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
-        reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.M, p.N, S);
+    splitk_reduce<SPLIT><<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
+        reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.out2, p.ldo2, p.n0, p.M, p.N, S);
   }
 }
 
@@ -1373,6 +1421,771 @@ void splitk_wide_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor cons
   TORCH_CHECK(false, "bad splitk_wide cfg");
 }
 
+// ============================================================================
+// Split-output entrypoints: write columns [0, N0) directly to contiguous out0
+// and columns [N0, N0 + N1) directly to contiguous out1 (N0 % 64 == 0, N1 % 64 == 0).
+// Eliminates any post-GEMM slice .contiguous() copy for fused projections.
+// ============================================================================
+void streamk_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
+                         at::Tensor& out0, at::Tensor& out1,
+                         at::Tensor& part, at::Tensor& cnt, int64_t cfg, int64_t ctas) {
+  using namespace dense_mxfp8;
+  const int M = (int)x.size(0), K = (int)x.size(1), N0 = (int)out0.size(1), N1 = (int)out1.size(1);
+  const int N = N0 + N1;
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "x: bf16 [M,K], row stride % 8, 16B aligned");
+  TORCH_CHECK(w.is_contiguous() && w.numel() * 4 == (int64_t)K * N, "w: Marlin 8-bit [K/16, 4N]");
+  TORCH_CHECK(s.is_contiguous() && s.element_size() == 1 && s.numel() == (int64_t)K / 32 * N, "s");
+  TORCH_CHECK(N0 > 0 && N1 > 0 && N0 % 64 == 0 && N1 % 64 == 0 && K % 64 == 0 && M >= 1, "shape");
+  TORCH_CHECK(out0.scalar_type() == at::kBFloat16 && out0.stride(1) == 1 && out0.size(0) == M &&
+                  out0.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(out0.data_ptr()) % 8 == 0, "out0");
+  TORCH_CHECK(out1.scalar_type() == at::kBFloat16 && out1.stride(1) == 1 && out1.size(0) == M &&
+                  out1.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(out1.data_ptr()) % 8 == 0, "out1");
+  TORCH_CHECK(part.scalar_type() == at::kFloat && cnt.scalar_type() == at::kInt &&
+                  cnt.numel() >= N / 64, "part/cnt");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  Params p{(const __nv_bfloat16*)x.data_ptr(), x.stride(0), M, (const uint4*)w.data_ptr(),
+           (const uint8_t*)s.data_ptr(), K, N, (__nv_bfloat16*)out0.data_ptr(), out0.stride(0),
+           part.data_ptr<float>(), cnt.data_ptr<int>(), g_dbg, g_sync, part.numel(),
+           (__nv_bfloat16*)out1.data_ptr(), out1.stride(0), N0};
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int v = (int)(cfg % 1000);
+#define LS(TB, W, ST, GPU)                                           \
+  do {                                                               \
+    TORCH_CHECK(M <= TB * 8, "M too large for cfg");                 \
+    launch<TB, W, ST, 0, GPU, 0, true>(p, (int)ctas, st);            \
+    return;                                                          \
+  } while (0)
+  switch (v) {
+    case 3: LS(1, 4, 3, 2);
+    case 8: LS(1, 8, 3, 2);
+  }
+#undef LS
+  TORCH_CHECK(false, "bad streamk_split cfg");
+}
+
+void splitk_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
+                        at::Tensor& out0, at::Tensor& out1,
+                        at::Tensor& part, int64_t cfg, int64_t S) {
+  using namespace dense_mxfp8;
+  const int M = (int)x.size(0), K = (int)x.size(1), N0 = (int)out0.size(1), N1 = (int)out1.size(1);
+  const int N = N0 + N1;
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "x: bf16 [M,K], row stride % 8, 16B aligned");
+  TORCH_CHECK(w.is_contiguous() && w.numel() * 4 == (int64_t)K * N, "w: Marlin 8-bit [K/16, 4N]");
+  TORCH_CHECK(s.is_contiguous() && s.element_size() == 1 && s.numel() == (int64_t)K / 32 * N, "s");
+  TORCH_CHECK(N0 > 0 && N1 > 0 && N0 % 64 == 0 && N1 % 64 == 0 && K % 64 == 0 && M >= 1, "shape");
+  TORCH_CHECK(out0.scalar_type() == at::kBFloat16 && out0.stride(1) == 1 && out0.size(0) == M, "out0");
+  TORCH_CHECK(out1.scalar_type() == at::kBFloat16 && out1.stride(1) == 1 && out1.size(0) == M, "out1");
+  TORCH_CHECK(part.scalar_type() == at::kFloat, "part");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  Params p{(const __nv_bfloat16*)x.data_ptr(), x.stride(0), M, (const uint4*)w.data_ptr(),
+           (const uint8_t*)s.data_ptr(), K, N, (__nv_bfloat16*)out0.data_ptr(), out0.stride(0),
+           part.data_ptr<float>(), nullptr, nullptr, g_sync, part.numel(),
+           (__nv_bfloat16*)out1.data_ptr(), out1.stride(0), N0};
+  auto st = at::cuda::getCurrentCUDAStream();
+#define L4S(TB, W, ST, GPU)                                  \
+  do {                                                       \
+    TORCH_CHECK(M <= TB * 8 || TB == 8, "M too large");      \
+    launch4<TB, W, ST, GPU, true>(p, (int)S, st);            \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                          \
+    return;                                                  \
+  } while (0)
+  switch ((int)cfg) {
+    case 20: L4S(2, 4, 4, 1);
+    case 21: L4S(2, 4, 3, 2);
+    case 30: L4S(3, 4, 4, 1);
+    case 31: L4S(3, 4, 3, 2);
+    case 40: L4S(4, 4, 4, 1);
+    case 41: L4S(4, 4, 3, 2);
+    case 60: L4S(6, 4, 4, 1);
+    case 61: L4S(6, 4, 3, 2);
+    case 80: L4S(8, 4, 4, 1);
+    case 81: L4S(8, 4, 3, 2);
+  }
+#undef L4S
+  TORCH_CHECK(false, "bad splitk_split cfg");
+}
+
+void splitk_wide_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
+                             at::Tensor& out0, at::Tensor& out1,
+                             at::Tensor& part, int64_t cfg, int64_t S) {
+  using namespace dense_mxfp8;
+  const int M = (int)x.size(0), K = (int)x.size(1), N0 = (int)out0.size(1), N1 = (int)out1.size(1);
+  const int N = N0 + N1;
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "x: bf16 [M,K], row stride % 8, 16B aligned");
+  TORCH_CHECK(w.is_contiguous() && w.numel() * 4 == (int64_t)K * N, "w: Marlin 8-bit [K/16, 4N]");
+  TORCH_CHECK(s.is_contiguous() && s.element_size() == 1 && s.numel() == (int64_t)K / 32 * N, "s");
+  TORCH_CHECK(N0 > 0 && N1 > 0 && N0 % 64 == 0 && N1 % 64 == 0 && K % 64 == 0 && M >= 1, "shape");
+  TORCH_CHECK(out0.scalar_type() == at::kBFloat16 && out0.stride(1) == 1 && out0.size(0) == M, "out0");
+  TORCH_CHECK(out1.scalar_type() == at::kBFloat16 && out1.stride(1) == 1 && out1.size(0) == M, "out1");
+  TORCH_CHECK(part.scalar_type() == at::kFloat, "part");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  Params p{(const __nv_bfloat16*)x.data_ptr(), x.stride(0), M, (const uint4*)w.data_ptr(),
+           (const uint8_t*)s.data_ptr(), K, N, (__nv_bfloat16*)out0.data_ptr(), out0.stride(0),
+           part.data_ptr<float>(), nullptr, nullptr, 0, part.numel(),
+           (__nv_bfloat16*)out1.data_ptr(), out1.stride(0), N0};
+  auto st = at::cuda::getCurrentCUDAStream();
+#define L5S(TB, TW, ST, GPU)                                 \
+  do {                                                       \
+    launch5<TB, TW, ST, GPU, true>(p, (int)S, st);           \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                          \
+    return;                                                  \
+  } while (0)
+  switch ((int)cfg) {
+    case 82: L5S(8, 2, 4, 1);
+    case 122: L5S(12, 2, 4, 1);
+    case 124: L5S(12, 2, 3, 1);
+    case 162: L5S(16, 2, 4, 1);
+  }
+#undef L5S
+  TORCH_CHECK(false, "bad splitk_wide_split cfg");
+}
+
+// ============================================================================
+// Bitwise-identical MoE router fast path (gate_gemv + dsv4_topk + fused_gate_topk)
+// ============================================================================
+namespace dsv41_router {
+
+__device__ __forceinline__ void bf16x8_to_fp32(uint4 u, float f[8]) {
+  const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float2 v = __bfloat1622float2(b2[i]);
+    f[2 * i] = v.x;
+    f[2 * i + 1] = v.y;
+  }
+}
+
+__device__ __forceinline__ void bf16x4_to_fp32(uint2 u, float f[4]) {
+  const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&u);
+#pragma unroll
+  for (int i = 0; i < 2; i++) {
+    const float2 v = __bfloat1622float2(b2[i]);
+    f[2 * i] = v.x;
+    f[2 * i + 1] = v.y;
+  }
+}
+
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int mask = 16; mask >= 1; mask >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, mask);
+  return v;
+}
+
+__device__ __forceinline__ float fmax_ptx(float a, float b) {
+  float r;
+  asm("max.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// Bit-identical to Triton 3.7.1 sm_80: tl.sqrt(tl.where(x > 20.0, x, tl.log(1.0 + tl.exp(x))))
+__device__ __forceinline__ float triton_softplus_sqrt(float x) {
+  float t;
+  asm("{\n\t"
+      ".reg .f32 %%e, %%y, %%y_scaled, %%y_norm, %%bias, %%m_f, %%f, %%p, %%t1, %%t2, %%ln, %%sel;\n\t"
+      ".reg .s32 %%yi, %%tmp, %%exp_i, %%mant_i;\n\t"
+      ".reg .pred %%p_sub, %%p_fin, %%p_zero, %%p_gt20;\n\t"
+      "mul.f32 %%e, %1, 0f3FB8AA3B;\n\t"
+      "ex2.approx.f32 %%e, %%e;\n\t"
+      "add.f32 %%y, %%e, 0f3F800000;\n\t"
+      "setp.lt.f32 %%p_sub, %%y, 0f00800000;\n\t"
+      "mul.f32 %%y_scaled, %%y, 0f4B000000;\n\t"
+      "selp.f32 %%y_norm, %%y_scaled, %%y, %%p_sub;\n\t"
+      "selp.f32 %%bias, 0fC1B80000, 0f00000000, %%p_sub;\n\t"
+      "mov.b32 %%yi, %%y_norm;\n\t"
+      "add.s32 %%tmp, %%yi, -1059760811;\n\t"
+      "and.b32 %%exp_i, %%tmp, -8388608;\n\t"
+      "sub.s32 %%mant_i, %%yi, %%exp_i;\n\t"
+      "cvt.rn.f32.s32 %%m_f, %%exp_i;\n\t"
+      "fma.rn.ftz.f32 %%t1, %%m_f, 0f34000000, %%bias;\n\t"
+      "mov.b32 %%f, %%mant_i;\n\t"
+      "add.f32 %%f, %%f, 0fBF800000;\n\t"
+      "fma.rn.ftz.f32 %%p, 0fBE055027, %%f, 0f3E1039F6;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0fBDF8CDCC;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0f3E0F2955;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0fBE2AD8B9;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0f3E4CED0B;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0fBE7FFF22;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0f3EAAAA78;\n\t"
+      "fma.rn.ftz.f32 %%p, %%p, %%f, 0fBF000000;\n\t"
+      "mul.f32 %%t2, %%f, %%p;\n\t"
+      "fma.rn.ftz.f32 %%t2, %%t2, %%f, %%f;\n\t"
+      "fma.rn.ftz.f32 %%ln, %%t1, 0f3F317218, %%t2;\n\t"
+      "setp.lt.u32 %%p_fin, %%yi, 2139095040;\n\t"
+      "@!%%p_fin fma.rn.ftz.f32 %%ln, %%y_norm, 0f7F800000, 0f7F800000;\n\t"
+      "setp.eq.f32 %%p_zero, %%y_norm, 0f00000000;\n\t"
+      "selp.f32 %%ln, 0fFF800000, %%ln, %%p_zero;\n\t"
+      "setp.gt.f32 %%p_gt20, %1, 0f41A00000;\n\t"
+      "selp.f32 %%sel, %1, %%ln, %%p_gt20;\n\t"
+      "sqrt.approx.ftz.f32 %0, %%sel;\n\t"
+      "}"
+      : "=f"(t)
+      : "f"(x));
+  return t;
+}
+
+template <int E, bool HAS_VL, typename IdxT, typename TokT, bool CG_LOAD>
+__device__ __forceinline__ void topk_warp_row(
+    const float* __restrict__ row_logits,
+    const float* __restrict__ corr_bias,
+    float* __restrict__ row_weights,
+    IdxT* __restrict__ row_ids,
+    float routed_scaling_factor,
+    const TokT* __restrict__ input_ids,
+    const float* __restrict__ bias_vl,
+    int64_t image_sentinel_lo,
+    int row,
+    int lane) {
+  constexpr int NE = E / 32;  // 8 for 256, 12 for 384 (128B coalesced per k!)
+  bool use_vl = false;
+  if constexpr (HAS_VL) {
+    const int64_t tid = static_cast<int64_t>(input_ids[row]);
+    use_vl = (tid >= image_sentinel_lo) && (tid < image_sentinel_lo + 5);
+  }
+  const float* const bptr = (HAS_VL && use_vl) ? bias_vl : corr_bias;
+
+  float w[NE];
+  float cur[NE];
+#pragma unroll
+  for (int k = 0; k < NE; k++) {
+    const int idx = k * 32 + lane;
+    const float lf = CG_LOAD ? __ldcg(row_logits + idx) : row_logits[idx];
+    const float bf = bptr[idx];
+    const float wi = triton_softplus_sqrt(lf);
+    float ci = wi + bf;
+    asm("{\n\t"
+        ".reg .pred %%p;\n\t"
+        "setp.num.f32 %%p, %0, %0;\n\t"
+        "selp.f32 %0, %0, 0fF149F2CA, %%p;\n\t"
+        "}"
+        : "+f"(ci));
+    w[k] = wi;
+    cur[k] = ci;
+  }
+
+  float sel_w[6];
+  uint32_t sel_id[6];
+#pragma unroll
+  for (int slot = 0; slot < 6; slot++) {
+    float mval = cur[0];
+#pragma unroll
+    for (int k = 1; k < NE; k++) mval = fmax_ptx(mval, cur[k]);
+#pragma unroll
+    for (int mask = 16; mask >= 1; mask >>= 1)
+      mval = fmax_ptx(mval, __shfl_xor_sync(0xffffffffu, mval, mask));
+
+    uint32_t mid = static_cast<uint32_t>(E);
+#pragma unroll
+    for (int k = 0; k < NE; k++) {
+      const uint32_t idx = static_cast<uint32_t>(k * 32 + lane);
+      if (cur[k] == mval && idx < mid) mid = idx;
+    }
+#pragma unroll
+    for (int mask = 16; mask >= 1; mask >>= 1) {
+      const uint32_t other = __shfl_xor_sync(0xffffffffu, mid, mask);
+      if (other < mid) mid = other;
+    }
+
+    float my_w = 0.0f;
+#pragma unroll
+    for (int k = 0; k < NE; k++) {
+      if (static_cast<uint32_t>(k * 32 + lane) == mid) {
+        my_w = w[k] + 0.0f;
+        cur[k] = __uint_as_float(0xFF800000u);  // -inf
+      }
+    }
+    sel_w[slot] = __shfl_sync(0xffffffffu, my_w, static_cast<int>(mid & 31u));
+    sel_id[slot] = mid;
+  }
+
+  // Exact Triton tree-sum order over 8 padded slots [w0,w1,w2,w3,w4,w5,0,0]
+  const float wsum = ((sel_w[0] + sel_w[4]) + sel_w[2]) + ((sel_w[1] + sel_w[5]) + sel_w[3]);
+  const float denom = (wsum > 0.0f) ? wsum : 1.0f;
+  float scale;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(scale) : "f"(routed_scaling_factor), "f"(denom));
+
+  if (lane < 6) {
+    float sw = 0.0f;
+    uint32_t sid = 0;
+#pragma unroll
+    for (int s = 0; s < 6; s++) {
+      if (lane == s) {
+        sw = sel_w[s];
+        sid = sel_id[s];
+      }
+    }
+    row_weights[lane] = scale * sw;
+    row_ids[lane] = static_cast<IdxT>(sid);
+  }
+}
+
+template <int E, bool HAS_VL, typename IdxT, typename TokT>
+__global__ void __launch_bounds__(32) dsv4_topk_kernel_cuda(
+    const float* __restrict__ logits,
+    const float* __restrict__ corr_bias,
+    float* __restrict__ topk_weights,
+    IdxT* __restrict__ topk_ids,
+    float routed_scaling_factor,
+    const TokT* __restrict__ input_ids,
+    const float* __restrict__ bias_vl,
+    int64_t image_sentinel_lo) {
+  const int row = blockIdx.x;
+  const int lane = threadIdx.x;
+  topk_warp_row<E, HAS_VL, IdxT, TokT, false>(
+      logits + (int64_t)row * E, corr_bias,
+      topk_weights + (int64_t)row * 6, topk_ids + (int64_t)row * 6,
+      routed_scaling_factor, input_ids, bias_vl, image_sentinel_lo, row, lane);
+}
+
+__device__ __forceinline__ bool signal_last_cta(int* done_cnt, int expected_prev) {
+  asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
+  uint32_t prev;
+  asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;\n"
+               : "=r"(prev)
+               : "l"(done_cnt)
+               : "memory");
+  return static_cast<int>(prev) == expected_prev;
+}
+
+// M == 1 GEMV (BLOCK_K = 2048, 1 row per CTA x 256 threads, zero inner-loop barriers!)
+template <int E, bool FUSED, typename IdxT>
+__global__ void __launch_bounds__(256) gate_gemv_m1_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    float* __restrict__ logits_out,
+    int K,
+    int64_t stride_wn,
+    int64_t stride_om,
+    const float* __restrict__ corr_bias,
+    float* __restrict__ topk_weights,
+    IdxT* __restrict__ topk_ids,
+    float routed_scaling_factor,
+    int* __restrict__ done_cnt) {
+  const int pid = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int c = tid * 8;
+  const __nv_bfloat16* w_row = w + (int64_t)pid * stride_wn;
+
+  float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  for (int k0 = 0; k0 < K; k0 += 2048) {
+    if (k0 + c < K) {
+      const uint4 wu = __ldcs(reinterpret_cast<const uint4*>(w_row + k0 + c));
+      const uint4 xu = *reinterpret_cast<const uint4*>(x + k0 + c);
+      float wf[8], xf[8];
+      bf16x8_to_fp32(wu, wf);
+      bf16x8_to_fp32(xu, xf);
+#pragma unroll
+      for (int j = 0; j < 8; j++) acc[j] = fmaf(wf[j], xf[j], acc[j]);
+    }
+  }
+  float s = acc[0] + acc[1];
+#pragma unroll
+  for (int j = 2; j < 8; j++) s = acc[j] + s;
+  s = warp_sum(s);
+
+  __shared__ float sm[8];
+  __shared__ bool is_last;
+  if (lane == 0) sm[warp] = s;
+  __syncthreads();
+  if (tid < 8) {
+    float v = sm[tid];
+    v += __shfl_xor_sync(0xffu, v, 4);
+    v += __shfl_xor_sync(0xffu, v, 2);
+    v += __shfl_xor_sync(0xffu, v, 1);
+    if (tid == 0) {
+      if constexpr (FUSED) {
+        __stcg(logits_out + pid, v);
+      } else {
+        logits_out[pid] = v;
+      }
+    }
+  }
+  if constexpr (FUSED) {
+    __syncthreads();
+    if (tid == 0) is_last = signal_last_cta(done_cnt, E - 1);
+    __syncthreads();
+    if (!is_last) return;
+    if (tid == 0) *done_cnt = 0;
+    if (warp == 0) {
+      topk_warp_row<E, false, IdxT, int64_t, true>(
+          logits_out, corr_bias, topk_weights, topk_ids,
+          routed_scaling_factor, nullptr, nullptr, 0, 0, lane);
+    }
+  }
+}
+
+// M == 2 GEMV (BLOCK_K = 512, 1 w-row per CTA x 128 threads, 0 inner-loop barriers -> 8.09 us!)
+template <int E, bool FUSED, typename IdxT>
+__global__ void __launch_bounds__(128) gate_gemv_m2_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    float* __restrict__ logits_out,
+    int K,
+    int64_t stride_xm,
+    int64_t stride_wn,
+    int64_t stride_om,
+    const float* __restrict__ corr_bias,
+    float* __restrict__ topk_weights,
+    IdxT* __restrict__ topk_ids,
+    float routed_scaling_factor,
+    int* __restrict__ done_cnt) {
+  const int pid = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int c = tid * 4;
+  const __nv_bfloat16* w_row = w + (int64_t)pid * stride_wn;
+  const __nv_bfloat16* x0 = x;
+  const __nv_bfloat16* x1 = x + stride_xm;
+
+  float acc0[4] = {0.f, 0.f, 0.f, 0.f};
+  float acc1[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int k0 = 0; k0 < K; k0 += 512) {
+    if (k0 + c < K) {
+      const uint2 wu = __ldcs(reinterpret_cast<const uint2*>(w_row + k0 + c));
+      const uint2 xu0 = *reinterpret_cast<const uint2*>(x0 + k0 + c);
+      const uint2 xu1 = *reinterpret_cast<const uint2*>(x1 + k0 + c);
+      float wf[4], xf0[4], xf1[4];
+      bf16x4_to_fp32(wu, wf);
+      bf16x4_to_fp32(xu0, xf0);
+      bf16x4_to_fp32(xu1, xf1);
+#pragma unroll
+      for (int j = 0; j < 4; j++) {
+        acc0[j] = fmaf(wf[j], xf0[j], acc0[j]);
+        acc1[j] = fmaf(wf[j], xf1[j], acc1[j]);
+      }
+    }
+  }
+
+  float s0 = acc0[3] + (acc0[2] + (acc0[0] + acc0[1]));
+  float s1 = acc1[3] + (acc1[2] + (acc1[0] + acc1[1]));
+  s0 = warp_sum(s0);
+  s1 = warp_sum(s1);
+
+  __shared__ float sm[2][4];
+  __shared__ bool is_last;
+  if (lane == 0) {
+    sm[0][warp] = s0;
+    sm[1][warp] = s1;
+  }
+  __syncthreads();
+  if (tid < 2) {
+    const float v = (sm[tid][0] + sm[tid][2]) + (sm[tid][1] + sm[tid][3]);
+    if constexpr (FUSED) {
+      __stcg(logits_out + (int64_t)tid * E + pid, v);
+    } else {
+      logits_out[(int64_t)tid * stride_om + pid] = v;
+    }
+  }
+  if constexpr (FUSED) {
+    __syncthreads();
+    if (tid == 0) is_last = signal_last_cta(done_cnt, E - 1);
+    __syncthreads();
+    if (!is_last) return;
+    if (tid == 0) *done_cnt = 0;
+    if (warp < 2) {
+      topk_warp_row<E, false, IdxT, int64_t, true>(
+          logits_out + (int64_t)warp * E, corr_bias,
+          topk_weights + (int64_t)warp * 6, topk_ids + (int64_t)warp * 6,
+          routed_scaling_factor, nullptr, nullptr, 0, warp, lane);
+    }
+  }
+}
+
+// M == 3..8 GEMV (BLOCK_K = 512, R w-rows per CTA x 64 threads, 3-stage cp.async x+w, 0 spills!)
+template <int M_MAX, int R, int E, bool FUSED, typename IdxT>
+__global__ void __launch_bounds__(R * 64, 1) gate_gemv_m3_8_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w,
+    float* __restrict__ logits_out,
+    int M,
+    int K,
+    int64_t stride_xm,
+    int64_t stride_wn,
+    int64_t stride_om,
+    const float* __restrict__ corr_bias,
+    float* __restrict__ topk_weights,
+    IdxT* __restrict__ topk_ids,
+    float routed_scaling_factor,
+    int* __restrict__ done_cnt) {
+  constexpr int NT = R * 64;
+  constexpr int ST = 3;
+  constexpr int XQ = M_MAX * 64;
+  const int tid_all = threadIdx.x;
+  const int r = tid_all >> 6;
+  const int tid = tid_all & 63;
+  const int pid = blockIdx.x * R + r;
+  const int lane = tid & 31, warp = tid >> 5;
+  const int c = tid * 8;
+  const __nv_bfloat16* w_row = w + (int64_t)pid * stride_wn;
+
+  __shared__ __align__(16) uint4 w_smem[ST][NT];
+  __shared__ __align__(16) uint4 x_smem[ST][XQ];
+  __shared__ float sm[R][M_MAX][2];
+  __shared__ bool is_last;
+  const uint32_t wbase = static_cast<uint32_t>(__cvta_generic_to_shared(w_smem));
+  const uint32_t xbase = static_cast<uint32_t>(__cvta_generic_to_shared(x_smem));
+
+  int next_k0 = 0;
+  auto issue_stage = [&](int slot) {
+    if (next_k0 < K) {
+      const int nb_w = (next_k0 + c < K) ? 16 : 0;
+      dense_mxfp8::cp16z(wbase + (slot * NT + tid_all) * 16, w_row + next_k0 + c, nb_w);
+      for (int q = tid_all; q < XQ; q += NT) {
+        const int xm = q >> 6, xcol = (q & 63) * 8;
+        const int nb_x = (xm < M && next_k0 + xcol < K) ? 16 : 0;
+        const __nv_bfloat16* xp = x + (int64_t)(xm < M ? xm : 0) * stride_xm + next_k0 + xcol;
+        dense_mxfp8::cp16z(xbase + (slot * XQ + q) * 16, xp, nb_x);
+      }
+      next_k0 += 512;
+    }
+    dense_mxfp8::cp_commit();
+  };
+#pragma unroll
+  for (int s = 0; s < ST - 1; s++) issue_stage(s);
+
+  float acc[M_MAX][8];
+#pragma unroll
+  for (int m = 0; m < M_MAX; m++)
+#pragma unroll
+    for (int j = 0; j < 8; j++) acc[m][j] = 0.f;
+
+  const int n_steps = (K + 511) / 512;
+  for (int step = 0; step < n_steps; step++) {
+    const int slot = step % ST;
+    const int k0 = step * 512;
+    dense_mxfp8::cp_wait<ST - 2>();
+    __syncthreads();
+    issue_stage((step + ST - 1) % ST);
+    if (k0 + c < K) {
+      const uint4 wu = w_smem[slot][tid_all];
+      float wf[8];
+      bf16x8_to_fp32(wu, wf);
+#pragma unroll
+      for (int m = 0; m < M_MAX; m++) {
+        if (m < M) {
+          const uint4 xu = x_smem[slot][m * 64 + tid];
+          float xf[8];
+          bf16x8_to_fp32(xu, xf);
+#pragma unroll
+          for (int j = 0; j < 8; j++) acc[m][j] = fmaf(wf[j], xf[j], acc[m][j]);
+        }
+      }
+    }
+  }
+  dense_mxfp8::cp_wait<0>();
+
+#pragma unroll
+  for (int m = 0; m < M_MAX; m++) {
+    if (m < M) {
+      float s = acc[m][0] + acc[m][1];
+#pragma unroll
+      for (int j = 2; j < 8; j++) s = acc[m][j] + s;
+      s = warp_sum(s);
+      if (lane == 0) sm[r][m][warp] = s;
+    }
+  }
+  __syncthreads();
+  if (tid < M) {
+    const float v = sm[r][tid][0] + sm[r][tid][1];
+    if constexpr (FUSED) {
+      __stcg(logits_out + (int64_t)tid * E + pid, v);
+    } else {
+      logits_out[(int64_t)tid * stride_om + pid] = v;
+    }
+  }
+  if constexpr (FUSED) {
+    __syncthreads();
+    if (tid_all == 0) is_last = signal_last_cta(done_cnt, (E / R) - 1);
+    __syncthreads();
+    if (!is_last) return;
+    if (tid_all == 0) *done_cnt = 0;
+    const int gw = tid_all >> 5;
+    for (int row = gw; row < M; row += (NT / 32)) {
+      topk_warp_row<E, false, IdxT, int64_t, true>(
+          logits_out + (int64_t)row * E, corr_bias,
+          topk_weights + (int64_t)row * 6, topk_ids + (int64_t)row * 6,
+          routed_scaling_factor, nullptr, nullptr, 0, row, lane);
+    }
+  }
+}
+
+}  // namespace dsv41_router
+
+void router_gate_gemv(at::Tensor const& x, at::Tensor const& w, at::Tensor& out) {
+  using namespace dsv41_router;
+  const int M = (int)x.size(0), K = (int)x.size(1), E = (int)w.size(0);
+  TORCH_CHECK(x.is_cuda() && w.is_cuda() && out.is_cuda(), "cuda");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16 &&
+                  out.scalar_type() == at::kFloat, "dtypes");
+  TORCH_CHECK(x.stride(1) == 1 && w.stride(1) == 1 && out.stride(1) == 1, "inner contiguous");
+  TORCH_CHECK(M >= 1 && M <= 8 && K >= 8 && (K % 8 == 0) && E >= 1 &&
+                  x.stride(0) % 8 == 0 && w.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "align");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  auto st = at::cuda::getCurrentCUDAStream();
+  const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
+  float* op = out.data_ptr<float>();
+  if (M == 1) {
+    gate_gemv_m1_kernel<384, false, int32_t><<<E, 256, 0, st>>>(
+        xp, wp, op, K, w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+  } else if (M == 2) {
+    gate_gemv_m2_kernel<384, false, int32_t><<<E, 128, 0, st>>>(
+        xp, wp, op, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+  } else if (M <= 4) {
+    if (E % 6 == 0)
+      gate_gemv_m3_8_kernel<4, 6, 384, false, int32_t><<<E / 6, 384, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+    else if (E % 4 == 0)
+      gate_gemv_m3_8_kernel<4, 4, 256, false, int32_t><<<E / 4, 256, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+    else
+      gate_gemv_m3_8_kernel<4, 1, 384, false, int32_t><<<E, 64, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+  } else {
+    if (E % 6 == 0)
+      gate_gemv_m3_8_kernel<8, 6, 384, false, int32_t><<<E / 6, 384, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+    else if (E % 4 == 0)
+      gate_gemv_m3_8_kernel<8, 4, 256, false, int32_t><<<E / 4, 256, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+    else
+      gate_gemv_m3_8_kernel<8, 1, 384, false, int32_t><<<E, 64, 0, st>>>(
+          xp, wp, op, M, K, x.stride(0), w.stride(0), out.stride(0), nullptr, nullptr, nullptr, 1.f, nullptr);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void router_dsv4_topk(
+    at::Tensor const& logits,
+    at::Tensor const& corr_bias,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double routed_scaling_factor,
+    c10::optional<at::Tensor> const& input_ids_opt,
+    c10::optional<at::Tensor> const& bias_vl_opt,
+    int64_t image_sentinel_lo) {
+  using namespace dsv41_router;
+  const int M = (int)logits.size(0), E = (int)logits.size(1);
+  if (M == 0) return;
+  TORCH_CHECK(logits.is_contiguous() && logits.scalar_type() == at::kFloat, "logits");
+  TORCH_CHECK(corr_bias.is_contiguous() && corr_bias.scalar_type() == at::kFloat && corr_bias.numel() == E, "bias");
+  TORCH_CHECK(topk_weights.is_contiguous() && topk_weights.scalar_type() == at::kFloat, "topk_weights");
+  TORCH_CHECK(topk_ids.is_contiguous() && (E == 256 || E == 384), "topk_ids / E");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(logits.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(corr_bias.data_ptr()) % 16 == 0, "16B align");
+  const bool has_vl = bias_vl_opt.has_value() && bias_vl_opt->defined() && image_sentinel_lo > 0;
+  const float* bvl_ptr = nullptr;
+  if (has_vl) {
+    TORCH_CHECK(input_ids_opt.has_value() && input_ids_opt->defined() && input_ids_opt->is_contiguous(), "input_ids");
+    TORCH_CHECK(bias_vl_opt->is_contiguous() && bias_vl_opt->scalar_type() == at::kFloat &&
+                    reinterpret_cast<uintptr_t>(bias_vl_opt->data_ptr()) % 16 == 0, "bias_vl");
+    bvl_ptr = bias_vl_opt->data_ptr<float>();
+  }
+  const at::cuda::OptionalCUDAGuard guard(logits.device());
+  auto st = at::cuda::getCurrentCUDAStream();
+  const float rsf = static_cast<float>(routed_scaling_factor);
+
+#define LAUNCH_TOPK(E_VAL, IDX_T)                                                                         \
+  do {                                                                                                    \
+    if (!has_vl) {                                                                                        \
+      dsv4_topk_kernel_cuda<E_VAL, false, IDX_T, int64_t><<<M, 32, 0, st>>>(                              \
+          logits.data_ptr<float>(), corr_bias.data_ptr<float>(),                                          \
+          topk_weights.data_ptr<float>(), reinterpret_cast<IDX_T*>(topk_ids.data_ptr()),                  \
+          rsf, nullptr, nullptr, 0);                                                                      \
+    } else if (input_ids_opt->scalar_type() == at::kInt) {                                                \
+      dsv4_topk_kernel_cuda<E_VAL, true, IDX_T, int32_t><<<M, 32, 0, st>>>(                               \
+          logits.data_ptr<float>(), corr_bias.data_ptr<float>(),                                          \
+          topk_weights.data_ptr<float>(), reinterpret_cast<IDX_T*>(topk_ids.data_ptr()),                  \
+          rsf, input_ids_opt->data_ptr<int32_t>(), bvl_ptr, image_sentinel_lo);                           \
+    } else {                                                                                              \
+      TORCH_CHECK(input_ids_opt->scalar_type() == at::kLong, "input_ids dtype");                          \
+      dsv4_topk_kernel_cuda<E_VAL, true, IDX_T, int64_t><<<M, 32, 0, st>>>(                               \
+          logits.data_ptr<float>(), corr_bias.data_ptr<float>(),                                          \
+          topk_weights.data_ptr<float>(), reinterpret_cast<IDX_T*>(topk_ids.data_ptr()),                  \
+          rsf, input_ids_opt->data_ptr<int64_t>(), bvl_ptr, image_sentinel_lo);                           \
+    }                                                                                                     \
+  } while (0)
+
+  if (E == 384) {
+    if (topk_ids.scalar_type() == at::kInt) LAUNCH_TOPK(384, int32_t);
+    else if (topk_ids.scalar_type() == at::kUInt32) LAUNCH_TOPK(384, uint32_t);
+    else { TORCH_CHECK(topk_ids.scalar_type() == at::kLong, "ids dtype"); LAUNCH_TOPK(384, int64_t); }
+  } else {
+    if (topk_ids.scalar_type() == at::kInt) LAUNCH_TOPK(256, int32_t);
+    else if (topk_ids.scalar_type() == at::kUInt32) LAUNCH_TOPK(256, uint32_t);
+    else { TORCH_CHECK(topk_ids.scalar_type() == at::kLong, "ids dtype"); LAUNCH_TOPK(256, int64_t); }
+  }
+#undef LAUNCH_TOPK
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void router_fused_gate_topk(
+    at::Tensor const& x,
+    at::Tensor const& w,
+    at::Tensor const& corr_bias,
+    at::Tensor& logits_scratch,
+    at::Tensor& done_cnt,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
+    double routed_scaling_factor) {
+  using namespace dsv41_router;
+  const int M = (int)x.size(0), K = (int)x.size(1), E = (int)w.size(0);
+  TORCH_CHECK(M >= 1 && M <= 8 && K % 512 == 0 && (E == 256 || E == 384), "shape");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, "bf16");
+  TORCH_CHECK(x.stride(1) == 1 && w.stride(1) == 1 && x.stride(0) % 8 == 0 && w.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0, "align");
+  TORCH_CHECK(logits_scratch.numel() >= M * E && done_cnt.numel() >= 1, "scratch");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  auto st = at::cuda::getCurrentCUDAStream();
+  const auto* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  const auto* wp = reinterpret_cast<const __nv_bfloat16*>(w.data_ptr());
+  float* lp = logits_scratch.data_ptr<float>();
+  const float* bp = corr_bias.data_ptr<float>();
+  float* twp = topk_weights.data_ptr<float>();
+  int* cntp = done_cnt.data_ptr<int>();
+  const float rsf = static_cast<float>(routed_scaling_factor);
+
+#define LAUNCH_FG(R_M, E_VAL, IDX_T)                                                                      \
+  do {                                                                                                    \
+    IDX_T* tip = reinterpret_cast<IDX_T*>(topk_ids.data_ptr());                                           \
+    if (M == 1) {                                                                                         \
+      gate_gemv_m1_kernel<E_VAL, true, IDX_T><<<E_VAL, 256, 0, st>>>(                                     \
+          xp, wp, lp, K, w.stride(0), E_VAL, bp, twp, tip, rsf, cntp);                                    \
+    } else if (M == 2) {                                                                                  \
+      gate_gemv_m2_kernel<E_VAL, true, IDX_T><<<E_VAL, 128, 0, st>>>(                                     \
+          xp, wp, lp, K, x.stride(0), w.stride(0), E_VAL, bp, twp, tip, rsf, cntp);                       \
+    } else if (M <= 4) {                                                                                  \
+      gate_gemv_m3_8_kernel<4, R_M, E_VAL, true, IDX_T><<<E_VAL / R_M, R_M * 64, 0, st>>>(                \
+          xp, wp, lp, M, K, x.stride(0), w.stride(0), E_VAL, bp, twp, tip, rsf, cntp);                    \
+    } else {                                                                                              \
+      gate_gemv_m3_8_kernel<8, R_M, E_VAL, true, IDX_T><<<E_VAL / R_M, R_M * 64, 0, st>>>(                \
+          xp, wp, lp, M, K, x.stride(0), w.stride(0), E_VAL, bp, twp, tip, rsf, cntp);                    \
+    }                                                                                                     \
+  } while (0)
+
+  if (E == 384) {
+    if (topk_ids.scalar_type() == at::kInt) LAUNCH_FG(6, 384, int32_t);
+    else if (topk_ids.scalar_type() == at::kUInt32) LAUNCH_FG(6, 384, uint32_t);
+    else { TORCH_CHECK(topk_ids.scalar_type() == at::kLong, "ids dtype"); LAUNCH_FG(6, 384, int64_t); }
+  } else {
+    if (topk_ids.scalar_type() == at::kInt) LAUNCH_FG(4, 256, int32_t);
+    else if (topk_ids.scalar_type() == at::kUInt32) LAUNCH_FG(4, 256, uint32_t);
+    else { TORCH_CHECK(topk_ids.scalar_type() == at::kLong, "ids dtype"); LAUNCH_FG(4, 256, int64_t); }
+  }
+#undef LAUNCH_FG
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 TORCH_LIBRARY_FRAGMENT(_dsv41_dense_mxfp8, m) {
   m.def("set_dbg(Tensor d) -> ()");
   m.def("splitk_wide(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
@@ -1380,11 +2193,23 @@ TORCH_LIBRARY_FRAGMENT(_dsv41_dense_mxfp8, m) {
   m.def("streamk_tiled(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int ctas) -> ()");
   m.def("set_sync(int v) -> ()", &dense_mxfp8_set_sync);
   m.def("streamk(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, Tensor(c!) cnt, int cfg, int ctas) -> ()");
+  m.def("streamk_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, Tensor(c!) cnt, int cfg, int ctas) -> ()");
+  m.def("splitk_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, int cfg, int S) -> ()");
+  m.def("splitk_wide_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, int cfg, int S) -> ()");
+  m.def("gate_gemv(Tensor x, Tensor w, Tensor(o!) out) -> ()");
+  m.def("dsv4_topk(Tensor logits, Tensor corr_bias, Tensor(w!) topk_weights, Tensor(i!) topk_ids, float routed_scaling_factor, Tensor? input_ids, Tensor? bias_vl, int image_sentinel_lo) -> ()");
+  m.def("fused_gate_topk(Tensor x, Tensor w, Tensor corr_bias, Tensor(l!) logits_scratch, Tensor(c!) done_cnt, Tensor(tw!) topk_weights, Tensor(ti!) topk_ids, float routed_scaling_factor) -> ()");
 }
 TORCH_LIBRARY_IMPL(_dsv41_dense_mxfp8, CUDA, m) {
   m.impl("streamk", &streamk_dense);
   m.impl("streamk_tiled", &streamk_tiled_dense);
   m.impl("splitk", &splitk_dense);
   m.impl("splitk_wide", &splitk_wide_dense);
+  m.impl("streamk_split", &streamk_split_dense);
+  m.impl("splitk_split", &splitk_split_dense);
+  m.impl("splitk_wide_split", &splitk_wide_split_dense);
+  m.impl("gate_gemv", &router_gate_gemv);
+  m.impl("dsv4_topk", &router_dsv4_topk);
+  m.impl("fused_gate_topk", &router_fused_gate_topk);
   m.impl("set_dbg", &dense_mxfp8_set_dbg);
 }

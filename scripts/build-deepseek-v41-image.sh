@@ -66,6 +66,7 @@ cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-p
 cp -a "$MODEL_DIR/native/dsv4_moe" "$WORKDIR/context/dsv4_moe"
 cp -a "$MODEL_DIR/native/dsv41_indexer" "$WORKDIR/context/dsv41_indexer"
 cp -a "$MODEL_DIR/native/dsv41_dense_mxfp8" "$WORKDIR/context/dsv41_dense_mxfp8"
+cp -a "$MODEL_DIR/native/dsv41_engram_cpu" "$WORKDIR/context/dsv41_engram_cpu"
 INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 
 # One build, as for Qwen: the pinned vLLM tree and shared LMCache payload are
@@ -79,6 +80,7 @@ COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 COPY dsv4_moe/ /tmp/dsv4_moe/
 COPY dsv41_indexer/ /tmp/dsv41_indexer/
 COPY dsv41_dense_mxfp8/ /tmp/dsv41_dense_mxfp8/
+COPY dsv41_engram_cpu/ /tmp/dsv41_engram_cpu/
 # patch 0004: compile the MXFP4 decode kernels into the vllm package (no GPU
 # needed; sm_80 only). The library is loaded only with VLLM_DSV4_MXFP4_DECODE=1.
 RUN bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
@@ -90,7 +92,10 @@ RUN bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && bash /tmp/dsv41_dense_mxfp8/build.sh /tmp/dsv41_dense_mxfp8/out --name _dsv41_dense_mxfp8 /tmp/dsv41_dense_mxfp8/dense_mxfp8.cu \\
     && cp /tmp/dsv41_dense_mxfp8/out/_dsv41_dense_mxfp8.so /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_dense_mxfp8.so \\
     && rm -rf /tmp/dsv41_dense_mxfp8 /root/.cache/torch_extensions \\
-    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_dense_mxfp8.so
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_dense_mxfp8.so \\
+    && bash /tmp/dsv41_engram_cpu/build.sh /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4_1/common \\
+    && rm -rf /tmp/dsv41_engram_cpu \\
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4_1/common/_dsv41_engram_cpu.so
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN python3 -m compileall -q /usr/local/lib/python3.12/dist-packages/vllm /opt/lmcache-patched/lmcache \
     && python3 -c 'import lmcache,sys,torch,lmcache.cuda_ops,lmcache.lmcache_native,lmcache.lmcache_fs; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert sys.version_info[:2] == (3,12); assert torch.version.cuda == "13.0"; print(lmcache.__version__, lmcache.__file__, torch.__version__, torch.version.cuda)' \

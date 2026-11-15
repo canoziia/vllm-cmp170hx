@@ -45,9 +45,17 @@ from actual remaining time rather than implementing every item below.
 Already deployed: deterministic MoE alignment; MXFP4 MoE decode; sparse decode;
 small-kernel fusion; mHC v2; MoE activation/sum fusion; FP8 draft head; thin wo_a;
 MoE prefill split; fast prefill indexer; dense MXFP8 kernels; verification graph
-selection, shared metadata / metadata graphs, live-load cohorts, request `spec_k`
-and the measured automatic width policy. See the patch series and model README
-for exact switches and scopes.
+selection, shared metadata / metadata graphs, live-load cohorts, request `spec_k`,
+the measured automatic width policy, post-KV expandable allocator segments (0017),
+bounded decode indexer workspace + candidate-sparse decode scoring (0018),
+Engram async stream overlap / NUMA binding / 264B packed host rows / OpenMP CPU
+gather (0019), zero-HBM fused `wq_b + indexer.wq_b` + `(1280, 4096)/(1280, 36864)`
+dense MXFP8 + bitwise fast MoE router (0020), 32-head exact-tile sparse MLA
+prefill + fused writer block-max + compact reader indexer (0021), exact YoCo
+consumer-layer prefill truncation + PP shadow candidate relay + quadratic cost
+chunking (0022), and mixed-width `spec_k` FULL CUDA graphs + ragged metadata
+replay (`adaptive/0010`). See the patch series and model README for exact
+switches and scopes.
 
 Previous engine-level negative/risky experiments include an MXFP4 MoE decode-kernel
 rewrite, alternative

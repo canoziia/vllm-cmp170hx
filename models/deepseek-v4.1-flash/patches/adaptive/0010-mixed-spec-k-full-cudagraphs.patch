@@ -1,0 +1,215 @@
+From fcb6144db6c09d0be7c1862fee6d8bb4f84e0e68 Mon Sep 17 00:00:00 2001
+From: canoziia <canoziia@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:39:24 +0000
+Subject: [PATCH] dsv41: mixed-width spec_k FULL CUDA graphs and ragged
+ metadata replay
+
+---
+ vllm/dsv41_opt_profile.py                     |  1 +
+ .../deepseek_v4_1/ampere/ampere_sparse.py     | 21 ++++++++-
+ vllm/v1/attention/backends/mla/indexer.py     | 11 ++++-
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 45 ++++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            | 21 +++++++--
+ 5 files changed, 90 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 509eed5..603dc2a 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -73,6 +73,7 @@ PROFILES: dict[str, dict[str, str]] = {
+ PROFILES["verification"] = {
+     **PROFILES["default"],
+     "VLLM_DSV41_VERIFICATION": "1",
++    "VLLM_DSV41_MIXED_SPEC_FULL_GRAPH": "1",
+     "VLLM_PP_DECODE_COHORT_LIVE_LOAD": "1",
+     "VLLM_DSV41_FAST_METADATA": "1",
+     "VLLM_DSV41_METADATA_GRAPHS": "1",
+diff --git a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+index 4f1524c..0624fd2 100644
+--- a/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
++++ b/vllm/models/deepseek_v4_1/ampere/ampere_sparse.py
+@@ -10,6 +10,8 @@ fused aiter norm+quant self-disable off ROCm), and
+ where Triton refuses native fp8 converts.
+ """
+ 
++import os
++
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.amd.rocm import (
+@@ -27,12 +29,29 @@ from vllm.platforms.interface import DeviceCapability
+ from vllm.v1.attention.backend import AttentionCGSupport
+ 
+ 
++def sm80_v41_mixed_spec_full_graph(vllm_config) -> bool:
++    """Opt-in FULL ragged decode graphs for CPU-selected heterogeneous spec_k."""
++    spec = vllm_config.speculative_config
++    return bool(
++        os.environ.get("VLLM_DSV41_MIXED_SPEC_FULL_GRAPH", "0") == "1"
++        and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++        and current_platform.is_device_capability_family(80)
++        and spec is not None
++        and spec.use_dspark()
++        and not vllm_config.parallel_config.use_ubatching
++        and vllm_config.lora_config is None
++        and "DeepseekV41ForCausalLM" in vllm_config.model_config.architectures
++    )
++
++
+ class _AmpereAdaptiveMetadata:
+     @classmethod
+     def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+         spec = vllm_config.speculative_config
+         if (current_platform.is_device_capability_family(80)
+-                and spec is not None and spec.uses_gpu_adaptive_verification()):
++                and spec is not None
++                and (spec.uses_gpu_adaptive_verification()
++                     or sm80_v41_mixed_spec_full_graph(vllm_config))):
+             # Existing builders stage device-driven request owners, compressed
+             # slots and ragged SWA indices into persistent buffers. Restrict
+             # this opt-in to the physical SM80 path covered by replay tests.
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index ddd6e0d..30ff9d9 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -878,11 +878,18 @@ def _supports_native_decode(next_n: int) -> bool:
+ 
+ def _sm80_v41_adaptive(vllm_config: VllmConfig) -> bool:
+     spec = vllm_config.speculative_config
+-    return (
++    if not (
+         current_platform.is_device_capability_family(80)
+-        and spec is not None and spec.uses_gpu_adaptive_verification()
++        and spec is not None
+         and "DeepseekV41ForCausalLM" in vllm_config.model_config.architectures
++    ):
++        return False
++    if spec.uses_gpu_adaptive_verification():
++        return True
++    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
++        sm80_v41_mixed_spec_full_graph,
+     )
++    return sm80_v41_mixed_spec_full_graph(vllm_config)
+ 
+ 
+ def _use_flattening(vllm_config: VllmConfig) -> bool:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index f493d60..b702622 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -422,12 +422,28 @@ class CudaGraphManager:
+                 if any(d.cg_mode == decode_mode and d.num_tokens == rows
+                        and d.uniform_token_count is None for d in existing):
+                     continue
++                _pcfg = getattr(self.vllm_config, "parallel_config", None)
++                pp_size = getattr(_pcfg, "pipeline_parallel_size", 1) if _pcfg is not None else 1
++                cohort_cap = (
++                    min(self.max_num_reqs, max(8, (self.max_num_reqs + pp_size - 1) // pp_size + 2))
++                    if pp_size > 1 and os.environ.get("VLLM_DSV41_MIXED_SPEC_FULL_GRAPH", "0") == "1"
++                    else self.max_num_reqs
++                )
+                 desc = BatchExecutionDescriptor(
+                     cg_mode=decode_mode, num_tokens=rows,
+-                    num_reqs=min(rows, self.max_num_reqs),
++                    num_reqs=min(rows, cohort_cap),
+                     max_query_len=self.decode_query_len,
+                     num_active_loras=loras,
+                 )
++                if cohort_cap < min(rows, self.max_num_reqs):
++                    wide_desc = BatchExecutionDescriptor(
++                        cg_mode=decode_mode, num_tokens=rows,
++                        num_reqs=min(rows, self.max_num_reqs),
++                        max_query_len=self.decode_query_len,
++                        num_active_loras=loras,
++                    )
++                    self._capture_descs[decode_mode].append(wide_desc)
++                    existing.append(wide_desc)
+                 self._capture_descs[decode_mode].append(desc)
+                 # Uniform full-width exact graphs retain first priority.
+                 pos = next((i for i, d in enumerate(existing)
+@@ -844,7 +860,10 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 pcp_manager=pcp_manager,
+                 metadata_graph_callback=(
+                     (lambda graph, metadata: self.metadata_graphs.__setitem__(
+-                        desc, (graph, metadata))) if capture_metadata else None
++                        desc, (graph, metadata)))
++                    if (capture_metadata or _can_capture_ragged_metadata_graph(
++                        self.vllm_config, desc, warmup, self.decode_query_len))
++                    else None
+                 ),
+                 metadata_graph_pool=self.pool,
+             )
+@@ -1200,3 +1219,25 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+     runner.maybe_remove_all_loras(runner.lora_config)
+     gc.collect()
+     torch.accelerator.empty_cache()
++
++
++def _can_capture_ragged_metadata_graph(
++    vllm_config: VllmConfig,
++    desc: BatchExecutionDescriptor,
++    warmup: bool,
++    decode_query_len: int,
++) -> bool:
++    if warmup or desc.cg_mode != CUDAGraphMode.FULL or desc.uniform_token_count is not None:
++        return False
++    if desc.max_query_len != decode_query_len:
++        return False
++    if (
++        os.environ.get("VLLM_DSV41_METADATA_GRAPHS", "0") != "1"
++        or os.environ.get("VLLM_DSV41_FAST_METADATA", "0") != "1"
++        or os.environ.get("VLLM_DSV41_SWA_RAGGED_INPLACE", "0") != "1"
++    ):
++        return False
++    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
++        sm80_v41_mixed_spec_full_graph,
++    )
++    return sm80_v41_mixed_spec_full_graph(vllm_config)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2cfd437..a07815f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -697,13 +697,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             max_num_reqs=self.max_num_reqs,
+             is_profiling=is_profiling,
+         )
++        from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
++            sm80_v41_mixed_spec_full_graph,
++        )
+         self.cudagraph_manager = ModelCudaGraphManager(
+             self.vllm_config,
+             self.device,
+             cudagraph_mode,
+             decode_query_len=self.decode_query_len,
+             lora_capture_cases=self.lora_capture_cases,
+-            varlen_decode=self.adaptive_verification is not None,
++            varlen_decode=(
++                self.adaptive_verification is not None
++                or sm80_v41_mixed_spec_full_graph(self.vllm_config)
++            ),
+         )
+         check_attention_cp_compatibility(self.vllm_config)
+         if isinstance(self.speculator, DraftModelSpeculator):
+@@ -1840,9 +1846,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if (metadata_graph is not None and not dummy_run
+                     and self.adaptive_verification is None
+                     and not input_batch.has_prefill
+-                    and input_batch.num_reqs == batch_desc.num_reqs
+-                    and input_batch.num_tokens == batch_desc.num_tokens
+-                    and uniform_tok_count == batch_desc.uniform_token_count):
++                    and (
++                        (input_batch.num_reqs == batch_desc.num_reqs
++                         and input_batch.num_tokens == batch_desc.num_tokens
++                         and uniform_tok_count == batch_desc.uniform_token_count)
++                        or (batch_desc.uniform_token_count is None
++                            and batch_desc.cg_mode == CUDAGraphMode.FULL
++                            and input_batch.num_reqs_after_padding == batch_desc.num_reqs
++                            and input_batch.num_tokens_after_padding == batch_desc.num_tokens
++                            and os.environ.get("VLLM_DSV41_MIXED_SPEC_FULL_GRAPH", "0") == "1")
++                    )):
+                 # Only exact CPU-known uniform batches: a metadata graph with
+                 # static output_size must never consume padded/ragged lengths.
+                 graph, attn_metadata = metadata_graph
+-- 
+2.55.0
+
