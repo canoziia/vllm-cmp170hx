@@ -98,9 +98,9 @@ finite numbers are `[0,1)`; 0 keeps only the newest block. Values near 1 react
 more slowly. Decay is a per-block retention factor, not an acceptance-rate
 threshold or a guaranteed number of independent samples.
 There is no separate `VLLM_DSV41_HISTORY_POLICY` user switch; the `verification`
-profile only enables the four execution optimisations above, never auto-k.
+profile only enables the five execution optimisations above, never auto-k.
 
-All four optimisation switches default off independently; explicit environment values override
+All five optimisation switches default off independently; explicit environment values override
 profile defaults. Configure the profile in `.env`, then use the regular build and
 Compose deployment. Do not enable a new performance profile without checking the
 workload's k5 regression gate.
@@ -110,8 +110,10 @@ With the verification profile enabled, OpenAI completions/chat requests may set
 **target-verified draft prefix**, not the target's sampling policy. Every emitted
 draft is still accepted/rejected by the target. The configured DSpark drafter
 still proposes its full block; this is not a drafter-compute shortcut. Requests
-can have different limits; nonuniform mixtures fall back to a compatible graph
-or eager execution rather than being falsely labelled uniform. Omission uses
+can have different limits; with `VLLM_DSV41_MIXED_SPEC_FULL_GRAPH=1` (`adaptive/0010`,
+on in `verification`), CPU-known nonuniform `spec_k` mixtures retain `FULL` CUDA
+graphs and static-buffer ragged metadata graph replay rather than dropping to
+`PIECEWISE`/eager. Omission uses
 the CPU history policy when `enable_adaptive_verification=true`, otherwise
 retains configured full width. Manual `spec_k` is fixed, not an adaptive upper
 bound. `spec_k` is supported only on DeepSeek V4.1 (DSpark). It travels in
@@ -131,9 +133,7 @@ The cost table is a local PP6/CMP170HX approximation from uniform-width
 measurements, not a general hardware model or oracle.
 No mode/prompt labels select k. Short requests may finish before enough feedback;
 near ties keep the current width. Structured-output and stale/preempted blocks
-are excluded from history updates. **Follow-up:** mixed widths can fall back to
-PIECEWISE rather than FULL and lose static metadata replay even at equal rows;
-the policy observes real recurrence but does not fix mixed FULL graph capture.
+are excluded from history updates.
 Workload-level measurements can follow different output trajectories across k;
 historical replay is not independent throughput or correctness validation.
 
@@ -679,6 +679,34 @@ tokenizer and the reasoning parser read them. Both keys are set so
 `reasoning_effort` cannot re-enable a disabled request; explicit
 `chat_template_kwargs.thinking` / `enable_thinking` win; any other value returns
 400. `tests/test_deepseek_thinking.py SOURCE_TREE` runs during the build.
+
+## Round-2 memory, Engram, decode, and prefill optimisations (patches 0017-0022, adaptive/0010)
+
+| patch | scope | numerics |
+|---|---|---|
+| 0017 | enable PyTorch `expandable_segments` after KV IPC export; opt-in startup memory/allocator probes | allocator-only (bitwise) |
+| 0018 | sequence-chunked 128 MiB decode indexer workspace + candidate-sparse decode scoring on reader layers | bitwise logits and top-512 |
+| 0019 | NUMA-bound 264 B packed FP8+UE8M0 host Engram rows (94.4 GiB/shard, zero RAM bloat), async stream overlap, and OpenMP+AVX2 CPU gather + compact H2D DMA (0 GPU SMs) | bitwise identical to GPU UVA gather |
+| 0020 | zero-peak-overshoot post-repack `wq_b + indexer.wq_b` fusion (`(1280, 36864)` split epilogue + `(1280, 4096)` dense MXFP8), bitwise SM80 MoE router (`gate_gemv + warp top-6`), and `MULTI_STREAM_OVERLAPPED` shared experts | router/shared-expert order bitwise; fused MXFP8 fp64 error <= Marlin (`<= 1.0002x`) |
+| 0021 | 32-head (`warps=4, stages=2, exact_tile`) sparse MLA prefill, fused writer 8-col block-max + register radix top-2048, and active-candidate compacted Tensor-Core reader (`N >= 32k`) | MLA prefill bitwise; writer/reader recall >= 99.96 % |
+| 0022 | exact YoCo consumer-layer (`21..39`) whole-chunk prefill truncation with prefix-cache SWA rollback guard, `PP2 -> PP5` Layer-20 shadow `topk`/candidate relay, and quadratic cost-budget chunk sizing (`>= 64k`) | exact on trailing query tokens and mid-prefix cache hits |
+| adaptive/0010 | `FULL` CUDA graphs and static-buffer ragged metadata graph replay for CPU-known heterogeneous `spec_k` cohorts (`verification` profile) | graph-capture equivalent |
+
+End-to-end A/B on a CMP 170HX host (PP6 `7,7,7,7,7,5`, checkpoint 1017, `verification` profile, DSpark `K=5` with `enable_adaptive_verification=true`, 180 W cap; baseline image `a10146d` vs `d6bfbc6`):
+
+| workload | `a10146d` | `d6bfbc6` | delta | notes |
+|---|---:|---:|---:|---|
+| counting warm c1 / c8 (tok/s) | 196.80 / 1174.61 | 206.00 / 1202.97 | +4.7 % / +2.4 % | c1 steps/s 33.13 -> 34.68; acc 5.88 |
+| code c1 / c8 (tok/s) | 167.99 / 922.69 | 176.92 / 939.67 | +5.3 % / +1.8 % | c1 steps/s 30.65 -> 31.75; acc 5.42 / 5.51 |
+| prose c1 / c8 (tok/s) | 78.33 / 381.48 | 79.83 / 458.94 | +1.9 % / +20.3 % | c8 steps/s 22.93 -> 28.00 (+22.1 %, mixed-k FULL graphs) |
+| mixed `spec_k=[1,2,3,5]x2` c8 (tok/s) | 440.35 | 451.47 | +2.5 % | explicit heterogeneous `spec_k` cohort |
+| 79.5k prefix-cached 256-tok decode (tok/s) | 112.76 | 117.14 | +3.9 % | 79,232 cached tokens, `spec_k=5` |
+| cold prefill 6.8k / 26.8k / 53.7k (tok/s) | 2287 / 4492 / 5219 | 2388 / 4650 / 5273 | +4.4 % / +3.5 % / +1.0 % | TTFT 2.83 / 5.77 / 10.18 s |
+| cold prefill 107.3k / 214.7k (tok/s) | 5542 / — | 5686 / 5612 | +2.6 % / — | TTFT 18.88 s (107k), 38.26 s (215k) |
+
+Validation notes:
+- YoCo mid-prefix rollback check (44,376-token query hitting 41,344 cached prefix tokens from a 79,476-token YoCo-truncated prefill): 2.83 s vs 9.29 s cold (3.28x), output text identical character-for-character to cold ground truth.
+- Post-capture GPU memory across PP0-PP5: 58.4 / 59.0 / 62.6 / 60.0 / 60.1 / 57.5 GiB (vs 58.1 / 58.6 / 62.4 / 59.7 / 59.7 / 57.3 GiB on `a10146d`), 0 B swap, balanced NUMA placement (94.42 GiB per Engram socket).
 
 ## Optimisation switches (patch 0014 profile)
 
