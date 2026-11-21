@@ -692,17 +692,17 @@ tokenizer and the reasoning parser read them. Both keys are set so
 | 0022 | exact YoCo consumer-layer (`21..39`) whole-chunk prefill truncation with prefix-cache SWA rollback guard, `PP2 -> PP5` Layer-20 shadow `topk`/candidate relay, and quadratic cost-budget chunk sizing (`>= 64k`) | exact on trailing query tokens and mid-prefix cache hits |
 | adaptive/0010 | `FULL` CUDA graphs and static-buffer ragged metadata graph replay for CPU-known heterogeneous `spec_k` cohorts (`verification` profile) | graph-capture equivalent |
 
-End-to-end A/B on a CMP 170HX host (PP6 `7,7,7,7,7,5`, checkpoint 1017, `verification` profile, DSpark `K=5` with `enable_adaptive_verification=true`, 180 W cap; baseline image `a10146d` vs `d6bfbc6`):
+End-to-end A/B on a CMP 170HX host (PP6 `7,7,7,7,7,5`, checkpoint 1017, `verification` profile, DSpark `K=5` with `enable_adaptive_verification=true`, 180 W cap; baseline image `a10146d` vs `8836741`):
 
-| workload | `a10146d` | `d6bfbc6` | delta | notes |
+| workload | `a10146d` | `8836741` | delta | notes |
 |---|---:|---:|---:|---|
-| counting warm c1 / c8 (tok/s) | 196.80 / 1174.61 | 206.00 / 1202.97 | +4.7 % / +2.4 % | c1 steps/s 33.13 -> 34.68; acc 5.88 |
-| code c1 / c8 (tok/s) | 167.99 / 922.69 | 176.92 / 939.67 | +5.3 % / +1.8 % | c1 steps/s 30.65 -> 31.75; acc 5.42 / 5.51 |
-| prose c1 / c8 (tok/s) | 78.33 / 381.48 | 79.83 / 458.94 | +1.9 % / +20.3 % | c8 steps/s 22.93 -> 28.00 (+22.1 %, mixed-k FULL graphs) |
+| counting warm c1 / c8 / c32 (tok/s) | 196.80 / 1174.61 / 2406.08 | 208.47 / 1199.06 / 2508.36 | +5.9 % / +2.1 % / +4.3 % | c1 steps/s 33.13 -> 35.09; acc 5.88 |
+| code c1 / c8 / c32 (tok/s) | 167.99 / 922.69 / 1948.46 | 175.19 / 936.07 / 2015.05 | +4.3 % / +1.5 % / +3.4 % | c1 steps/s 30.65 -> 31.97; acc 5.42–5.44 |
+| prose c1 / c8 / c32 (tok/s) | 78.33 / 381.48 / 937.53 | 80.86 / 459.47 / 923.62 | +3.2 % / +20.4 % / -1.5 % | c8 steps/s 22.93 -> 27.39 (+19.5 %, mixed-k FULL graphs) |
 | mixed `spec_k=[1,2,3,5]x2` c8 (tok/s) | 440.35 | 451.47 | +2.5 % | explicit heterogeneous `spec_k` cohort |
 | 79.5k prefix-cached 256-tok decode (tok/s) | 112.76 | 117.14 | +3.9 % | 79,232 cached tokens, `spec_k=5` |
-| cold prefill 6.8k / 26.8k / 53.7k (tok/s) | 2287 / 4492 / 5219 | 2388 / 4650 / 5273 | +4.4 % / +3.5 % / +1.0 % | TTFT 2.83 / 5.77 / 10.18 s |
-| cold prefill 107.3k / 214.7k (tok/s) | 5542 / — | 5686 / 5612 | +2.6 % / — | TTFT 18.88 s (107k), 38.26 s (215k) |
+| cold prefill 6.8k / 26.8k / 53.7k (tok/s) | 2287 / 4492 / 5219 | 2371 / 4727 / 5646 | +3.7 % / +5.2 % / +8.2 % | TTFT 2.83 / 5.69 / 9.52 s |
+| cold prefill 107.3k / 214.7k (tok/s) | 5542 / — | 6351 / 6540 | +14.6 % / — | TTFT 16.91 s (107k), 32.87 s (215k) |
 
 Validation notes:
 - YoCo mid-prefix rollback check (44,376-token query hitting 41,344 cached prefix tokens from a 79,476-token YoCo-truncated prefill): 2.83 s vs 9.29 s cold (3.28x), output text identical character-for-character to cold ground truth.
