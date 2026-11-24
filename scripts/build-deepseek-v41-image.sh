@@ -280,10 +280,23 @@ COPY lmcache-ext-src/ /tmp/lmcache-ext-src/
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN (python3 -c 'import torch, lmcache.cuda_ops, lmcache.lmcache_native, lmcache.lmcache_fs, lmcache.lmcache_redis' 2>/dev/null \
-        || (cd /tmp/lmcache-ext-src \
-            && PYTHONPATH="" CUDA_HOME=/usr/local/cuda PATH="/usr/local/cuda/bin:$PATH" TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=4 NVCC_THREADS=1 BUILD_WITH_CUDA=1 python3 build_lmcache_exts.py \
-            && rm -f /opt/lmcache-patched/lmcache/*.so \
-            && cp -v /tmp/lmcache-ext-src/lmcache/*.so /opt/lmcache-patched/lmcache/)) \
+        || (set -eu; \
+            PURGE_PKGS=""; \
+            if [ ! -f /usr/local/cuda/include/cusparse.h ]; then \
+                CUDA_VER="${CUDA_VERSION:-$(python3 -c 'import torch; print(torch.version.cuda)')}"; \
+                CUDA_DASH=$(echo "$CUDA_VER" | cut -d. -f1,2 | tr '.' '-'); \
+                PURGE_PKGS="libcusparse-dev-${CUDA_DASH} libcublas-dev-${CUDA_DASH} libcusolver-dev-${CUDA_DASH}"; \
+                apt-get update -y; \
+                apt-get install -y --no-install-recommends --allow-change-held-packages ${PURGE_PKGS}; \
+            fi; \
+            cd /tmp/lmcache-ext-src; \
+            PYTHONPATH="" CUDA_HOME=/usr/local/cuda PATH="/usr/local/cuda/bin:$PATH" TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=4 NVCC_THREADS=1 BUILD_WITH_CUDA=1 python3 build_lmcache_exts.py; \
+            rm -f /opt/lmcache-patched/lmcache/*.so; \
+            cp -v /tmp/lmcache-ext-src/lmcache/*.so /opt/lmcache-patched/lmcache/; \
+            if [ -n "$PURGE_PKGS" ]; then \
+                apt-get purge -y ${PURGE_PKGS}; \
+                rm -rf /var/lib/apt/lists/*; \
+            fi)) \
     && rm -rf /tmp/lmcache-ext-src /root/.cache/torch_extensions \
     && python3 -m compileall -q /opt/lmcache-patched/lmcache \
     && python3 /tmp/test-lmcache-patches.py \
