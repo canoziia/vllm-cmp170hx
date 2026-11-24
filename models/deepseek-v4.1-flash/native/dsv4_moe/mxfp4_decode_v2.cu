@@ -99,6 +99,14 @@ __device__ __forceinline__ uint32_t pl(uint32_t t) {
 template <int DQ>
 __device__ __forceinline__ void deq_raw(uint32_t q, uint32_t& a0, uint32_t& a1, uint32_t& a2,
                                         uint32_t& a3) {
+  if constexpr (DQ == 3) {
+    a0 = ((q & 0x000F000Fu) * 0x1040u) & 0x81C081C0u;
+    a2 = ((q & 0x00F000F0u) * 0x0104u) & 0x81C081C0u;
+    const uint32_t qh = q >> 8;
+    a1 = ((qh & 0x000F000Fu) * 0x1040u) & 0x81C081C0u;
+    a3 = ((qh & 0x00F000F0u) * 0x0104u) & 0x81C081C0u;
+    return;
+  }
   if constexpr (DQ == 2) {
     a0 = ((q & 0x000F000Fu) * 0x1040u) & 0x81C081C0u;
     a2 = ((q & 0x00F000F0u) * 0x0104u) & 0x81C081C0u;
@@ -123,7 +131,9 @@ struct Frags {
 };
 
 template <int DQ, int R, int CR, int TW, int K, int N, bool W13>
-__global__ void __launch_bounds__(WARPS * 32)
+__global__ void __launch_bounds__(
+    WARPS * 32,
+    (CR * TW <= 2) ? 7 : ((CR * TW <= 4) ? 5 : ((CR * TW <= 8) ? (DQ == 0 ? 5 : 4) : 2)))
     mxfp4_dec2_gemm(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
                     const int4* __restrict__ W, const uint8_t* __restrict__ S,
                     const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
@@ -131,7 +141,9 @@ __global__ void __launch_bounds__(WARPS * 32)
                     int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
                     float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
                     float limit, int sum_order, int* __restrict__ sync,
-                    __nv_bfloat16* __restrict__ aux) {
+                    __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+                    bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+                    int local_E) {
   static_assert(CR % 2 == 0 && R % CR == 0, "chunks hold whole 32-k scale groups");
   static_assert(K % (16 * R) == 0 && N % (64 * TW) == 0, "shape");
   constexpr int CH = R / CR;
@@ -151,6 +163,20 @@ __global__ void __launch_bounds__(WARPS * 32)
   constexpr int krows = K >> 4;
   constexpr int wrow = N >> 1;
   const int nblk = ntpp[0] >> 3;
+  if (nblk == 0) {
+    if constexpr (!W13) {
+      if (fuse) {
+        const int64_t total_p2 = ((int64_t)(n_slots / topk) * N) >> 1;
+        __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(aux);
+        const __nv_bfloat162 z = __floats2bfloat162_rn(0.f, 0.f);
+        for (int64_t i = (int64_t)blockIdx.x * (WARPS * 32) + threadIdx.x;
+             i < total_p2; i += (int64_t)gridDim.x * (WARPS * 32)) {
+          dst[i] = z;
+        }
+      }
+    }
+    return;
+  }
   const int items = nblk * TG * KS;
 
   auto split = [&](int item, int& b, int& ks, int& t0) {
@@ -251,14 +277,34 @@ __global__ void __launch_bounds__(WARPS * 32)
   auto sum_tile = [&](int tg) {
     constexpr int P2 = 32 * TW;  // bf16 pairs per tile row
     const int M = n_slots / topk;
+    int prev_m = -1;
+    uint32_t own_mask = 0xffu;
     for (int task = lane; task < M * P2; task += 32) {
       const int m = task / P2, pp = task - m * P2;
+      if (topk_ids_raw != nullptr && m != prev_m) {
+        prev_m = m;
+        own_mask = 0u;
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+          if (k < topk) {
+            const int64_t idx = (int64_t)m * topk + k;
+            const int64_t eid = topk_i64
+                ? __ldg(reinterpret_cast<const int64_t*>(topk_ids_raw) + idx)
+                : static_cast<int64_t>(
+                      __ldg(reinterpret_cast<const int32_t*>(topk_ids_raw) + idx));
+            if (eid >= 0 && eid < global_E) {
+              const int le = expert_map != nullptr ? __ldg(expert_map + eid) : (int)eid;
+              if (le >= 0 && le < local_E) own_mask |= (1u << k);
+            }
+          }
+        }
+      }
       const int n = tg * 64 * TW + 2 * pp;
       const __nv_bfloat16* src = out + (int64_t)m * topk * N + n;
       float2 v[8];
 #pragma unroll
       for (int k = 0; k < 8; k++) {
-        if (k < topk) {
+        if (k < topk && ((own_mask >> k) & 1u)) {
           const uint32_t raw = __ldcg(reinterpret_cast<const unsigned int*>(src + (int64_t)k * N));
           v[k] = __bfloat1622float2(u2b(raw));
         } else {
@@ -484,7 +530,9 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
                       at::Tensor const& sorted, at::Tensor const& eids, at::Tensor const& ntpp,
                       at::Tensor const& topk_w, int64_t topk, int64_t n_slots, int cap,
                       bool fuse, double limit, int64_t sum_order, at::Tensor& ctr,
-                      at::Tensor& sync, at::Tensor& out, at::Tensor& aux) {
+                      at::Tensor& sync, at::Tensor& out, at::Tensor& aux,
+                      const void* topk_ids_raw, bool topk_i64, const int32_t* expert_map_ptr,
+                      int64_t global_E) {
   constexpr int T = WARPS * 32;
   constexpr int SMEM = WARPS * 2 * CR * TW * 32 * (int)sizeof(int4);
   constexpr int KS = KK / 16 / R;
@@ -528,31 +576,36 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
         W13 ? out.data_ptr<float>() : nullptr,
         W13 ? nullptr : (__nv_bfloat16*)out.data_ptr(), fuse ? 1 : 0, (float)limit,
         (int)sum_order, fuse ? sync.data_ptr<int32_t>() : nullptr,
-        fuse ? (__nv_bfloat16*)aux.data_ptr() : nullptr);
+        fuse ? (__nv_bfloat16*)aux.data_ptr() : nullptr, topk_ids_raw, topk_i64,
+        expert_map_ptr, (int)global_E, (int)w.size(0));
   return KS;
 }
 
 // ---------------- deterministic MoE align (== fast_det_align / torch det path) -------------
 template <typename IdT>
 __global__ void __launch_bounds__(1024)
-    det_align_kernel(const IdT* __restrict__ ids, int S, int E, int BS,
-                     int32_t* __restrict__ sorted, int cap, int32_t* __restrict__ eids, int nb,
-                     int32_t* __restrict__ ntpp) {
+    det_align_kernel(const IdT* __restrict__ ids, const int32_t* __restrict__ emap, int S,
+                     int global_E, int local_E, int BS, int32_t* __restrict__ sorted, int cap,
+                     int32_t* __restrict__ eids, int nb, int32_t* __restrict__ ntpp) {
   __shared__ int cnt[1024];
   __shared__ int sblk[1024];
-  __shared__ int sid[512];
+  __shared__ int sid[1024];
   __shared__ int wsum[32];
   const int tid = threadIdx.x;
   cnt[tid] = 0;
   for (int i = tid; i < S; i += blockDim.x) {
-    const int64_t e = (int64_t)ids[i];
-    sid[i] = (e >= 0 && e < E) ? (int)e : -1;
+    const int64_t raw_e = (int64_t)ids[i];
+    int e = -1;
+    if (raw_e >= 0 && raw_e < global_E) {
+      e = emap != nullptr ? emap[raw_e] : (int)raw_e;
+    }
+    sid[i] = (e >= 0 && e < local_E) ? e : -1;
   }
   __syncthreads();
   for (int i = tid; i < S; i += blockDim.x)
     if (sid[i] >= 0) atomicAdd(&cnt[sid[i]], 1);
   __syncthreads();
-  const int myblk = tid < E ? (cnt[tid] + BS - 1) / BS : 0;
+  const int myblk = tid < local_E ? (cnt[tid] + BS - 1) / BS : 0;
   // exclusive block-wide scan of myblk
   const int lane = tid & 31, wid = tid >> 5;
   int inc = myblk;
@@ -586,9 +639,10 @@ __global__ void __launch_bounds__(1024)
     if (e < 0) continue;
     int rank = 0;
     for (int j = 0; j < i; j++) rank += sid[j] == e;
-    sorted[sblk[e] * BS + rank] = i;
+    const int pos = sblk[e] * BS + rank;
+    if (pos < cap) sorted[pos] = i;
   }
-  if (tid < E)
+  if (tid < local_E)
     for (int k = 0; k < myblk; k++)
       if (excl + k < nb) eids[excl + k] = tid;
   if (tid == 0) *ntpp = total;
@@ -601,12 +655,14 @@ using namespace dsv4_mxfp4_v2;
 // w13: part [KS, n_slots, N] fp32 (+ fused: aux = h [n_slots, N/2]) -> returns KS.
 // w2 : out [n_slots, N] bf16 (+ fused: aux = y [n_slots/topk, N]) -> returns 1.
 // cfg & 15: (CR, TW) variant as v1; cfg >> 4: CTA-per-SM cap.  dq: 0 / 1 / 2.
-int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
-                         at::Tensor const& sorted, at::Tensor const& eids, at::Tensor const& ntpp,
-                         at::Tensor const& topk_w, int64_t topk, int64_t n_slots, int64_t K,
-                         int64_t N, bool w13, int64_t cfg, int64_t dq, bool fuse, double limit,
-                         int64_t sum_order, at::Tensor& ctr, at::Tensor& sync, at::Tensor& out,
-                         at::Tensor& aux) {
+int64_t dsv4_mxfp4_gemm2_ep(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
+                            at::Tensor const& sorted, at::Tensor const& eids,
+                            at::Tensor const& ntpp, at::Tensor const& topk_w, int64_t topk,
+                            int64_t n_slots, int64_t K, int64_t N, bool w13, int64_t cfg,
+                            int64_t dq, bool fuse, double limit, int64_t sum_order,
+                            at::Tensor& ctr, at::Tensor& sync, at::Tensor& out, at::Tensor& aux,
+                            c10::optional<at::Tensor> const& topk_ids,
+                            c10::optional<at::Tensor> const& expert_map, int64_t global_E) {
   TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.stride(1) == 1 && a.stride(0) % 2 == 0,
               "a: bf16, unit inner stride, even row stride");
   TORCH_CHECK(w.is_contiguous() && s.is_contiguous() && s.element_size() == 1,
@@ -619,6 +675,30 @@ int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor co
   TORCH_CHECK(!fuse || (sync.scalar_type() == at::kInt && sync.is_contiguous()),
               "sync: int32 counters (zeroed once)");
   TORCH_CHECK(sum_order >= 0 && sum_order <= 2, "sum_order 0..2");
+
+  const void* topk_ids_raw = nullptr;
+  bool topk_i64 = false;
+  const int32_t* expert_map_ptr = nullptr;
+  const bool has_tids = topk_ids.has_value() && topk_ids->defined();
+  const bool has_emap = expert_map.has_value() && expert_map->defined();
+  if (has_emap) {
+    TORCH_CHECK(has_tids, "gemm_ep: topk_ids required when expert_map is provided");
+    TORCH_CHECK(expert_map->is_cuda() && expert_map->is_contiguous() &&
+                    expert_map->scalar_type() == at::kInt && global_E > 0 &&
+                    expert_map->numel() >= global_E,
+                "expert_map: contiguous CUDA int32 with >= global_E elements");
+    expert_map_ptr = expert_map->data_ptr<int32_t>();
+  }
+  if (has_tids) {
+    TORCH_CHECK(topk_ids->is_cuda() && topk_ids->is_contiguous() &&
+                    (topk_ids->scalar_type() == at::kInt ||
+                     topk_ids->scalar_type() == at::kLong) &&
+                    topk_ids->numel() >= n_slots && global_E > 0,
+                "topk_ids: contiguous CUDA int32/int64 with >= n_slots elements and global_E > 0");
+    topk_ids_raw = topk_ids->data_ptr();
+    topk_i64 = topk_ids->scalar_type() == at::kLong;
+  }
+
   const at::cuda::OptionalCUDAGuard guard(a.device());
   const int cap = (int)(cfg >> 4);
 #define DSV4_CASE2(WW, KK, NN, R, CFG, CR, TW)                                                \
@@ -626,15 +706,23 @@ int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor co
     if (dq == 0)                                                                              \
       return launch<0, R, CR, TW, KK, NN, WW>(a, w, s, sorted, eids, ntpp, topk_w, topk,      \
                                               n_slots, cap, fuse, limit, sum_order, ctr,     \
-                                              sync, out, aux);                                \
+                                              sync, out, aux, topk_ids_raw, topk_i64,         \
+                                              expert_map_ptr, global_E);                      \
     if (dq == 1)                                                                              \
       return launch<1, R, CR, TW, KK, NN, WW>(a, w, s, sorted, eids, ntpp, topk_w, topk,      \
                                               n_slots, cap, fuse, limit, sum_order, ctr,     \
-                                              sync, out, aux);                                \
+                                              sync, out, aux, topk_ids_raw, topk_i64,         \
+                                              expert_map_ptr, global_E);                      \
     if (dq == 2)                                                                              \
       return launch<2, R, CR, TW, KK, NN, WW>(a, w, s, sorted, eids, ntpp, topk_w, topk,      \
                                               n_slots, cap, fuse, limit, sum_order, ctr,     \
-                                              sync, out, aux);                                \
+                                              sync, out, aux, topk_ids_raw, topk_i64,         \
+                                              expert_map_ptr, global_E);                      \
+    if (dq == 3)                                                                              \
+      return launch<3, R, CR, TW, KK, NN, WW>(a, w, s, sorted, eids, ntpp, topk_w, topk,      \
+                                              n_slots, cap, fuse, limit, sum_order, ctr,     \
+                                              sync, out, aux, topk_ids_raw, topk_i64,         \
+                                              expert_map_ptr, global_E);                      \
   }
   DSV4_CASE2(true, 5120, 4608, 80, 0, 4, 1)
   DSV4_CASE2(true, 5120, 4608, 80, 1, 4, 2)
@@ -666,24 +754,56 @@ int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor co
               " dq=", dq);
 }
 
+int64_t dsv4_mxfp4_gemm2(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
+                         at::Tensor const& sorted, at::Tensor const& eids, at::Tensor const& ntpp,
+                         at::Tensor const& topk_w, int64_t topk, int64_t n_slots, int64_t K,
+                         int64_t N, bool w13, int64_t cfg, int64_t dq, bool fuse, double limit,
+                         int64_t sum_order, at::Tensor& ctr, at::Tensor& sync, at::Tensor& out,
+                         at::Tensor& aux) {
+  return dsv4_mxfp4_gemm2_ep(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, K, N, w13,
+                             cfg, dq, fuse, limit, sum_order, ctr, sync, out, aux,
+                             c10::nullopt, c10::nullopt, 0);
+}
+
+void dsv4_det_align_ep(at::Tensor const& ids, c10::optional<at::Tensor> const& expert_map,
+                       int64_t global_E, int64_t local_E, int64_t BS, at::Tensor& sorted,
+                       at::Tensor& eids, at::Tensor& ntpp) {
+  TORCH_CHECK(ids.is_cuda() && ids.is_contiguous() &&
+                  (ids.scalar_type() == at::kInt || ids.scalar_type() == at::kLong),
+              "ids int32/int64 CUDA contiguous");
+  TORCH_CHECK(ids.numel() <= 1024 && global_E > 0 && local_E > 0 && local_E <= 1024 && BS > 0,
+              "align_ep: S <= 1024, global_E > 0, 0 < local_E <= 1024, BS > 0");
+  TORCH_CHECK(sorted.scalar_type() == at::kInt && eids.scalar_type() == at::kInt &&
+                  ntpp.scalar_type() == at::kInt && sorted.is_contiguous() &&
+                  eids.is_contiguous(),
+              "align outputs int32 contiguous");
+  const int32_t* emap_ptr = nullptr;
+  if (expert_map.has_value() && expert_map->defined()) {
+    TORCH_CHECK(expert_map->is_cuda() && expert_map->is_contiguous() &&
+                    expert_map->scalar_type() == at::kInt && expert_map->numel() >= global_E,
+                "align_ep: expert_map must be int32 CUDA contiguous with numel >= global_E");
+    emap_ptr = expert_map->data_ptr<int32_t>();
+  }
+  const at::cuda::OptionalCUDAGuard guard(ids.device());
+  auto st = at::cuda::getCurrentCUDAStream();
+  if (ids.scalar_type() == at::kInt)
+    det_align_kernel<int32_t><<<1, 1024, 0, st>>>(
+        ids.data_ptr<int32_t>(), emap_ptr, (int)ids.numel(), (int)global_E, (int)local_E,
+        (int)BS, sorted.data_ptr<int32_t>(), (int)sorted.numel(), eids.data_ptr<int32_t>(),
+        (int)eids.numel(), ntpp.data_ptr<int32_t>());
+  else
+    det_align_kernel<int64_t><<<1, 1024, 0, st>>>(
+        ids.data_ptr<int64_t>(), emap_ptr, (int)ids.numel(), (int)global_E, (int)local_E,
+        (int)BS, sorted.data_ptr<int32_t>(), (int)sorted.numel(), eids.data_ptr<int32_t>(),
+        (int)eids.numel(), ntpp.data_ptr<int32_t>());
+}
+
 void dsv4_det_align(at::Tensor const& ids, int64_t E, int64_t BS, at::Tensor& sorted,
                     at::Tensor& eids, at::Tensor& ntpp) {
   TORCH_CHECK(ids.is_contiguous() && (ids.scalar_type() == at::kInt ||
                                       ids.scalar_type() == at::kLong), "ids int32/int64");
   TORCH_CHECK(ids.numel() <= 512 && E > 0 && E <= 1024 && BS > 0, "align: S <= 512, E <= 1024");
-  TORCH_CHECK(sorted.scalar_type() == at::kInt && eids.scalar_type() == at::kInt &&
-                  ntpp.scalar_type() == at::kInt && sorted.is_contiguous() &&
-                  eids.is_contiguous(), "align outputs int32 contiguous");
-  const at::cuda::OptionalCUDAGuard guard(ids.device());
-  auto st = at::cuda::getCurrentCUDAStream();
-  if (ids.scalar_type() == at::kInt)
-    det_align_kernel<int32_t><<<1, 1024, 0, st>>>(
-        ids.data_ptr<int32_t>(), (int)ids.numel(), (int)E, (int)BS, sorted.data_ptr<int32_t>(),
-        (int)sorted.numel(), eids.data_ptr<int32_t>(), (int)eids.numel(), ntpp.data_ptr<int32_t>());
-  else
-    det_align_kernel<int64_t><<<1, 1024, 0, st>>>(
-        ids.data_ptr<int64_t>(), (int)ids.numel(), (int)E, (int)BS, sorted.data_ptr<int32_t>(),
-        (int)sorted.numel(), eids.data_ptr<int32_t>(), (int)eids.numel(), ntpp.data_ptr<int32_t>());
+  dsv4_det_align_ep(ids, c10::nullopt, E, E, BS, sorted, eids, ntpp);
 }
 
 int64_t dsv4_mxfp4_abi2() { return 1; }
@@ -694,14 +814,24 @@ TORCH_LIBRARY(_dsv4_moe2, m) {
       "Tensor topk_w, int topk, int n_slots, int K, int N, bool w13, int cfg, int dq, "
       "bool fuse, float limit, int sum_order, Tensor(c!) ctr, Tensor(d!) sync, "
       "Tensor(o!) out, Tensor(x!) aux) -> int");
+  m.def(
+      "gemm_ep(Tensor a, Tensor w, Tensor s, Tensor sorted, Tensor eids, Tensor ntpp, "
+      "Tensor topk_w, int topk, int n_slots, int K, int N, bool w13, int cfg, int dq, "
+      "bool fuse, float limit, int sum_order, Tensor(c!) ctr, Tensor(d!) sync, "
+      "Tensor(o!) out, Tensor(x!) aux, Tensor? topk_ids, Tensor? expert_map, "
+      "int global_E) -> int");
   m.def("align(Tensor ids, int E, int BS, Tensor(a!) sorted, Tensor(b!) eids, "
         "Tensor(c!) ntpp) -> ()");
+  m.def("align_ep(Tensor ids, Tensor? expert_map, int global_E, int local_E, int BS, "
+        "Tensor(a!) sorted, Tensor(b!) eids, Tensor(c!) ntpp) -> ()");
   m.def("abi() -> int");
 }
 
 TORCH_LIBRARY_IMPL(_dsv4_moe2, CUDA, m) {
   m.impl("gemm", &dsv4_mxfp4_gemm2);
+  m.impl("gemm_ep", &dsv4_mxfp4_gemm2_ep);
   m.impl("align", &dsv4_det_align);
+  m.impl("align_ep", &dsv4_det_align_ep);
 }
 TORCH_LIBRARY_IMPL(_dsv4_moe2, CompositeExplicitAutograd, m) {
   m.impl("abi", &dsv4_mxfp4_abi2);

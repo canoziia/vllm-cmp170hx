@@ -462,6 +462,7 @@ static void launch(const Params& p, int ctas, cudaStream_t stream) {
     int64_t c = (t + W - 1) / W;
     ctas = (int)std::max<int64_t>(1, std::min<int64_t>(c, (int64_t)occ * sms));
   }
+  TORCH_CHECK(p.K % (32 * GPU) == 0, "streamk: K must be a multiple of 32*GPU");
   const int64_t Uu = (int64_t)(p.N / 64) * (p.K / 32 / GPU);
   if ((int64_t)ctas * W > Uu) ctas = (int)(Uu / W);  // >= 1 unit per warp (strictly increasing ranges)
   TORCH_CHECK(ctas >= 1 && Uu * ctas * W < (1ll << 31), "U*T overflow / too small");
@@ -763,6 +764,7 @@ static void launch3(const Params& p, int ctas, cudaStream_t stream) {
   }();
   TORCH_CHECK(occ > 0, "streamk_tiled config does not fit");
   TORCH_CHECK((p.N / 64) % W == 0, "streamk_tiled: N/64 must be a multiple of W");
+  TORCH_CHECK(p.K % (32 * GPU) == 0, "streamk_tiled: K must be a multiple of 32*GPU");
   const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int64_t U = (int64_t)(p.N / 64 / W) * (p.K / 32 / GPU);
   if (ctas == 0) ctas = occ * sms;
@@ -998,6 +1000,7 @@ static void launch4(const Params& p, int S, cudaStream_t stream) {
   constexpr int SMEMP = ST * STG * 16, SMEMT = W * TB * 8 * 68 * 4;
   constexpr int SMEM = SMEMP > SMEMT ? SMEMP : SMEMT;
   TORCH_CHECK((p.N / 64) % W == 0, "splitk: N/64 must be a multiple of W");
+  TORCH_CHECK(p.K % (32 * GPU) == 0, "splitk: K must be a multiple of 32*GPU");
   const int GU = p.K / 32 / GPU;
   TORCH_CHECK(S >= 1 && S <= GU, "splitk: bad split");
   const int TG = p.N / 64 / W;
@@ -1208,6 +1211,7 @@ static void launch5(const Params& p, int S, cudaStream_t stream) {
   constexpr int SMEMP = ST * STG * 16, SMEMT = TW * 2 * 8 * 36 * 4;
   constexpr int SMEM = SMEMP > SMEMT ? SMEMP : SMEMT;
   TORCH_CHECK((p.N / 64) % TW == 0, "splitk_wide: N/64 must be a multiple of TW");
+  TORCH_CHECK(p.K % (32 * GPU) == 0, "splitk_wide: K must be a multiple of 32*GPU");
   const int GU = p.K / 32 / GPU;
   TORCH_CHECK(S >= 1 && S <= GU, "splitk_wide: bad split");
   TORCH_CHECK(p.ldo % 4 == 0 && reinterpret_cast<uintptr_t>(p.out) % 8 == 0, "splitk_wide: out alignment");
@@ -1232,6 +1236,240 @@ static void launch5(const Params& p, int S, cudaStream_t stream) {
     splitk_reduce<SPLIT><<<(unsigned)((per + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const float4*>(p.part), p.out, p.ldo, p.out2, p.ldo2, p.n0, p.M, p.N, S);
   }
+}
+
+// =========================================================================
+// WARP-K-SPLIT NO-BARRIER MXFP8 DECODE GEMM (M <= 8, TB=1)
+// Replaces streamk_gemm's per-warp sentinel + scalar-store epilogue with:
+//   - per-warp zero-barrier cp.async K-split inside CTA
+//   - CTA-level SMEM reduction + coalesced 128B BF16 store
+//   - S == 1: zero partials, zero sentinels; S > 1: parallel-row sentinel poll
+// =========================================================================
+template <int W, int T_PER_CTA, int ST, int GPU, int S, bool SPLIT = false>
+__global__ void __launch_bounds__(W * 32) ksplit_nobarrier_gemm(const Params p) {
+  static_assert(W % T_PER_CTA == 0);
+  constexpr int WPT = W / T_PER_CTA;
+  constexpr int SW = GPU * (132 + 32);
+  constexpr int OFF_S = 128 * GPU;
+  constexpr int OFF_X = 132 * GPU;
+  extern __shared__ __align__(128) uint4 smem[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int g = lane >> 2, c4 = lane & 3;
+  const int wt_idx = warp / WPT;
+  const int wk_idx = warp % WPT;
+  const int cs = blockIdx.x;
+  const int tile = blockIdx.y * T_PER_CTA + wt_idx;
+
+  const int N = p.N, M = p.M;
+  const int GU = (p.K >> 5) / GPU;
+  const int tot_k = S * WPT;
+  const int my_k = cs * WPT + wk_idx;
+  const int u0 = (my_k * GU) / tot_k;
+  const int u1 = ((my_k + 1) * GU) / tot_k;
+  int l_left = u1 - u0;
+
+  uint4* const wring = smem + warp * ST * SW;
+  const uint32_t ring = (uint32_t)__cvta_generic_to_shared(wring);
+
+  const int q0 = lane, q1 = 32 + lane;
+  const uint32_t d_w0 = (q0 ^ ((q0 >> 3) & 1)) * 16, d_w1 = (q1 ^ ((q1 >> 3) & 1)) * 16;
+  const uint32_t d_s = (OFF_S + lane) * 16;
+  const uint32_t d_x = (OFF_X + g * 4 + (c4 ^ ((g >> 1) & 3))) * 16;
+  const int sw = (lane >> 2) & 1;
+  const int r_w0 = (2 * lane) ^ sw, r_w1 = (2 * lane + 1) ^ sw;
+  const uint32_t r_x = (OFF_X + (lane & 7) * 4 + ((lane >> 3) ^ (((lane & 7) >> 1) & 3))) * 16;
+
+  const int64_t rowN = N;
+  const uint4* l_pw = p.w + (int64_t)u0 * (2 * GPU) * rowN + tile * 64 + lane;
+  const uint8_t* l_ps = p.s + (int64_t)u0 * GPU * N + tile * 64 + lane * 16;
+  const int xb_n = g < M ? 16 : 0;
+  const __nv_bfloat16* l_px = p.x + (int64_t)(g < M ? g : 0) * p.lda + u0 * GPU * 32 + c4 * 8;
+
+  auto issue = [&](const int slot) {
+    if (l_left > 0) {
+      const uint32_t dst = ring + slot * SW * 16;
+#pragma unroll
+      for (int r = 0; r < 2 * GPU; r++) {
+        cp16(dst + r * 1024 + d_w0, l_pw + r * rowN);
+        cp16(dst + r * 1024 + d_w1, l_pw + r * rowN + 32);
+      }
+      if (lane < 4) {
+#pragma unroll
+        for (int gi = 0; gi < GPU; gi++) cp16(dst + d_s + gi * 64, l_ps + gi * N);
+      }
+#pragma unroll
+      for (int gi = 0; gi < GPU; gi++) cp16z(dst + d_x + gi * 512, l_px + gi * 32, xb_n);
+      l_left--;
+      l_pw += 2 * GPU * rowN;
+      l_ps += GPU * N;
+      l_px += GPU * 32;
+    }
+    cp_commit();
+  };
+#pragma unroll
+  for (int s = 0; s < ST - 1; s++) issue(s);
+
+  float acc[4][4];
+#pragma unroll
+  for (int j = 0; j < 4; j++)
+#pragma unroll
+    for (int v = 0; v < 4; v++) acc[j][v] = 0.f;
+
+  int n = u1 - u0;
+  while (n > 0) {
+#pragma unroll
+    for (int s = 0; s < ST; s++) {
+      if (n > 0) {
+        cp_wait<ST - 2>();
+        __syncwarp();
+        issue((s + ST - 1) % ST);
+        const uint4* stp = wring + s * SW;
+        const uint32_t st = ring + s * SW * 16;
+#pragma unroll
+        for (int gi = 0; gi < GPU; gi++) {
+          const uint2 sv = reinterpret_cast<const uint2*>(stp + OFF_S + gi * 4)[g];
+          uint32_t sd[8];
+          const uint32_t e[2] = {sv.x, sv.y};
+          constexpr uint32_t sel[4] = {0x4040u, 0x4242u, 0x4141u, 0x4343u};
+#pragma unroll
+          for (int j = 0; j < 8; j++)
+            sd[j] = __byte_perm(e[j >> 2], 0, sel[j & 3]) * 128u + 0x3c003c00u;
+          uint32_t xb[4];
+          ldsm4(st + r_x + gi * 512, xb);
+          uint4 wv[2][2];
+#pragma unroll
+          for (int i = 0; i < 2; i++) {
+            wv[i][0] = stp[(gi * 2 + i) * 64 + r_w0];
+            wv[i][1] = stp[(gi * 2 + i) * 64 + r_w1];
+          }
+#pragma unroll
+          for (int i = 0; i < 2; i++) {
+            const uint32_t wd[8] = {wv[i][0].x, wv[i][0].y, wv[i][0].z, wv[i][0].w,
+                                    wv[i][1].x, wv[i][1].y, wv[i][1].z, wv[i][1].w};
+#pragma unroll
+            for (int jj = 0; jj < 4; jj++) {
+              const uint32_t qa = wd[2 * jj], qb = wd[2 * jj + 1];
+              const uint32_t a0 = hmul2u(fp8_lo(qa), sd[2 * jj]);
+              const uint32_t a2 = hmul2u(fp8_hi<0>(qa), sd[2 * jj]);
+              const uint32_t a1 = hmul2u(fp8_lo(qb), sd[2 * jj + 1]);
+              const uint32_t a3 = hmul2u(fp8_hi<0>(qb), sd[2 * jj + 1]);
+              mma_bf16(acc[jj], a0, a1, a2, a3, xb[2 * i], xb[2 * i + 1]);
+            }
+          }
+        }
+        n--;
+      }
+    }
+  }
+  cp_wait<0>();
+  __syncthreads();
+
+  float* tw = reinterpret_cast<float*>(smem) + warp * 8 * 68;
+#pragma unroll
+  for (int jj = 0; jj < 4; jj++)
+#pragma unroll
+    for (int v = 0; v < 4; v++) {
+      const int col = 16 * jj + 8 * (v >> 1) + g, tok = 2 * c4 + (v & 1);
+      tw[tok * 68 + col] = acc[jj][v];
+    }
+  __syncthreads();
+
+  float* tile_base = reinterpret_cast<float*>(smem) + (wt_idx * WPT) * 8 * 68;
+  __nv_bfloat16* out_t = p.out + tile * 64;
+  int64_t ldo_t = p.ldo;
+  if constexpr (SPLIT) {
+    if (tile * 64 >= p.n0) {
+      out_t = p.out2 + (tile * 64 - p.n0);
+      ldo_t = p.ldo2;
+    }
+  }
+
+  if constexpr (S == 1) {
+    for (int row = wk_idx; row < M; row += WPT) {
+      float2 sum = *reinterpret_cast<const float2*>(tile_base + row * 68 + 2 * lane);
+#pragma unroll
+      for (int w = 1; w < WPT; w++) {
+        const float2 v = *reinterpret_cast<const float2*>(tile_base + (w * 8 + row) * 68 + 2 * lane);
+        sum.x += v.x;
+        sum.y += v.y;
+      }
+      *reinterpret_cast<__nv_bfloat162*>(out_t + (int64_t)row * ldo_t + 2 * lane) =
+          __floats2bfloat162_rn(sum.x, sum.y);
+    }
+  } else {
+    if (cs > 0) {
+      float* p_dst = p.part + (int64_t)(tile * (S - 1) + (cs - 1)) * (8 * 64);
+      for (int row = wk_idx; row < M; row += WPT) {
+        float2 sum = *reinterpret_cast<const float2*>(tile_base + row * 68 + 2 * lane);
+#pragma unroll
+        for (int w = 1; w < WPT; w++) {
+          const float2 v = *reinterpret_cast<const float2*>(tile_base + (w * 8 + row) * 68 + 2 * lane);
+          sum.x += v.x;
+          sum.y += v.y;
+        }
+        uint2* dst2 = reinterpret_cast<uint2*>(p_dst + row * 64) + lane;
+        const uint32_t sx = __float_as_uint(sum.x), sy = __float_as_uint(sum.y);
+        asm volatile("st.relaxed.gpu.global.v2.u32 [%0], {%1,%2};\n"
+                     ::"l"(dst2), "r"(sx), "r"(sy) : "memory");
+      }
+    } else {
+      for (int row = wk_idx; row < M; row += WPT) {
+        float2 sum = *reinterpret_cast<const float2*>(tile_base + row * 68 + 2 * lane);
+#pragma unroll
+        for (int w = 1; w < WPT; w++) {
+          const float2 v = *reinterpret_cast<const float2*>(tile_base + (w * 8 + row) * 68 + 2 * lane);
+          sum.x += v.x;
+          sum.y += v.y;
+        }
+        uint2 u[S - 1];
+        bool pending;
+        do {
+          pending = false;
+#pragma unroll
+          for (int k = 0; k < S - 1; k++) {
+            const uint2* src = reinterpret_cast<const uint2*>(
+                p.part + (int64_t)(tile * (S - 1) + k) * (8 * 64) + row * 64) + lane;
+            asm volatile("ld.relaxed.gpu.global.v2.u32 {%0,%1}, [%2];\n"
+                         : "=r"(u[k].x), "=r"(u[k].y) : "l"(src) : "memory");
+            pending |= (u[k].x == 0xFFFFFFFFu) | (u[k].y == 0xFFFFFFFFu);
+          }
+        } while (pending);
+#pragma unroll
+        for (int k = 0; k < S - 1; k++) {
+          sum.x += __uint_as_float(u[k].x);
+          sum.y += __uint_as_float(u[k].y);
+          uint2* dst = reinterpret_cast<uint2*>(
+              p.part + (int64_t)(tile * (S - 1) + k) * (8 * 64) + row * 64) + lane;
+          constexpr uint32_t SENT = 0xFFFFFFFFu;
+          asm volatile("st.relaxed.gpu.global.v2.u32 [%0], {%1,%2};\n"
+                       ::"l"(dst), "r"(SENT), "r"(SENT) : "memory");
+        }
+        *reinterpret_cast<__nv_bfloat162*>(out_t + (int64_t)row * ldo_t + 2 * lane) =
+            __floats2bfloat162_rn(sum.x, sum.y);
+      }
+    }
+  }
+}
+
+template <int W, int TP, int ST, int GPU, int S, bool SPLIT = false>
+static void launch_ksplit_nobarrier(const Params& p, cudaStream_t stream) {
+  constexpr int SW = GPU * (132 + 32);
+  constexpr int SM1 = W * ST * SW * 16;
+  constexpr int SM2 = W * 8 * 68 * 4;
+  constexpr int SMEM = SM1 > SM2 ? SM1 : SM2;
+  TORCH_CHECK(p.M >= 1 && p.M <= 8, "ksplit_nobarrier: M must be 1..8");
+  TORCH_CHECK(p.N % (64 * TP) == 0 && p.K % (32 * GPU) == 0, "ksplit_nobarrier: shape alignment");
+  if constexpr (S > 1) {
+    TORCH_CHECK(p.part_n >= (int64_t)(p.N / 64) * (S - 1) * 8 * 64, "ksplit_nobarrier: part too small");
+  }
+  auto kern = ksplit_nobarrier_gemm<W, TP, ST, GPU, S, SPLIT>;
+  static bool init = [&] {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    return true;
+  }();
+  (void)init;
+  dim3 grid(S, (p.N / 64) / TP);
+  kern<<<grid, W * 32, SMEM, stream>>>(p);
 }
 
 }  // namespace dense_mxfp8
@@ -1276,6 +1514,7 @@ void streamk_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s
     // M <= 8
     case 0: L(1, 4, 4, 1);
     case 1: L(1, 4, 4, 2);
+    case 2: L(1, 4, 3, 1);
     case 3: L(1, 4, 3, 2);
     case 5: L(1, 4, 6, 1);
     case 7: L(1, 6, 4, 2);
@@ -1360,18 +1599,37 @@ void splitk_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
     case 20: L4(2, 4, 4, 1);
     case 21: L4(2, 4, 3, 2);
     case 22: L4(2, 8, 3, 1);
+    case 23: L4(2, 2, 4, 1);
+    case 24: L4(2, 2, 3, 2);
+    case 25: L4(2, 3, 4, 1);
+    case 26: L4(2, 3, 3, 2);
     case 30: L4(3, 4, 4, 1);
     case 31: L4(3, 4, 3, 2);
     case 32: L4(3, 8, 3, 1);
+    case 33: L4(3, 2, 4, 1);
+    case 34: L4(3, 2, 3, 2);
+    case 35: L4(3, 3, 4, 1);
+    case 36: L4(3, 3, 3, 2);
     case 40: L4(4, 4, 4, 1);
     case 41: L4(4, 4, 3, 2);
     case 42: L4(4, 8, 3, 1);
+    case 43: L4(4, 2, 4, 1);
+    case 45: L4(4, 3, 4, 1);
+    case 46: L4(4, 3, 3, 2);
     case 60: L4(6, 4, 4, 1);
     case 61: L4(6, 4, 3, 2);
     case 62: L4(6, 8, 3, 1);
+    case 63: L4(6, 2, 4, 1);
+    case 64: L4(6, 2, 3, 2);
+    case 65: L4(6, 3, 4, 1);
+    case 66: L4(6, 3, 3, 2);
     case 80: L4(8, 4, 4, 1);
     case 81: L4(8, 4, 3, 2);
     case 82: L4(8, 8, 3, 1);
+    case 83: L4(8, 2, 4, 1);
+    case 84: L4(8, 2, 3, 2);
+    case 85: L4(8, 3, 4, 1);
+    case 86: L4(8, 3, 3, 2);
   }
 #undef L4
   TORCH_CHECK(false, "bad splitk cfg");
@@ -1406,16 +1664,18 @@ void splitk_wide_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor cons
     case 80: L5(8, 4, 3, 1);
     case 81: L5(8, 4, 4, 1);
     case 82: L5(8, 2, 4, 1);
+    case 83: L5(8, 1, 4, 1);
+    case 84: L5(8, 2, 3, 1);
     case 120: L5(12, 4, 3, 1);
     case 121: L5(12, 4, 4, 1);
     case 122: L5(12, 2, 4, 1);
-    case 160: L5(16, 4, 3, 1);
-    case 161: L5(16, 4, 4, 1);
-    case 162: L5(16, 2, 4, 1);
-    case 83: L5(8, 1, 4, 1);
     case 123: L5(12, 1, 4, 1);
     case 124: L5(12, 2, 3, 1);
     case 125: L5(12, 1, 6, 1);
+    case 160: L5(16, 4, 3, 1);
+    case 161: L5(16, 4, 4, 1);
+    case 162: L5(16, 2, 4, 1);
+    case 164: L5(16, 2, 3, 1);
   }
 #undef L5
   TORCH_CHECK(false, "bad splitk_wide cfg");
@@ -1458,6 +1718,7 @@ void streamk_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor co
     return;                                                          \
   } while (0)
   switch (v) {
+    case 2: LS(1, 4, 3, 1);
     case 3: LS(1, 4, 3, 2);
     case 8: LS(1, 8, 3, 2);
   }
@@ -1496,14 +1757,19 @@ void splitk_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor con
   switch ((int)cfg) {
     case 20: L4S(2, 4, 4, 1);
     case 21: L4S(2, 4, 3, 2);
+    case 22: L4S(2, 8, 3, 1);
     case 30: L4S(3, 4, 4, 1);
     case 31: L4S(3, 4, 3, 2);
+    case 32: L4S(3, 8, 3, 1);
     case 40: L4S(4, 4, 4, 1);
     case 41: L4S(4, 4, 3, 2);
+    case 42: L4S(4, 8, 3, 1);
     case 60: L4S(6, 4, 4, 1);
     case 61: L4S(6, 4, 3, 2);
+    case 62: L4S(6, 8, 3, 1);
     case 80: L4S(8, 4, 4, 1);
     case 81: L4S(8, 4, 3, 2);
+    case 82: L4S(8, 8, 3, 1);
   }
 #undef L4S
   TORCH_CHECK(false, "bad splitk_split cfg");
@@ -1538,9 +1804,12 @@ void splitk_wide_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tenso
   } while (0)
   switch ((int)cfg) {
     case 82: L5S(8, 2, 4, 1);
+    case 84: L5S(8, 2, 3, 1);
     case 122: L5S(12, 2, 4, 1);
+    case 123: L5S(12, 1, 4, 1);
     case 124: L5S(12, 2, 3, 1);
     case 162: L5S(16, 2, 4, 1);
+    case 164: L5S(16, 2, 3, 1);
   }
 #undef L5S
   TORCH_CHECK(false, "bad splitk_wide_split cfg");
@@ -2186,6 +2455,66 @@ void router_fused_gate_topk(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void ksplit_nobarrier_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
+                            at::Tensor& out, at::Tensor& part, int64_t cfg) {
+  using namespace dense_mxfp8;
+  const int M = (int)x.size(0), K = (int)x.size(1), N = (int)out.size(1);
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "x: bf16 [M,K], row stride % 8, 16B aligned");
+  TORCH_CHECK(w.is_contiguous() && w.numel() * 4 == (int64_t)K * N, "w: Marlin 8-bit [K/16, 4N]");
+  TORCH_CHECK(s.is_contiguous() && s.element_size() == 1 && s.numel() == (int64_t)K / 32 * N, "s");
+  TORCH_CHECK(out.scalar_type() == at::kBFloat16 && out.stride(1) == 1 && out.size(0) == M &&
+                  out.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 8 == 0,
+              "out");
+  TORCH_CHECK(part.scalar_type() == at::kFloat, "part");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  Params p{(const __nv_bfloat16*)x.data_ptr(), x.stride(0), M, (const uint4*)w.data_ptr(),
+           (const uint8_t*)s.data_ptr(), K, N, (__nv_bfloat16*)out.data_ptr(), out.stride(0),
+           part.data_ptr<float>(), nullptr, nullptr, 0, part.numel()};
+  auto st = at::cuda::getCurrentCUDAStream();
+  switch ((int)cfg) {
+    case 0: launch_ksplit_nobarrier<8, 1, 3, 1, 2, false>(p, st); return;  // qkv_a, context_wkv
+    case 1: launch_ksplit_nobarrier<4, 1, 4, 1, 1, false>(p, st); return;  // wo_b (0-part)
+    case 2: launch_ksplit_nobarrier<4, 2, 3, 2, 1, false>(p, st); return;  // wq_b+idx, wq_b (0-part)
+    case 3: launch_ksplit_nobarrier<4, 1, 4, 1, 6, false>(p, st); return;  // shared_w13
+    case 4: launch_ksplit_nobarrier<4, 1, 3, 1, 1, false>(p, st); return;  // shared_w2 (0-part)
+    case 5: launch_ksplit_nobarrier<8, 1, 3, 1, 1, false>(p, st); return;  // main_proj (0-part)
+    case 6: launch_ksplit_nobarrier<4, 1, 3, 1, 4, false>(p, st); return;  // fallback S=4
+  }
+  TORCH_CHECK(false, "bad ksplit_nobarrier cfg");
+}
+
+void ksplit_nobarrier_split_dense(at::Tensor const& x, at::Tensor const& w, at::Tensor const& s,
+                                  at::Tensor& out0, at::Tensor& out1, at::Tensor& part, int64_t cfg) {
+  using namespace dense_mxfp8;
+  const int M = (int)x.size(0), K = (int)x.size(1);
+  const int N0 = (int)out0.size(1), N1 = (int)out1.size(1), N = N0 + N1;
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.stride(1) == 1 && x.stride(0) % 8 == 0 &&
+                  reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+              "x");
+  TORCH_CHECK(w.is_contiguous() && w.numel() * 4 == (int64_t)K * N, "w");
+  TORCH_CHECK(s.is_contiguous() && s.element_size() == 1 && s.numel() == (int64_t)K / 32 * N, "s");
+  TORCH_CHECK(N0 % 64 == 0 && N1 % 64 == 0, "N0/N1 % 64");
+  TORCH_CHECK(out0.scalar_type() == at::kBFloat16 && out0.stride(1) == 1 && out0.size(0) == M &&
+                  out0.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(out0.data_ptr()) % 8 == 0,
+              "out0");
+  TORCH_CHECK(out1.scalar_type() == at::kBFloat16 && out1.stride(1) == 1 && out1.size(0) == M &&
+                  out1.stride(0) % 4 == 0 && reinterpret_cast<uintptr_t>(out1.data_ptr()) % 8 == 0,
+              "out1");
+  TORCH_CHECK(part.scalar_type() == at::kFloat, "part");
+  const at::cuda::OptionalCUDAGuard guard(x.device());
+  Params p{(const __nv_bfloat16*)x.data_ptr(), x.stride(0), M, (const uint4*)w.data_ptr(),
+           (const uint8_t*)s.data_ptr(), K, N, (__nv_bfloat16*)out0.data_ptr(), out0.stride(0),
+           part.data_ptr<float>(), nullptr, nullptr, 0, part.numel(),
+           (__nv_bfloat16*)out1.data_ptr(), out1.stride(0), N0};
+  auto st = at::cuda::getCurrentCUDAStream();
+  switch ((int)cfg) {
+    case 2: launch_ksplit_nobarrier<4, 2, 3, 2, 1, true>(p, st); return;
+  }
+  TORCH_CHECK(false, "bad ksplit_nobarrier_split cfg");
+}
+
 TORCH_LIBRARY_FRAGMENT(_dsv41_dense_mxfp8, m) {
   m.def("set_dbg(Tensor d) -> ()");
   m.def("splitk_wide(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg, int S) -> ()");
@@ -2196,6 +2525,8 @@ TORCH_LIBRARY_FRAGMENT(_dsv41_dense_mxfp8, m) {
   m.def("streamk_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, Tensor(c!) cnt, int cfg, int ctas) -> ()");
   m.def("splitk_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, int cfg, int S) -> ()");
   m.def("splitk_wide_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, int cfg, int S) -> ()");
+  m.def("ksplit_nobarrier(Tensor x, Tensor w, Tensor s, Tensor(o!) out, Tensor(p!) part, int cfg) -> ()");
+  m.def("ksplit_nobarrier_split(Tensor x, Tensor w, Tensor s, Tensor(o0!) out0, Tensor(o1!) out1, Tensor(p!) part, int cfg) -> ()");
   m.def("gate_gemv(Tensor x, Tensor w, Tensor(o!) out) -> ()");
   m.def("dsv4_topk(Tensor logits, Tensor corr_bias, Tensor(w!) topk_weights, Tensor(i!) topk_ids, float routed_scaling_factor, Tensor? input_ids, Tensor? bias_vl, int image_sentinel_lo) -> ()");
   m.def("fused_gate_topk(Tensor x, Tensor w, Tensor corr_bias, Tensor(l!) logits_scratch, Tensor(c!) done_cnt, Tensor(tw!) topk_weights, Tensor(ti!) topk_ids, float routed_scaling_factor) -> ()");
@@ -2208,6 +2539,8 @@ TORCH_LIBRARY_IMPL(_dsv41_dense_mxfp8, CUDA, m) {
   m.impl("streamk_split", &streamk_split_dense);
   m.impl("splitk_split", &splitk_split_dense);
   m.impl("splitk_wide_split", &splitk_wide_split_dense);
+  m.impl("ksplit_nobarrier", &ksplit_nobarrier_dense);
+  m.impl("ksplit_nobarrier_split", &ksplit_nobarrier_split_dense);
   m.impl("gate_gemv", &router_gate_gemv);
   m.impl("dsv4_topk", &router_dsv4_topk);
   m.impl("fused_gate_topk", &router_fused_gate_topk);

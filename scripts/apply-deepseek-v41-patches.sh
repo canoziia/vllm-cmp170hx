@@ -4,9 +4,10 @@ set -euo pipefail
 [[ $# -eq 1 ]] || { echo "Usage: $0 SOURCE_TREE" >&2; exit 2; }
 SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# shellcheck disable=SC1091
 MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
+# shellcheck disable=SC1091
 source "$MODEL_DIR/manifests/source.env"
+PYTHON=${PYTHON:-python3}
 
 (cd "$REPO_ROOT" && sha256sum -c models/deepseek-v4.1-flash/manifests/patches.sha256)
 
@@ -36,125 +37,68 @@ apply_series() {
   done <"$series"
 }
 
-ENABLE_PERF_DEBUG=${ENABLE_PERF_DEBUG:-0}
-[[ $ENABLE_PERF_DEBUG == 0 || $ENABLE_PERF_DEBUG == 1 ]] || exit 2
-# Adaptive verification is compiled in by default. It stays inert unless the
-# runtime spec config sets enable_adaptive_verification, so a production image
-# carries the code without changing behaviour. Set
-# ENABLE_ADAPTIVE_VERIFICATION=0 to reproduce an image built without it.
+# Adaptive verification + topology-aware fusions are compiled in by
+# default and remain inert unless enabled via runtime config / VLLM_DSV41_OPT_PROFILE.
 ENABLE_ADAPTIVE_VERIFICATION=${ENABLE_ADAPTIVE_VERIFICATION:-1}
 [[ $ENABLE_ADAPTIVE_VERIFICATION == 0 || $ENABLE_ADAPTIVE_VERIFICATION == 1 ]] || exit 2
-if [[ ${ENABLE_HOT_DSPARK_TOGGLE:-0} != 0 ]]; then
-  echo "Use ENABLE_PERF_DEBUG=1 for the combined debug package" >&2
-  exit 2
-fi
+
 apply_series "$MODEL_DIR/patches/series"
-"$REPO_ROOT/scripts/apply-vllm-common-patches.sh" "$SOURCE_TREE"
-# Order matters: the tracing package is maintained against the adaptive-modified
-# PPHandler and draft-propose code, so the adaptive series has to go first.
-if [[ $ENABLE_ADAPTIVE_VERIFICATION == 0 && $ENABLE_PERF_DEBUG == 1 ]]; then
-  echo "ENABLE_PERF_DEBUG requires the adaptive series: optional/0002-hot-perf-debug.patch is" >&2
-  echo "maintained against the adaptive-modified PPHandler/draft-propose code. Use" >&2
-  echo "ENABLE_ADAPTIVE_VERIFICATION=1 (the default), or build the tracing image from the" >&2
-  echo "commit that predates this rebase to reproduce the older combination." >&2
-  exit 2
-fi
 if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
   apply_series "$MODEL_DIR/patches/adaptive/series"
 fi
-if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  apply_series "$MODEL_DIR/patches/optional/series.perf-debug"
-fi
 
-# The pinned author revision provides native PP6+DSpark; the local patch adds
-# the early, idempotent PP communicator primer.
-grep -q 'supports_aux_hidden_states_over_pp.*True' \
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
-grep -q 'spec_decode_needs_target_embed(vllm_config)' \
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
-grep -q '_pp_communicators_primed' \
-  "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
-grep -q 'handler.broadcast_group' \
-  "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
-python3 "$MODEL_DIR/tests/test_triton_logits_workspace.py" "$SOURCE_TREE"
-python3 "$MODEL_DIR/tests/test_dsv41_encoding_1017.py" "$SOURCE_TREE"
-python3 "$MODEL_DIR/tests/test_deepseek_thinking.py" "$SOURCE_TREE"
-python3 "$MODEL_DIR/tests/test_dsv41_round2_opts.py" "$SOURCE_TREE"
+# Verify all 45 shared vLLM invariants (async-PP, Mamba, structured-output spec, NVFP4 amax).
+"$PYTHON" "$REPO_ROOT/scripts/test-vllm-common-patches.py" "$SOURCE_TREE"
+
+# Verify DeepSeek-V4.1 upstream 0e3c8db structural & offline test suites.
+grep -q '_pp_communicators_primed' "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
+"$PYTHON" "$MODEL_DIR/tests/test_triton_logits_workspace.py" "$SOURCE_TREE"
+"$PYTHON" "$MODEL_DIR/tests/test_dsv41_encoding_1017.py" "$SOURCE_TREE"
+"$PYTHON" "$MODEL_DIR/tests/test_deepseek_thinking.py" "$SOURCE_TREE"
+"$PYTHON" "$MODEL_DIR/tests/test_dsv41_round2_opts.py" "$SOURCE_TREE"
 
 compile_files=(
   "$SOURCE_TREE/vllm/dsv41_memory.py"
   "$SOURCE_TREE/vllm/dsv41_opt_profile.py"
   "$SOURCE_TREE/vllm/v1/core/sched/dsv41_prefill_sched.py"
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/common/engram.py"
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/attention.py"
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/shadow_source.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/common/engram.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/attention.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/model.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/vl_model.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/indexer.py"
+  "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/mqa_logits.py"
   "$SOURCE_TREE/vllm/model_executor/kernels/linear/mxfp8/dsv41_dense_mxfp8.py"
-  "$SOURCE_TREE/vllm/v1/attention/ops/dsv41_indexer_prefill.py"
-  "$SOURCE_TREE/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py"
-  "$SOURCE_TREE/vllm/model_executor/layers/sparse_attn_indexer.py"
-  "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
-  "$SOURCE_TREE/vllm/v1/attention/ops/mqa_logits_triton.py"
+  "$SOURCE_TREE/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py"
+  "$SOURCE_TREE/vllm/model_executor/layers/fused_moe/moe_prefill.py"
+  "$SOURCE_TREE/vllm/v1/attention/ops/dsv41_thin_woa.py"
+  "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/markov_argmax.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/utils.py"
   "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
 )
-if [[ ${ENABLE_ADAPTIVE_VERIFICATION:-1} == 1 ]]; then
-  grep -q 'def record_confidence_rows' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
-  # Inert unless enabled: the runtime default must stay false, and every PP hook
-  # the series adds must sit behind an adaptive check, otherwise shipping it by
-  # default would silently change ordinary production runs.
+
+if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
   grep -q 'enable_adaptive_verification: bool = False' \
     "$SOURCE_TREE/vllm/config/speculative.py"
-  python3 "$MODEL_DIR/tests/test_adaptive_switch_routing.py" "$SOURCE_TREE"
-  python3 "$MODEL_DIR/tests/test_verification_profile.py" "$SOURCE_TREE"
-  # the budget published by the last rank can never exceed the drafts that exist
-  grep -q 'pp_verification_budget = min(pp_verification_budget, scheduled_drafts)' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
-  grep -q 'if self.use_pp and self.adaptive_verification is not None:' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
-  grep -q 'if budget is not None or lengths is not None:' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
-  grep -q 'and not cls.supports_device_cpu_query_lens_mismatch()' \
-    "$SOURCE_TREE/vllm/v1/attention/backend.py"
-  grep -q 'use_adaptive_verification' \
-    "$SOURCE_TREE/vllm/v1/attention/backend.py"
-  grep -q 'supports_aux_hidden_states_over_pp' \
-    "$SOURCE_TREE/vllm/models/deepseek_v4_1/nvidia/model.py"
+  "$PYTHON" "$MODEL_DIR/tests/test_adaptive_switch_routing.py" "$SOURCE_TREE"
+  "$PYTHON" "$MODEL_DIR/tests/test_verification_profile.py" "$SOURCE_TREE"
+  "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$SOURCE_TREE"
+  VLLM_DSV41_COST_MS_FUSED=1 "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$SOURCE_TREE"
+  "$PYTHON" "$MODEL_DIR/tests/test_cohort_packing.py" "$SOURCE_TREE"
+  "$PYTHON" "$MODEL_DIR/tests/test_verification_dispatch.py" "$SOURCE_TREE"
   compile_files+=(
+    "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/model_state.py"
+    "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py"
+    "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/columns.py"
+    "$SOURCE_TREE/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/markov_symm.py"
     "$SOURCE_TREE/vllm/v1/core/sched/dsv41_fixed_policy.py"
     "$SOURCE_TREE/vllm/v1/core/sched/dsv41_measured_policy.py"
     "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/cudagraph_utils.py"
+    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
     "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
   )
 fi
 
-if [[ ${ENABLE_PERF_DEBUG:-0} == 1 ]]; then
-  grep -q 'signal.SIGUSR2' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
-  grep -q 'if not self.enabled and not self._reload_requested' \
-    "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
-  compile_files+=(
-    "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py"
-    "$SOURCE_TREE/vllm/v1/core/sched/dsv41_hot_policy_debug.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/pp_utils.py"
-  )
-else
-  [[ ! -e "$SOURCE_TREE/vllm/v1/worker/gpu/perf_debug.py" ]]
-  ! grep -q 'perf_debug' "$SOURCE_TREE/vllm/v1/worker/gpu_worker.py"
-  [[ ! -e "$SOURCE_TREE/vllm/v1/core/sched/dsv41_hot_policy_debug.py" ]]
-  ! grep -q 'dsv41_hot_policy' "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
-fi
-
-if [[ $ENABLE_PERF_DEBUG == 1 ]]; then
-  compile_files+=(
-    "$SOURCE_TREE/vllm/v1/core/sched/scheduler.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/model_runner.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/cudagraph_utils.py"
-    "$SOURCE_TREE/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
-  )
-fi
 git -C "$SOURCE_TREE" diff --check
-python3 -m py_compile "${compile_files[@]}"
-echo "Pinned DeepSeek V4.1 source validation completed successfully."
+"$PYTHON" -m py_compile "${compile_files[@]}"
+echo "Pinned DeepSeek V4.1 upstream ($SOURCE_COMMIT) validation completed successfully."

@@ -1,50 +1,358 @@
-From 41695a6aa325c6149274c3fabdd1d3f98643d88a Mon Sep 17 00:00:00 2001
-From: canoziia <canoziia@users.noreply.github.com>
-Date: Sun, 15 Nov 2026 10:03:56 +0000
-Subject: [PATCH] dsv41: Engram async stream overlap, NUMA binding, packed host
- rows, and CPU gather
+From: Canoziia <canoziia@projectk.org>
+Subject: [PATCH] dsv41: post-KV expandable segments, pinned host Engram + OpenMP gather, and Vision CPU offload
 
----
- vllm/models/deepseek_v4_1/common/engram.py    | 955 +++++++++++++++++-
- .../common/engram_cpu_gather.cpp              | 334 ++++++
- vllm/models/deepseek_v4_1/nvidia/model.py     |  23 +
- 3 files changed, 1279 insertions(+), 33 deletions(-)
- create mode 100644 vllm/models/deepseek_v4_1/common/engram_cpu_gather.cpp
-
-diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
-index abc503f..89833b5 100644
---- a/vllm/models/deepseek_v4_1/common/engram.py
-+++ b/vllm/models/deepseek_v4_1/common/engram.py
-@@ -34,7 +34,17 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
-   cache for the rest.
+diff --git a/vllm/dsv41_memory.py b/vllm/dsv41_memory.py
+new file mode 100644
+index 0000000..54dd21e
+--- /dev/null
++++ b/vllm/dsv41_memory.py
+@@ -0,0 +1,156 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DeepSeek V4.1 Flash (SM80): opt-in allocator controls and probes.
++
++Every switch here is off by default and changes only *where* tensors live,
++never what any kernel computes, so outputs stay bitwise identical.
++
++``VLLM_DSV41_EXPANDABLE_AFTER_KV=1``
++    The deployment keeps ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False``
++    because the KV cache is exported to the LMCache server with
++    ``UntypedStorage._share_cuda_()`` (legacy CUDA IPC), which needs ordinary
++    ``cudaMalloc`` segments, and vLLM rejects ``expandable_segments:True`` in
++    the environment whenever a KV connector is configured.  This switch keeps
++    the KV cache (and everything allocated before it: weights, workspaces,
++    PP communicators) in ordinary segments and turns expandable segments on
++    only *after* the KV cache has been allocated and registered with the
++    connector.  Prefill/decode transients and CUDA-graph pools allocated
++    afterwards then come from one growing VMM segment per stream, which
++    removes the cross-size fragmentation that otherwise leaves gigabytes of
++    reserved-but-unused blocks.  vLLM's own ``CuMemAllocator`` toggles the same
++    setting at runtime around its pool, so runtime toggling is supported.
++
++``VLLM_DSV41_MEM_HISTORY=<dir>``
++    Start ``torch.cuda.memory._record_memory_history`` at device init and dump
++    a snapshot to ``<dir>/pp<rank>-<pid>-<n>.pickle`` on ``SIGUSR1`` and at
++    the step given by ``VLLM_DSV41_MEM_HISTORY_DUMP_STEP`` (default: never).
++    Diagnostic only (CPU overhead per allocation); never enable in
++    production.
++
++``VLLM_DSV41_MEM_STATS_EVERY=<n>``
++    Every ``n`` worker steps, log allocated / reserved / peak / inactive-split
++    bytes, segment count and allocation retries (``torch.cuda.memory_stats``,
++    no device sync).  Cheap; intended for non-production validation runs.
++"""
++
++from __future__ import annotations
++
++import os
++import signal
++import time
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_GiB = float(1 << 30)
++_state = {"steps": 0, "dumps": 0, "history": None, "rank": 0}
++
++
++def _env_flag(name: str) -> bool:
++    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def expandable_after_kv_enabled() -> bool:
++    return _env_flag("VLLM_DSV41_EXPANDABLE_AFTER_KV")
++
++
++def _env_requests_expandable() -> bool:
++    return "expandable_segments:true" in os.environ.get(
++        "PYTORCH_CUDA_ALLOC_CONF", ""
++    ).replace(" ", "").lower()
++
++
++def maybe_enable_expandable_after_kv() -> bool:
++    """Call once the KV cache is allocated and registered with the connector.
++
++    Returns True when expandable segments were switched on.
++    """
++    if not expandable_after_kv_enabled() or not torch.cuda.is_available():
++        return False
++    if _env_requests_expandable():
++        # Already expandable for every allocation; nothing to do (and vLLM
++        # would have rejected this together with a KV connector anyway).
++        return False
++    before = torch.cuda.memory_reserved()
++    # Release the cached free blocks the profile/warmup runs left in ordinary
++    # segments; the KV cache, weights and workspaces are live and unaffected.
++    torch.cuda.empty_cache()
++    setter = getattr(
++        torch._C,
++        "_accelerator_setAllocatorSettings",
++        torch.cuda.memory._set_allocator_settings,
++    )
++    setter("expandable_segments:True")
++    logger.info(
++        "DSV41 memory: expandable segments enabled after KV allocation "
++        "(reserved %.2f -> %.2f GiB; KV/weights stay in ordinary segments).",
++        before / _GiB,
++        torch.cuda.memory_reserved() / _GiB,
++    )
++    return True
++
++
++def _dump_history(reason: str) -> None:
++    out_dir = _state["history"]
++    if not out_dir:
++        return
++    _state["dumps"] += 1
++    path = os.path.join(
++        out_dir, f"pp{_state['rank']}-{os.getpid()}-{_state['dumps']}.pickle"
++    )
++    try:
++        torch.cuda.memory._dump_snapshot(path)
++        logger.info("DSV41 memory: snapshot (%s) written to %s", reason, path)
++    except Exception as e:  # diagnostics must never take the worker down
++        logger.warning("DSV41 memory: snapshot failed: %s", e)
++
++
++def maybe_start_history(rank: int) -> None:
++    out_dir = os.environ.get("VLLM_DSV41_MEM_HISTORY", "").strip()
++    _state["rank"] = rank
++    if not out_dir or not torch.cuda.is_available():
++        return
++    os.makedirs(out_dir, exist_ok=True)
++    max_entries = int(os.environ.get("VLLM_DSV41_MEM_HISTORY_ENTRIES", "200000"))
++    torch.cuda.memory._record_memory_history(
++        enabled="all", context="all", stacks="python", max_entries=max_entries
++    )
++    _state["history"] = out_dir
++    try:
++        signal.signal(signal.SIGUSR1, lambda *_: _dump_history("SIGUSR1"))
++    except ValueError:  # not the main thread
++        logger.warning("DSV41 memory: SIGUSR1 handler not installed")
++    logger.warning(
++        "DSV41 memory: recording allocation history to %s (diagnostic, slow)",
++        out_dir,
++    )
++
++
++def step_tick() -> None:
++    """Called once per worker step (execute_model)."""
++    _state["steps"] += 1
++    step = _state["steps"]
++    dump_step = int(os.environ.get("VLLM_DSV41_MEM_HISTORY_DUMP_STEP", "0") or 0)
++    if dump_step and step == dump_step:
++        _dump_history(f"step {step}")
++    every = int(os.environ.get("VLLM_DSV41_MEM_STATS_EVERY", "0") or 0)
++    if every <= 0 or step % every or not torch.cuda.is_available():
++        return
++    s = torch.cuda.memory_stats()
++    logger.info(
++        "DSV41 memory step=%d alloc=%.3f peak_alloc=%.3f reserved=%.3f "
++        "peak_reserved=%.3f inactive_split=%.3f GiB segments=%d "
++        "alloc_retries=%d ooms=%d t=%.0f",
++        step,
++        s.get("allocated_bytes.all.current", 0) / _GiB,
++        s.get("allocated_bytes.all.peak", 0) / _GiB,
++        s.get("reserved_bytes.all.current", 0) / _GiB,
++        s.get("reserved_bytes.all.peak", 0) / _GiB,
++        s.get("inactive_split_bytes.all.current", 0) / _GiB,
++        s.get("segment.all.current", 0),
++        s.get("num_alloc_retries", 0),
++        s.get("num_ooms", 0),
++        time.time(),
++    )
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index f8eb4e8..3544a9a 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -4,6 +4,11 @@
+ import importlib.util
+ import os
+ 
++# DeepSeek V4.1 Flash SM80: one switch for the per-patch switches (patch 0014).
++from vllm.dsv41_opt_profile import apply as _dsv41_apply_opt_profile
++
++_dsv41_apply_opt_profile()
++
+ 
+ def _get_torch_root():
+     """Locate the installed torch package without importing it."""
+diff --git a/vllm/models/deepseek_v4/common/vision.py b/vllm/models/deepseek_v4/common/vision.py
+index ddf3cfc..615fd2e 100644
+--- a/vllm/models/deepseek_v4/common/vision.py
++++ b/vllm/models/deepseek_v4/common/vision.py
+@@ -220,6 +220,11 @@ class DeepseekV4ViT(nn.Module):
+             ]
+         )
+         self.norm = DeepseekV4RMSNorm(config.vision_dim)
++        self._cpu_offloaded: bool = False
++
++    def offload_to_cpu(self) -> None:
++        self.to("cpu")
++        self._cpu_offloaded = True
+ 
+     def enable_mm_device_normalize(self) -> None:
+         self.patch_embed.input_norm = FusedMMInputNorm(
+@@ -231,13 +236,32 @@ class DeepseekV4ViT(nn.Module):
+     def forward(
+         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
+     ) -> torch.Tensor:
++        if not self._cpu_offloaded:
++            x = self.patch_embed(patches)
++            cos, sin = get_vision_cos_sin(
++                n_vit_h, n_vit_w, self.rope_dim, self.rope_theta
++            )
++            cos = async_tensor_h2d(cos, x.device)
++            sin = async_tensor_h2d(sin, x.device)
++            for block in self.blocks:
++                x = block(x, cos, sin)
++            return self.norm(x)
++
++        dev = patches.device
++        self.patch_embed.to(dev)
+         x = self.patch_embed(patches)
++        self.patch_embed.to("cpu")
+         cos, sin = get_vision_cos_sin(n_vit_h, n_vit_w, self.rope_dim, self.rope_theta)
+-        cos = async_tensor_h2d(cos, x.device)
+-        sin = async_tensor_h2d(sin, x.device)
++        cos = async_tensor_h2d(cos, dev)
++        sin = async_tensor_h2d(sin, dev)
+         for block in self.blocks:
++            block.to(dev)
+             x = block(x, cos, sin)
+-        return self.norm(x)
++            block.to("cpu")
++        self.norm.to(dev)
++        x = self.norm(x)
++        self.norm.to("cpu")
++        return x
+ 
+     def forward_packed(
+         self,
+@@ -250,10 +274,24 @@ class DeepseekV4ViT(nn.Module):
+         """Varlen path for encoder CUDA graphs: multiple images packed along
+         rows, per-image attention via `cu_seqlens`, RoPE tables precomputed
+         on device. Pure-tensor (no host reads, no H2D), safe to capture."""
++        if not self._cpu_offloaded:
++            x = self.patch_embed(patches)
++            for block in self.blocks:
++                x = block(x, cos, sin, cu_seqlens, max_seqlen)
++            return self.norm(x)
++
++        dev = patches.device
++        self.patch_embed.to(dev)
+         x = self.patch_embed(patches)
++        self.patch_embed.to("cpu")
+         for block in self.blocks:
++            block.to(dev)
+             x = block(x, cos, sin, cu_seqlens, max_seqlen)
+-        return self.norm(x)
++            block.to("cpu")
++        self.norm.to(dev)
++        x = self.norm(x)
++        self.norm.to("cpu")
++        return x
+ 
+ 
+ def build_packed_vit_metadata(
+@@ -374,14 +412,28 @@ class DeepseekV4Aligner(nn.Module):
+             quant_config=None,
+             disable_tp=use_data_parallel,
+         )
++        self._cpu_offloaded: bool = False
++
++    def offload_to_cpu(self) -> None:
++        self.to("cpu")
++        self._cpu_offloaded = True
+ 
+     def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
+         r = self.downsample_ratio
+         x = x.view(n_vit_h, n_vit_w, -1).permute(2, 0, 1)
+         x = F.pad(x, (0, -n_vit_w % r, 0, -n_vit_h % r))
+         x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
++        if not self._cpu_offloaded:
++            hidden, _ = self.w1(x)
++            out, _ = self.w2(F.gelu(hidden))
++            return out
++        dev = x.device
++        self.w1.to(dev)
+         hidden, _ = self.w1(x)
++        self.w1.to("cpu")
++        self.w2.to(dev)
+         out, _ = self.w2(F.gelu(hidden))
++        self.w2.to("cpu")
+         return out
+ 
+     def forward_packed(
+@@ -398,8 +450,17 @@ class DeepseekV4Aligner(nn.Module):
+         are transposed before flattening).
+         """
+         gathered = vision_spatial_merge(x, merge_idx, merge_mask)
++        if not self._cpu_offloaded:
++            hidden, _ = self.w1(gathered)
++            out, _ = self.w2(F.gelu(hidden))
++            return out
++        dev = gathered.device
++        self.w1.to(dev)
+         hidden, _ = self.w1(gathered)
++        self.w1.to("cpu")
++        self.w2.to(dev)
+         out, _ = self.w2(F.gelu(hidden))
++        self.w2.to("cpu")
+         return out
+ 
+ 
+@@ -426,7 +487,11 @@ def encode_images(
+     """
+     sizes = [h * w for h, w in vit_grid]
+     attn_backend = vision_model.blocks[0].attn.attn.attn_backend
+-    if len(vit_grid) == 1 or attn_backend != AttentionBackendEnum.FLASH_ATTN:
++    if (
++        vision_model._cpu_offloaded
++        or len(vit_grid) == 1
++        or attn_backend != AttentionBackendEnum.FLASH_ATTN
++    ):
+         return [
+             aligner(vision_model(item, h, w), h, w)
+             for item, (h, w) in zip(patches.split(sizes), vit_grid, strict=True)
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+index dad3b32..009d0a9 100644
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -18,19 +18,26 @@ streams tokens chunk-by-chunk:
  """
  
-+import ctypes
+ import ctypes
 +import hashlib
-+import os
-+import platform
+ import mmap
+ import os
+ import platform
 +import queue
 +import subprocess
-+import tempfile
+ import sys
+ import tempfile
 +import threading
  import weakref
-+from contextlib import contextmanager
+ from collections.abc import Callable
+-from contextlib import ExitStack
++from contextlib import ExitStack, contextmanager
 +from pathlib import Path
  
  import numpy as np
  import torch
-@@ -548,6 +558,372 @@ class NgramHashState(nn.Module):
+ from torch import nn
+ 
++import vllm.envs as envs
++
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.distributed import (
+@@ -496,6 +503,533 @@ class NgramHashState(nn.Module):
          return output
  
  
-+def _engram_async_prefetch_enabled() -> bool:
-+    return os.environ.get("VLLM_DSV41_ENGRAM_ASYNC_PREFETCH", "0") == "1"
-+
-+
-+def _engram_async_min_tokens() -> int:
-+    return max(1, int(os.environ.get("VLLM_DSV41_ENGRAM_ASYNC_MIN_TOKENS", "64")))
-+
-+
 +def _engram_prefetch_sms() -> int:
 +    return int(os.environ.get("VLLM_DSV41_ENGRAM_PREFETCH_SMS", "0"))
 +
@@ -53,19 +361,15 @@ index abc503f..89833b5 100644
 +    return os.environ.get("VLLM_DSV41_ENGRAM_NUMA_BIND", "0") == "1"
 +
 +
-+def _engram_gpu_scales_enabled() -> bool:
-+    return os.environ.get("VLLM_DSV41_ENGRAM_GPU_SCALES", "0") == "1"
-+
-+
 +def _engram_packed_host_enabled() -> bool:
 +    return os.environ.get("VLLM_DSV41_ENGRAM_PACKED_HOST", "0") == "1"
 +
 +
 +def _engram_packed_stride(min_row_bytes: int) -> int:
-+    # Default 16-byte alignment (e.g. 264 -> 272 bytes) preserves 128-bit
-+    # vectorized LDG.E.128 UVA loads on SM80 while keeping host overhead ~3%.
 +    default_stride = ((min_row_bytes + 15) // 16) * 16
-+    stride = int(os.environ.get("VLLM_DSV41_ENGRAM_PACKED_STRIDE", str(default_stride)))
++    stride = int(
++        os.environ.get("VLLM_DSV41_ENGRAM_PACKED_STRIDE", str(default_stride))
++    )
 +    if stride < min_row_bytes:
 +        raise ValueError(
 +            f"VLLM_DSV41_ENGRAM_PACKED_STRIDE={stride} < minimum row size {min_row_bytes}"
@@ -90,7 +394,8 @@ index abc503f..89833b5 100644
 +        return True
 +    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 +
-+    return BreakableCUDAGraphCapture.is_active()
++    capture = BreakableCUDAGraphCapture.current()
++    return bool(capture is not None and capture._capturing)
 +
 +
 +def _parse_cpulist(cpulist: str) -> set[int]:
@@ -129,7 +434,6 @@ index abc503f..89833b5 100644
 +            return None
 +
 +        candidates = [pci]
-+        # Handle 8-hex-digit vs 4-hex-digit PCI domain formatting across drivers.
 +        if pci.startswith("00000000:"):
 +            candidates.append("0000:" + pci[9:])
 +        elif pci.startswith("0000:"):
@@ -161,12 +465,70 @@ index abc503f..89833b5 100644
 +def _numa_bind_current_gpu(
 +    device_index: int | None = None, strict_bind: bool = True
 +):
-+    """Temporarily bind thread CPU affinity AND Linux NUMA mempolicy to the
-+    GPU's local NUMA node so `cudaHostAlloc` locks pinned host pages strictly
-+    onto the PCIe-local socket (reclaiming clean pagecache on the local socket
-+    instead of spilling across UPI/Infinity Fabric when free watermarks dip)."""
++    """Bind CPU affinity & NUMA mempolicy (or MPOL_INTERLEAVE) during host alloc."""
 +    if not _engram_numa_bind_enabled() or not hasattr(os, "sched_getaffinity"):
 +        yield None
++        return
++    if os.environ.get("VLLM_DSV41_ENGRAM_NUMA_INTERLEAVE", "0") == "1":
++        libc = None
++        saved_pol = False
++        orig_mode = ctypes.c_int(0)
++        orig_mask = ctypes.c_ulong(0)
++        if platform.system() == "Linux" and platform.machine().lower() in (
++            "x86_64",
++            "amd64",
++        ):
++            try:
++                node_dirs = [
++                    int(p.name[4:])
++                    for p in Path("/sys/devices/system/node").glob("node[0-9]*")
++                    if p.name[4:].isdigit() and int(p.name[4:]) < 63
++                ]
++                if len(node_dirs) > 1:
++                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
++                    rc = libc.syscall(
++                        ctypes.c_long(239),
++                        ctypes.byref(orig_mode),
++                        ctypes.byref(orig_mask),
++                        ctypes.c_ulong(64),
++                        ctypes.c_void_p(0),
++                        ctypes.c_ulong(0),
++                    )
++                    if rc == 0:
++                        mask_val = 0
++                        for nd in node_dirs:
++                            mask_val |= 1 << nd
++                        target_mask = ctypes.c_ulong(mask_val)
++                        rc_set = libc.syscall(
++                            ctypes.c_long(238),
++                            ctypes.c_int(3),
++                            ctypes.byref(target_mask),
++                            ctypes.c_ulong(64),
++                        )
++                        saved_pol = rc_set == 0
++            except Exception:
++                saved_pol = False
++        try:
++            yield ("interleave", -1) if saved_pol else None
++        finally:
++            if saved_pol and libc is not None:
++                try:
++                    if orig_mode.value == 0:
++                        libc.syscall(
++                            ctypes.c_long(238),
++                            ctypes.c_int(0),
++                            ctypes.c_void_p(0),
++                            ctypes.c_ulong(0),
++                        )
++                    else:
++                        libc.syscall(
++                            ctypes.c_long(238),
++                            orig_mode,
++                            ctypes.byref(orig_mask),
++                            ctypes.c_ulong(64),
++                        )
++                except Exception:
++                    pass
 +        return
 +    info = _get_cuda_device_numa_info(device_index)
 +    if info is None:
@@ -179,17 +541,15 @@ index abc503f..89833b5 100644
 +        yield None
 +        return
 +
-+    # On Linux x86_64, combine sched_setaffinity with set_mempolicy(MPOL_BIND
-+    # or MPOL_PREFERRED) so the kernel reclaims clean page cache on `numa_node`
-+    # rather than falling back to a remote zone under MPOL_DEFAULT.
 +    libc = None
 +    saved_pol = False
 +    orig_mode = ctypes.c_int(0)
 +    orig_mask = ctypes.c_ulong(0)
-+    if platform.system() == "Linux" and platform.machine().lower() in (
-+        "x86_64",
-+        "amd64",
-+    ) and 0 <= numa_node < 63:
++    if (
++        platform.system() == "Linux"
++        and platform.machine().lower() in ("x86_64", "amd64")
++        and 0 <= numa_node < 63
++    ):
 +        try:
 +            libc = ctypes.CDLL("libc.so.6", use_errno=True)
 +            SYS_set_mempolicy, SYS_get_mempolicy = 238, 239
@@ -321,38 +681,38 @@ index abc503f..89833b5 100644
 +
 +        lib = ctypes.CDLL(str(so_path))
 +        lib.engram_cpu_gather_bf16.argtypes = [
-+            ctypes.c_void_p,  # weight
-+            ctypes.c_int64,   # w_stride
-+            ctypes.c_void_p,  # scales
-+            ctypes.c_int64,   # s_stride
-+            ctypes.c_void_p,  # local_ids
-+            ctypes.c_void_p,  # out_bf16
-+            ctypes.c_int64,   # vocab_start
-+            ctypes.c_int64,   # vocab_end
-+            ctypes.c_int64,   # num_tokens
-+            ctypes.c_int64,   # local_heads
-+            ctypes.c_int64,   # local_valid_heads
-+            ctypes.c_int64,   # dim
-+            ctypes.c_int64,   # quant_block
-+            ctypes.c_int,     # num_threads
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int,
 +        ]
 +        lib.engram_cpu_gather_bf16.restype = None
 +        lib.engram_cpu_gather_fp8.argtypes = [
-+            ctypes.c_void_p,  # weight
-+            ctypes.c_int64,   # w_stride
-+            ctypes.c_void_p,  # scales
-+            ctypes.c_int64,   # s_stride
-+            ctypes.c_void_p,  # local_ids
-+            ctypes.c_void_p,  # out_fp8
-+            ctypes.c_void_p,  # out_scales
-+            ctypes.c_int64,   # vocab_start
-+            ctypes.c_int64,   # vocab_end
-+            ctypes.c_int64,   # num_tokens
-+            ctypes.c_int64,   # local_heads
-+            ctypes.c_int64,   # local_valid_heads
-+            ctypes.c_int64,   # dim
-+            ctypes.c_int64,   # quant_block
-+            ctypes.c_int,     # num_threads
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int64,
++            ctypes.c_int,
 +        ]
 +        lib.engram_cpu_gather_fp8.restype = None
 +        _CPU_GATHER_LIB = lib
@@ -403,25 +763,96 @@ index abc503f..89833b5 100644
 +        return task
 +
 +
- def _engram_head_shard_weight_loader(
-     param: torch.nn.Parameter, loaded_weight: torch.Tensor
- ) -> None:
-@@ -562,8 +938,11 @@ def _engram_head_shard_weight_loader(
-     )
-     if param.numel() > (1 << 30):
-         _stream_copy_engram(param.data, shard)
-+    elif not param.data.is_cuda and param.data.element_size() == 1:
-+        param.data.view(torch.uint8).copy_(shard.view(torch.uint8))
-     else:
-         param.data.copy_(shard)
-+    param._engram_load_ver = getattr(param, "_engram_load_ver", 0) + 1
- 
- 
- def _stream_copy_engram(dst: torch.Tensor, src: torch.Tensor) -> None:
-@@ -603,10 +982,23 @@ def _stream_copy_engram(dst: torch.Tensor, src: torch.Tensor) -> None:
-     rows_per_chunk = max((1 << 30) // row_bytes, 1)
-     prev_threads = torch.get_num_threads()
-     torch.set_num_threads(1)
++_PINNED_KEEPALIVE: list[tuple[object, torch.Tensor, int]] = []
++
++
++def _exact_pinned_tensor(
++    shape: tuple[int, ...],
++    dtype: torch.dtype,
++    device_index: int | None = None,
++) -> torch.Tensor | None:
++    """Pinned host tensor occupying exact byte size via cudaHostAllocMapped."""
++    try:
++        from cuda.bindings import runtime as cudart
++    except ImportError:
++        return None
++    nbytes = dtype.itemsize
++    for size in shape:
++        nbytes *= size
++    logger.info(
++        "Allocating mapped pinned host memory: %d bytes (%.2f GiB); "
++        "the driver faults and locks the pages, this can take a while...",
++        nbytes,
++        nbytes / 1024**3,
++    )
++    strict_bind = os.environ.get("VLLM_DSV41_ENGRAM_NUMA_STRICT", "0") == "1"
++    with _numa_bind_current_gpu(device_index, strict_bind=strict_bind) as numa_bound:
++        if numa_bound is not None:
++            logger.info(
++                "Binding pinned host allocation (%.2f GiB) to PCI %s NUMA node %d (%s)",
++                nbytes / 1024**3,
++                numa_bound[0],
++                numa_bound[1],
++                "MPOL_BIND" if strict_bind else "MPOL_PREFERRED",
++            )
++        err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
++    if int(err) != 0 and strict_bind and _engram_numa_bind_enabled():
++        with _numa_bind_current_gpu(device_index, strict_bind=False):
++            err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
++    if int(err) != 0:
++        return None
++    ptr = int(ptr)
++    err, _ = cudart.cudaHostGetDevicePointer(ptr, 0)
++    err_attr, attr = cudart.cudaPointerGetAttributes(ptr)
++    if (
++        int(err) != 0
++        or int(err_attr) != 0
++        or attr.type != cudart.cudaMemoryType.cudaMemoryTypeHost
++    ):
++        cudart.cudaFreeHost(ptr)
++        return None
++    try:
++        buf = (ctypes.c_char * nbytes).from_address(ptr)
++        tensor = torch.frombuffer(buf, dtype=torch.uint8).view(dtype).view(shape)
++        torch.cuda.init()
++        if not tensor.is_pinned():
++            raise RuntimeError("cudaHostAlloc memory not reported as pinned")
++    except Exception:
++        cudart.cudaFreeHost(ptr)
++        return None
++    _PINNED_KEEPALIVE.append((buf, tensor, ptr))
++    logger.info(
++        "Engram pinned host memory at exact size: %d bytes (%.2f GiB)",
++        nbytes,
++        nbytes / 1024**3,
++    )
++    return tensor
++
++
++def _stream_copy_engram(dst: torch.Tensor, src: torch.Tensor) -> None:
++    """Stream ~94 GiB safetensors shard in 1 GiB chunks with MADV_DONTNEED."""
++    libc = ctypes.CDLL("libc.so.6", use_errno=True)
++    MADV_SEQUENTIAL, MADV_DONTNEED = 2, 4
++    PAGE = 4096
++
++    def align_down(x: int) -> int:
++        return x & ~(PAGE - 1)
++
++    def align_up(x: int) -> int:
++        return (x + PAGE - 1) & ~(PAGE - 1)
++
++    base = src.data_ptr()
++    nbytes = src.numel() * src.element_size()
++    libc.madvise(
++        ctypes.c_void_p(align_down(base)),
++        ctypes.c_size_t(align_up(base + nbytes) - align_down(base)),
++        MADV_SEQUENTIAL,
++    )
++
++    row_bytes = src.stride(0) * src.element_size()
++    rows_per_chunk = max((1 << 30) // row_bytes, 1)
++    prev_threads = torch.get_num_threads()
++    torch.set_num_threads(1)
 +    dst_u8 = (
 +        dst.view(torch.uint8)
 +        if not dst.is_cuda and dst.element_size() == 1
@@ -432,47 +863,71 @@ index abc503f..89833b5 100644
 +        if dst_u8 is not None and src.element_size() == 1
 +        else None
 +    )
-     try:
-         for i in range(0, src.shape[0], rows_per_chunk):
-             j = min(i + rows_per_chunk, src.shape[0])
--            dst[i:j].copy_(src[i:j])
++    try:
++        for i in range(0, src.shape[0], rows_per_chunk):
++            j = min(i + rows_per_chunk, src.shape[0])
 +            if dst_u8 is not None and src_u8 is not None:
 +                dst_u8[i:j].copy_(src_u8[i:j])
 +            else:
 +                dst[i:j].copy_(src[i:j])
-             a = align_up(src[i:j].data_ptr())
-             b = align_down(src[i:j].data_ptr() + (j - i) * row_bytes)
-             if b > a:
-@@ -631,6 +1023,8 @@ def _engram_lookup_kernel(
-     TOTAL_HEADS: tl.constexpr,
-     DIM: tl.constexpr,
-     QUANT_BLOCK: tl.constexpr,
-+    W_STRIDE: tl.constexpr,
-+    S_STRIDE: tl.constexpr,
-     BLOCK_R: tl.constexpr,
-     GRID: tl.constexpr,
++            a = align_up(src[i:j].data_ptr())
++            b = align_down(src[i:j].data_ptr() + (j - i) * row_bytes)
++            if b > a:
++                libc.madvise(
++                    ctypes.c_void_p(a), ctypes.c_size_t(b - a), MADV_DONTNEED
++                )
++    finally:
++        torch.set_num_threads(prev_threads)
++
++
+ def _engram_head_shard_weight_loader(
+     param: torch.nn.Parameter, loaded_weight: torch.Tensor
+ ) -> None:
+@@ -508,7 +1042,13 @@ def _engram_head_shard_weight_loader(
+     assert shard.shape == param.shape, (
+         f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
+     )
+-    param.data.copy_(shard)
++    if param.numel() > (1 << 30):
++        _stream_copy_engram(param.data, shard)
++    elif not param.data.is_cuda and param.data.element_size() == 1:
++        param.data.view(torch.uint8).copy_(shard.view(torch.uint8))
++    else:
++        param.data.copy_(shard)
++    param._engram_load_ver = getattr(param, "_engram_load_ver", 0) + 1
+ 
+ 
+ # Branching on SORTED at runtime intermittently crashes Triton 3.8's
+@@ -556,6 +1096,8 @@ def _engram_lookup_kernel(
+     WORD: tl.constexpr = tl.uint8,
+     PACKED_FP4: tl.constexpr = False,
+     SOFTWARE_FP8: tl.constexpr = False,
++    W_STRIDE_R: tl.constexpr = 0,
++    S_STRIDE_R: tl.constexpr = 0,
  ):
-@@ -654,15 +1048,15 @@ def _engram_lookup_kernel(
-         ).to(tl.int64)
-         owned = valid & (head < TOTAL_HEADS)
-         owned &= (index >= vocab_start) & (index < vocab_end)
--        local = tl.where(owned, index - vocab_start, 0)
-+        local = tl.where(owned, index - vocab_start, 0).to(tl.int64)
-         values = tl.load(
--            weight + local[:, None] * DIM + cols[None, :],
-+            weight + local[:, None] * W_STRIDE + cols[None, :],
-             mask=owned[:, None],
-             other=0,
-         )
-         values = _decode_fp8_f32(values, False)
-         scale = tl.load(
--            scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
-+            scales + local[:, None] * S_STRIDE + scale_cols[None, :],
-             mask=owned[:, None],
-             other=0,
-         )
-@@ -675,11 +1069,51 @@ def _engram_lookup_kernel(
-         )
+     """Gather FP8 or MXFP4 rows as dequantized BF16, or FP8 rows as packed
+     values/scales (copied WORD at a time).
+@@ -600,10 +1142,15 @@ def _engram_lookup_kernel(
+             else:
+                 row_weight = peer.to(tl.pointer_type(tl.float8e4nv))
+             row_scales = (peer + PEER_ROWS * ROW_BYTES).to(tl.pointer_type(tl.uint8))
++            row_weight += local * ROW_BYTES
++            row_scales += local * (DIM // QUANT_BLOCK)
+         else:
+-            row_weight, row_scales = weight, scales
+-        row_weight += local * ROW_BYTES
+-        row_scales += local * (DIM // QUANT_BLOCK)
++            w_stride_r: tl.constexpr = W_STRIDE_R if W_STRIDE_R > 0 else ROW_BYTES
++            s_stride_r: tl.constexpr = (
++                S_STRIDE_R if S_STRIDE_R > 0 else (DIM // QUANT_BLOCK)
++            )
++            row_weight = weight + local * w_stride_r
++            row_scales = scales + local * s_stride_r
+         if PACKED:
+             # Copy values and scales WORD at a time: one memory request a word.
+             word_bytes: tl.constexpr = WORD.primitive_bitwidth // 8
+@@ -673,6 +1220,48 @@ def _engram_lookup_kernel(
+             )
  
  
 +@triton.jit
@@ -494,12 +949,16 @@ index abc503f..89833b5 100644
 +        rows = base + tl.arange(0, BLOCK_R)
 +        valid = rows < num_rows
 +        row_i64 = rows.to(tl.int64)
-+        values = tl.load(
++        code = tl.load(
 +            staged_w + row_i64[:, None] * DIM + cols[None, :],
 +            mask=valid[:, None],
 +            other=0,
-+        )
-+        values = _decode_fp8_f32(values, False)
++        ).to(tl.int32)
++        magnitude = code & 0x7F
++        normal = ((magnitude << 20) + (120 << 23)).to(tl.float32, bitcast=True)
++        subnormal = (magnitude & 7).to(tl.float32) * 0.001953125
++        decoded = tl.where(magnitude < 8, subnormal, normal)
++        decoded = tl.where((code & 0x80) != 0, -decoded, decoded)
 +        scale = tl.load(
 +            staged_s + row_i64[:, None] * s_row_cols + scale_cols[None, :],
 +            mask=valid[:, None],
@@ -508,80 +967,27 @@ index abc503f..89833b5 100644
 +        scale = (scale.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 +        tl.store(
 +            out + row_i64[:, None] * DIM + cols[None, :],
-+            (values * scale).to(tl.bfloat16),
++            (decoded * scale).to(tl.bfloat16),
 +            mask=valid[:, None],
 +        )
 +
 +
- _PINNED_KEEPALIVE: list[tuple[object, torch.Tensor, int]] = []
+ def engram_head_shard_rank() -> int:
+     """This rank's slot among the hash-head shards of one engram table.
  
- 
- def _exact_pinned_tensor(
--    shape: tuple[int, ...], dtype: torch.dtype
-+    shape: tuple[int, ...],
-+    dtype: torch.dtype,
-+    device_index: int | None = None,
- ) -> torch.Tensor | None:
-     """Pinned host tensor occupying exactly `shape`'s byte size, or None.
- 
-@@ -690,8 +1124,6 @@ def _exact_pinned_tensor(
-     without copying it.
-     """
-     try:
--        import ctypes
--
-         from cuda.bindings import runtime as cudart
-     except ImportError:
-         return None
-@@ -704,7 +1136,28 @@ def _exact_pinned_tensor(
-         nbytes,
-         nbytes / 1024**3,
-     )
--    err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
-+    # Default to MPOL_PREFERRED so pages land on the local PCIe NUMA socket
-+    # without setting CONSTRAINT_MEMORY_POLICY (which triggers the Linux OOM
-+    # killer during cudaHostAlloc page pinning if a single socket is slightly
-+    # below 94.4 GiB free). Set VLLM_DSV41_ENGRAM_NUMA_STRICT=1 for MPOL_BIND.
-+    strict_bind = os.environ.get("VLLM_DSV41_ENGRAM_NUMA_STRICT", "0") == "1"
-+    with _numa_bind_current_gpu(
-+        device_index, strict_bind=strict_bind
-+    ) as numa_bound:
-+        if numa_bound is not None:
-+            logger.info(
-+                "Binding pinned host allocation (%.2f GiB) to PCI %s NUMA node %d (%s)",
-+                nbytes / 1024**3,
-+                numa_bound[0],
-+                numa_bound[1],
-+                "MPOL_BIND" if strict_bind else "MPOL_PREFERRED",
-+            )
-+        err, ptr = cudart.cudaHostAlloc(nbytes, int(cudart.cudaHostAllocMapped))
-+    if int(err) != 0 and strict_bind and _engram_numa_bind_enabled():
-+        with _numa_bind_current_gpu(device_index, strict_bind=False):
-+            err, ptr = cudart.cudaHostAlloc(
-+                nbytes, int(cudart.cudaHostAllocMapped)
-+            )
-     if int(err) != 0:
-         return None
-     ptr = int(ptr)
-@@ -775,19 +1228,41 @@ class ParallelEngramEmbedding(nn.Module):
-         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
-         self.tp_size = tp_size
-         self.cpu_offload = cpu_offload
+@@ -1077,9 +1666,30 @@ class ParallelEngramEmbedding(nn.Module):
+                 self.peer_rows, self.vocab_end_idx - row_start
+             )
+         self._skip_layerwise_reload = self.cpu_offload and self.peer_rows == 0
++        self._device_index = torch.accelerator.current_device_index()
 +        self.local_valid_heads = max(
 +            0, min(self.n_hash_cols - self.head_start, self.part_n_hash_cols)
 +        )
-+        self._device_index = torch.accelerator.current_device_index()
-         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
--        self._view_src: tuple[int, int] | None = None
-+        self._view_src: tuple[int, int, int] | None = None
-+        self._packed_host: torch.Tensor | None = None
-+        self._gpu_scales_cache: torch.Tensor | None = None
-+        self._gpu_scales_ver: tuple[int, int] | None = None
          self._num_sms = torch.cuda.get_device_properties(
 -            torch.accelerator.current_device_index()
 +            self._device_index
          ).multi_processor_count
- 
++
 +        # Lazy state for VLLM_DSV41_ENGRAM_CPU_PREFETCH=1.
 +        self._cpu_cap: int = 0
 +        self._cpu_compact_mode: bool = False
@@ -596,142 +1002,123 @@ index abc503f..89833b5 100644
 +        self._h2d_in_flight: bool = False
 +        self._async_worker: _EngramAsyncWorker | None = None
 +        self._default_cpu_threads: int | None = None
++        self._packed_host: torch.Tensor | None = None
 +
-         def _alloc(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-             if not cpu_offload:
-                 # Explicit device: model init runs under a `torch.device("cuda")`
-                 # context, which would otherwise put the shard in HBM.
-                 return torch.empty(shape, dtype=dtype)
--            if envs.VLLM_ENGRAM_EXACT_PIN:
--                tensor = _exact_pinned_tensor(shape, dtype)
-+            if getattr(envs, "VLLM_ENGRAM_EXACT_PIN", True):
-+                tensor = _exact_pinned_tensor(shape, dtype, self._device_index)
-                 if tensor is not None:
-                     return tensor
-                 logger.warning(
-@@ -795,16 +1270,38 @@ class ParallelEngramEmbedding(nn.Module):
-                     "torch's pinned allocator, which rounds up to the next "
-                     "power of two."
+         weight, scales = self._allocate_weights()
+         self.weight = nn.Parameter(weight, requires_grad=False)
+         self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
+@@ -1178,23 +1788,61 @@ class ParallelEngramEmbedding(nn.Module):
+                     packed[:weight_bytes].view(weight_dtype).view(-1, self.row_bytes),
+                     packed[weight_bytes:].view(-1, scale_dim),
                  )
--            return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
--
--        self.weight = nn.Parameter(
--            _alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn),
--            requires_grad=False,
--        )
--        self.weight_scale_inv = nn.Parameter(
--            _alloc((self.part_num_embeddings, dim // block_size), torch.uint8),
--            requires_grad=False,
-+            with _numa_bind_current_gpu(self._device_index):
-+                return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
-+
-+        scale_cols = dim // block_size
-+        use_packed_host = cpu_offload and _engram_packed_host_enabled()
-+        use_gpu_scales_only = (
-+            cpu_offload
-+            and _engram_gpu_scales_enabled()
-+            and not use_packed_host
-+            and not _engram_cpu_prefetch_enabled()
-         )
-+
-+        if use_packed_host:
-+            packed_stride = _engram_packed_stride(dim + scale_cols)
-+            self._packed_host = _alloc(
-+                (self.part_num_embeddings, packed_stride), torch.uint8
-+            )
-+            w_tensor = self._packed_host[:, :dim].view(torch.float8_e4m3fn)
-+            s_tensor = self._packed_host[:, dim : dim + scale_cols]
-+        else:
-+            w_tensor = _alloc((self.part_num_embeddings, dim), torch.float8_e4m3fn)
-+            if use_gpu_scales_only:
-+                s_tensor = torch.empty(
-+                    (self.part_num_embeddings, scale_cols),
-+                    dtype=torch.uint8,
-+                    device=torch.device("cuda", self._device_index),
++        # Exact-size pinned allocation via cudaHostAllocMapped prevents PyTorch's
++        # CachingHostAllocator from rounding 23.6 GiB shards up to 32 GiB (which
++        # totals 256 GiB across 8 shards and OOMs 251 GiB hosts).
++        if getattr(envs, "VLLM_ENGRAM_EXACT_PIN", True) and current_platform.is_cuda():
++            if self.cpu_offload and _engram_packed_host_enabled():
++                packed_stride = _engram_packed_stride(self.row_bytes + scale_dim)
++                packed_host = _exact_pinned_tensor(
++                    (self.part_num_embeddings, packed_stride),
++                    torch.uint8,
++                    self._device_index,
 +                )
-+            else:
-+                s_tensor = _alloc((self.part_num_embeddings, scale_cols), torch.uint8)
-+
-+        self.weight = nn.Parameter(w_tensor, requires_grad=False)
-+        self.weight_scale_inv = nn.Parameter(s_tensor, requires_grad=False)
-         for param in (self.weight, self.weight_scale_inv):
-             set_weight_attrs(
-                 param,
-@@ -816,10 +1313,12 @@ class ParallelEngramEmbedding(nn.Module):
-         if cpu_offload:
-             logger.info(
-                 "Engram table offloaded to pinned host memory: %d rows x %d, "
--                "%.2f GiB per rank",
-+                "%.2f GiB per rank (packed_host=%s, gpu_scales=%s)",
-                 self.part_num_embeddings,
-                 dim,
--                self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
-+                self.part_num_embeddings * (dim + scale_cols) / 1024**3,
-+                use_packed_host,
-+                _engram_gpu_scales_enabled(),
-             )
++                if packed_host is not None:
++                    self._packed_host = packed_host
++                    return (
++                        packed_host[:, : self.row_bytes].view(weight_dtype),
++                        packed_host[:, self.row_bytes : self.row_bytes + scale_dim],
++                    )
++            w_exact = _exact_pinned_tensor(
++                (self.part_num_embeddings, self.row_bytes),
++                weight_dtype,
++                self._device_index,
++            )
++            s_exact = (
++                _exact_pinned_tensor(
++                    (self.part_num_embeddings, scale_dim),
++                    torch.uint8,
++                    self._device_index,
++                )
++                if w_exact is not None
++                else None
++            )
++            if w_exact is not None and s_exact is not None:
++                return w_exact, s_exact
++            logger.warning(
++                "Exact-size pinned allocation failed; falling back to "
++                "torch's pinned allocator, which rounds up to the next power of two."
++            )
+         # Model initialization may be inside a CUDA device context.
+-        return (
+-            torch.empty(
+-                self.part_num_embeddings,
+-                self.row_bytes,
+-                dtype=weight_dtype,
+-                device="cpu",
+-                pin_memory=True,
+-            ),
+-            torch.empty(
+-                self.part_num_embeddings,
+-                scale_dim,
+-                dtype=torch.uint8,
+-                device="cpu",
+-                pin_memory=True,
+-            ),
+-        )
++        with _numa_bind_current_gpu(self._device_index):
++            return (
++                torch.empty(
++                    self.part_num_embeddings,
++                    self.row_bytes,
++                    dtype=weight_dtype,
++                    device="cpu",
++                    pin_memory=True,
++                ),
++                torch.empty(
++                    self.part_num_embeddings,
++                    scale_dim,
++                    dtype=torch.uint8,
++                    device="cpu",
++                    pin_memory=True,
++                ),
++            )
  
-     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
-@@ -830,15 +1329,318 @@ class ParallelEngramEmbedding(nn.Module):
-         """
+     def process_weights_after_loading(self) -> None:
+         """Peers read this table's rows directly, so serve only once every GPU
+@@ -1230,16 +1878,293 @@ class ParallelEngramEmbedding(nn.Module):
+             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
          if not self.cpu_offload:
              return self.weight.data, self.weight_scale_inv.data
 -        src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
-+        scale_cols = self.dim // self.block_size
 +        packed_ptr = (
 +            self._packed_host.data_ptr() if self._packed_host is not None else 0
 +        )
-+        src = (
-+            self.weight.data_ptr(),
-+            self.weight_scale_inv.data_ptr(),
-+            packed_ptr,
-+        )
++        src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr(), packed_ptr)
          if self._view_src != src:
 -            self._views = (
 -                get_accelerator_view_from_cpu_tensor(self.weight.data),
 -                get_accelerator_view_from_cpu_tensor(self.weight_scale_inv.data),
 -            )
++            scale_dim = self.dim // self.block_size
 +            if (
 +                self._packed_host is not None
 +                and self.weight.data_ptr() == packed_ptr
-+                and self.weight_scale_inv.data_ptr() == packed_ptr + self.dim
++                and self.weight_scale_inv.data_ptr() == packed_ptr + self.row_bytes
 +            ):
 +                packed_uva = get_accelerator_view_from_cpu_tensor(self._packed_host)
-+                w_view = packed_uva[:, : self.dim].view(torch.float8_e4m3fn)
-+                s_view = packed_uva[:, self.dim : self.dim + scale_cols]
++                self._views = (
++                    packed_uva[:, : self.row_bytes].view(self.weight.dtype),
++                    packed_uva[:, self.row_bytes : self.row_bytes + scale_dim],
++                )
 +            else:
-+                w_view = (
-+                    self.weight.data
-+                    if self.weight.is_cuda
-+                    else get_accelerator_view_from_cpu_tensor(self.weight.data)
++                self._views = (
++                    get_accelerator_view_from_cpu_tensor(self.weight.data),
++                    get_accelerator_view_from_cpu_tensor(self.weight_scale_inv.data),
 +                )
-+                s_view = (
-+                    self.weight_scale_inv.data
-+                    if self.weight_scale_inv.is_cuda
-+                    else get_accelerator_view_from_cpu_tensor(
-+                        self.weight_scale_inv.data
-+                    )
-+                )
-+            self._views = (w_view, s_view)
              self._view_src = src
          assert self._views is not None
--        return self._views
-+        w_view, s_view = self._views
-+        if _engram_gpu_scales_enabled() and not self.weight_scale_inv.is_cuda:
-+            ver = (
-+                self.weight_scale_inv.data_ptr(),
-+                getattr(self.weight_scale_inv, "_engram_load_ver", 0),
-+            )
-+            if self._gpu_scales_ver != ver and not _is_graph_capture_active():
-+                self._gpu_scales_cache = self.weight_scale_inv.data.to(
-+                    device=torch.device("cuda", self._device_index),
-+                    non_blocking=False,
-+                )
-+                self._gpu_scales_ver = ver
-+            if self._gpu_scales_cache is not None and self._gpu_scales_ver == ver:
-+                s_view = self._gpu_scales_cache
-+        return w_view, s_view
-+
+         return self._views
+ 
 +    def _resolve_cpu_threads(self) -> int:
 +        configured = int(os.environ.get("VLLM_DSV41_ENGRAM_CPU_THREADS", "0"))
 +        if configured > 0:
@@ -739,8 +1126,6 @@ index abc503f..89833b5 100644
 +        if self._default_cpu_threads is None:
 +            info = _get_cuda_device_numa_info(self._device_index)
 +            if info is not None:
-+                # Prefer physical-core count (~half logical SMT threads) on the
-+                # GPU's local socket, capped to avoid cross-rank oversubscription.
 +                ncpus = len(info[2])
 +            elif hasattr(os, "sched_getaffinity"):
 +                ncpus = len(os.sched_getaffinity(0))
@@ -752,6 +1137,10 @@ index abc503f..89833b5 100644
 +    def should_use_cpu_prefetch(self, num_tokens: int) -> bool:
 +        return (
 +            self.cpu_offload
++            and not self.packed_fp4
++            and self.dp_size == 1
++            and not self.peer_rows
++            and self._shared_memory is None
 +            and _engram_cpu_prefetch_enabled()
 +            and num_tokens >= _engram_cpu_min_tokens()
 +            and not self.weight.is_cuda
@@ -925,7 +1314,9 @@ index abc503f..89833b5 100644
 +        stream = torch.cuda.current_stream(out.device)
 +        if self.local_valid_heads > 0:
 +            h_end = self.head_start + self.local_valid_heads
-+            ids_contig = indices[:, self.head_start:h_end].to(dtype=torch.int64).contiguous()
++            ids_contig = (
++                indices[:, self.head_start : h_end].to(dtype=torch.int64).contiguous()
++            )
 +            self._host_ids[:num_tokens, : self.local_valid_heads].copy_(
 +                ids_contig, non_blocking=True
 +            )
@@ -947,9 +1338,6 @@ index abc503f..89833b5 100644
 +        start_event: torch.cuda.Event,
 +        done_event: torch.cuda.Event,
 +    ) -> _AsyncPrefetchTask:
-+        """Stage `indices` D2H on `prefetch_stream`, run OpenMP gather on a
-+        background CPU thread (0 GPU SMs during gather + DMA), and DMA `out`
-+        H2D on `prefetch_stream`."""
 +        num_tokens = indices.shape[0]
 +        compact = self._ensure_cpu_staging(num_tokens, out.device)
 +        if self._async_worker is None:
@@ -968,7 +1356,7 @@ index abc503f..89833b5 100644
 +            if self.local_valid_heads > 0:
 +                h_end = self.head_start + self.local_valid_heads
 +                ids_contig = (
-+                    indices[:, self.head_start:h_end]
++                    indices[:, self.head_start : h_end]
 +                    .to(dtype=torch.int64)
 +                    .contiguous()
 +                )
@@ -986,149 +1374,123 @@ index abc503f..89833b5 100644
 +                self._h2d_in_flight = False
 +            self._run_cpu_gather_kernel(num_tokens, compact)
 +            with torch.cuda.stream(prefetch_stream):
-+                self._upload_cpu_gathered(
-+                    num_tokens, out, compact, background=True
-+                )
++                self._upload_cpu_gathered(num_tokens, out, compact, background=True)
 +                h2d_done.record(prefetch_stream)
 +                self._h2d_in_flight = True
 +                done_event.record(prefetch_stream)
 +
 +        return self._async_worker.submit(_worker_job)
- 
++
      def lookup(
          self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
-@@ -847,14 +1649,27 @@ class ParallelEngramEmbedding(nn.Module):
- 
-         `background` limits the grid to leave SMs for concurrent work.
-         """
--        rows = indices.shape[0] * self.part_n_hash_cols
-+        num_tokens = indices.shape[0]
-+        rows = num_tokens * self.part_n_hash_cols
+     ) -> None:
+@@ -1252,6 +2177,9 @@ class ParallelEngramEmbedding(nn.Module):
+         rows = indices.shape[0] * self.part_n_hash_cols
          if not rows:
              return
-+        if self.should_use_cpu_prefetch(num_tokens):
++        if out.dtype == torch.bfloat16 and self.should_use_cpu_prefetch(indices.shape[0]):
 +            self._cpu_lookup_sync(indices, out)
 +            return
          weight, scales = self._storage()
+         ids_stride_t, ids_stride_h = indices.stride()
+         sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
+@@ -1272,17 +2200,28 @@ class ParallelEngramEmbedding(nn.Module):
+             dst = dst.int()
          # The table dwarfs TLB reach, so a persistent grid near the SM count
          # beats one program per row; halve it to leave SMs for the main stream.
-         tiles = triton.cdiv(rows, 16)
--        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+-        max_grid = self._num_sms // 2 if background else self._num_sms
 +        if background:
 +            pref_sms = _engram_prefetch_sms()
-+            sm_budget = (
++            max_grid = (
 +                min(self._num_sms, pref_sms)
 +                if pref_sms > 0
 +                else max(1, self._num_sms // 2)
 +            )
 +        else:
-+            sm_budget = self._num_sms
-+        grid = min(tiles, sm_budget)
-         _engram_lookup_kernel[(grid,)](
-             weight.view(torch.uint8),
-             scales,
-@@ -870,6 +1685,8 @@ class ParallelEngramEmbedding(nn.Module):
-             TOTAL_HEADS=self.n_hash_cols,
-             DIM=self.dim,
-             QUANT_BLOCK=self.block_size,
-+            W_STRIDE=weight.stride(0),
-+            S_STRIDE=scales.stride(0),
-             BLOCK_R=16,
-             GRID=grid,
++            max_grid = self._num_sms
+         # Host reads are latency bound: once the rows fill the grid with
+         # 128-row tiles, each program keeps 8x the reads in flight.
+         block_r = 128 if rows >= 128 * max_grid else 16
+         packed = out.dtype == torch.uint8
++        w_stride_r = 0 if self.peer_rows else weight.stride(0) * weight.element_size()
++        s_stride_r = 0 if self.peer_rows else scales.stride(0) * scales.element_size()
+         # Copy packed rows 8 bytes per load where their values, scales and
+         # output rows are 8-byte aligned.
+         wide = (
+             packed
+             and self.dim // self.block_size % 8 == 0
+             and (out.stride(0) | out.data_ptr()) % 8 == 0
++            and (self.peer_rows or (w_stride_r | s_stride_r) % 8 == 0)
          )
-@@ -1066,13 +1883,85 @@ class Engram(nn.Module):
-             layout.head_dim,
-             dtype=torch.bfloat16,
+         grid = min(triton.cdiv(rows, block_r), max_grid)
+         software_fp8 = (
+@@ -1314,6 +2253,8 @@ class ParallelEngramEmbedding(nn.Module):
+             PEER_ROWS=self.peer_rows,
+             PACKED_FP4=self.packed_fp4,
+             SOFTWARE_FP8=software_fp8,
++            W_STRIDE_R=w_stride_r,
++            S_STRIDE_R=s_stride_r,
+             WORD=tl.uint64 if wide else tl.uint8,
+             num_warps=8 if block_r == 128 else 4,
          )
-+        self._prefetch_stream: torch.cuda.Stream | None = None
-+        self._start_event: torch.cuda.Event | None = None
-+        self._done_event: torch.cuda.Event | None = None
-+        self._prefetch_pending: bool = False
-+        self._prefetch_task: _AsyncPrefetchTask | None = None
-+
-+    def _ensure_prefetch_resources(self, device: torch.device) -> None:
-+        if self._prefetch_stream is None:
-+            self._prefetch_stream = torch.cuda.Stream(device=device)
-+            self._start_event = torch.cuda.Event()
-+            self._done_event = torch.cuda.Event()
-+
-+    def finish_prefetch(self) -> None:
-+        """Join any in-flight async Engram prefetch onto the current stream."""
-+        if not self._prefetch_pending:
-+            return
-+        task = self._prefetch_task
-+        self._prefetch_task = None
-+        if task is not None:
-+            task.wait()
-+        assert self._done_event is not None
-+        if torch.cuda.is_current_stream_capturing():
-+            self._done_event.synchronize()
-+        else:
-+            torch.cuda.current_stream(self.staged_rows.device).wait_event(
-+                self._done_event
-+            )
-+        self._prefetch_pending = False
+@@ -1767,7 +2708,9 @@ class Engram(nn.Module):
+             return
+         if self._prefetch_stream is None:
+             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
++        self._prefetch_start = torch.cuda.Event()
+         self._prefetch_done = torch.cuda.Event()
++        self._pending_cpu_task: _AsyncPrefetchTask | None = None
  
      def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
--        """Gather this layer's rows on the main stream before decoder layers."""
--        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
-+        """Gather this layer's rows before decoder layers (async on a side
-+        stream for large non-captured prefill batches when enabled)."""
-+        num_tokens = hash_ids.shape[0]
-+        if self._prefetch_pending:
-+            self.finish_prefetch()
-+        if num_tokens == 0:
-+            return
-+        out = self.staged_rows[:num_tokens]
-+        use_async = (
-+            _engram_async_prefetch_enabled()
-+            and not envs.VLLM_DISABLE_MULTI_STREAM_PARALLEL
-+            and num_tokens >= _engram_async_min_tokens()
-+            and not _is_graph_capture_active()
-+        )
-+        if not use_async:
-+            self.embed_tokens.lookup(hash_ids, out)
-+            return
-+
-+        self._ensure_prefetch_resources(out.device)
-+        assert (
-+            self._prefetch_stream is not None
-+            and self._start_event is not None
-+            and self._done_event is not None
-+        )
-+        cur_stream = torch.cuda.current_stream(out.device)
-+        self._start_event.record(cur_stream)
-+        hash_ids.record_stream(self._prefetch_stream)
-+        out.record_stream(self._prefetch_stream)
-+
-+        if self.embed_tokens.should_use_cpu_prefetch(num_tokens):
-+            self._prefetch_task = self.embed_tokens.submit_cpu_prefetch(
-+                hash_ids,
-+                out,
-+                self._prefetch_stream,
-+                self._start_event,
-+                self._done_event,
+         """Look up, or prefetch from host memory, rows before the decoder layers
+@@ -1788,6 +2731,22 @@ class Engram(nn.Module):
+         if is_forward_context_available() and (dp := get_forward_context().dp_metadata):
+             num_tokens = int(dp.num_tokens_across_dp_cpu.max())
+         current = stream = torch.cuda.current_stream()
++        self._pending_cpu_task = None
++        if self.embed_tokens.should_use_cpu_prefetch(hash_ids.shape[0]):
++            assert (
++                self._prefetch_stream is not None
++                and self._prefetch_start is not None
++                and self._prefetch_done is not None
 +            )
-+        else:
-+            with torch.cuda.stream(self._prefetch_stream):
-+                self._prefetch_stream.wait_event(self._start_event)
-+                self.embed_tokens.lookup(hash_ids, out, background=True)
-+                self._done_event.record(self._prefetch_stream)
-+            self._prefetch_task = None
-+        self._prefetch_pending = True
++            self._prefetch_start.record(current)
++            self._pending_cpu_task = self.embed_tokens.submit_cpu_prefetch(
++                hash_ids,
++                rows,
++                self._prefetch_stream,
++                self._prefetch_start,
++                self._prefetch_done,
++            )
++            return
+         # Big lookups stall persistent main-stream kernels anyway: run them inline.
+         _, inline_min_tokens = _engram_lookup_thresholds(hash_ids.device)
+         if inline_min_tokens is not None and num_tokens >= inline_min_tokens:
+@@ -1797,7 +2756,8 @@ class Engram(nn.Module):
+             assert stream is not None
+             stream.wait_stream(current)
+             # Keep temporary hash storage alive until lookup finishes reading it.
+-            hash_ids.record_stream(stream)
++            if not torch.cuda.is_current_stream_capturing():
++                hash_ids.record_stream(stream)
+             with torch.cuda.stream(stream):
+                 self.embed_tokens.lookup(hash_ids, rows, background=True)
+         assert self._prefetch_done is not None
+@@ -1806,6 +2766,9 @@ class Engram(nn.Module):
+     @eager_break_during_capture
+     def _finish_prefetch(self, event: torch.cuda.Event) -> None:
+         # Wait for this layer's lookup only, not for later layers on the stream.
++        if self._pending_cpu_task is not None:
++            self._pending_cpu_task.wait()
++            self._pending_cpu_task = None
+         torch.cuda.current_stream().wait_event(event)
  
-     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
-         """Gather heads, returning only local tokens when SP is enabled."""
-+        if self._prefetch_pending:
-+            self.finish_prefetch()
-         rows = self.staged_rows[: hash_ids.shape[0]]
-         if self.embed_tokens.tp_size == 1:
-             return rows
-diff --git a/vllm/models/deepseek_v4_1/common/engram_cpu_gather.cpp b/vllm/models/deepseek_v4_1/common/engram_cpu_gather.cpp
+     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v41/common/engram_cpu_gather.cpp b/vllm/models/deepseek_v41/common/engram_cpu_gather.cpp
 new file mode 100644
 index 0000000..39191c9
 --- /dev/null
-+++ b/vllm/models/deepseek_v4_1/common/engram_cpu_gather.cpp
++++ b/vllm/models/deepseek_v41/common/engram_cpu_gather.cpp
 @@ -0,0 +1,334 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Multi-threaded OpenMP + AVX2 CPU gather & FP8(E4M3FN) x UE8M0 -> BF16
@@ -1464,54 +1826,106 @@ index 0000000..39191c9
 +        std::memcpy(dst_s, scales + local * s_stride, static_cast<size_t>(s_cols));
 +    }
 +}
-diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 66940ea..596bf27 100644
---- a/vllm/models/deepseek_v4_1/nvidia/model.py
-+++ b/vllm/models/deepseek_v4_1/nvidia/model.py
-@@ -792,6 +792,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
-                 aux_hidden_states.append(aux_hidden_state)
-                 final_aux_recon = aux_recon
-+        if engram_hashes is not None:
-+            for lyr in islice(self.layers, self.start_layer, self.end_layer):
-+                engram = getattr(lyr, "engram", None)
-+                if engram is not None and engram._prefetch_pending:
-+                    engram.finish_prefetch()
-         if layer is not None:
-             # Reuse if the last layer was captured as an aux hidden state
-             if self.end_layer in self.aux_hidden_state_layers:
-@@ -1054,6 +1059,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-             else:
-                 layer.hc_attn_fn_broadcast.copy_(broadcast)
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index 4f75170..c01ae82 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -253,6 +253,8 @@ class DeepseekV41ForCausalLM(
+                 )
+             )
+             span_offset += span_len
++        if getattr(self.vision, "_cpu_offloaded", False):
++            torch.cuda.empty_cache()
+         return tuple(embeds)
  
-+    def finalize_engram_weights(self) -> None:
-+        from ..common.engram import (
-+            _engram_cpu_prefetch_enabled,
-+            _engram_gpu_scales_enabled,
-+            _load_engram_cpu_lib,
+     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+@@ -330,9 +332,35 @@ class DeepseekV41ForCausalLM(
+         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
+         return self.language_model.get_mtp_target_hidden_states()
+ 
++    def set_moe_parameters(self) -> None:
++        if hasattr(self.language_model, "set_moe_parameters"):
++            self.language_model.set_moe_parameters()
++
++    def build_specialized_decode(self, *args, **kwargs):
++        return self.language_model.build_specialized_decode(*args, **kwargs)
++
++    def _maybe_offload_vision_tower(self) -> None:
++        import os
++
++        if os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1":
++            self.vision.offload_to_cpu()
++            self.aligner.offload_to_cpu()
++            torch.cuda.empty_cache()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
++        loaded_params = loader.load_weights(mapped)
++        self._maybe_offload_vision_tower()
++        self._weights_finalized = True
++        return loaded_params
++
++    def process_weights_after_loading(self) -> None:
++        if getattr(self, "_weights_finalized", False):
++            return
++        if hasattr(self.language_model, "process_weights_after_loading"):
++            self.language_model.process_weights_after_loading()
++        self._maybe_offload_vision_tower()
+ 
+     def get_mm_mapping(self) -> MultiModelKeys:
+         """Get the module prefixes in the multimodal model."""
+diff --git a/vllm/v1/worker/gpu/buffer_utils.py b/vllm/v1/worker/gpu/buffer_utils.py
+index 8ebbc8b..4888566 100644
+--- a/vllm/v1/worker/gpu/buffer_utils.py
++++ b/vllm/v1/worker/gpu/buffer_utils.py
+@@ -36,6 +36,23 @@ def set_default_max_concurrency(n: int) -> None:
+     _DEFAULT_MAX_CONCURRENCY = max(2, n)
+ 
+ 
++def async_copy_to_gpu(
++    x: torch.Tensor | np.ndarray,
++    out: torch.Tensor | None = None,
++    device: torch.device | None = None,
++) -> torch.Tensor:
++    if isinstance(x, np.ndarray):
++        x = torch.from_numpy(x)
++    assert x.is_cpu
++
++    if out is None:
++        assert device is not None
++        out = torch.empty_like(x, device=device)
++
++    pinned = x.pin_memory() if not out.is_cpu and is_pin_memory_available() else x
++    return out.copy_(pinned, non_blocking=True)
++
++
+ class UvaBuffer:
+     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
+         if not is_uva_available():
+diff --git a/vllm/v1/worker/workspace.py b/vllm/v1/worker/workspace.py
+index 5abbcf5..18da345 100644
+--- a/vllm/v1/worker/workspace.py
++++ b/vllm/v1/worker/workspace.py
+@@ -129,6 +129,20 @@ class WorkspaceManager:
+         """Check if workspace is locked."""
+         return self._locked
+ 
++    def fits(self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]) -> bool:
++        """True if ``get_simultaneous(*shapes_and_dtypes)`` would be served by
++        the current slot's buffer without a resize (safe during graph capture)."""
++        total_bytes = sum(
++            round_up(_compute_bytes(s, d), 256) for s, d in shapes_and_dtypes
++        )
++        workspace_id = dbo_current_ubatch_id() * self._num_lanes + _workspace_lane.get()
++        if workspace_id >= len(self._current_workspaces):
++            return False
++        return (
++            self._workspace_size_bytes(self._current_workspaces[workspace_id])
++            >= total_bytes
 +        )
 +
-+        has_local_engram = False
-+        for layer in islice(self.layers, self.start_layer, self.end_layer):
-+            engram = getattr(layer, "engram", None)
-+            if engram is not None:
-+                has_local_engram = True
-+                if _engram_gpu_scales_enabled():
-+                    engram.embed_tokens._storage()
-+        if has_local_engram and _engram_cpu_prefetch_enabled():
-+            _load_engram_cpu_lib()
-+
- 
- def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
-     """Parameter name the linear quant method registers for weight scales.
-@@ -1293,6 +1315,7 @@ class DeepseekV41LLMForCausalLM(
-     def process_weights_after_loading(self) -> None:
-         self.model.finalize_mega_moe_weights()
-         self.model.finalize_mhc_broadcast_weights()
-+        self.model.finalize_engram_weights()
- 
-     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-         return self.model.get_expert_mapping()
--- 
-2.55.0
-
+     def _get_workspace_id(self) -> int:
+         lane = _workspace_lane.get()
+         if lane >= self._num_lanes:

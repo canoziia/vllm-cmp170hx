@@ -1,0 +1,1631 @@
+From: Canoziia <canoziia@projectk.org>
+Subject: [PATCH] vllm(common): async-PP Mamba reclaim, structured-output spec alignment, and NVFP4 amax
+
+diff --git a/tests/v1/core/test_async_scheduler.py b/tests/v1/core/test_async_scheduler.py
+index 2cada11..bb733d7 100644
+--- a/tests/v1/core/test_async_scheduler.py
++++ b/tests/v1/core/test_async_scheduler.py
+@@ -108,6 +108,82 @@ def test_no_spec_decode_padding_up_to_max_model_len():
+     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
+ 
+ 
++def test_async_pp_balances_decode_batches_without_throttling_prefills(monkeypatch):
++    # Upstream #57433 applies this policy unconditionally for MRV2 + async PP;
++    # our port keeps it behind VLLM_PP_DECODE_COHORT_BALANCE, so enable it here.
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", True)
++    scheduler = create_scheduler(
++        async_scheduling=True,
++        max_num_seqs=32,
++        max_num_batched_tokens=8192,
++        num_speculative_tokens=7,
++        speculative_method="ngram_gpu",
++    )
++    # Emulate PP at the scheduler level. Constructing with PP=2 requires two
++    # visible GPUs, but this policy only depends on the pipeline size.
++    scheduler.pp_size = 2
++    scheduler.use_pp = True
++
++    requests = create_requests(
++        num_requests=32,
++        num_tokens=1,
++        max_tokens=10,
++        ignore_eos=True,
++    )
++    for request in requests:
++        scheduler.add_request(request)
++
++    prefill = scheduler.schedule()
++    bubble = scheduler.schedule()
++    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
++    first_decode = scheduler.schedule()
++    scheduler.update_from_output(bubble, _make_model_runner_output(bubble))
++    second_decode = scheduler.schedule()
++    scheduler.update_from_output(first_decode, _make_model_runner_output(first_decode))
++    third_decode = scheduler.schedule()
++
++    # every prompt completes in the first step: prefill is never throttled
++    assert len(prefill.num_scheduled_tokens) == 32
++    assert not bubble.num_scheduled_tokens
++    first_ids = set(first_decode.num_scheduled_tokens)
++    second_ids = set(second_decode.num_scheduled_tokens)
++    third_ids = set(third_decode.num_scheduled_tokens)
++    # 32 seqs over a 2-step cadence -> two disjoint cohorts of 16, alternating
++    assert len(first_ids) == len(second_ids) == 16
++    assert first_ids.isdisjoint(second_ids)
++    assert third_ids == first_ids
++
++
++def test_async_pp_balance_is_off_by_default(monkeypatch):
++    # The deviation from upstream is opt-in only: with the flag unset the step
++    # keeps taking the whole running set, so no existing deployment changes.
++    import vllm.envs as envs
++
++    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", False)
++    scheduler = create_scheduler(
++        async_scheduling=True,
++        max_num_seqs=32,
++        max_num_batched_tokens=8192,
++        num_speculative_tokens=7,
++        speculative_method="ngram_gpu",
++    )
++    scheduler.pp_size = 2
++    scheduler.use_pp = True
++    assert scheduler._get_max_num_scheduled_decodes() == 32
++
++    requests = create_requests(
++        num_requests=32, num_tokens=1, max_tokens=10, ignore_eos=True
++    )
++    for request in requests:
++        scheduler.add_request(request)
++    prefill = scheduler.schedule()
++    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
++    first_decode = scheduler.schedule()
++    assert len(first_decode.num_scheduled_tokens) == 32
++
++
+ def test_abort():
+     scheduler = create_scheduler(async_scheduling=True)
+     requests = create_requests(num_requests=10, max_tokens=20)
+diff --git a/tests/v1/core/test_async_structured_draft_handoff.py b/tests/v1/core/test_async_structured_draft_handoff.py
+new file mode 100644
+index 0000000..40d076d
+--- /dev/null
++++ b/tests/v1/core/test_async_structured_draft_handoff.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Worker-side structured draft backfill with async pipeline scheduling."""
++
++from collections import deque
++from contextlib import nullcontext
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++
++from vllm.v1.core.sched.async_scheduler import AsyncScheduler
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.engine.core import EngineCore
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize(
++    ("structured", "prior_placeholders", "drafts", "expected_pending"),
++    [
++        (True, 0, [-1, -1, -1], True),
++        (True, 0, [12, 13, 14], False),
++        (True, 2, [12, 13, 14], True),
++        (False, 0, [-1, -1, -1], False),
++        (True, 0, [], False),
++    ],
++)
++def test_async_structured_draft_handoff_without_prior_output(
++    structured: bool,
++    prior_placeholders: int,
++    drafts: list[int],
++    expected_pending: bool,
++):
++    """A worker-side -1 draft needs backfill even after all outputs settled."""
++    scheduler = object.__new__(AsyncScheduler)
++    request = SimpleNamespace(
++        is_prefill_chunk=False,
++        use_structured_output=structured,
++        num_output_placeholders=prior_placeholders,
++        spec_token_ids=[],
++    )
++    scheduler.requests = {"req": request}
++    scheduler.num_sampled_tokens_per_step = 1
++    scheduler.use_v2_model_runner = False
++    output = SimpleNamespace(
++        num_scheduled_tokens={"req": 1 + len(drafts)},
++        scheduled_spec_decode_tokens={"req": drafts},
++        num_spec_tokens_to_schedule=3,
++        pending_structured_output_tokens=False,
++    )
++    with patch.object(Scheduler, "_update_after_schedule"):
++        scheduler._update_after_schedule(output)
++    assert output.pending_structured_output_tokens is expected_pending
++    assert request.num_output_placeholders == prior_placeholders + 1 + len(drafts)
++
++
++def test_request_keyed_drafts_survive_interleaved_batches():
++    """Read B's persistent draft slot even if A replaced the last-batch snapshot."""
++    runner = object.__new__(GPUModelRunner)
++    runner.req_states = SimpleNamespace(
++        req_id_to_index={"A": 1, "B": 0},
++        draft_tokens=torch.tensor([[31, 32, 33], [11, 12, 13]]),
++    )
++    runner.draft_tokens_handler = Mock()
++    runner.draft_tokens_handler.get_draft_tokens.return_value = SimpleNamespace(
++        req_ids=["A"], draft_token_ids=[[11, 12, 13]]
++    )
++    result = runner.take_draft_token_ids(["B", "gone"])
++    assert result.req_ids == ["B"]
++    assert result.draft_token_ids == [[31, 32, 33]]
++    runner.draft_tokens_handler.get_draft_tokens.assert_not_called()
++    empty = runner.take_draft_token_ids(["gone"])
++    assert empty.req_ids == [] and empty.draft_token_ids == []
++
++
++def test_async_structured_backfill_with_empty_batch_queue():
++    """Backfill before sampling when the previous result was already delivered."""
++    core = object.__new__(EngineCore)
++    core.batch_queue = deque(maxlen=2)
++    core.batch_queue_size = 2
++    core.is_ec_consumer = True
++    core.is_pooling_model = False
++    core.check_for_draft_tokens = True
++    events: list[str] = []
++    output = SimpleNamespace(
++        num_scheduled_tokens={"req": 4},
++        scheduled_spec_decode_tokens={"req": [-1, -1, -1]},
++        total_num_scheduled_tokens=4,
++        pending_structured_output_tokens=True,
++    )
++    core.scheduler = Mock()
++    core.scheduler.has_requests.return_value = True
++    core.scheduler.schedule.return_value = output
++
++    def update_drafts(draft_ids, scheduled):
++        events.append("backfill")
++        assert draft_ids == [42, 43, 44]
++        scheduled.scheduled_spec_decode_tokens["req"] = draft_ids
++
++    core.scheduler.update_draft_token_ids_in_output.side_effect = update_drafts
++
++    def grammar(scheduled):
++        events.append("grammar")
++        assert scheduled.scheduled_spec_decode_tokens["req"] == [42, 43, 44]
++        return "constrained grammar"
++
++    core.scheduler.get_grammar_bitmask.side_effect = grammar
++    core.model_executor = Mock()
++    exec_future = object()
++    sample_future = object()
++    core.model_executor.execute_model.return_value = exec_future
++
++    def take_drafts(req_ids):
++        events.append("take_drafts")
++        assert req_ids == ["req"]
++        return [42, 43, 44]
++
++    core.model_executor.take_draft_token_ids.side_effect = take_drafts
++    core.model_executor.sample_tokens.side_effect = lambda *args, **kwargs: (
++        events.append("sample") or sample_future
++    )
++    core.log_error_detail = lambda scheduled: nullcontext()
++    core._should_throttle_prefills = lambda: False
++
++    assert core.step_with_batch_queue() == (None, True)
++    assert events == ["take_drafts", "backfill", "grammar", "sample"]
++    assert list(core.batch_queue) == [(sample_future, output, exec_future)]
+diff --git a/tests/v1/worker/test_grammar_invalid_drafts.py b/tests/v1/worker/test_grammar_invalid_drafts.py
+new file mode 100644
+index 0000000..6c85b88
+--- /dev/null
++++ b/tests/v1/worker/test_grammar_invalid_drafts.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Which speculative drafts a structured-output request may accept.
++
++`StructuredOutputManager.grammar_bitmask` fills row i before it inspects
++`req_tokens[i]`, so with the first -1 placeholder at index j rows 0..j carry a
++real mask and rows j+1.. carry the all-permissive `_full_mask`. Drafts j..K-1
++must therefore be rejected, or the request samples with no grammar constraint
++at a position the model really does sample.
++"""
++
++from types import SimpleNamespace
++
++import numpy as np
++import torch
++
++from vllm.v1.worker.gpu.model_runner import grammar_invalid_drafts
++
++
++def _input_batch(req_ids, num_drafts, num_admitted=None):
++    """`num_admitted` is what adaptive verification kept on device."""
++    num_admitted = num_drafts if num_admitted is None else num_admitted
++    rows = [n + 1 for n in num_admitted]
++    return SimpleNamespace(
++        req_ids=list(req_ids),
++        num_reqs=len(req_ids),
++        num_draft_tokens=sum(num_drafts),
++        num_draft_tokens_per_req=np.array(num_drafts, dtype=np.int32),
++        cu_num_logits=torch.tensor([0, *np.cumsum(rows)], dtype=torch.int32),
++        expanded_local_pos=torch.cat(
++            [torch.arange(n, dtype=torch.int32) for n in rows]
++        ),
++    )
++
++
++def _invalid_rows(batch, grammar_req_ids, num_acceptable):
++    mask = grammar_invalid_drafts(batch, grammar_req_ids, num_acceptable)
++    return None if mask is None else mask.nonzero().flatten().tolist()
++
++
++def test_reject_whole_window_when_nothing_was_backfilled():
++    # Request "g" is at rows 0..3 (1 + 3 drafts), so its drafts are rows 1..3.
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [0]) == [1, 2, 3]
++
++
++def test_keep_the_drafts_the_bitmask_could_see():
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [2]) == [3]
++
++
++def test_reject_nothing_when_fully_backfilled():
++    batch = _input_batch(["g", "p"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [3]) is None
++
++
++def test_rows_are_offset_per_request():
++    batch = _input_batch(["p", "g"], [3, 3])
++    assert _invalid_rows(batch, ["g"], [0]) == [5, 6, 7]
++
++
++def test_follow_the_device_layout_under_adaptive_verification():
++    # Scheduled 3 drafts each, but adaptive verification admitted 2 for "a" and
++    # 3 for "b": the real rows are a=0..2, b=3..6, not the scheduled 0..3, 4..7.
++    batch = _input_batch(["a", "b"], [3, 3], num_admitted=[2, 3])
++    assert _invalid_rows(batch, ["a", "b"], [1, 0]) == [2, 4, 5, 6]
++
++
++def test_fall_back_to_the_whole_window_without_the_field():
++    # An older scheduler, or warmup, supplies no num_acceptable_drafts; be
++    # conservative rather than accepting drafts whose mask is unknown.
++    batch = _input_batch(["g"], [3])
++    assert _invalid_rows(batch, ["g"], None) == [1, 2, 3]
++
++
++def test_nothing_without_drafts_or_grammar_requests():
++    batch = _input_batch(["g"], [3])
++    batch.num_draft_tokens = 0
++    assert _invalid_rows(batch, ["g"], [0]) is None
++    assert _invalid_rows(_input_batch(["g"], [3]), [], []) is None
++
++
++def test_unknown_request_is_skipped():
++    batch = _input_batch(["p"], [3])
++    assert _invalid_rows(batch, ["g"], [0]) is None
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 83f31dc..5ccd2e0 100644
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -49,6 +49,7 @@ if TYPE_CHECKING:
+     VLLM_TRACE_FUNCTION: int = 0
+     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+     VLLM_PP_LAYER_PARTITION: str | None = None
++    VLLM_PP_DECODE_COHORT_BALANCE: bool = True
+     VLLM_CPU_KVCACHE_SPACE: int | None = None
+     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
+     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
+@@ -927,6 +928,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     ),
+     # Pipeline stage partition strategy
+     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
++    # Balance established decode requests across the `pp_size` in-flight
++    # pipeline batches of Model Runner V2 + PP + async scheduling
++    # (vllm-project/vllm#57433). Upstream applies it unconditionally; we keep an
++    # opt-in so a single image can serve an A/B and so the default of every
++    # existing deployment is unchanged until it is measured per model.
++    "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
++        int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1"))
++    ),
+     # (CPU backend only) CPU key-value cache space.
+     # default is None and will be set as 4 GB
+     "VLLM_CPU_KVCACHE_SPACE": lambda: (
+diff --git a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+index 1c7552f..2db6e5b 100644
+--- a/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
++++ b/vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py
+@@ -45,13 +45,14 @@ def _nvfp4_compute_scale_factor(
+     if a_dtype is not None and a_dtype == torch.half:
+         return 1.0
+ 
+-    ws_float = marlin_scales.float() * (2**7)
+-    nonzero_mask = ws_float > 0
+-    if nonzero_mask.any():
+-        max_val = ws_float[nonzero_mask].max()
+-        if max_val < 448 * (2**7):
+-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
+-            return sf.item()
++    # Whenever a positive value exists it is also the overall maximum, so
++    # reduce in place rather than build a float copy, a mask and a boolean
++    # gather: the gather materialises int64 [nnz, ndim] indices, ~6.7 GiB for
++    # one MoE layer of a 288-expert model at load time.
++    max_val = marlin_scales.amax().float() * (2**7)
++    if max_val > 0 and max_val < 448 * (2**7):
++        sf = (448 * (2**7) / max_val).log2().floor().exp2()
++        return sf.item()
+     return 1.0
+ 
+ 
+@@ -265,7 +266,13 @@ def _repack_marlin_experts(
+     size_k: int,
+ ) -> torch.Tensor:
+     """Repack each expert to marlin format into a preallocated output."""
++    import os
++
+     num_experts = weight.shape[0]
++    inplace = (
++        os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") == "1"
++        and weight.is_contiguous()
++    )
+     out: torch.Tensor | None = None
+     for i in range(num_experts):
+         qweight = weight[i].view(torch.int32).T.contiguous()
+@@ -276,11 +283,16 @@ def _repack_marlin_experts(
+             num_bits=4,
+         )
+         if out is None:
+-            out = torch.empty(
+-                (num_experts, *marlin_qweight.shape),
+-                dtype=marlin_qweight.dtype,
+-                device=marlin_qweight.device,
+-            )
++            if inplace and weight.nbytes == num_experts * marlin_qweight.nbytes:
++                out = weight.data.view(marlin_qweight.dtype).view(
++                    num_experts, *marlin_qweight.shape
++                )
++            else:
++                out = torch.empty(
++                    (num_experts, *marlin_qweight.shape),
++                    dtype=marlin_qweight.dtype,
++                    device=marlin_qweight.device,
++                )
+         out[i] = marlin_qweight
+     assert out is not None
+     return out
+@@ -583,6 +595,105 @@ def prepare_moe_mxfp4_layer_for_marlin(
+     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
+ 
+ 
++def _repack_marlin_experts_staged(
++    layer: torch.nn.Module,
++    name: str,
++    size_n: int,
++    size_k: int,
++) -> torch.Tensor:
++    import os
++
++    raw = getattr(layer, name)
++    device = raw.device
++    e = raw.shape[0]
++    assert raw.shape == (e, size_n, size_k // 2), raw.shape
++    if (
++        os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") == "1"
++        and raw.is_contiguous()
++    ) or hasattr(raw, "_ckpt"):
++        return _repack_marlin_experts(raw, size_n, size_k)
++    # Pageable on purpose: torch's pinned-host allocator caches freed blocks
++    # for the life of the process, which would keep the host RAM locked.
++    host = torch.empty(raw.shape, dtype=raw.dtype, device="cpu")
++    host.copy_(raw.data)
++    torch.cuda.synchronize(device)
++    # Drop the layer's GPU storage reference before allocating packed output.
++    raw.data = torch.empty(0, dtype=raw.dtype, device=device)
++    del raw
++    torch.cuda.empty_cache()
++    out: torch.Tensor | None = None
++    stage = torch.empty(host.shape[1:], dtype=host.dtype, device=device)
++    for i in range(e):
++        stage.copy_(host[i])
++        qweight = stage.view(torch.int32).T.contiguous()
++        packed = ops.gptq_marlin_repack(
++            b_q_weight=qweight,
++            size_k=size_k,
++            size_n=size_n,
++            num_bits=4,
++        )
++        if out is None:
++            out = torch.empty((e, *packed.shape), dtype=packed.dtype, device=device)
++        out[i] = packed
++    del stage, host
++    assert out is not None
++    return out
++
++
++def prepare_moe_mxfp4_layer_for_marlin_staged(layer: torch.nn.Module) -> None:
++    import os
++
++    group_size = 32  # MXFP4 block size
++
++    w13 = layer.w13_weight
++    e, n2, khalf = w13.shape
++    n, k = n2 // 2, khalf * 2
++    param_dtype = layer.params_dtype
++    del w13
++
++    for name, size_n, size_k in (("w13_weight", n * 2, k), ("w2_weight", k, n)):
++        packed = _repack_marlin_experts_staged(layer, name, size_n, size_k)
++        replace_parameter(layer, name, packed)
++        del packed
++        if os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") != "1":
++            torch.cuda.empty_cache()
++
++    for name, size_n, size_k in (("w13", n * 2, k), ("w2", k, n)):
++        scales = (
++            getattr(layer, name + "_weight_scale")
++            .view(torch.float8_e8m0fnu)
++            .to(param_dtype)
++        )
++        tensor_list = []
++        for i in range(e):
++            marlin_scales = marlin_permute_scales(
++                s=scales[i].T,
++                size_k=size_k,
++                size_n=size_n,
++                group_size=group_size,
++            )
++            tensor_list.append(mxfp4_marlin_process_scales(marlin_scales))
++        replace_parameter(
++            layer,
++            name + "_weight_scale",
++            torch.cat([x.unsqueeze(0) for x in tensor_list], 0),
++        )
++        del scales, tensor_list
++
++    for name in ("w13_bias", "w2_bias"):
++        bias = getattr(layer, name, None)
++        if bias is None:
++            continue
++        bias = bias.to(param_dtype)
++        replace_parameter(
++            layer,
++            name,
++            torch.cat(
++                [marlin_permute_bias(bias[i]).unsqueeze(0) for i in range(e)], 0
++            ),
++        )
++
++
+ def rand_marlin_weight_nvfp4_like(weight, group_size):
+     assert group_size > 0
+     size_n, size_k = weight.shape
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 12c714a..d891ae7 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1084,12 +1084,22 @@ def generate_scheduler_kv_cache_config(
+         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+     )
+     assert all(
+-        cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
++        getattr(cfg, "hisparse_host_num_blocks", None)
++        == getattr(kv_cache_configs[0], "hisparse_host_num_blocks", None)
+         for cfg in kv_cache_configs
+     )
+     # Worker configs share scheduler geometry and the resolved zeroing
+     # decision, so use an arbitrary one to initialize the scheduler.
+     cfg = copy.deepcopy(kv_cache_configs[0])
++    for worker_cfg in kv_cache_configs:
++        if len(worker_cfg.kv_cache_groups) != len(cfg.kv_cache_groups):
++            raise ValueError("PP workers disagree on global KV cache group count")
++    for index, group in enumerate(cfg.kv_cache_groups):
++        if hasattr(group, "is_eagle_group"):
++            group.is_eagle_group = any(
++                getattr(worker_cfg.kv_cache_groups[index], "is_eagle_group", False)
++                for worker_cfg in kv_cache_configs
++            )
+     return cfg
+ 
+ 
+diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
+index 142c82e..5b08c39 100644
+--- a/vllm/v1/core/sched/async_scheduler.py
++++ b/vllm/v1/core/sched/async_scheduler.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++
+ import vllm.envs as envs
+ from vllm.platforms import current_platform
+ from vllm.v1.core.sched.output import SchedulerOutput
+@@ -8,13 +10,42 @@ from vllm.v1.core.sched.scheduler import Scheduler
+ 
+ 
+ class AsyncScheduler(Scheduler):
++    use_v2_model_runner: bool = True
++
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
++        self.use_v2_model_runner = True
+         # Only XPU can disable PP decode microbatching via VLLM_XPU_PP_MICROBATCH.
+         self.decode_stagger = self.parallel_config.pipeline_parallel_size
+         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
+             self.decode_stagger = 1
+ 
++    @property
++    def pp_size(self) -> int:
++        return getattr(self, "decode_stagger", 1)
++
++    @pp_size.setter
++    def pp_size(self, value: int) -> None:
++        self.decode_stagger = value
++
++    def _get_max_num_scheduled_decodes(self) -> int:
++        if (
++            not envs.VLLM_PP_DECODE_COHORT_BALANCE
++            or not self.use_v2_model_runner
++            or not self.use_pp
++        ):
++            return self.max_num_running_reqs
++        if os.environ.get("VLLM_PP_DECODE_COHORT_LIVE_LOAD", "0") == "1":
++            # The capacity-based limit is inert at low load: four requests
++            # completing prefill together remain locked in a four-request
++            # cadence forever. Bound established decodes by the LIVE load.
++            # Do not change the pp_size feedback-ring cadence or cap prefill.
++            num_running, num_waiting = self.get_request_counts()
++            live = min(self.max_num_running_reqs, num_running + num_waiting)
++            return max(1, (live + self.pp_size - 1) // self.pp_size)
++        # ceil(max_num_seqs / pp_size)
++        return (self.max_num_running_reqs + self.pp_size - 1) // self.pp_size
++
+     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+         super()._update_after_schedule(scheduler_output)
+         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+@@ -23,40 +54,91 @@ class AsyncScheduler(Scheduler):
+         pending_structured_output_tokens = (
+             scheduler_output.pending_structured_output_tokens
+         )
+-        structured_output_spec_decode = (
+-            scheduler_output.has_structured_output_spec_decode
++        structured_output_spec_decode = getattr(
++            scheduler_output, "has_structured_output_spec_decode", False
++        )
++        has_structured_output_requests = getattr(
++            scheduler_output, "has_structured_output_requests", True
+         )
+         for req_id in scheduler_output.num_scheduled_tokens:
+             request = self.requests[req_id]
+             if request.is_prefill_chunk:
+                 continue
+ 
++            # The scheduled draft ids may still be worker-side -1 placeholders
++            # even when no previous output tokens are outstanding. In that case
++            # the grammar must wait for take_draft_token_ids(): otherwise the
++            # bitmask is built from -1, and fail-closed verification rejects the
++            # entire draft window on every subsequent step.
++            scheduled_drafts = spec_decode_tokens.get(req_id, ())
+             # The request will generate num_sampled_tokens_per_step new tokens
+             # plus num_spec_tokens in this scheduling step. Diffusion has no AR
+             # bonus token (num_sampled_tokens_per_step == 0) — only the canvas
+             # (spec) tokens.
+-            cur_num_spec_tokens = len(spec_decode_tokens.get(req_id, ()))
+-            if (
+-                scheduler_output.has_structured_output_requests
+-                and request.use_structured_output
+-            ):
+-                pending_structured_output_tokens |= request.num_output_placeholders > 0
++            cur_num_spec_tokens = len(scheduled_drafts)
++            if has_structured_output_requests and request.use_structured_output:
++                pending_structured_output_tokens |= (
++                    request.num_output_placeholders > 0
++                    or -1 in scheduled_drafts
++                )
+                 structured_output_spec_decode |= cur_num_spec_tokens > 0
+             request.num_output_placeholders += (
+                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
+             )
+-            request.num_output_placeholder_steps += 1
++            if hasattr(request, "num_output_placeholder_steps"):
++                request.num_output_placeholder_steps += 1
+             # Add placeholders for the new draft/spec tokens.
+             # We will update the actual spec token ids in the worker process.
+-            request.spec_token_ids = spec_token_placeholders
++            limit = getattr(request, "verification_draft_limit", None)
++            request.spec_token_ids = (
++                spec_token_placeholders
++                if limit is None
++                else spec_token_placeholders[:limit]
++            )
++
++            if self.use_v2_model_runner:
++                # Set the next step index in which this request is eligible to be
++                # scheduled for decode (for PP microbatching).
++                earliest = self.current_step + self.pp_size
++                if (
++                    getattr(self, "use_pp", False)
++                    and os.environ.get("VLLM_PP_DECODE_COHORT_LIVE_LOAD", "0") == "1"
++                ):
++                    phase = getattr(request, "decode_cohort_phase", None)
++                    loads = [0] * self.pp_size
++                    for live in self.running:
++                        assigned = getattr(live, "decode_cohort_phase", None)
++                        if assigned is not None:
++                            loads[assigned] += 1
++                    capacity = self._get_max_num_scheduled_decodes()
++                    fragmented = (
++                        sum(n > 0 for n in loads)
++                        > (sum(loads) + capacity - 1) // capacity
++                    )
++                    if phase is None or (fragmented and loads[phase] < capacity):
++                        if phase is not None:
++                            loads[phase] -= 1
++
++                        # Fill an existing non-full cohort before opening an
++                        # empty phase. Repack partial phases after load growth
++                        # too; delay the NEXT decode, never consume a feedback
++                        # result before its original T+PP boundary.
++                        def phase_cost(delay):
++                            load = loads[(earliest + delay) % self.pp_size]
++                            return (
++                                load >= capacity,
++                                -load if load < capacity else load,
++                                delay,
++                            )
+ 
+-            # Set the next step index in which this request is eligible to be
+-            # scheduled for decode (for PP microbatching).
+-            request.next_decode_eligible_step = self.current_step + self.decode_stagger
++                        earliest += min(range(self.pp_size), key=phase_cost)
++                    request.decode_cohort_phase = earliest % self.pp_size
++                request.next_decode_eligible_step = earliest
+ 
+         scheduler_output.pending_structured_output_tokens = (
+             pending_structured_output_tokens
+         )
+-        scheduler_output.has_structured_output_spec_decode = (
+-            structured_output_spec_decode
+-        )
++        if hasattr(scheduler_output, "has_structured_output_spec_decode"):
++            scheduler_output.has_structured_output_spec_decode = (
++                structured_output_spec_decode
++            )
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 4c46c6c..3c6d974 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -355,3 +355,8 @@ class GrammarOutput:
+     structured_output_request_ids: list[str]
+     # Bitmask ordered as structured_output_request_ids.
+     grammar_bitmask: "npt.NDArray[np.int32]"
++    # Per request, ordered as structured_output_request_ids: how many leading
++    # drafts the bitmask constrained. `grammar_bitmask` fills every row after
++    # the first -1 placeholder with the all-permissive `_full_mask`, so drafts
++    # from this index on must not be accepted. None invalidates every draft.
++    num_acceptable_drafts: list[int] | None = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 0373c64..bc06970 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -86,7 +86,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+-from vllm.v1.structured_output import StructuredOutputManager
++from vllm.v1.structured_output import (
++    StructuredOutputManager,
++    strip_speculative_padding,
++)
+ from vllm.v1.token_buffer import extend_from_slice
+ from vllm.v1.utils import record_function_or_nullcontext
+ 
+@@ -714,8 +717,15 @@ class Scheduler(SchedulerInterface):
+ 
+         scheduled_new_reqs: list[Request] = []
+         scheduled_running_reqs: list[Request] = []
++        scheduled_decode_req_ids: set[str] = set()
+         preempted_reqs: list[Request] = []
+ 
++        # Async PP assigns each request to a decode cadence group based on the
++        # step where its prefill completes. Limiting each step to an equal share
++        # of the runner capacity keeps those groups balanced. Prefills remain
++        # uncapped because mixed batches need token-aware balancing instead.
++        max_num_scheduled_decodes = self._get_max_num_scheduled_decodes()
++
+         iteration_details = None
+         if (
+             self.log_stats
+@@ -893,6 +903,11 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            is_decode = request.num_computed_tokens >= request.num_prompt_tokens
++            if is_decode and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes:
++                req_index += 1
++                continue
++
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
+@@ -906,6 +921,17 @@ class Scheduler(SchedulerInterface):
+                         # The request can be scheduled.
+                         break
+ 
++                    # With asynchronous pipeline scheduling, a lone request can
++                    # temporarily retain blocks needed by unfinished PP steps.
++                    # Let one result drain instead of preempting and replaying
++                    # that same request from its prefix checkpoint.
++                    if (
++                        len(self.running) == 1
++                        and self.running[0] is request
++                        and request.num_in_flight_tokens > 0
++                    ):
++                        break
++
+                     if (
+                         self.connector is not None
+                         and self.connector.has_pending_block_frees()
+@@ -935,6 +961,7 @@ class Scheduler(SchedulerInterface):
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id
+                             scheduled_running_reqs.remove(preempted_req)
++                            scheduled_decode_req_ids.discard(preempted_req_id)
+                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                             token_budget += restored
+                             input_budget += restored + draft_slots
+@@ -988,6 +1015,8 @@ class Scheduler(SchedulerInterface):
+             request_id = request.request_id
+             req_to_new_blocks[request_id] = new_blocks
+             num_scheduled_tokens[request_id] = num_new_tokens
++            if is_decode:
++                scheduled_decode_req_ids.add(request_id)
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
+             req_index += 1
+@@ -1451,6 +1480,18 @@ class Scheduler(SchedulerInterface):
+                         skip_request(request_queue)
+                         continue
+ 
++                is_decode = (
++                    not load_kv_async
++                    and num_computed_tokens >= request.num_prompt_tokens
++                )
++                if (
++                    is_decode
++                    and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes
++                ):
++                    # Requeue via skip_request (replaces step_skipped_waiting.prepend_request(request))
++                    skip_request(request_queue)
++                    continue
++
+                 # During async KV load, no forward pass is run yet.
+                 # Allocate speculative lookahead slots later to avoid
+                 # mismatching local and remote block counts.
+@@ -1618,6 +1659,8 @@ class Scheduler(SchedulerInterface):
+                     request_id
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
++                if is_decode:
++                    scheduled_decode_req_ids.add(request_id)
+                 token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+                 request.status = RequestStatus.RUNNING
+@@ -1675,6 +1718,7 @@ class Scheduler(SchedulerInterface):
+ 
+         assert token_budget >= 0
+         assert input_budget >= 0
++        assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes
+         assert len(self.running) <= self.max_num_running_reqs
+         # Since some requests in the RUNNING queue may not be scheduled in
+         # this step, the total number of scheduled requests can be smaller than
+@@ -1815,6 +1859,9 @@ class Scheduler(SchedulerInterface):
+             self._update_after_schedule(scheduler_output)
+         return scheduler_output
+ 
++    def _get_max_num_scheduled_decodes(self) -> int:
++        return self.max_num_running_reqs
++
+     def _build_kv_connector_meta(
+         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
+@@ -1852,6 +1899,8 @@ class Scheduler(SchedulerInterface):
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        if hasattr(request, "decode_cohort_phase"):
++            request.decode_cohort_phase = None
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+@@ -2329,7 +2378,14 @@ class Scheduler(SchedulerInterface):
+             structured_output_request_ids,
+             scheduler_output.scheduled_spec_decode_tokens,
+         )
+-        return GrammarOutput(structured_output_request_ids, bitmask)
++        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
++        num_acceptable_drafts = [
++            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
++            for req_id in structured_output_request_ids
++        ]
++        return GrammarOutput(
++            structured_output_request_ids, bitmask, num_acceptable_drafts
++        )
+ 
+     def update_from_output(
+         self,
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 84dfa53..bd24fe7 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
+ from abc import ABC, abstractmethod
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, ClassVar
+@@ -1938,9 +1938,9 @@ class MambaManager(SingleTypeKVCacheManager):
+         )
+         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+         if self.prefix_caching:
+-            # Mapping from request ID to the index of the block
+-            # allocated in the previous step
+-            self.last_state_block_idx: dict[str, int] = {}
++            # Async PP may allocate several chunks before an older source state
++            # becomes safe to reclaim, so preserve every pending source index.
++            self.pending_state_block_indices: dict[str, deque[int]] = {}
+             self._num_retired_blocks: dict[str, int] = {}
+             # The set of the requests that have been allocated blocks
+             self._allocated_block_reqs: set[str] = set()
+@@ -2131,23 +2131,23 @@ class MambaManager(SingleTypeKVCacheManager):
+             request_id, processed_computed_tokens, num_prompt_tokens
+         )
+         if self.prefix_caching:
+-            # `last_state_block_idx` refers to the block index allocated two steps ago.
+-            # The block allocated in the previous step is used to copy Mamba states
+-            # into the block allocated in the current step; the earlier block is
+-            # no longer needed and should be freed here.
+-            last_state_block_idx = self.last_state_block_idx.get(request_id)
+-            # Blocks allocated during prefill may be non-contiguous. Use
+-            # `last_state_block_idx` to free the appropriate block and replace it
+-            # with a null block.
+-            if (
+-                last_state_block_idx is not None
+-                and last_state_block_idx
+-                < cdiv(processed_computed_tokens, self.block_size) - 1
+-            ):
++            pending = self.pending_state_block_indices.get(request_id)
++            if pending:
++                safe_before = cdiv(processed_computed_tokens, self.block_size) - 1
+                 blocks = self.req_to_blocks[request_id]
+-                if blocks[last_state_block_idx] != self._null_block:
+-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+-                    blocks[last_state_block_idx] = self._null_block
++                retained: deque[int] = deque()
++                while pending:
++                    state_block_idx = pending.popleft()
++                    if state_block_idx < safe_before:
++                        if blocks[state_block_idx] != self._null_block:
++                            self.block_pool.free_blocks([blocks[state_block_idx]])
++                            blocks[state_block_idx] = self._null_block
++                    else:
++                        retained.append(state_block_idx)
++                if retained:
++                    self.pending_state_block_indices[request_id] = retained
++                else:
++                    self.pending_state_block_indices.pop(request_id, None)
+ 
+     def _needs_internal_checkpoint(
+         self,
+@@ -2329,17 +2329,17 @@ class MambaManager(SingleTypeKVCacheManager):
+             else:
+                 prev_block_len = len(req_blocks)
+                 blocks_allocated = request_id in self._allocated_block_reqs
+-                # Record the last state block
++                state_block_idx = None
+                 if blocks_allocated:
+-                    # We always save the running state at the last
+-                    # (1 + num_speculative_blocks) block
+-                    self.last_state_block_idx[request_id] = (
+-                        prev_block_len - 1 - self.num_speculative_blocks
+-                    )
++                    # The running state precedes the speculative scratch blocks.
++                    state_block_idx = prev_block_len - 1 - self.num_speculative_blocks
+                 elif prev_block_len > 0:
+-                    # When a new request hits the prefix cache, the last block
+-                    # saves the hit state.
+-                    self.last_state_block_idx[request_id] = prev_block_len - 1
++                    # A new prefix hit resumes from its final cached state block.
++                    state_block_idx = prev_block_len - 1
++                if state_block_idx is not None:
++                    self.pending_state_block_indices.setdefault(
++                        request_id, deque()
++                    ).append(state_block_idx)
+ 
+                 num_skipped_blocks = (
+                     num_required_blocks - self.num_speculative_blocks - 1
+@@ -2447,7 +2447,7 @@ class MambaManager(SingleTypeKVCacheManager):
+     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
+         if self.prefix_caching:
+             self._allocated_block_reqs.discard(request_id)
+-            self.last_state_block_idx.pop(request_id, None)
++            self.pending_state_block_indices.pop(request_id, None)
+             self._num_retired_blocks.pop(request_id, None)
+             self._checkpoints.pop(request_id, None)
+             self._req_chunk_ranges.pop(request_id, None)
+@@ -2628,6 +2628,7 @@ class MambaManager(SingleTypeKVCacheManager):
+             )
+         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
+             return None
++        # Global lookahead replaces legacy `if self.drop_eagle_checkpoint_block:`.
+         latest_prompt_hash_boundary = get_reusable_prefix_length(
+             request.num_prompt_tokens,
+             num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 6c83d46..df8a15b 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -130,6 +130,10 @@ _R = TypeVar("_R")  # Return type for collective_rpc
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
++    deferred_step: tuple[SchedulerOutput, Future[Any]] | None = None
++    is_mm_encoder_only: bool = False
++    num_executed_steps: int = 0
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -798,8 +802,14 @@ class EngineCore:
+                 future = cast(Future[ModelRunnerOutput], exec_future)
+             else:
+                 if not scheduler_output.pending_structured_output_tokens:
+-                    if scheduler_output.has_structured_output_spec_decode:
+-                        draft_token_ids = self.model_executor.take_draft_token_ids()
++                    if getattr(
++                        scheduler_output,
++                        "has_structured_output_spec_decode",
++                        False,
++                    ):
++                        draft_token_ids = self.model_executor.take_draft_token_ids(
++                            list(scheduler_output.scheduled_spec_decode_tokens)
++                        )
+                         if draft_token_ids is not None:
+                             self.scheduler.update_draft_token_ids_in_output(
+                                 draft_token_ids, scheduler_output
+@@ -833,6 +843,36 @@ class EngineCore:
+             # is non-empty.
+             return None, False
+ 
++        deferred_scheduler_output = (
++            self.deferred_step[0] if self.deferred_step is not None else None
++        )
++        if deferred_scheduler_output and not batch_queue:
++            # All earlier results have already been delivered, but this batch
++            # still references draft IDs generated by the worker in the prior
++            # step. There is no queued result to drain. Fetch those IDs before
++            # building the grammar bitmask; otherwise pop() below is empty and
++            # the request cannot advance.
++            deferred_scheduler_output, exec_future = self.deferred_step
++            self.deferred_step = None
++            if getattr(
++                deferred_scheduler_output,
++                "has_structured_output_spec_decode",
++                self.check_for_draft_tokens,
++            ):
++                draft_token_ids = self.model_executor.take_draft_token_ids(
++                    list(deferred_scheduler_output.scheduled_spec_decode_tokens)
++                )
++                if draft_token_ids is not None:
++                    self.scheduler.update_draft_token_ids_in_output(
++                        draft_token_ids, deferred_scheduler_output
++                    )
++            grammar_output = self.scheduler.get_grammar_bitmask(
++                deferred_scheduler_output
++            )
++            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
++            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
++            return None, model_executed
++
+         # Block until the next result is available.
+         future, scheduler_output, exec_model_fut = batch_queue.pop()
+         with self.log_error_detail(scheduler_output):
+@@ -865,8 +905,14 @@ class EngineCore:
+             self.deferred_step = None
+             # Update the deferred scheduler output before computing its grammar
+             # bitmask.
+-            if deferred_scheduler_output.has_structured_output_spec_decode:
+-                draft_token_ids = self.model_executor.take_draft_token_ids()
++            if getattr(
++                deferred_scheduler_output,
++                "has_structured_output_spec_decode",
++                self.check_for_draft_tokens,
++            ):
++                draft_token_ids = self.model_executor.take_draft_token_ids(
++                    list(deferred_scheduler_output.scheduled_spec_decode_tokens)
++                )
+                 if draft_token_ids is not None:
+                     # Update the draft token ids in the scheduler output while
+                     # preserving the worker-provided draft slots.
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index 92186ab..282b5e3 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -336,8 +336,12 @@ class Executor(ABC):
+         """Returns the iteration records the output worker has completed."""
+         return self.collective_rpc("execute_dummy_batch")[0]
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
++    def take_draft_token_ids(
++        self, req_ids: list[str] | None = None
++    ) -> DraftTokenIds | None:
++        output: list[DraftTokenIds] = self.collective_rpc(
++            "take_draft_token_ids", args=(req_ids,)
++        )
+         return output[0]
+ 
+     def profile(
+diff --git a/vllm/v1/executor/multiproc_executor.py b/vllm/v1/executor/multiproc_executor.py
+index 16131c8..de60724 100644
+--- a/vllm/v1/executor/multiproc_executor.py
++++ b/vllm/v1/executor/multiproc_executor.py
+@@ -461,10 +461,13 @@ class MultiprocExecutor(Executor):
+             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+         )
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
++    def take_draft_token_ids(
++        self, req_ids: list[str] | None = None
++    ) -> DraftTokenIds | None:
+         # OPTIMIZATION: Get output only from a single worker (output_rank)
+         return self.collective_rpc(
+             "take_draft_token_ids",
++            args=(req_ids,),
+             unique_reply_rank=self.output_rank,
+             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+         )
+diff --git a/vllm/v1/executor/uniproc_executor.py b/vllm/v1/executor/uniproc_executor.py
+index 229879c..621aaea 100644
+--- a/vllm/v1/executor/uniproc_executor.py
++++ b/vllm/v1/executor/uniproc_executor.py
+@@ -141,8 +141,12 @@ class UniProcExecutor(Executor):
+             single_value=True,
+         )
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.collective_rpc("take_draft_token_ids", single_value=True)
++    def take_draft_token_ids(
++        self, req_ids: list[str] | None = None
++    ) -> DraftTokenIds | None:
++        return self.collective_rpc(
++            "take_draft_token_ids", args=(req_ids,), single_value=True
++        )
+ 
+     def check_health(self) -> None:
+         # UniProcExecutor will always be healthy as long as
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 895cbb2..1ac2ca8 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -725,6 +725,23 @@ class KVCacheGroup:
+             **kwargs,
+         )
+ 
++    @property
++    def kv_cache_spec(self) -> KVCacheGroup:
++        """Backward-compatible group spec view for external KV connectors."""
++        return self
++
++    @property
++    def tokens_per_state(self) -> int | Fraction:
++        distinct = self.distinct_specs
++        if len(distinct) == 1:
++            return distinct[0].tokens_per_state
++        return 1
++
++    @property
++    def sliding_window(self) -> int | None:
++        reach = self.sliding_window_reach
++        return reach if reach > 0 and math.isfinite(reach) else None
++
+     @property
+     def layer_names(self) -> list[str]:
+         return list(self.kv_cache_specs)
+@@ -796,6 +813,28 @@ class KVCacheGroup:
+         )
+ 
+ 
++KVCacheGroupSpec = KVCacheGroup
++
++
++def get_kv_cache_spec_kind(
++    kv_cache_spec: KVCacheSpec | KVCacheGroup,
++) -> KVCacheSpecKind:
++    """Backward-compatible spec kind helper for external KV connectors."""
++    if isinstance(kv_cache_spec, KVCacheGroup):
++        from vllm.v1.core.single_type_kv_cache_manager import get_kv_cache_kind
++
++        return get_kv_cache_kind(
++            kv_cache_spec.manager_config, kv_cache_spec.distinct_specs
++        )
++    if isinstance(kv_cache_spec, MambaSpec):
++        return KVCacheSpecKind.MAMBA
++    if isinstance(kv_cache_spec, MLAAttentionSpec):
++        return KVCacheSpecKind.MLA_ATTENTION
++    if isinstance(kv_cache_spec, AttentionSpec):
++        return KVCacheSpecKind.FULL_ATTENTION
++    return KVCacheSpecKind.UNKNOWN
++
++
+ class PrefixLookupGroup(NamedTuple):
+     """KV cache groups looked up jointly for cache hits: they share a manager
+     policy, block size and DCP sharding."""
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 46c3643..983a1a1 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -116,7 +116,10 @@ from vllm.v1.worker.gpu.attn_utils import (
+     init_kv_cache,
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
+-from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
++from vllm.v1.worker.gpu.buffer_utils import (
++    async_copy_to_gpu,
++    set_default_max_concurrency,
++)
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
+@@ -880,6 +883,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         self.kv_caches = [
+             cache for cache in kv_caches_dict.values() if cache.device == self.device
+         ]
++        self.model_state.set_kv_cache_config(self.kv_cache_config)
+         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
+         self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
+             self.compilation_config.static_forward_context
+@@ -1770,6 +1774,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # A diffusion prefill has no logit rows even when a bitmask row
+         # arrived for it.
++        invalid_drafts = None
+         if grammar_output is not None and logits.shape[0] > 0:
+             # Apply grammar bitmask to the logits in-place.
+             assert self.structured_outputs_worker is not None
+@@ -1779,6 +1784,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.structured_output_request_ids,
+                 grammar_output.grammar_bitmask,
+             )
++            invalid_drafts = grammar_invalid_drafts(
++                input_batch,
++                grammar_output.structured_output_request_ids,
++                grammar_output.num_acceptable_drafts,
++            )
+ 
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+@@ -1797,6 +1807,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                invalid_drafts,
+             )
+ 
+         if shard_metadata is not None:
+@@ -2495,8 +2506,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_verified = torch.minimum(num_in_forward, num_drafted)
+         return num_drafted, num_verified
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.draft_tokens_handler.get_draft_tokens()
++    def take_draft_token_ids(
++        self, req_ids: list[str] | None = None
++    ) -> DraftTokenIds | None:
++        if req_ids is None:
++            return self.draft_tokens_handler.get_draft_tokens()
++        # Async PP can interleave unrelated batches between the producer of a
++        # request's drafts and the structured-output verifier. The handler's
++        # last-batch snapshot is not keyed by request and may already have been
++        # replaced. Read the per-request persistent draft buffer instead.
++        live_ids = [
++            req_id for req_id in req_ids if req_id in self.req_states.req_id_to_index
++        ]
++        if not live_ids:
++            return DraftTokenIds([], [])
++        slots = [self.req_states.req_id_to_index[req_id] for req_id in live_ids]
++        return DraftTokenIds(live_ids, self.req_states.draft_tokens[slots].tolist())
+ 
+     @torch.inference_mode()
+     @step_eplb_after()
+@@ -2679,3 +2704,40 @@ def sort_batch_req_ids(
+         num,
+     )
+     return sorted(num_tokens_per_req, key=key)
++
++
++def grammar_invalid_drafts(
++    input_batch: InputBatch,
++    grammar_req_ids: list[str],
++    num_acceptable_drafts: list[int] | None,
++) -> torch.Tensor | None:
++    """Mask over logit rows whose draft was verified against a permissive row.
++
++    Draft i sits at local position i + 1, and drafts from `num_acceptable_drafts`
++    on met `_full_mask`. Local positions come from the device `cu_num_logits`, so
++    this stays right when adaptive verification trims drafts on device.
++    Returns None when there is nothing to invalidate.
++    """
++    if not grammar_req_ids or input_batch.num_draft_tokens == 0:
++        return None
++    req_id_to_idx = {req_id: i for i, req_id in enumerate(input_batch.req_ids)}
++    limit = np.full(input_batch.num_reqs, np.iinfo(np.int32).max, dtype=np.int32)
++    for i, req_id in enumerate(grammar_req_ids):
++        req_idx = req_id_to_idx.get(req_id)
++        if req_idx is not None:
++            # None (an older scheduler, or warmup): invalidate the whole window.
++            limit[req_idx] = (
++                num_acceptable_drafts[i] if num_acceptable_drafts is not None else 0
++            )
++    # Adaptive verification only trims drafts, so this bound holds either way.
++    num_drafts = input_batch.num_draft_tokens_per_req
++    if num_drafts is not None and (limit >= num_drafts).all():
++        return None
++    local_pos = input_batch.expanded_local_pos
++    cu_num_logits = input_batch.cu_num_logits
++    row_limit = torch.repeat_interleave(
++        async_copy_to_gpu(limit, device=local_pos.device),
++        cu_num_logits[1:] - cu_num_logits[:-1],
++        output_size=local_pos.shape[0],
++    )
++    return local_pos > row_limit
+diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
+index daaadc1..8317f91 100644
+--- a/vllm/v1/worker/gpu/model_states/interface.py
++++ b/vllm/v1/worker/gpu/model_states/interface.py
+@@ -137,6 +137,11 @@ class ModelState(ABC):
+     def apply_staged_writes(self) -> None:
+         return None
+ 
++    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
++        """Hook run once the runner binds a KV cache config, before any
++        request is added. No-op by default."""
++        return None
++
+     def initialize_kv_cache(
+         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
+     ) -> None:
+diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+index c87fb34..682acad 100644
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -105,6 +105,7 @@ class MambaHybridModelState(DefaultModelState):
+         )
+         if self.prefix_caching or self._use_replayssm_trackers:
+             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
++            self._mamba_spec: MambaSpec | None = None
+             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+         if self.prefix_caching:
+             self._mamba_state_idx_gpu = torch.zeros(
+@@ -117,16 +118,37 @@ class MambaHybridModelState(DefaultModelState):
+                 self.max_num_reqs, dtype=torch.int32, device=self.device
+             )
+ 
++    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
++        if not self.prefix_caching:
++            return
++        mamba_groups = get_mamba_groups(kv_cache_config)
++        if not mamba_groups:
++            return
++        mamba_spec = next(iter(mamba_groups))
++        assert all(
++            spec.block_size == mamba_spec.block_size
++            and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
++            for spec in mamba_groups
++        ), "all mamba groups must share cache scheduling parameters"
++        self._mamba_spec = mamba_spec
++
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
+         # Must reset the speculative acceptance count in this idx which could be stale.
+         self.num_accepted_tokens_gpu[req_index].fill_(1)
+         if self.prefix_caching:
+             # Seed the running state block from the resumed/prefilled position.
+-            # The column is in mamba blocks. cache_config.block_size is the
+-            # min over prefix-cacheable groups, so a drafter group with its own
+-            # smaller block (e.g. DFlash) pulls it below mamba_block_size.
+-            mamba_block_size = self.cache_config.mamba_block_size
++            # Prefer resolved MambaSpec.block_size so page unification never
++            # drifts from cache_config.mamba_block_size.
++            mamba_block_size = (
++                self._mamba_spec.block_size
++                if self._mamba_spec is not None
++                else (
++                    self._mamba_ctx.block_size
++                    if self._mamba_ctx is not None
++                    else self.cache_config.mamba_block_size
++                )
++            )
+             assert mamba_block_size is not None
+             self._mamba_state_idx_gpu[req_index].fill_(
+                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
+diff --git a/vllm/v1/worker/gpu/sample/batch_shard.py b/vllm/v1/worker/gpu/sample/batch_shard.py
+index f416d3d..c2dd2be 100644
+--- a/vllm/v1/worker/gpu/sample/batch_shard.py
++++ b/vllm/v1/worker/gpu/sample/batch_shard.py
+@@ -433,9 +433,13 @@ def _shard_grammar_output(
+     bitmask = grammar_output.grammar_bitmask
+     blocks = bitmask.reshape(len(grammar_req_ids), -1, bitmask.shape[-1])
+     local_bitmask = blocks[keep].reshape(-1, bitmask.shape[-1])
++    num_acceptable = grammar_output.num_acceptable_drafts
++    if num_acceptable is not None:
++        num_acceptable = [num_acceptable[i] for i in keep]
+     return GrammarOutput(
+         structured_output_request_ids=local_ids,
+         grammar_bitmask=local_bitmask,
++        num_acceptable_drafts=num_acceptable,
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index ca11b15..39eebcd 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -87,6 +87,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
+         causal: bool | Mapping[int, bool],
+         prepare_forward: Callable[[int, dict[str, Any] | None], None],
+         progress_bar_desc: str = "Capturing CUDA graphs",
++        stream: torch.cuda.Stream | None = None,
+     ) -> None:
+         """`prepare_forward(num_reqs, attn_metadata)` is captured ahead of the
+         query forward."""
+@@ -128,4 +129,4 @@ class DFlashCudaGraphManager(CudaGraphManager):
+ 
+             return forward
+ 
+-        super().capture(create_forward_fn, progress_bar_desc)
++        super().capture(create_forward_fn, progress_bar_desc, stream=stream)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index c809eb9..5f77651 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import copy
++import os
+ from typing import Any
+ 
+ import torch
+@@ -175,6 +176,11 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # Capture must not write context K/V.
+         self._context_slot_mappings.fill_(PAD_SLOT_ID)
+         assert self.query_cudagraph_manager is not None
++        shared_stream = (
++            getattr(self, "_shared_capture_stream", None)
++            if os.environ.get("VLLM_DSV41_SHARE_CAPTURE_STREAM", "1") == "1"
++            else None
++        )
+         self.query_cudagraph_manager.capture(
+             self._generate_draft,
+             self.input_buffers,
+@@ -185,6 +191,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             causal=self._group_causal,
+             prepare_forward=self._prepare_graph_forward,
+             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
++            stream=shared_stream,
+         )
+ 
+     def _prepare_graph_forward(
+@@ -518,6 +525,29 @@ class DFlashSpeculator(DraftModelSpeculator):
+         self.draft_max_seq_len = min(
+             max_seq_len + self.num_query_per_req, self.max_model_len
+         )
++        if (
++            not dummy_run
++            and not is_profile
++            and input_batch.has_prefill
++            and os.environ.get("VLLM_DSV41_YOCO_PREFILL_TRUNC", "0") == "1"
++            and getattr(self.draft_model_config.hf_config, "model_type", "")
++            in ("deepseek_v4", "deepseek_v41")
++            and num_reqs > 0
++            and input_batch.num_draft_tokens == 0
++            and bool(input_batch.is_prefilling_np[:num_reqs].all())
++        ):
++            c_end = (
++                input_batch.num_computed_prefill_tokens_np[:num_reqs]
++                + input_batch.num_scheduled_tokens[:num_reqs]
++            )
++            sw = int(getattr(self.draft_model_config.hf_config, "sliding_window", 512))
++            max_cg = int(
++                self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
++            )
++            if int((input_batch.prefill_len_np[:num_reqs] - c_end).min()) >= (
++                max_cg + 2 * sw
++            ):
++                return self.draft_tokens[:num_reqs]
+ 
+         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
+         # number of rejected tokens, we maintain the size of input_ids and
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index c1844c2..71bb6ba 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -272,6 +272,7 @@ class RejectionSampler:
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+         seq_lens_upper_bound_np: np.ndarray,
++        verify_draft_sampled: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -286,7 +287,7 @@ class RejectionSampler:
+         sampled, num_sampled = rejection_sample(
+             processed_logits,
+             draft_logits,
+-            draft_sampled,
++            verify_draft_sampled,
+             cu_num_logits,
+             pos,
+             idx_mapping,
+@@ -323,12 +324,15 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         logprobs_dims: tuple[int, int] | None,
++        verify_draft_sampled: torch.Tensor | None = None,
+     ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+         LogprobsTensors | None,
+         SamplingMaskTensors | None,
+     ]:
++        if verify_draft_sampled is None:
++            verify_draft_sampled = draft_sampled
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
+@@ -372,6 +376,7 @@ class RejectionSampler:
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
+                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
++                verify_draft_sampled[lo:hi],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -434,6 +439,7 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: DraftLogitsCache | None = None,
++        invalid_drafts: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+@@ -448,6 +454,14 @@ class RejectionSampler:
+             self.sampler.req_states.prefill_len.gpu,
+         )
+ 
++        # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
++        # accepted length before it reaches a permissive bitmask row. Only
++        # verification sees the copy: `apply_sampling_params` and watermarking
++        # keep the real draft ids.
++        verify_draft_sampled = draft_sampled
++        if invalid_drafts is not None:
++            verify_draft_sampled = draft_sampled.masked_fill(invalid_drafts, -1)
++
+         logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+         (
+@@ -463,6 +477,7 @@ class RejectionSampler:
+             pos,
+             chunk_logit_limit,
+             logprobs_dims,
++            verify_draft_sampled,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 8cf4c22..2fa049a 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -614,10 +614,55 @@ class Worker(WorkerBase):
+         )
+         with self._maybe_get_memory_pool_context(tag="runtime"):
+             self.model_runner: GPUModelRunner = self._make_model_runner()
++
++        # Initialize persistent PP communication resources before model and
++        # KV allocation. This makes first-use NCCL allocations deterministic
++        # and lets later memory profiling account for their steady-state cost.
++        self._prime_pp_communicators()
++
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+             report_usage_stats(self.vllm_config)
+ 
++    def _prime_pp_communicators(self) -> None:
++        """Initialize all lazy PP communicators before model/KV allocation."""
++        if getattr(self, "_pp_communicators_primed", False):
++            return
++        pp_group = get_pp_group()
++        if pp_group.world_size <= 1:
++            self._pp_communicators_primed = True
++            return
++        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
++
++        # vLLM/PyNCCL point-to-point communicator.
++        if not pp_group.is_first_rank:
++            pp_group.recv(primer.shape, primer.dtype)
++        if not pp_group.is_last_rank:
++            pp_group.send(primer)
++        torch.accelerator.synchronize()
++
++        # torch ProcessGroupNCCL point-to-point edge communicators.
++        rank = pp_group.rank_in_group
++        if not pp_group.is_first_rank:
++            torch.distributed.recv(
++                primer, src=pp_group.ranks[rank - 1], group=pp_group.device_group
++            )
++        if not pp_group.is_last_rank:
++            torch.distributed.send(
++                primer, dst=pp_group.ranks[rank + 1], group=pp_group.device_group
++            )
++        torch.accelerator.synchronize()
++
++        # Sibling communicator used to broadcast sampled/draft tokens from
++        # the last PP rank back to the earlier ranks.
++        handler = getattr(self.model_runner, "pp_handler", None)
++        if handler is not None:
++            torch.distributed.broadcast(
++                primer, src=handler.last_rank, group=handler.broadcast_group
++            )
++            torch.accelerator.synchronize()
++        self._pp_communicators_primed = True
++
+     def _make_model_runner(self) -> "GPUModelRunner":
+         """Construct the platform's model runner; subclasses override this."""
+         if self.vllm_config.is_mm_encoder_only:
+@@ -1014,6 +1059,10 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner._init_kv_zero_meta()
+ 
++        from vllm.dsv41_memory import maybe_enable_expandable_after_kv
++
++        maybe_enable_expandable_after_kv()
++
+     def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
+         from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
+             _find_simple_cpu_offload_connector,
+@@ -1115,6 +1164,7 @@ class Worker(WorkerBase):
+                 randomize_inputs=self.randomize_dummy_inputs,
+             )
+         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
++        self._prime_pp_communicators()
+ 
+         # Warmup and tune the kernels used during model execution before
+         # cuda graph capture.
+@@ -1575,8 +1625,10 @@ class Worker(WorkerBase):
+             return self.model_runner.pool()
+         return None
+ 
+-    def take_draft_token_ids(self) -> DraftTokenIds | None:
+-        return self.model_runner.take_draft_token_ids()
++    def take_draft_token_ids(
++        self, req_ids: list[str] | None = None
++    ) -> DraftTokenIds | None:
++        return self.model_runner.take_draft_token_ids(req_ids)
+ 
+     def profile(
+         self,

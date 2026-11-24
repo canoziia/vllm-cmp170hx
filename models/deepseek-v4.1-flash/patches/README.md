@@ -1,71 +1,59 @@
-# DeepSeek V4.1 patch series
+# DeepSeek V4.1 Flash SM80 Patch Series (Upstream `vllm` `0e3c8db`)
 
-Base source: `344303947/dsv41-flash-pp5-170hx` at
-`d63af5a472dc76b12d7a73d50a5af142844c15d1` (the author's current HEAD).
+Base source: official `https://github.com/vllm-project/vllm.git` at
+`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`.
 
-## Default active series
+## Base Series (`patches/series`)
 
-The model-specific `models/deepseek-v4.1-flash/patches/series` contains two patches.
-The build then applies the shared runtime fixes in `patches/vllm/series`:
+Applied in order by `scripts/apply-deepseek-v41-patches.sh`:
 
-1. `0001-prime-pp-communicators-before-model-load.patch`
-   - Initializes persistent PP communication resources immediately after
-     `GPUModelRunner` and `PPHandler` construction, before model, CPU Engram,
-     and KV allocation.
-   - Primes the vLLM/PyNCCL point-to-point communicator, torch
-     ProcessGroupNCCL edge communicators, and the sampled/draft-token feedback
-     broadcast group.
-   - Uses an explicit idempotency flag, so the existing pre-warmup ordering
-     check becomes a no-op after successful early initialization.
-   - Makes later memory accounting include communicator resources and avoids
-     first-use NCCL allocation failures under tight HBM budgets.
-2. `0002-fixed-triton-logits-workspace.patch`
-   - Reuses the profiled sparse-indexer logits workspace on CUDA devices where
-     DeepGEMM is unavailable, including CMP 170HX.
-   - Keeps the existing 128 MiB budget and automatic prefill sub-chunking; it
-     changes allocation reuse, not request admission or indexer results.
+1. `0001-upstream-0e3c8db-compat-and-entrypoints.patch`
+   - Preserves SM80 / DeepSeek-V4.1 entrypoints, `vllm.env_override` profile bootstrap,
+     and `--sse-keep-alive-interval` CLI compatibility on upstream `vllm` `0e3c8db`.
+2. `0002-common-async-pp-mamba-and-structured-spec-fixes.patch`
+   - Ports all 4 shared runtime invariants verified by `scripts/test-vllm-common-patches.py`:
+     async-PP Mamba state reclamation, resumed hybrid cache geometry restoration,
+     structured-output + speculative batch alignment, and NVFP4 empty-amax safety.
+3. `0003-openai-thinking-sse-keepalive-and-1017-encoding.patch`
+   - Ports top-level `"thinking": {"type": "enabled" | "disabled"}` OpenAI chat mapping
+     and exact checkpoint-`1017` prompt/tool-namespace encoding (`deepseek_v41_encoding.py`).
+4. `0004-dsv41-memory-engram-cpu-offload-and-vision-offload.patch`
+   - Ports post-KV `expandable_segments` allocator activation (`vllm/dsv41_memory.py`),
+     NUMA-aware 264 B packed host Engram offload with OpenMP+AVX2 CPU gather + compact
+     H2D DMA (`native/dsv41_engram_cpu`), early PP communicator priming, and zero-GPU-HBM
+     CPU-offloaded multimodal vision tower execution (`vl_model.py`).
+5. `0005-dsv41-sm80-moe-decode-and-prefill-split.patch`
+   - Ports SM80 weight-streaming MXFP4 MoE decode kernels (`native/dsv4_moe`), fused
+     SwiGLU activation + top-k sum, single-CTA deterministic MoE block alignment, and
+     split-list MXFP4 MoE prefill (`moe_prefill.py`).
+6. `0006-dsv41-sm80-dense-mxfp8-thin-woa-and-fast-router.patch`
+   - Ports 1x-HBM dense MXFP8 decode GEMMs (`native/dsv41_dense_mxfp8`), post-repack
+     zero-overshoot `wq_b + indexer.wq_b` fusion, thin-M grouped `wo_a` GEMM, and
+     bitwise SM80 MoE router (`gate_gemv + sqrtsoftplus top-k`).
+7. `0007-dsv41-sm80-attention-indexer-swa-yoco-and-dspark.patch`
+   - Ports SM80 `nvfp4_ds_mla` sparse-attention decode & 32-head prefill optimizations,
+     bounded 64/128 MiB sequence-chunked decode indexer workspace, fast CUDA prefill
+     indexer (`native/dsv41_indexer`), ragged SWA C++ metadata (`native/dsv41_swa`),
+     prefill AllReduce overlap, and FP8 DSpark draft head / Markov sampling hooks.
+8. `0008-dsv41-opt-profiles-and-prefill-sched-helper.patch`
+   - Adds `vllm/dsv41_opt_profile.py` (`default`, `verification`, `tep4`,
+     `tep4_verification`, `tep4_fused`) and `dsv41_prefill_sched.py` quadratic cost-chunk
+     helper.
 
-The shared series adds async-PP Mamba state reclamation and resolved-cache
-geometry restoration; both are also used by Qwen. The communicator primer
-stays DeepSeek-specific because it explicitly primes the DSpark PP feedback
-broadcast group and has not been validated as part of Qwen's final source.
+## Adaptive Verification & Topology-Aware Fusion Series (`patches/adaptive/series`)
 
-Default builds include no performance-debug runtime code.
+Compiled in by default (`ENABLE_ADAPTIVE_VERIFICATION=1`) and inert unless enabled via
+runtime config / `VLLM_DSV41_OPT_PROFILE`:
 
-## Optional diagnostic series
-
-`ENABLE_PERF_DEBUG=1` additionally applies:
-
-1. `optional/0002-hot-perf-debug.patch`
-   - Includes both the DSpark compute toggle and a disabled-by-default,
-     SIGUSR2-controlled diagnostic tracer. No separate hot-DSpark build flag.
-   - The toggle uses a scheduler control file, per-batch K, K0/K5 target graphs,
-     and context-only draft updates while off to preserve restart-free re-enable.
-   - Sampled mode uses asynchronous CUDA Events and deferred pinned D2H copies
-     without stream synchronization.
-   - Detailed eager mode and hot torch-profiler mode are disabled: the former
-     desynchronized PP shapes, and the latter reproduced PP2 worker stalls
-     under the small-expert fixture. External process sampling is available;
-     CMP 170HX does not expose CUPTI CUDA kernel activities.
-   - Runtime sampling stays on the production Graph dispatch/padding path.
-
-LMCache is **never patched at stage 1**. The layer-only patch that used to do this
-(`optional/0003-lmcache-event-capability-cache.patch`, applied only under
-`ENABLE_PERF_DEBUG=1` and SHA-256-pinned to the third-party base image's
-`event_ipc.py`) has been removed: stage 1 is an intermediate image, not a
-deployable artifact, so patching its bundled LMCache matched no configuration we
-run, while the SHA pin made every debug build abort whenever the base image
-moved. The single source of truth for that fix is
-`patches/lmcache/0003-event-capability-cache.patch`, applied to the digest-pinned
-official payload and exported to both client and server images through
-`PYTHONPATH=/opt/lmcache-patched`. To reproduce the historical
-`73d0be8-debug-eventfix` image, check out the commit that built it.
-
-The pinned author revision already contains native PP6+DSpark support, including
-auxiliary hidden-state relay capability and last-rank target-embedding sharing.
-No superseded PP+DSpark patches are retained or applied.
-
-The author's CPU Engram offload, exact-size pinned allocation, staged Marlin,
-ShadowSource, Ampere sparse-attention fixes, streamed Engram loading, and PP6
-rank-2 memory fix are part of the pinned base. No disk Engram, Zero Engram,
-GPU-scale, or lazy-trigger patches are included.
+1. `adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`
+   - Request-local measured adaptive verification policy (`dsv41_measured_policy.py`),
+     manual `vllm_xargs.spec_k` (`[0, 5]`), live-load cohort packing, and uniform
+     sub-width (`k=1..5`) + mixed-`spec_k` `FULL` CUDA graphs with metadata replay.
+2. `adaptive/0002-dsv41-topology-fusions-and-tep4-fused-profile.patch`
+   - Topology-aware SM80 collective dispatch (`ampere_peer_topology()` auto-detecting
+     `"nvlink"` vs `"pcie"` with zero code changes), single-kernel Lamport Markov
+     exchange (`markov_symm.py`), in-graph text embedding (`vl_model.py`), TP-local
+     greedy speculative verification (`tp_greedy_*` in `native/dsv41_r2`), single-kernel
+     `fused_gate_topk_align` (with `is_padding` + `bias_vl` + EP block-8 alignment),
+     `w2_splitk_ep` with 256-col low-M sum + fused shared-expert `__hadd2`, C++ tensor-core
+     `woa_mxfp8_splitk`, and zero-HBM `dequant_marlin_mxfp8 + cuBLAS` prefill.

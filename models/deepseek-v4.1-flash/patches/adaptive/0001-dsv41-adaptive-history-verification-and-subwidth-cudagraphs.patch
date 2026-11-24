@@ -1,0 +1,1654 @@
+From: Canoziia <canoziia@projectk.org>
+Subject: [PATCH] dsv41(adaptive): history-based measured verification policy, spec_k, and sub-width/mixed CUDA graphs
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index b0975b8..e529575 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -643,6 +643,9 @@ class SpeculativeConfig:
+     """Whether to adaptively size the draft-verification budget from per-request
+     confidence. Currently only supported for method="dspark"."""
+ 
++    adaptive_verification_decay: float = 0.95
++    """Exponential moving-average decay for CPU history verification policy."""
++
+     prefill_context_kv_only: bool = False
+     """Set on a P/D prefill instance (Model Runner V2, DFlash-based speculators)
+     to only store the drafter's context K/V, which the decode instance reads:
+@@ -1508,7 +1511,7 @@ class SpeculativeConfig:
+ 
+         if (
+             config_cls.adaptive_verification_uses_draft_logits
+-            and self.enable_adaptive_verification
++            and self.uses_gpu_adaptive_verification()
+             and self.use_local_argmax_reduction
+         ):
+             raise ValueError(
+@@ -2038,6 +2041,23 @@ class SpeculativeConfig:
+     def use_dspark(self) -> bool:
+         return self.method == "dspark"
+ 
++    def uses_history_verification(self) -> bool:
++        """The public adaptive switch selects DeepSeek's CPU-known prefixes."""
++        target = self.target_model_config
++        return bool(
++            self.enable_adaptive_verification
++            and self.use_dspark()
++            and target is not None
++            and "DeepseekV41ForCausalLM" in target.architectures
++        )
++
++    def uses_gpu_adaptive_verification(self) -> bool:
++        """Internal device-layout capability, not a second user switch."""
++        return (
++            self.enable_adaptive_verification
++            and not self.uses_history_verification()
++        )
++
+     def uses_dynamic_speculative_decoding(self) -> bool:
+         return self.num_speculative_tokens_per_batch_size is not None
+ 
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index 4ea6278..bfe9cef 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -1295,7 +1295,7 @@ class VllmConfig:
+             raise ValueError("AuxOutput Connector requires prefix caching.")
+         if (
+             self.speculative_config is not None
+-            and self.speculative_config.enable_adaptive_verification
++            and self.speculative_config.uses_gpu_adaptive_verification()
+         ):
+             raise ValueError(
+                 "--enable-return-routed-experts is incompatible with "
+@@ -1395,7 +1395,7 @@ class VllmConfig:
+         speculative_config = self.speculative_config
+         if (
+             speculative_config is not None
+-            and speculative_config.enable_adaptive_verification
++            and speculative_config.uses_gpu_adaptive_verification()
+         ):
+             raise ValueError(
+                 "sampling distribution replay with speculative decoding "
+@@ -2793,6 +2793,12 @@ class VllmConfig:
+         else:
+             prefill_sizes = list(shared_sizes)
+ 
++        if decode_sizes is None:
++            _env_req_sizes = os.environ.get("VLLM_DSV41_DECODE_REQ_SIZES", "").strip()
++            if _env_req_sizes and _env_req_sizes.lower() not in ("0", "off", "none"):
++                decode_sizes = [
++                    int(x) for x in _env_req_sizes.split(",") if x.strip()
++                ]
+         if decode_sizes is not None:
+             decode_sizes = explicit(
+                 decode_sizes,
+@@ -2854,6 +2860,11 @@ class VllmConfig:
+         speculative_config = self.speculative_config
+         if speculative_config is not None and (
+             speculative_config.enable_adaptive_verification
++            or (
++                os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++                and self.model_config is not None
++                and "DeepseekV41ForCausalLM" in self.model_config.architectures
++            )
+         ):
+             token_sizes.update(
+                 self.get_varlen_decode_cudagraph_token_sizes(
+@@ -3446,6 +3457,35 @@ class VllmConfig:
+         if not spec_config or not spec_config.enable_adaptive_verification:
+             return
+ 
++        if spec_config.uses_history_verification():
++            parallel = self.parallel_config
++            valid_pp_tp_dcp = (
++                parallel.pipeline_parallel_size == 6
++                and parallel.tensor_parallel_size == 1
++                and parallel.decode_context_parallel_size == 1
++            ) or (
++                parallel.pipeline_parallel_size == 1
++                and parallel.decode_context_parallel_size
++                in (1, parallel.tensor_parallel_size)
++            )
++            if (
++                not current_platform.is_device_capability_family(80)
++                or spec_config.num_speculative_tokens != 5
++                or spec_config.draft_sample_method != "greedy"
++                or not valid_pp_tp_dcp
++                or parallel.data_parallel_size != 1
++                or parallel.prefill_context_parallel_size != 1
++                or parallel.use_ubatching
++                or self.lora_config is not None
++                or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
++            ):
++                raise ValueError(
++                    "Adaptive DeepSeek history verification currently requires "
++                    "SM80, five greedy drafts, PP6/TP1/DCP1 or PP1/TEP+DCP, "
++                    "CUDA graphs and no LoRA/DBO"
++                )
++            return
++
+         if self.lora_config is not None:
+             # The per-token LoRA mapping is built from CPU placeholder boundaries,
+             # while the trimmed batch's true boundaries are decided on the GPU.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
+index 96b39ae..9764ce2 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_connector.py
+@@ -1231,10 +1231,30 @@ def _resolve_lmcache_mp_connector() -> type[KVConnectorBase_V1]:
+         return LMCacheMPConnectorUpstream
+ 
+     try:
++        import lmcache.integration.vllm.kv_cache_groups as _lmc_kv_groups
++        import lmcache.integration.vllm.lmcache_mp_connector as _lmc_mp_mod
+         from lmcache.integration.vllm.lmcache_mp_connector import (
+             LMCacheMPConnector as _ExternalLMCacheMPConnector,
+         )
+ 
++        _orig_gtpb = getattr(_lmc_kv_groups, "get_tokens_per_block", None)
++        _is_sw = getattr(_lmc_kv_groups, "_is_sliding_window_spec", None)
++        if (
++            callable(_orig_gtpb)
++            and callable(_is_sw)
++            and not getattr(_orig_gtpb, "_dsv41_sw_dcp_safe", False)
++        ):
++
++            def _sw_dcp_safe_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
++                if dcp_size > 1 and _is_sw(kv_cache_spec):
++                    return int(kv_cache_spec.block_size)
++                return int(_orig_gtpb(kv_cache_spec, dcp_size))
++
++            _sw_dcp_safe_tokens_per_block._dsv41_sw_dcp_safe = True  # type: ignore[attr-defined]
++            _lmc_kv_groups.get_tokens_per_block = _sw_dcp_safe_tokens_per_block
++            if hasattr(_lmc_mp_mod, "get_tokens_per_block"):
++                _lmc_mp_mod.get_tokens_per_block = _sw_dcp_safe_tokens_per_block
++
+         logger.info(
+             "Using external LMCacheMPConnector from "
+             "lmcache.integration.vllm.lmcache_mp_connector"
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index 925c976..a4705ce 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -131,11 +131,7 @@ class DSparkDeepseekV4Model(nn.Module):
+         )
+         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+ 
+-        self.topk_indices_buffer = torch.empty(
+-            vllm_config.scheduler_config.max_num_batched_tokens,
+-            config.index_topk,
+-            dtype=torch.int32,
+-        )
++        self.topk_indices_buffer = None
+ 
+         current_vllm_config = get_current_vllm_config()
+         # The target model already holds the GEMM-RS workspace (same hidden
+@@ -342,8 +338,10 @@ def _insert_context_kv(
+     # swa_bytes_per_token once the sliding-window and compressed records can
+     # differ). block_size stays the layer's, so the op's size(1) check still
+     # cross-checks the two rather than restating the tensor.
++    from vllm.models.deepseek_v41.attention import _dsv41_swa_ops
++
+     cache = attn.swa_cache_layer.kv_cache
+-    torch.ops._C.fused_deepseek_v4_kv_rope_insert(
++    _dsv41_swa_ops().fused_deepseek_v4_kv_rope_insert(
+         kv,
+         cache,
+         slot_mapping,
+@@ -420,7 +418,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+                 or extra.get("dspark_fused_markov", is_ampere() or is_hopper())
+             )
+             and spec_config.draft_sample_method == "probabilistic"
+-            and not spec_config.enable_adaptive_verification
++            and not spec_config.uses_gpu_adaptive_verification()
+             and not vllm_config.model_config.use_fp64_gumbel
+             and getattr(vllm_config, "watermark_config", None) is None
+             and not vllm_config.parallel_config.enable_batch_sharded_sampling
+@@ -437,6 +435,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+             self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+             self.num_speculative_steps = spec_config.num_speculative_tokens
+ 
++        self._fp8_draft_head = None
+         self.set_moe_parameters()
+ 
+     def set_moe_parameters(self) -> None:
+@@ -500,20 +499,56 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+         step = None if decode is None else decode.plan(positions)
+         return self.model(input_ids, positions, inputs_embeds, decode_step=step)
+ 
++    def build_fp8_draft_head(self) -> None:
++        from .dspark_fp8_head import Fp8DraftHead
++
++        if self._fp8_draft_head is None and self.lm_head.weight.is_cuda:
++            self._fp8_draft_head = Fp8DraftHead(self.lm_head.weight.data)
++
++    def maybe_build_fp8_draft_head(self) -> None:
++        from .dspark_fp8_head import draft_head_fp8_enabled
++
++        if draft_head_fp8_enabled():
++            self.build_fp8_draft_head()
++
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Base logits U_k = lm_head(norm(head_hidden))."""
+         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+ 
+     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        # Full-vocab draft: base logits, no d2t scatter.
++        if self._fp8_draft_head is not None:
++            local = self._fp8_draft_head(self.model.norm(hidden_states))
++            return self.logits_processor._gather_logits(local)
+         return self.compute_logits(hidden_states)
+ 
+     def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """This TP rank's vocab shard of compute_draft_logits, not gathered."""
++        if self._fp8_draft_head is not None:
++            return self._fp8_draft_head(self.model.norm(hidden_states))
+         return self.logits_processor(
+             self.lm_head, self.model.norm(hidden_states), skip_gather=True
+         )
+ 
++    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Same logits, this rank's vocab columns only (masked, no gather)."""
++        if self._fp8_draft_head is not None:
++            logits = self._fp8_draft_head(self.model.norm(hidden_states))
++            self.logits_processor._mask_outside_vocab(logits, self.lm_head)
++            return logits
++        return self.logits_processor.get_shard_logits(
++            self.lm_head, self.model.norm(hidden_states)
++        )
++
++    def select_draft_token_shard(
++        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
++    ) -> torch.Tensor:
++        return self.model.markov_head.select_top_tokens(
++            markov_embed, base_shard_logits, self.logits_processor
++        )
++
++    def markov_fusion_operands(self):
++        return self.model.markov_head.fusion_operands(self.logits_processor)
++
+     def draft_logits_shard(self) -> tuple[int, int] | None:
+         """`(first column, width)` of `compute_draft_logits_local` within
+         the full draft logits, or None when it is not a plain slice of them
+diff --git a/vllm/models/deepseek_v41/nvidia/model_state.py b/vllm/models/deepseek_v41/nvidia/model_state.py
+index bd4aaf3..a302d10 100644
+--- a/vllm/models/deepseek_v41/nvidia/model_state.py
++++ b/vllm/models/deepseek_v41/nvidia/model_state.py
+@@ -176,7 +176,10 @@ def _skip_tail_min_remaining(vllm_config: VllmConfig, window: int) -> int | None
+     priority preemption can return its step's budget. The second window covers the
+     few tokens MTP lookahead or max_model_len shave off a chunk."""
+     if (
+-        vllm_config.model_config.supports_multimodal_inputs
++        (
++            vllm_config.model_config.supports_multimodal_inputs
++            and vllm_config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
++        )
+         or vllm_config.scheduler_config.policy == "priority"
+     ):
+         return None
+@@ -189,7 +192,7 @@ def _skip_tail_min_remaining(vllm_config: VllmConfig, window: int) -> int | None
+     draft_slots = dropped_drafts = 0
+     if spec is not None:
+         draft_slots = spec.max_num_new_slots_for_drafting
+-        if spec.enable_adaptive_verification:
++        if spec.uses_gpu_adaptive_verification():
+             dropped_drafts = spec.num_speculative_tokens
+     # Each scheduled request takes draft_slots off the input budget, and
+     # adaptive verification may drop every draft before graph dispatch.
+diff --git a/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py b/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py
+index 93bfd37..80b9960 100644
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/__init__.py
+@@ -101,7 +101,7 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
+         "DSpark speculative decoding without adaptive verification": (
+             spec is not None
+             and spec.method == "dspark"
+-            and not spec.enable_adaptive_verification
++            and not spec.uses_gpu_adaptive_verification()
+         ),
+         "the FLASHINFER_MLA_SPARSE_DSV41 attention backend, an fp8 KV cache "
+         "and the MXFP4 indexer with sparse logits": (
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 7fecebd..700d030 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -10,15 +10,25 @@ from typing import ClassVar
+ 
+ import numpy as np
+ import torch
++import flashinfer as _flashinfer_mod
+ from flashinfer import (
+     BatchAttentionWithAttentionSinkWrapper,
+     BatchDecodeWithPagedKVCacheWrapper,
+-    BatchPrefillWithCausalBidirectionalRangesWrapper,
+     BatchPrefillWithPagedKVCacheWrapper,
+     BatchPrefillWithRaggedKVCacheWrapper,
+     get_seq_lens,
+     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+ )
++
++class _MissingBidirectionalRangesWrapper:
++    pass
++
++
++BatchPrefillWithCausalBidirectionalRangesWrapper = getattr(
++    _flashinfer_mod,
++    "BatchPrefillWithCausalBidirectionalRangesWrapper",
++    _MissingBidirectionalRangesWrapper,
++)
+ from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
+ from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+ from flashinfer.utils import (
+@@ -119,7 +129,9 @@ logger = init_logger(__name__)
+ _MM_PREFIX_KV_DTYPES = (None, "auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
+ # An SM100 NVFP4 cache keeps its V scales in the trtllm-gen swizzle.
+ _MM_PREFIX_READS_SWIZZLED_V_SF = (
+-    "v_sf_swizzled"
++    BatchPrefillWithCausalBidirectionalRangesWrapper
++    is not _MissingBidirectionalRangesWrapper
++    and "v_sf_swizzled"
+     in inspect.signature(BatchPrefillWithCausalBidirectionalRangesWrapper).parameters
+ )
+ 
+@@ -129,7 +141,12 @@ def _native_mm_prefix(vllm_config: VllmConfig | None) -> bool:
+     only when FLASHINFER is selected explicitly."""
+     from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+-    if vllm_config is None or vllm_config.model_config is None:
++    if (
++        BatchPrefillWithCausalBidirectionalRangesWrapper
++        is _MissingBidirectionalRangesWrapper
++        or vllm_config is None
++        or vllm_config.model_config is None
++    ):
+         return False
+     model_config = vllm_config.model_config
+     return (
+@@ -1508,7 +1525,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+         speculative_config = vllm_config.speculative_config
+         return (
+             speculative_config is not None
+-            and speculative_config.enable_adaptive_verification
++            and speculative_config.uses_gpu_adaptive_verification()
+             and decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
+             and not use_dcp
+         )
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index fe557e3..b5312b2 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -418,7 +418,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
+     cu_seqlen_ks: torch.Tensor
+     cu_seqlen_ke: torch.Tensor
+     cu_seq_lens: torch.Tensor
+-    token_to_seq: torch.Tensor
++    token_to_seq: torch.Tensor | None
+     total_seq_lens: int
+     # Host upper bound on cu_seqlen_ke - cu_seqlen_ks, sizing the compressed
+     # DeepGEMM prefill logits.
+@@ -528,11 +528,12 @@ class BuildPrefillChunkMetadataKernel(
+                 mask=mask,
+             )
+ 
+-        # Compute token_to_seq
+-        for i in range(0, compressed_seq_len, BLOCK_SIZE):
+-            offset = i + tl.arange(0, BLOCK_SIZE)
+-            mask = offset < compressed_seq_len
+-            tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)
++        # Compute token_to_seq (only needed by ROCm KV gather, never on CUDA)
++        if token_to_seq_ptr is not None:
++            for i in range(0, compressed_seq_len, BLOCK_SIZE):
++                offset = i + tl.arange(0, BLOCK_SIZE)
++                mask = offset < compressed_seq_len
++                tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)
+ 
+     def dispatch(
+         self,
+@@ -642,7 +643,7 @@ class BuildPrefillChunkMetadataKernel(
+                 "cu_compressed_seq_lens", torch.int32
+             ),
+             row_start_cu_compressed_seq_lens=int32_ptr,
+-            token_to_seq=int32_ptr,
++            token_to_seq=int32_ptr if current_platform.is_rocm() else None,
+             cu_compressed_seq_len_ks=int32_ptr,
+             cu_compressed_seq_len_ke=int32_ptr,
+             query_slice_start=compile_key.query_slice_start,
+@@ -662,7 +663,7 @@ class BuildPrefillChunkMetadataKernel(
+         uncompressed_seq_lens: torch.Tensor,
+         cu_compressed_seq_lens: torch.Tensor,
+         row_start_cu_compressed_seq_lens: torch.Tensor,
+-        token_to_seq: torch.Tensor,
++        token_to_seq: torch.Tensor | None,
+         cu_compressed_seq_len_ks: torch.Tensor,
+         cu_compressed_seq_len_ke: torch.Tensor,
+         query_slice_start: int,
+@@ -902,7 +903,9 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
+     # size while still fitting within the flashmla_sparse workspace.
+     # For DeepSeek-V3.2, the max_model_len is 163840.
+     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
+-    return max_model_len * (576 * 2 // 132) * factor
++    # Cap at 128K tokens' worth so 1M max_model_len does not reserve >1 GiB of
++    # gather workspace; longer prefills split cleanly across gather chunks.
++    return min(max_model_len, 131072) * (576 * 2 // 132) * factor
+ 
+ 
+ def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) -> int:
+@@ -965,7 +968,7 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
+     next_n = 1 + vllm_config.num_speculative_tokens
+     return not _supports_native_decode(next_n) or (
+         speculative_config is not None
+-        and speculative_config.enable_adaptive_verification
++        and speculative_config.uses_gpu_adaptive_verification()
+         and (
+             _supports_flattened_device_query_lens()
+             or _supports_deepseek_v4_flattened_device_query_lens(vllm_config)
+@@ -1031,7 +1034,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         )
+         self.use_adaptive_verification = bool(
+             self.vllm_config.speculative_config
+-            and self.vllm_config.speculative_config.enable_adaptive_verification
++            and self.vllm_config.speculative_config.uses_gpu_adaptive_verification()
+         )
+         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
+         # Plan prefill chunks for the fused MQA+top-k kernel (not bounded by
+@@ -1237,7 +1240,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
+         """Prepare native or per-token flattened decode tensors."""
+         spec_config = self.vllm_config.speculative_config
+-        adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
++        adaptive = bool(spec_config and spec_config.uses_gpu_adaptive_verification())
+         min_decode_len = int(decode_lens_cpu.min().item())
+         if not use_native:
+             assert self.decode_seq_lens_buffer.dim() == 1
+@@ -1738,7 +1741,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             min_decode_len = int(decode_lens_cpu.min().item())
+             write_is_uniform = min_decode_len == max_decode_len
+             next_n = 1 + self.num_speculative_tokens
+-            if self.use_adaptive_verification:
++            if (
++                self.use_adaptive_verification
++                or common_attn_metadata.max_query_len > max_decode_len
++            ):
+                 # Varlen FULL graphs are captured by distributing the graph's
+                 # token bucket over as many one-token dummy requests as
+                 # possible. Runtime adaptive budgets can put up to next_n
+@@ -1746,7 +1752,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 # branch must describe that upper bound rather than the dummy
+                 # partition. Device per-request lengths still select the live
+                 # rows at replay.
+-                max_decode_len = next_n
++                max_decode_len = max(common_attn_metadata.max_query_len, next_n)
+                 write_is_uniform = False
+             # The kernel sees max_decode_len Q rows, not the configured next_n,
+             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
+@@ -1988,7 +1994,11 @@ def build_prefill_chunk_metadata(
+ 
+     num_reqs = end_idx - start_idx
+     device = block_table.device
+-    token_to_seq = torch.empty(total_seq_lens, dtype=torch.int32, device=device)
++    token_to_seq = (
++        torch.empty(total_seq_lens, dtype=torch.int32, device=device)
++        if current_platform.is_rocm()
++        else None
++    )
+ 
+     if pcp_plan is not None:
+         cu_seq_lens = pcp_plan.global_cu
+diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
+index b2187e1..5443f45 100644
+--- a/vllm/v1/attention/selector.py
++++ b/vllm/v1/attention/selector.py
+@@ -147,7 +147,7 @@ def get_attn_backend(
+     speculative_config = vllm_config.speculative_config
+     use_adaptive_verification = (
+         speculative_config is not None
+-        and speculative_config.enable_adaptive_verification
++        and speculative_config.uses_gpu_adaptive_verification()
+     )
+     if use_adaptive_verification:
+         from vllm.compilation.backends import model_tag
+diff --git a/vllm/v1/core/sched/dsv41_fixed_policy.py b/vllm/v1/core/sched/dsv41_fixed_policy.py
+new file mode 100644
+index 0000000..4b6ee06
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_fixed_policy.py
+@@ -0,0 +1,203 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fixed measured CPU policy adapter. No external source loading, capability or trace IO.
++
++Per-request state is generation-pinned. Only valid actual-width feedback can
++advance selection; scheduled widths remain retained when a fresh choice is
++ineligible. Feedback recurrence is CPU-visible cadence, not GPU kernel time.
++"""
++
++import math
++import time
++from types import SimpleNamespace
++from .dsv41_measured_policy import Policy
++
++
++class FixedHistoryPolicy:
++    def __init__(self, logger, decay=0.95):
++        if isinstance(decay, bool) or not math.isfinite(decay) or not 0 <= decay < 1:
++            raise ValueError("invalid history decay")
++        self.logger = logger
++        self.decay = decay
++        self.active = {}
++        self.generation = 0
++        self.feedback_time = None
++        self.warned = False
++        self.logger.info(
++            "DSV41 fixed measured CPU policy enabled: decay=%s; no hot loader", decay
++        )
++
++    def make_entry(self, request):
++        return self.new_entry(Policy({"decay": self.decay}))
++
++    def new_entry(self, plugin):
++        self.generation += 1
++        return SimpleNamespace(
++            plugin=plugin,
++            k=5,
++            generation=self.generation,
++            previous=None,
++            fresh=False,
++            seq=0,
++            failed=False,
++        )
++
++    def admit(self, request):
++        if getattr(request, "verification_draft_limit", None) is None:
++            self.active[request.request_id] = self.make_entry(request)
++
++    def is_disabled(self, entry):
++        return entry.failed
++
++    def trace(self, event):
++        pass
++
++    def fail(self, rid, entry, exc):
++        # Fail closed to fixed full5, not an unvalidated width. Manual never
++        # enters this adapter. No retry until next request admission.
++        entry.failed = True
++        entry.k = 5
++        entry.fresh = False
++        if not self.warned:
++            self.logger.warning(
++                "DSV41 fixed policy failure (%s); full5 retained", type(exc).__name__
++            )
++            self.warned = True
++
++    def retained_limits(self, requests):
++        return {
++            r.request_id: self.active[r.request_id].k
++            for r in requests
++            if r.request_id in self.active
++            and getattr(r, "verification_draft_limit", None) is None
++        }
++
++    def choose(self, requests, concurrency, residents=None):
++        result = {}
++        for r in requests:
++            entry = self.active.get(r.request_id)
++            if (
++                entry is None
++                or getattr(r, "verification_draft_limit", None) is not None
++            ):
++                continue
++            if not self.is_disabled(entry) and entry.fresh:
++                try:
++                    k = entry.plugin.choose(
++                        dict(
++                            current_k=entry.k,
++                            concurrency=concurrency,
++                            cohort_size=len(requests),
++                        )
++                    )
++                    if type(k) is not int or not 1 <= k <= 5 or k > entry.k + 1:
++                        raise ValueError("policy width outside allowed transition")
++                    self.trace(
++                        dict(
++                            event="choose",
++                            request=r.request_id,
++                            seq=entry.seq,
++                            old=entry.k,
++                            next=k,
++                            concurrency=concurrency,
++                            diagnostics=getattr(entry.plugin, "diagnostics", {}),
++                        )
++                    )
++                    entry.k = k
++                    entry.fresh = False
++                except Exception as exc:
++                    self.fail(r.request_id, entry, exc)
++            result[r.request_id] = entry.k
++        return result
++
++    def scheduled(self, output, residents, concurrency):
++        if not self.active:
++            return
++        now = time.perf_counter()
++        key = tuple(sorted(r.request_id for r in residents))
++        prefilling = any(r.is_prefill_chunk for r in residents)
++        stamps = {}
++        for rid, drafts in output.scheduled_spec_decode_tokens.items():
++            entry = self.active.get(rid)
++            if entry is not None and not self.is_disabled(entry):
++                entry.seq += 1
++                stamps[rid] = (
++                    entry.generation,
++                    now,
++                    key,
++                    prefilling,
++                    concurrency,
++                    len(drafts),
++                    entry.seq,
++                )
++        output._dsv41_policy_stamps = stamps
++
++    def begin_feedback(self):
++        self.feedback_time = time.perf_counter()
++
++    def feedback(self, output, request, drafted, accepted, output_tokens, valid):
++        rid = request.request_id
++        entry = self.active.get(rid)
++        stamp = getattr(output, "_dsv41_policy_stamps", {}).get(rid)
++        if (
++            entry is None
++            or stamp is None
++            or stamp[0] != entry.generation
++            or self.is_disabled(entry)
++        ):
++            return
++        _, sent, key, prefilling, concurrency, actual_k, seq = stamp
++        now = (
++            self.feedback_time
++            if self.feedback_time is not None
++            else time.perf_counter()
++        )
++        latency = now - sent
++        previous = entry.previous
++        entry.previous = (now, key, prefilling, actual_k)
++        seconds = latency
++        timing_valid = bool(
++            valid
++            and not prefilling
++            and previous is not None
++            and previous[1] == key
++            and not previous[2]
++            and previous[3] == actual_k
++        )
++        if timing_valid:
++            seconds = now - previous[0]
++        if not valid:
++            entry.previous = None
++        if not 0 < seconds < 60 or actual_k != drafted:
++            timing_valid = False
++        event = dict(
++            request=rid,
++            seq=seq,
++            k=drafted,
++            accepted=accepted,
++            output_tokens=output_tokens,
++            seconds=seconds,
++            latency_s=latency,
++            timing_kind="feedback_recurrence"
++            if timing_valid
++            else "dispatch_to_feedback",
++            timing_valid=timing_valid,
++            valid=valid,
++            concurrency=concurrency,
++            load_epoch=hash(key),
++        )
++        self.trace(dict(event="feedback", **event))
++        if not valid:
++            return
++        try:
++            entry.plugin.observe(event)
++            entry.fresh = True
++        except Exception as exc:
++            self.fail(rid, entry, exc)
++
++    def forget(self, request_id):
++        self.active.pop(request_id, None)
++
++    def observe(self, request_id, drafted, accepted):
++        # Compatibility with old scheduler call; actual observations are
++        # exclusively processed by feedback() with attributed timing.
++        pass
+diff --git a/vllm/v1/core/sched/dsv41_measured_policy.py b/vllm/v1/core/sched/dsv41_measured_policy.py
+new file mode 100644
+index 0000000..9b7b0c4
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_measured_policy.py
+@@ -0,0 +1,239 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Request-local measured/predicted speculative verification selection.
++
++Discount evidence, not empirical speed. Calibrate candidate predictions to the
++current observed output/time level, then blend each width's measured evidence.
++Require a gain tolerance plus measured-ratio and paired-prefix uncertainty to
++avoid chasing marginal noise. These gates are engineering heuristics, not
++formal confidence guarantees. Timing is CPU-visible recurrence, not GPU time.
++No task labels, external IO, CUDA objects or fixed observation windows.
++"""
++
++API_VERSION = 1
++# Steady-state GPU step curves on 4x GA100 80G TEP4+DCP1 (k=1..5):
++# Keep true gentle slope at c=1..8 (avoiding short-run TTFT skew that
++# over-trimmed c=1..8 prose) while preserving exact sub-width CG gains at c=16,32.
++COST_MS = {
++    1: (12.8400, 13.8000, 14.1500, 15.0500, 15.7200),
++    2: (14.7200, 15.7000, 16.3000, 18.5400, 19.3100),
++    4: (16.8000, 18.7000, 20.7700, 22.8000, 25.5000),
++    8: (22.3400, 25.0000, 29.6000, 31.5000, 33.5000),
++    16: (28.5500, 32.5200, 38.2600, 43.9900, 48.0700),
++    32: (40.5000, 53.8000, 63.0000, 72.5000, 81.2200),
++}
++
++
++def costs(c):
++    cs = sorted(COST_MS)
++    if c <= cs[0]:
++        return [v / 1000 for v in COST_MS[cs[0]]]
++    for lo, hi in zip(cs, cs[1:]):
++        if c <= hi:
++            w = (c - lo) / (hi - lo)
++            return [
++                (a * (1 - w) + b * w) / 1000 for a, b in zip(COST_MS[lo], COST_MS[hi])
++            ]
++    return [v / 1000 for v in COST_MS[cs[-1]]]
++
++
++class Policy:
++    def __init__(self, config):
++        self.decay = float(config.get("decay", 0.95))
++        self.w = float(config.get("prediction_weight", 1.0))
++        if not 0 <= self.decay < 1 or not 0 < self.w <= 100:
++            raise ValueError("invalid config")
++        self.k = 5
++        self.n = [0.0] * 5
++        self.y = [0.0] * 5
++        self.t = [0.0] * 5
++        self.risk = [0.0] * 5
++        self.success = [0.0] * 5
++        self.prior = 1.0
++        self.epoch = None
++        self.diagnostics = {}
++        self.latest = None
++        self.trimmed = False
++        self.history = [[0.0] * 6 for _ in range(5)]
++        self.q = [0.0] * 5
++        self.y2 = [0.0] * 5
++        self.t2 = [0.0] * 5
++        self.yt = [0.0] * 5
++
++    def observe(self, e):
++        k = e["k"]
++        a = e["accepted"]
++        dt = e["seconds"]
++        if not 1 <= k <= 5 or not 0 <= a <= k:
++            raise ValueError("invalid feedback")
++        self.latest = e.copy()
++        self.history = [[v * self.decay for v in row] for row in self.history]
++        self.history[k - 1][a] += 1
++        self.prior *= self.decay
++        if self.epoch != e["load_epoch"]:
++            self.n = [0.0] * 5
++            self.y = [0.0] * 5
++            self.t = [0.0] * 5
++            self.epoch = e["load_epoch"]
++            self.q = [0.0] * 5
++            self.y2 = [0.0] * 5
++            self.t2 = [0.0] * 5
++            self.yt = [0.0] * 5
++        for j in range(5):
++            self.n[j] *= self.decay
++            self.y[j] *= self.decay
++            self.t[j] *= self.decay
++            self.q[j] *= self.decay**2
++            self.y2[j] *= self.decay
++            self.t2[j] *= self.decay
++            self.yt[j] *= self.decay
++            self.risk[j] *= self.decay
++            self.success[j] *= self.decay
++            if j < k:
++                self.risk[j] += 1
++                self.success[j] += a > j
++        if e["timing_valid"]:
++            j = k - 1
++            y = e["output_tokens"]
++            self.n[j] += 1
++            self.y[j] += y
++            self.t[j] += dt
++            self.q[j] += 1
++            self.y2[j] += y * y
++            self.t2[j] += dt * dt
++            self.yt[j] += y * dt
++
++    def choose(self, context):
++        self.k = context["current_k"]
++        p = []
++        previous = 1.0
++        for n, s in zip(self.risk, self.success):
++            previous = min(
++                previous, (s + self.prior + 0.5 * previous) / (n + self.prior + 1)
++            )
++            p.append(previous)
++        E = [1 + sum(p[:k]) for k in range(1, 6)]
++        C = costs(context["concurrency"])
++        # Calibrate predictions to the SAME current observed level. A bad
++        # current block cannot punish only the measured arm while unseen arms
++        # retain their optimistic absolute level. Preserve predicted k ratios.
++        i = self.k - 1
++        scale = self.y[i] / self.n[i] / E[i] if self.n[i] else 1.0
++        time_scale = self.t[i] / self.n[i] / C[i] if self.n[i] else 1.0
++        predicted_y = [e * scale for e in E]
++        predicted_t = [c * time_scale for c in C]
++        scores = [
++            (y + self.w * e) / (t + self.w * c)
++            for y, t, e, c in zip(self.y, self.t, predicted_y, predicted_t)
++        ]
++        # Estimated SE of ratio-of-totals using centered y-rate*t residuals.
++        # Kish ESS alone does not lose confidence when an arm ages; cap by
++        # decayed mass so stale evidence really loses influence/confidence.
++        se = []
++        for j in range(5):
++            n = self.n[j]
++            if n <= 0:
++                se.append(0.0)
++                continue
++            rate = self.y[j] / self.t[j]
++            variance = max(
++                0.0, (self.y2[j] - 2 * rate * self.yt[j] + rate * rate * self.t2[j]) / n
++            )
++            ess = min(n, n * n / self.q[j])
++            # nonzero floor prevents a single constant sample claiming certainty
++            se.append((variance + 1.0) ** 0.5 / (self.t[j] / n) / (ess + 1) ** 0.5)
++        fractions = [t / (t + self.w * c) for t, c in zip(self.t, predicted_t)]
++        # All model-only predictions share incumbent calibration; its common
++        # absolute noise cancels for their relative ordering. Charge uncertainty
++        # only for candidate's independent actual evidence contribution.
++        gate = [f * (s * s + se[self.k - 1] ** 2) ** 0.5 for f, s in zip(fractions, se)]
++        hist = self.history[i]
++        mass = sum(hist)
++        model_se = []
++        for j in range(5):
++            if j >= i:
++                model_se.append(0.0)
++                continue
++            # Paired marginal efficiency on prefixes observed at current width.
++            diffs = [
++                ((1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i])
++                * scale
++                / time_scale
++                for a in range(6)
++            ]
++            mean = sum(w * d for w, d in zip(hist, diffs)) / mass if mass else 0.0
++            variance = (
++                sum(w * (d - mean) ** 2 for w, d in zip(hist, diffs)) / mass
++                if mass
++                else 0.0
++            )
++            model_se.append((variance / (mass + 1)) ** 0.5)
++        gate = [(a * a + b * b) ** 0.5 for a, b in zip(gate, model_se)]
++        ready = bool(
++            self.latest and self.latest["k"] == self.k and self.latest["timing_valid"]
++        )
++        best = self.k
++        if ready:
++            if not self.trimmed:
++                peak = max(scores)
++                cold = max(k for k in range(1, 6) if scores[k - 1] >= 0.98 * peak)
++                if scores[cold - 1] > scores[best - 1] * 1.03:
++                    best = cold
++            else:
++                for k in range(1, min(5, self.k + 1) + 1):
++                    if (
++                        scores[k - 1] - scores[self.k - 1]
++                        > 0.03 * scores[self.k - 1] + gate[k - 1]
++                        and scores[k - 1] > scores[best - 1]
++                    ):
++                        best = k
++        if best < 5:
++            self.trimmed = True
++        self.diagnostics = dict(
++            score=scores,
++            se=se,
++            gate=gate,
++            model_se=model_se,
++            ready=ready,
++            trimmed=self.trimmed,
++        )
++        return best
++
++
++def self_test():
++    p = Policy({})
++    for _ in range(20):
++        p.observe(
++            dict(
++                k=5,
++                accepted=5,
++                seconds=0.03,
++                output_tokens=6,
++                timing_valid=True,
++                load_epoch=1,
++            )
++        )
++        assert p.choose(dict(current_k=5, concurrency=1)) == 5
++    p = Policy({})
++    p.observe(
++        dict(
++            k=2,
++            accepted=1,
++            seconds=0.025,
++            output_tokens=2,
++            timing_valid=True,
++            load_epoch=1,
++        )
++    )
++    for _ in range(10):
++        p.observe(
++            dict(
++                k=3,
++                accepted=2,
++                seconds=3 / 90,
++                output_tokens=3,
++                timing_valid=True,
++                load_epoch=1,
++            )
++        )
++    assert abs(p.y[1] / p.t[1] - 80) < 1e-8
++    assert abs(p.n[1] - 0.95**10) < 1e-8
+diff --git a/vllm/v1/core/sched/dsv41_spec_k.py b/vllm/v1/core/sched/dsv41_spec_k.py
+new file mode 100644
+index 0000000..0b20714
+--- /dev/null
++++ b/vllm/v1/core/sched/dsv41_spec_k.py
+@@ -0,0 +1,59 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DeepSeek V4.1 request-local verification width (``vllm_xargs.spec_k``).
++
++``vllm_xargs`` already reaches ``SamplingParams.extra_args`` unchanged for every
++model. Only ``DeepseekV41ForCausalLM`` consults this module (two
++architecture-gated call sites: input validation and scheduler admission);
++every other model ignores the key exactly like the unpatched engine.
++"""
++import os
++
++from vllm.exceptions import VLLMValidationError
++
++
++def _widths_enabled(spec) -> bool:
++    # Explicit verification widths, or the public adaptive switch selecting
++    # DeepSeek's CPU history policy (which honours manual spec_k first).
++    return (os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++            or spec.uses_history_verification())
++
++
++def validate_request(extra_args, speculative_config) -> None:
++    """Front-end validation; failures surface as HTTP 400."""
++    if not extra_args or "spec_k" not in extra_args:
++        return
++    value = extra_args["spec_k"]
++    if type(value) is not int or value < 0:
++        raise VLLMValidationError(
++            "vllm_xargs.spec_k must be a nonnegative integer",
++            parameter="vllm_xargs.spec_k",
++        )
++    if (speculative_config is None
++            or speculative_config.method != "dspark"
++            or not _widths_enabled(speculative_config)):
++        raise VLLMValidationError(
++            "spec_k requires VLLM_DSV41_VERIFICATION=1 and DSpark",
++            parameter="vllm_xargs.spec_k",
++        )
++    if not 0 <= value <= speculative_config.num_speculative_tokens:
++        raise VLLMValidationError(
++            "spec_k must be an integer between 0 and configured draft count",
++            parameter="vllm_xargs.spec_k",
++        )
++
++
++def draft_limit(request, spec, num_spec_tokens: int,
++                use_v2_model_runner: bool) -> int | None:
++    """Scheduler admission: the request's verified-draft limit, or None."""
++    params = request.sampling_params
++    extra = params.extra_args if params is not None else None
++    limit = extra.get("spec_k") if extra else None
++    if limit is None:
++        return None
++    if (spec is None or spec.method != "dspark"
++            or not use_v2_model_runner
++            or not _widths_enabled(spec)):
++        raise ValueError("spec_k requires enabled DSpark verification widths")
++    if type(limit) is not int or not 0 <= limit <= num_spec_tokens:
++        raise ValueError("spec_k must be an integer in the configured draft range")
++    return limit
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bc06970..f486986 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -401,6 +401,14 @@ class Scheduler(SchedulerInterface):
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+ 
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
++        self.dsv41_history_policy = None
++        spec = vllm_config.speculative_config
++        if spec is not None and spec.uses_history_verification():
++            from .dsv41_fixed_policy import FixedHistoryPolicy
++
++            self.dsv41_history_policy = FixedHistoryPolicy(
++                logger, decay=spec.adaptive_verification_decay
++            )
+         self._pending_encoder_input_ids: dict[str, set[int]] = {}
+         # Scheduler iteration counter. Drives the PP+async decode-throttle
+         # cadence (`next_decode_eligible_step`).
+@@ -484,6 +492,17 @@ class Scheduler(SchedulerInterface):
+         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
+ 
+         self._pause_state: PauseState = PauseState.UNPAUSED
++        self.dsv41_prefill_helper = None
++        if any(
++            a in self.vllm_config.model_config.architectures
++            for a in (
++                "DeepseekV41ForCausalLM",
++                "DeepseekV41VLForConditionalGeneration",
++            )
++        ):
++            from .dsv41_prefill_sched import Dsv41PrefillHelper
++
++            self.dsv41_prefill_helper = Dsv41PrefillHelper(self.block_size)
+ 
+         # Remaining-block reservations of in-flight prefills gate async loads.
+         # Parked async KV loads can number thousands, so theirs are cached until
+@@ -768,6 +787,37 @@ class Scheduler(SchedulerInterface):
+             throttle_prefills and not self.prefill_capacity_bound
+         ) and any(not r.is_prefill_chunk for r in self.running)
+ 
++        history_limits = {}
++        if self.dsv41_history_policy is not None:
++            history_limits.update(
++                self.dsv41_history_policy.retained_limits(self.running)
++            )
++            eligible = [
++                r
++                for r in self.running
++                if not r.is_prefill_chunk
++                and self.current_step >= r.next_decode_eligible_step
++                and r.num_stale_output_tokens == 0
++                and not r.use_structured_output
++                and (r.spec_token_ids or r.num_output_placeholders > 0)
++            ]
++            if eligible:
++                eligible = eligible[
++                    : getattr(
++                        self,
++                        "_get_max_num_scheduled_decodes",
++                        lambda: self.max_num_running_reqs,
++                    )()
++                ]
++                num_running, num_waiting = self.get_request_counts()
++                history_limits.update(
++                    self.dsv41_history_policy.choose(
++                        eligible,
++                        min(self.max_num_running_reqs, num_running + num_waiting),
++                        self.running,
++                    )
++                )
++
+         # `long_prefill_token_threshold` exists to stop a long prefill from
+         # starving other requests of the token budget. When it is the only
+         # request there is nobody to starve, so let it use the whole budget.
+@@ -831,6 +881,11 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            limit = getattr(request, "verification_draft_limit", None)
++            if limit is None:
++                limit = history_limits.get(request.request_id)
++            if limit is not None and len(request.spec_token_ids) > limit:
++                request.spec_token_ids = request.spec_token_ids[:limit]
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+@@ -838,6 +893,15 @@ class Scheduler(SchedulerInterface):
+             )
+             if 0 < long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = long_prefill_token_threshold
++            if (
++                self.dsv41_prefill_helper is not None
++                and request.num_computed_tokens < request.num_prompt_tokens
++            ):
++                num_new_tokens = self.dsv41_prefill_helper.maybe_cap_prefill_chunk(
++                    request.num_computed_tokens,
++                    num_new_tokens,
++                    min(token_budget, input_budget - draft_slots),
++                )
+             num_new_tokens = min(
+                 num_new_tokens, token_budget, input_budget - draft_slots
+             )
+@@ -1032,6 +1096,11 @@ class Scheduler(SchedulerInterface):
+                     - request.num_tokens
+                     - request.num_output_placeholders
+                 )
++                limit = getattr(request, "verification_draft_limit", None)
++                if limit is None:
++                    limit = history_limits.get(request.request_id)
++                if limit is not None:
++                    num_scheduled_spec_tokens = min(num_scheduled_spec_tokens, limit)
+                 if num_scheduled_spec_tokens > 0:
+                     spec_token_ids = request.spec_token_ids
+                     if len(spec_token_ids) > num_scheduled_spec_tokens:
+@@ -1381,6 +1450,8 @@ class Scheduler(SchedulerInterface):
+                     # Not for diffusion where draft tokens can't be padded.
+                     if (
+                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
++                        and getattr(request, "verification_draft_limit", None) is None
++                        and self.dsv41_history_policy is None
+                         and self.num_sampled_tokens_per_step > 0
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+@@ -1402,6 +1473,18 @@ class Scheduler(SchedulerInterface):
+ 
+                     if 0 < long_prefill_token_threshold < num_new_tokens:
+                         num_new_tokens = long_prefill_token_threshold
++                    if (
++                        self.dsv41_prefill_helper is not None
++                        and not pad_spec_decode
++                        and num_computed_tokens < request.num_prompt_tokens
++                    ):
++                        num_new_tokens = (
++                            self.dsv41_prefill_helper.maybe_cap_prefill_chunk(
++                                num_computed_tokens,
++                                num_new_tokens,
++                                request_token_budget,
++                            )
++                        )
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+@@ -1857,6 +1940,13 @@ class Scheduler(SchedulerInterface):
+ 
+         with record_function_or_nullcontext("schedule: update_after_schedule"):
+             self._update_after_schedule(scheduler_output)
++        if self.dsv41_history_policy is not None:
++            num_running, num_waiting = self.get_request_counts()
++            self.dsv41_history_policy.scheduled(
++                scheduler_output,
++                self.running,
++                min(self.max_num_running_reqs, num_running + num_waiting),
++            )
+         return scheduler_output
+ 
+     def _get_max_num_scheduled_decodes(self) -> int:
+@@ -2392,6 +2482,8 @@ class Scheduler(SchedulerInterface):
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.begin_feedback()
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         logprobs = model_runner_output.logprobs
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+@@ -2507,7 +2599,34 @@ class Scheduler(SchedulerInterface):
+                     num_draft_tokens = num_verified = len(scheduled_spec_token_ids)
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+-                num_rejected = len(scheduled_spec_token_ids) - num_accepted
++                scheduled_draft_count = len(scheduled_spec_token_ids)
++                num_rejected = scheduled_draft_count - num_accepted
++                if self.dsv41_history_policy is not None:
++                    has_invalid_drafts = num_verified != scheduled_draft_count
++                    self.dsv41_history_policy.feedback(
++                        scheduler_output,
++                        request,
++                        scheduled_draft_count,
++                        num_accepted,
++                        len(generated_token_ids),
++                        valid=(
++                            not output_is_stale
++                            and 0 <= num_accepted <= scheduled_draft_count
++                            and not has_invalid_drafts
++                            and not request.use_structured_output
++                            and request.num_output_tokens + len(generated_token_ids)
++                            < request.max_tokens
++                        ),
++                    )
++                    if (
++                        not output_is_stale
++                        and not has_invalid_drafts
++                        and not request.use_structured_output
++                        and getattr(request, "verification_draft_limit", None) is None
++                    ):
++                        self.dsv41_history_policy.observe(
++                            req_id, scheduled_draft_count, num_accepted
++                        )
+                 # Rejections roll back num_computed_tokens (and, under async
+                 # scheduling, num_output_placeholders, which covers the spec
+                 # tokens). A stale rejection count predates the preemption
+@@ -3119,9 +3238,13 @@ class Scheduler(SchedulerInterface):
+                 continue
+ 
+             # Add newly generated spec token ids to the request.
+-            request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
++            spec_token_ids = self.structured_output_manager.trim_spec_tokens(
+                 request, spec_token_ids
+             )
++            limit = getattr(request, "verification_draft_limit", None)
++            request.spec_token_ids = (
++                spec_token_ids if limit is None else spec_token_ids[:limit]
++            )
+ 
+     def update_draft_token_ids_in_output(
+         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
+@@ -3166,6 +3289,20 @@ class Scheduler(SchedulerInterface):
+         return request_id in self.requests
+ 
+     def add_request(self, request: Request) -> None:
++        if "DeepseekV41ForCausalLM" in self.vllm_config.model_config.architectures:
++            from vllm.v1.core.sched.dsv41_spec_k import draft_limit
++
++            limit = draft_limit(
++                request,
++                self.vllm_config.speculative_config,
++                self.num_spec_tokens,
++                True,
++            )
++            if limit is not None:
++                request.verification_draft_limit = limit
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.forget(request.request_id)
++            self.dsv41_history_policy.admit(request)
+         existing = self.requests.get(request.request_id)
+         if existing is not None:
+             update = StreamingUpdate.from_request(request)
+@@ -3310,6 +3447,8 @@ class Scheduler(SchedulerInterface):
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+         self._free_request_blocks(request)
++        if self.dsv41_history_policy is not None:
++            self.dsv41_history_policy.forget(request.request_id)
+         del self.requests[request.request_id]
+ 
+     @property
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 7d06244..7bda6bb 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -153,6 +153,11 @@ class InputProcessor:
+                 self.structured_outputs_config,
+                 self.tokenizer,
+             )
++            if "DeepseekV41ForCausalLM" in self.model_config.architectures:
++                # DeepSeek V4.1 request-local verification width (vllm_xargs.spec_k).
++                from vllm.v1.core.sched.dsv41_spec_k import validate_request
++
++                validate_request(params.extra_args, self.speculative_config)
+             if (
+                 params.prompt_logprob_token_ids is not None
+                 and self.vllm_config.cache_config.kv_sharing_fast_prefill
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 52243d4..bee43c9 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import gc
+ import itertools
++import os
+ from collections import defaultdict
+ from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
+ from contextlib import ExitStack
+@@ -361,6 +362,83 @@ class CudaGraphManager:
+                 if ubatch_desc is not None:
+                     decode_descs.append(ubatch_desc)
+ 
++        if (
++            capture_decode
++            and type(self).__name__ == "ModelCudaGraphManager"
++            and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++            and any(
++                arch in self.vllm_config.model_config.architectures
++                for arch in (
++                    "DeepseekV41ForCausalLM",
++                    "DeepseekV41VLForConditionalGeneration",
++                )
++            )
++        ):
++            decode_max_tokens = decode_cudagraph_capture_max_tokens(compilation_config)
++            raw_spec = os.environ.get(
++                "VLLM_DSV41_SUBWIDTH_GRAPHS", "1:1-5;2:2-5;4,8,16,32:2-6"
++            ).strip()
++            sub_specs: list[tuple[int, int]] = []
++            if raw_spec and raw_spec.lower() not in ("0", "off", "none"):
++                for clause in raw_spec.split(";"):
++                    clause = clause.strip()
++                    if not clause:
++                        continue
++                    r_part, w_part = clause.split(":", 1)
++                    r_list = [int(x) for x in r_part.split(",") if x.strip()]
++                    w_list: list[int] = []
++                    for tok in w_part.split(","):
++                        tok = tok.strip()
++                        if "-" in tok:
++                            lo_s, hi_s = tok.split("-", 1)
++                            w_list.extend(range(int(lo_s), int(hi_s) + 1))
++                        elif tok:
++                            w_list.append(int(tok))
++                    for reqs in r_list:
++                        if reqs <= self.max_num_reqs:
++                            for width in w_list:
++                                if 1 <= width <= self.decode_query_len:
++                                    sub_specs.append((reqs, width))
++            for (reqs, width), loras in product(sub_specs, self.lora_capture_cases):
++                rows = reqs * width
++                if rows > decode_max_tokens:
++                    continue
++                sdesc = BatchExecutionDescriptor(
++                    cg_mode=decode_mode,
++                    num_tokens=rows,
++                    num_reqs=reqs,
++                    uniform_token_count=width,
++                    num_active_loras=loras,
++                )
++                if sdesc not in decode_descs:
++                    decode_descs.append(sdesc)
++            if (
++                not self.varlen_decode
++                and os.environ.get("VLLM_DSV41_MIXED_SPEC_FULL_GRAPH", "1") == "1"
++                and not self.vllm_config.parallel_config.use_ubatching
++            ):
++                raw_mixed = os.environ.get(
++                    "VLLM_DSV41_MIXED_SPEC_TOKENS",
++                    "16,24,32,40,48,64,80,96,128,160,192",
++                ).strip()
++                mixed_rows = (
++                    tuple(int(x) for x in raw_mixed.split(",") if x.strip())
++                    if raw_mixed and raw_mixed.lower() not in ("0", "off", "none")
++                    else ()
++                )
++                for rows, loras in product(mixed_rows, self.lora_capture_cases):
++                    if rows > decode_max_tokens:
++                        continue
++                    rdesc = BatchExecutionDescriptor(
++                        cg_mode=decode_mode,
++                        num_tokens=rows,
++                        num_reqs=min(rows, self.max_num_reqs),
++                        max_query_len=self.decode_query_len,
++                        num_active_loras=loras,
++                    )
++                    if rdesc not in token_keyed_descs:
++                        token_keyed_descs.append(rdesc)
++
+         for num_tokens, num_active_loras in product(
+             prefill_sizes, self.lora_capture_cases
+         ):
+@@ -391,7 +469,10 @@ class CudaGraphManager:
+         for desc in decode_descs + token_keyed_descs:
+             descs_by_mode[desc.cg_mode].append(desc)
+         for mode, descs in descs_by_mode.items():
+-            descs.sort(key=lambda d: d.num_tokens, reverse=True)
++            descs.sort(
++                key=lambda d: (d.num_tokens, d.num_reqs or 0),
++                reverse=True,
++            )
+             self._capture_descs[mode] = descs
+ 
+         # A uniform decode batch looks up its request count among the graphs of
+@@ -414,7 +495,10 @@ class CudaGraphManager:
+         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
+             mode_descs = sorted(
+                 (d for d in token_keyed_descs if d.cg_mode == mode),
+-                key=lambda d: d.num_tokens,
++                key=lambda d: (
++                    d.num_tokens,
++                    d.num_reqs if d.num_reqs is not None else self.max_num_reqs,
++                ),
+             )
+             for num_active_loras in self.lora_capture_cases:
+                 lora_descs = [
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 983a1a1..c192650 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
+ 
+ import functools
+ import gc
++import os
+ import time
+ from collections.abc import Iterable, Iterator
+ from contextlib import AbstractContextManager, contextmanager
+@@ -493,7 +494,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     device=self.device,
+                     adaptive_verification_enabled=(
+                         self.speculative_config is not None
+-                        and self.speculative_config.enable_adaptive_verification
++                        and self.speculative_config.uses_gpu_adaptive_verification()
+                     ),
+                     draft_logits=draft_logits,
+                 )
+@@ -1102,11 +1103,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     @torch.inference_mode()
+     def profile_run(self, randomize_inputs: bool = False) -> None:
++        import os
++
+         if self.vllm_config.aux_output_config.enabled:
+             self.aux_output_connector = get_aux_output_connector(
+                 self.model, self.vllm_config
+             )
+-        if self.supports_mm_inputs and self.is_first_pp_rank:
++        skip_offloaded_mm_profile = (
++            self.cache_config.kv_cache_memory_bytes is not None
++            and os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1"
++        )
++        if (
++            self.supports_mm_inputs
++            and self.is_first_pp_rank
++            and not skip_offloaded_mm_profile
++        ):
+             mm_config = self.model_config.multimodal_config
+             if mm_config is not None and not mm_config.skip_mm_profiling:
+                 mm_budget = MultiModalBudget(
+@@ -1136,6 +1147,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         del hidden_states, sample_hidden_states
+         self.reset_encoder_cache()
+         gc.collect()
++        if torch.cuda.is_available():
++            torch.cuda.empty_cache()
+ 
+     def reset_mm_cache(self) -> None:
+         if self.encoder_cache is not None:
+@@ -1225,6 +1238,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.cudagraph_manager.capture_stream,
+                     )
+                     if self.speculator is not None:
++                        self.speculator._shared_capture_stream = (
++                            self.cudagraph_manager.capture_stream
++                        )
+                         with self.draft_context():
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None and not profile_only:
+@@ -1491,6 +1507,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             decode_graph_eligible=decode_graph_eligible,
+             max_seq_len_np=max_seq_len_np,
+         )
++        if (
++            num_reqs == 1
++            and decode_graph_eligible
++            and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
++        ):
++            max_query_len = num_toks
+         return batch_state, get_uniform_decode_token_count(
+             num_reqs, num_toks, max_query_len, decode_graph_eligible
+         )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 669a372..357a450 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -27,6 +27,7 @@ across TP ranks: each rank runs the Markov loop only for the requests it owns
+ (the same owners as verification), see `_sample_sequential_sharded`.
+ """
+ 
++import os
+ from typing import Any
+ 
+ import torch
+@@ -45,6 +46,10 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
+ from vllm.v1.worker.gpu.sample.greedy_argmax import greedy_argmax
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dspark.markov_argmax import (
++    FusedMarkovSampler,
++    build_fused_markov_sampler,
++)
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
+ logger = init_logger(__name__)
+@@ -88,6 +93,7 @@ class DSparkSpeculator(DFlashSpeculator):
+ 
+         # Whether the markov bias is fused into the Gumbel sample kernel.
+         self._fuse_markov_bias: bool = False
++        self._fused_markov: FusedMarkovSampler | None = None
+ 
+     def load_model(self, target_model: torch.nn.Module) -> None:
+         super().load_model(target_model)
+@@ -147,6 +153,13 @@ class DSparkSpeculator(DFlashSpeculator):
+         target_attn_layer_names: set[str],
+     ) -> torch.nn.Module:
+         model = load_dspark_model(target_model, self.vllm_config)
++        if os.environ.get("VLLM_DSPARK_DRAFT_HEAD_FP8", "0") == "1":
++            if not hasattr(model, "build_fp8_draft_head"):
++                raise ValueError(
++                    "VLLM_DSPARK_DRAFT_HEAD_FP8=1 is not supported by "
++                    f"{type(model).__name__}"
++                )
++            model.build_fp8_draft_head()
+         # Reduced draft vocab: probabilistic rejection sampling indexes draft
+         # logits by target id, so precompute the draft->target column map and a
+         # scratch buffer to scatter logits into target vocab before sampling.
+@@ -164,15 +177,47 @@ class DSparkSpeculator(DFlashSpeculator):
+                 device=self.device,
+             )
+         self.use_confidence_head = (
+-            self.enable_adaptive_verification
++            self.speculative_config.uses_gpu_adaptive_verification()
+             and model.model.confidence_head is not None
+         )
+         if self.use_confidence_head:
+             # The acceptance estimator is not needed when a trained confidence head
+             # is available.
+             self.use_acceptance_estimator = False
++        if (
++            self.use_local_argmax_reduction
++            and self.draft_logits is None
++            and os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
++        ):
++            self._fused_markov = build_fused_markov_sampler(
++                model, self.max_num_reqs, self.num_speculative_steps, self.device
++            )
+         return model
+ 
++    def _validate_local_argmax_reduction(self) -> None:
++        if not self.use_local_argmax_reduction:
++            return
++        if self.speculative_config.draft_sample_method == "probabilistic":
++            raise ValueError(
++                "use_local_argmax_reduction is not compatible with "
++                "draft_sample_method='probabilistic'."
++            )
++        missing = [
++            name
++            for name in ("compute_draft_logits_shard", "select_draft_token_shard")
++            if not hasattr(self.model, name)
++        ]
++        if missing:
++            raise ValueError(
++                "use_local_argmax_reduction is enabled but DSpark draft model "
++                f"{self.model.__class__.__name__} does not implement "
++                f"{', '.join(missing)}()."
++            )
++        logger.info(
++            "DSpark: vocab-sharded Markov head with local argmax reduction "
++            "(communication: O(2*tp_size) vs O(vocab_size) per draft position)."
++        )
++
+     def supports_batch_sharded_draft_logits(self) -> bool:
+         # A model's own sample_sequential kernels write the full-size cache.
+         return not hasattr(self.model, "sample_sequential")
+@@ -264,10 +309,31 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        if self.use_local_argmax_reduction:
++            base_logits = self.model.compute_draft_logits_shard(sample_hidden)
++        else:
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
++        if self._fused_markov is not None:
++            prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++            self._fused_markov.sample(num_reqs, base_logits, prev, self.draft_tokens)
++            if self.use_confidence_head:
++                previous_ids = torch.cat(
++                    (prev[:, None], self.draft_tokens[:num_reqs, : n_spec - 1]),
++                    dim=1,
++                )
++                markov_embeds = self.model.markov_embed(previous_ids.flatten()).view(
++                    num_reqs, n_spec, -1
++                )
++                conf = self._confidence(
++                    sample_hidden, markov_embeds, (num_reqs, n_spec)
++                )
++                if conf is not None:
++                    self.draft_token_confidence_probs[:num_reqs] = conf
++            return
++
+         # Anchor (bonus) token per request = the input id at query offset 0,
+         # read via the precomputed persistent index (fixed buffer for capture).
+         confidence = self._sample_markov_chain(
+@@ -325,6 +391,13 @@ class DSparkSpeculator(DFlashSpeculator):
+             markov_embed, state = self._markov_step(prev, hidden_by_step[:, i], state)
+             if self.use_confidence_head:
+                 markov_embeds.append(markov_embed)
++            if self.use_local_argmax_reduction:
++                draft_sampled_i = self.model.map_draft_to_target(
++                    self.model.select_draft_token_shard(markov_embed, base_logits[:, i])
++                )
++                out_tokens[:, i] = draft_sampled_i
++                prev = draft_sampled_i
++                continue
+             bias = self.model.markov_bias(markov_embed)
+             logits_i = base_logits[:, i]
+             # The kernel rounds the sum to the logits dtype, as `logits + bias`
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 71bb6ba..30d425f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -163,7 +163,7 @@ class RejectionSampler:
+         if watermark_key is not None:
+             assert isinstance(sampler, GPUWatermarkSampler)
+         self.num_speculative_steps = spec_config.num_speculative_tokens
+-        self.enable_adaptive_verification = spec_config.enable_adaptive_verification
++        self.enable_adaptive_verification = spec_config.uses_gpu_adaptive_verification()
+         rejection_sample_method = spec_config.rejection_sample_method
+         self.use_block_verification: bool = False
+         self.fly_window_size = 0
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 8ce2229..d3bb286 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -251,7 +251,7 @@ class DraftModelSpeculator(BaseSpeculator):
+             self.draft_tokens, dtype=torch.float32
+         )
+         self.enable_adaptive_verification = (
+-            self.speculative_config.enable_adaptive_verification
++            self.speculative_config.uses_gpu_adaptive_verification()
+         )
+         self.use_acceptance_estimator = self.enable_adaptive_verification
+         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None

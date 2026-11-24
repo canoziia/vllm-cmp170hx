@@ -3,7 +3,7 @@
 # Usage: bash build.sh [OUT_DIR] [SRC_CPP]
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-OUT="${1:-${HERE}/../../vllm-src/vllm/models/deepseek_v4_1/common}"
+OUT="${1:-${HERE}/../../vllm-src/vllm/models/deepseek_v41/common}"
 SRC="${2:-${OUT}/engram_cpu_gather.cpp}"
 mkdir -p "$OUT"
 CXX=${CXX:-g++}

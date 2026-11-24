@@ -85,7 +85,10 @@ def main() -> None:
         assert "cu_num_logits_np[-1]" not in mr_src, (
             "YoCo prefill check must not gate on cu_num_logits_np[-1] == 0 in V1 GPUModelRunner"
         )
-        assert "_needs_dsv41_yoco_eager" in mr_src
+        nv_model_src = (
+            root / "vllm/models/deepseek_v41/nvidia/model.py"
+        ).read_text()
+        assert "VLLM_DSV41_PREFILL_AR_OVERLAP" in nv_model_src
         sp_src = (
             root / "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
         ).read_text()

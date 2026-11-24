@@ -18,7 +18,7 @@ for enabled in (False,True):
   assert not(s.uses_history_verification() and s.uses_gpu_adaptive_verification())
 # All device-only consumers must route through the internal capability,
 # never mistake CPU-known variable widths for a device-compacted layout.
-for name in ('v1/worker/gpu/model_runner.py','v1/worker/gpu/spec_decode/dspark/speculator.py','v1/worker/gpu/spec_decode/rejection_sampler.py','v1/attention/selector.py','v1/attention/backends/mla/indexer.py','v1/attention/backends/flashinfer.py','models/deepseek_v4_1/ampere/ampere_sparse.py'):
+for name in ('v1/worker/gpu/model_runner.py','v1/worker/gpu/spec_decode/dspark/speculator.py','v1/worker/gpu/spec_decode/rejection_sampler.py','v1/attention/selector.py','v1/attention/backends/mla/indexer.py','v1/attention/backends/flashinfer.py','models/deepseek_v41/nvidia/model_state.py'):
  text=(root/name).read_text();ast.parse(text)
  assert '.enable_adaptive_verification' not in text or all(
   not isinstance(n,ast.Attribute) or not isinstance(n.value,ast.Name)

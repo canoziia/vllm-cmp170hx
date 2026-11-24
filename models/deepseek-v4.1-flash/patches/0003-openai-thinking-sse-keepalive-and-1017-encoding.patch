@@ -1,0 +1,389 @@
+From: Canoziia <canoziia@projectk.org>
+Subject: [PATCH] entrypoints/tokenizers: DeepSeek top-level thinking, SSE keep-alive, and exact 1017 encoding
+
+diff --git a/vllm/entrypoints/openai/chat_completion/deepseek_thinking.py b/vllm/entrypoints/openai/chat_completion/deepseek_thinking.py
+new file mode 100644
+index 0000000..fd636ee
+--- /dev/null
++++ b/vllm/entrypoints/openai/chat_completion/deepseek_thinking.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4 / V4.1 request-level ``thinking`` switch (DeepSeek API format).
++
++DeepSeek's API takes ``"thinking": {"type": "enabled" | "disabled"}`` at the
++top level of a chat request. vLLM keeps unknown top-level fields in
++``model_extra`` and otherwise ignores them, so the DeepSeek tokenizers and
++output parsers (which read ``chat_template_kwargs``) fell back to thinking mode.
++
++One shared implementation for every DeepSeek architecture listed in
++``DEEPSEEK_THINKING_ARCHITECTURES`` (the V4-Flash image stacks its series on
++the V4.1 series, so both models use this file). The switch is copied into
++``chat_template_kwargs["thinking"]`` once, before the parser and the renderer
++read the kwargs, so both see the same value (and a PD prefill/decode pair
++renders the same prompt). An explicit ``chat_template_kwargs.thinking`` /
++``enable_thinking`` wins.
++"""
++
++from typing import Any
++
++# V4: Vision-Exp checkpoints declare DeepseekV4ForCausalLM and resolve to
++# DeepseekV4ForConditionalGeneration. V4.1: DeepseekV41ForCausalLM (declared
++# and resolved).
++DEEPSEEK_THINKING_ARCHITECTURES = frozenset(
++    {
++        "DeepseekV4ForCausalLM",
++        "DeepseekV4ForConditionalGeneration",
++        "DeepseekV41ForCausalLM",
++    }
++)
++_TYPES = {"enabled": True, "disabled": False}
++
++
++def is_deepseek_thinking_model(architectures: Any) -> bool:
++    return any(a in DEEPSEEK_THINKING_ARCHITECTURES for a in (architectures or ()))
++
++
++def apply_deepseek_thinking(request: Any, architectures: Any) -> str | None:
++    """Fold a top-level ``thinking`` into ``chat_template_kwargs``.
++
++    Returns an error message for an invalid value, otherwise None. Requests
++    for other architectures, or without a top-level ``thinking``, are not
++    modified.
++    """
++    if not is_deepseek_thinking_model(architectures):
++        return None
++    extra = getattr(request, "model_extra", None) or {}
++    if "thinking" not in extra:
++        return None
++    value = extra["thinking"]
++    kind = value.get("type") if isinstance(value, dict) else None
++    if kind not in _TYPES:
++        return (
++            "'thinking' must be an object {\"type\": \"enabled\"} or "
++            f"{{\"type\": \"disabled\"}}; got {value!r}"
++        )
++    kwargs = dict(request.chat_template_kwargs or {})
++    if "thinking" not in kwargs and "enable_thinking" not in kwargs:
++        # both keys: build_chat_params derives enable_thinking from
++        # reasoning_effort unless it is present, and the tokenizers OR them
++        kwargs["thinking"] = kwargs["enable_thinking"] = _TYPES[kind]
++        request.chat_template_kwargs = kwargs
++    return None
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 175fba3..f79170a 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -42,6 +42,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionStreamResponse,
+     ChatMessage,
+ )
++from vllm.entrypoints.openai.chat_completion.deepseek_thinking import (
++    apply_deepseek_thinking,
++)
+ from vllm.entrypoints.openai.chat_completion.stream_processor import (
+     ChatStreamProcessor,
+ )
+@@ -321,6 +324,17 @@ class OpenAIServingChat(GenerateBaseServing):
+         # Streaming response
+         tokenizer = self.renderer.tokenizer
+         assert tokenizer is not None
++        # DeepSeek V4 / V4.1: top-level thinking {type} -> chat_template_kwargs,
++        # before the parser and the renderer read them
++        thinking_error = apply_deepseek_thinking(
++            request,
++            [
++                *(getattr(self.model_config, "architectures", None) or ()),
++                *(getattr(self.model_config.hf_config, "architectures", None) or ()),
++            ],
++        )
++        if thinking_error is not None:
++            return self.create_error_response(thinking_error, param="thinking")
+         chat_template_kwargs = self._effective_chat_template_kwargs(request)
+         parser: Parser | None = None
+         if self.parser_cls is not None:
+diff --git a/vllm/entrypoints/openai/sse_keep_alive.py b/vllm/entrypoints/openai/sse_keep_alive.py
+new file mode 100644
+index 0000000..5b6d89e
+--- /dev/null
++++ b/vllm/entrypoints/openai/sse_keep_alive.py
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Compatibility re-export for ``vllm.entrypoints.serve.utils.sse_keep_alive``."""
++
++from vllm.entrypoints.serve.utils.sse_keep_alive import (
++    SSE_KEEP_ALIVE_COMMENT,
++    with_sse_keep_alive,
++)
++
++__all__ = ["SSE_KEEP_ALIVE_COMMENT", "with_sse_keep_alive"]
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index 5afc9ab..2b679f7 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -3,11 +3,15 @@
+ 
+ import asyncio
+ import functools
++import json
+ from collections.abc import Sequence
+ from http import HTTPStatus
+ from typing import Any
+ 
+-import orjson
++try:
++    import orjson
++except ImportError:
++    orjson = None  # type: ignore[assignment]
+ from fastapi import Request
+ from fastapi.exceptions import RequestValidationError
+ from fastapi.responses import JSONResponse, Response
+@@ -23,6 +27,14 @@ from vllm.platforms import current_platform
+ logger = init_logger(__name__)
+ 
+ 
++def _json_default(obj: Any) -> Any:
++    if hasattr(obj, "tolist"):
++        return obj.tolist()
++    if hasattr(obj, "item"):
++        return obj.item()
++    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
++
++
+ def create_json_response(
+     result: BaseModel | Sequence[BaseModel] | dict[str, Any],
+     *,
+@@ -38,6 +50,16 @@ def create_json_response(
+         content = result
+     else:
+         content = [item.model_dump() for item in result]
++    if orjson is None:
++        try:
++            body = json.dumps(
++                content, default=_json_default, separators=(",", ":")
++            ).encode("utf-8")
++        except TypeError:
++            return JSONResponse(content=content, status_code=status_code)
++        return Response(
++            content=body, status_code=status_code, media_type="application/json"
++        )
+     try:
+         body = orjson.dumps(
+             content, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index c366d73..6318c6c 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -12,6 +12,7 @@ from vllm.renderers.chat_utils import ChatCompletionMessageParam
+ from .deepseek_v41_encoding import (
+     IMAGE_PLACEHOLDER,
+     REASONING_EFFORT_MAPPINGS,
++    _tool_name_for_encoding,
+     encode_messages,
+ )
+ from .hf import HfTokenizer, get_cached_tokenizer
+@@ -96,7 +97,10 @@ def _tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
+         for k, v in tool["function"].items()
+         if k != "defer_loading" and v is not None
+     }
+-    return {"type": "function", "function": function}
++    res: dict[str, Any] = {"type": "function", "function": function}
++    if tool.get("namespace") is not None:
++        res["namespace"] = tool["namespace"]
++    return res
+ 
+ 
+ def _add_updated_tool_schemas(
+@@ -104,7 +108,13 @@ def _add_updated_tool_schemas(
+ ) -> list[dict[str, Any]]:
+     """Like deepseek-recipe, follow each user turn whose tool results reference
+     tools with a system turn listing those tools' schemas, in reference order."""
+-    tools_by_name = {tool["function"]["name"]: tool for tool in tools or []}
++    tools_by_name: dict[str, dict[str, Any]] = {}
++    for tool in tools or []:
++        tools_by_name[tool["function"]["name"]] = tool
++        fn = dict(tool["function"])
++        if tool.get("namespace") is not None:
++            fn["namespace"] = tool["namespace"]
++        tools_by_name[_tool_name_for_encoding(fn)] = tool
+     result: list[dict[str, Any]] = []
+     referenced: list[dict[str, Any]] = []
+     for message, next_message in zip(conversation, [*conversation[1:], {}]):
+@@ -170,12 +180,17 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                 effort = None
+             if effort is None:
+                 effort = "high"
++            # The 1017 checkpoint dropped "xhigh" (low/high/max = 50/75/100).
++            # Keep accepting it from existing clients as the next level above
++            # the default instead of rejecting the request.
++            if effort == "xhigh":
++                effort = "max"
+             if not (
+                 (type(effort) is int and 1 <= effort <= 100)
+                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
+             ):
+                 raise ValueError(
+-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
++                    "DeepSeek V4.1 reasoning_effort must be low, high, max, "
+                     "or an integer within [1, 100] in chat_template_kwargs"
+                 )
+ 
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 0ba68db..f8b45c2 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -7,7 +7,6 @@
+ Differences from the reference:
+ - `developer` messages are supported and render as user turns.
+ - Images arrive as placeholders; deepseek_v41.py flattens content first.
+-- Tool namespaces (`ns::name`) are not supported.
+ - A system message's `updated_tools` renders as deepseek-recipe's
+   "### Updated Tool Schemas" (tool search results).
+ 
+@@ -16,7 +15,7 @@ Message normalization and serving controls live in deepseek_v41.py.
+ 
+ import copy
+ import json
+-from typing import Any, Dict, List, Optional, Union
++from typing import Any, Dict, List, Optional, Tuple, Union
+ 
+ bos_token: str = "<｜begin▁of▁sentence｜>"
+ eos_token: str = "<｜end▁of▁sentence｜>"
+@@ -62,19 +61,61 @@ def to_json(value: Any) -> str:
+ 
+ 
+ def tools_from_openai_format(tools):
+-    """Extract function definitions from OpenAI-format tool list."""
+-    return [tool["function"] for tool in tools]
++    """Extract function definitions with namespace-qualified names."""
++    functions = []
++    for tool in tools:
++        function = dict(tool["function"])
++        if tool.get("namespace") is not None:
++            function["namespace"] = tool["namespace"]
++        function["name"] = _tool_name_for_encoding(function)
++        namespace = function.pop("namespace", None)
++        if isinstance(namespace, dict) and namespace.get("description"):
++            function["description"] = (
++                namespace["description"] + "\n" + (function.get("description") or "")
++            )
++        functions.append(function)
++    return functions
++
++
++def _split_tool_name(
++    name: str, namespace: Optional[str] = None
++) -> Tuple[Optional[str], str]:
++    """Split a qualified name and validate any explicit namespace."""
++    prefix, separator, bare_name = name.partition("::")
++    if separator:
++        assert namespace in (None, prefix), (
++            f"Conflicting tool namespaces: {namespace} != {prefix}"
++        )
++        namespace, name = prefix, bare_name
++    assert "::" not in name, f"Tool name must not contain '::': {name}"
++    assert namespace is None or "::" not in namespace, (
++        f"Tool namespace must not contain '::': {namespace}"
++    )
++    return namespace, name
++
++
++def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
++    namespace = tool.get("namespace")
++    if isinstance(namespace, dict):
++        namespace = namespace["name"]
++    namespace, name = _split_tool_name(tool["name"], namespace)
++    return name if namespace is None else f"{namespace}::{name}"
+ 
+ 
+ def tool_calls_from_openai_format(tool_calls):
+     """Convert OpenAI-format tool calls to internal format."""
+-    return [
+-        {
+-            "name": tool_call["function"]["name"],
+-            "arguments": tool_call["function"]["arguments"],
+-        }
+-        for tool_call in tool_calls
+-    ]
++    calls = []
++    for tool_call in tool_calls:
++        function = tool_call["function"]
++        namespace, name = _split_tool_name(
++            function["name"],
++            tool_call.get("namespace") or function.get("namespace"),
++        )
++        call = {"name": name, "arguments": function["arguments"]}
++        if namespace is not None:
++            call["namespace"] = namespace
++        calls.append(call)
++    return calls
+ 
+ 
+ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+@@ -92,10 +133,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+ 
+         if role == "tool":
+             # Convert tool message to a user message with tool_result block
++            content = msg.get("content", "")
++            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
++                content = msg["content_blocks"]
+             tool_block = {
+                 "type": "tool_result",
+                 "tool_use_id": msg.get("tool_call_id", ""),
+-                "content": msg.get("content", ""),
++                "content": content,
+                 "_image_indices": msg.get("_image_indices", []),
+             }
+             # Merge into previous message if it's already a user (merged tool)
+@@ -115,13 +159,17 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         elif role == "user":
+             content_blocks = msg.get("content_blocks")
+             if content_blocks is None:
+-                content_blocks = [
+-                    {
+-                        "type": "text",
+-                        "text": msg.get("content", ""),
+-                        "_image_indices": msg.get("_image_indices", []),
+-                    }
+-                ]
++                content = msg.get("content", "")
++                if isinstance(content, list):
++                    content_blocks = content
++                else:
++                    content_blocks = [
++                        {
++                            "type": "text",
++                            "text": content,
++                            "_image_indices": msg.get("_image_indices", []),
++                        }
++                    ]
+             if (
+                 merged
+                 and merged[-1].get("role") == "user"
+@@ -197,7 +245,6 @@ REASONING_EFFORT_TEMPLATE = (
+ REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+     "low": 50,
+     "high": 75,
+-    "xhigh": 75,
+     "max": 100,
+ }
+ 
+@@ -463,7 +510,7 @@ def render_message(
+                 tool_call_template.format(
+                     dsml_token=dsml_token,
+                     tool_call_tag_name=tool_call_tag_name,
+-                    name=tc.get("name"),
++                    name=_tool_name_for_encoding(tc),
+                     arguments=encode_arguments_to_dsml(tc),
+                 )
+                 for tc in tool_calls
+@@ -546,8 +593,6 @@ def render_message(
+     elif (
+         messages[index].get("role") in ["user", "developer"]
+         or (messages[index].get("role") == "system" and index > 0)
+-        # A final assistant message left open by wo_eos is not followed by a turn.
+-        or (is_last and role == "assistant" and not wo_eos)
+     ):
+         # Normal generation: append Assistant + thinking token
+         # (mid-conversation system messages also trigger the assistant header)
