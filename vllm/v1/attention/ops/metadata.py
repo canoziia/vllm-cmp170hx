@@ -77,7 +77,6 @@ def _indexer_decode_metadata_kernel(
     BLOCK_COLS: tl.constexpr,
 ):
     token = tl.program_id(0)
-    cols = tl.arange(0, triton.next_power_of_2(BLOCK_COLS))
     actual_tokens = tl.load(query_start_loc + num_reqs)
     if token < num_tokens:
         req = _token_request(query_start_loc, tl.full((1,), token, tl.int32), num_reqs)
@@ -92,16 +91,25 @@ def _indexer_decode_metadata_kernel(
         tl.store(
             indices + token, tl.where(valid, req, num_reqs + token - actual_tokens)
         )
-        blocks = tl.load(
-            block_table + req.to(tl.int64) * input_stride + cols,
-            valid & (cols < BLOCK_COLS),
-            other=0,
+        req_cols = tl.where(
+            valid, tl.minimum(BLOCK_COLS, (length >> 6) + 2), 0
         )
-        tl.store(
-            output_block_table + token.to(tl.int64) * output_stride + cols,
-            blocks,
-            cols < BLOCK_COLS,
-        )
+        col_offs = tl.arange(0, 256)
+        col_base = 0
+        while col_base < req_cols:
+            cols = col_base + col_offs
+            mask = cols < req_cols
+            blocks = tl.load(
+                block_table + req.to(tl.int64) * input_stride + cols,
+                mask,
+                other=0,
+            )
+            tl.store(
+                output_block_table + token.to(tl.int64) * output_stride + cols,
+                blocks,
+                mask,
+            )
+            col_base += 256
     else:
         tail = num_tokens + (token - num_tokens) * 256 + tl.arange(0, 256)
         tl.store(output_seq_lens + tail, 0, tail < capacity)

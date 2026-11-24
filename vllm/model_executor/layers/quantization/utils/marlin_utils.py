@@ -428,12 +428,39 @@ def get_marlin_workspace(device: torch.device) -> torch.Tensor:
     if not is_workspace_manager_initialized():
         return marlin_make_workspace_new(device, MARLIN_MAX_BLOCKS_PER_SM)
 
-    return current_workspace_manager().get_persistent(
-        ("marlin_locks", current_stream()),
+    stream = current_stream()
+    manager = current_workspace_manager()
+    if manager.is_locked() and not torch.cuda.is_current_stream_capturing():
+        # Eager side streams (shared-expert aux stream for 193..256 tokens,
+        # multi-stream attention GEMMs up to 1024 tokens) can reach Marlin
+        # with a stream that no warmup or capture ever used. The locks are a
+        # few KiB, never resized and outside every CUDA graph, so allocate
+        # them lazily per stream instead of failing the request.
+        key = (device.index, stream.cuda_stream)
+        locks = _EAGER_STREAM_MARLIN_LOCKS.get(key)
+        if locks is None:
+            try:
+                return manager.get_persistent(
+                    ("marlin_locks", stream),
+                    (num_compute_units(device.index) * MARLIN_MAX_BLOCKS_PER_SM,),
+                    torch.int,
+                    zero_init=True,
+                )
+            except AssertionError:
+                locks = marlin_make_workspace_new(device, MARLIN_MAX_BLOCKS_PER_SM)
+                _EAGER_STREAM_MARLIN_LOCKS[key] = locks
+        return locks
+
+    return manager.get_persistent(
+        ("marlin_locks", stream),
         (num_compute_units(device.index) * MARLIN_MAX_BLOCKS_PER_SM,),
         torch.int,
         zero_init=True,
     )
+
+
+# Marlin locks of eager side streams first seen after the workspace locked.
+_EAGER_STREAM_MARLIN_LOCKS: dict[tuple[int | None, int], torch.Tensor] = {}
 
 
 def _marlin_gemm(
