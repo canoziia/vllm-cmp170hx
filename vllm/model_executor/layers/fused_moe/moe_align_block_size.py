@@ -1,13 +1,104 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Literal, overload
 
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe import (
+    dsv4_mxfp4_decode as _dsv4_mxfp4_decode,
+)
+from vllm.model_executor.layers.fused_moe import fast_det_align as _fast_det_align
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
+
+_EXPERT_MAP_LOCAL_COUNT: dict[int, int] = {}
+
+
+def _get_local_num_experts(expert_map: torch.Tensor | None) -> int | None:
+    if expert_map is None:
+        return None
+    key = expert_map.data_ptr()
+    cnt = _EXPERT_MAP_LOCAL_COUNT.get(key)
+    if cnt is None and not torch.cuda.is_current_stream_capturing():
+        cnt = int((expert_map >= 0).sum().item())
+        _EXPERT_MAP_LOCAL_COUNT[key] = cnt
+    return cnt
+
+
+def _deterministic_moe_align_enabled() -> bool:
+    val = os.environ.get("VLLM_DETERMINISTIC_MOE_ALIGN")
+    if val is not None:
+        return val.strip().lower() not in ("0", "false", "off", "no")
+    return _dsv4_mxfp4_decode.cuda_align_enabled() or _fast_det_align.enabled()
+
+
+def _moe_align_block_size_deterministic(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: torch.Tensor | None,
+) -> None:
+    """Deterministic replacement for ops.moe_align_block_size."""
+    numel = topk_ids.numel()
+    flat = topk_ids.view(-1).to(torch.int64)
+    if expert_map is not None:
+        in_range = (flat >= 0) & (flat < expert_map.numel())
+        local = torch.where(
+            in_range,
+            expert_map[flat.clamp(0, expert_map.numel() - 1)].to(torch.int64),
+            -1,
+        )
+    else:
+        local = flat
+    valid = (local >= 0) & (local < num_experts)
+    key = torch.where(valid, local, num_experts)
+
+    order = torch.argsort(key, stable=True)
+    sorted_key = key[order]
+
+    counts_full = torch.zeros(
+        num_experts + 1, dtype=torch.int64, device=topk_ids.device
+    )
+    counts_full.scatter_add_(0, key, torch.ones_like(key))
+    counts = counts_full[:num_experts]
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    cum_padded = torch.zeros(num_experts + 1, dtype=torch.int64, device=topk_ids.device)
+    torch.cumsum(padded_counts, 0, out=cum_padded[1:])
+    cum_unpadded = torch.zeros_like(cum_padded)
+    torch.cumsum(counts, 0, out=cum_unpadded[1:])
+
+    max_padded = sorted_ids.numel()
+    pos_in_sorted = torch.arange(numel, dtype=torch.int64, device=topk_ids.device)
+    safe_key = sorted_key.clamp(max=num_experts - 1)
+    rank = pos_in_sorted - cum_unpadded[safe_key]
+    dest_valid = cum_padded[safe_key] + rank
+    dest_invalid = max_padded + pos_in_sorted - cum_unpadded[num_experts]
+    dest = torch.where(sorted_key < num_experts, dest_valid, dest_invalid)
+
+    scratch = torch.full(
+        (max_padded + numel,),
+        numel,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    scratch.scatter_(0, dest, order.to(torch.int32))
+    sorted_ids.copy_(scratch[:max_padded])
+
+    nblocks = expert_ids.numel()
+    block_starts = (
+        torch.arange(nblocks, dtype=torch.int64, device=topk_ids.device) * block_size
+    )
+    block_expert = torch.searchsorted(cum_padded[1:], block_starts, right=True)
+    total_padded = cum_padded[num_experts]
+    block_expert = torch.where(block_starts < total_padded, block_expert, -1)
+    expert_ids.copy_(block_expert.to(torch.int32))
+    num_tokens_post_pad.copy_(total_padded.to(torch.int32).reshape(1))
 
 
 @overload
@@ -150,16 +241,60 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-        scatter_idx,
-    )
+    eff_map = expert_map if ignore_invalid_experts else None
+    det_align = scatter_idx is None and _deterministic_moe_align_enabled()
+    local_e = _get_local_num_experts(eff_map) if det_align else None
+    if (
+        det_align
+        and _dsv4_mxfp4_decode.cuda_align_enabled()
+        and _dsv4_mxfp4_decode.try_det_align(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            eff_map,
+            local_num_experts=local_e,
+        )
+    ):
+        pass
+    elif (
+        det_align
+        and _fast_det_align.enabled()
+        and _fast_det_align.try_align(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            eff_map,
+            local_num_experts=local_e,
+        )
+    ):
+        pass
+    elif det_align and os.environ.get("VLLM_DETERMINISTIC_MOE_ALIGN", "0") == "1":
+        _moe_align_block_size_deterministic(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            eff_map,
+        )
+    else:
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            eff_map,
+            scatter_idx,
+        )
 
     if expert_map is not None and not ignore_invalid_experts:
         expert_ids = expert_map[expert_ids]

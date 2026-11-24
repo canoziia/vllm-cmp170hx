@@ -21,6 +21,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe import (
+    dsv4_mxfp4_decode as _dsv4_mxfp4_decode,
+)
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
@@ -86,6 +89,7 @@ def _fused_marlin_moe(
     output: torch.Tensor | None = None,
     activation_config: ApplyMoEActivationConfig | None = None,
     mul_topk_weights_in_gemm2: bool = True,
+    _block_lists: list | None = None,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -116,7 +120,43 @@ def _fused_marlin_moe(
 
     intermediate_cache2 = _resize_cache(intermediate_cache2, (M * num_topk, N))
 
-    intermediate_cache1 = ops.moe_wna16_marlin_gemm(
+    import os
+    from functools import partial
+
+    gemm = ops.moe_wna16_marlin_gemm
+    if _block_lists is not None:
+        from vllm.model_executor.layers.fused_moe import moe_prefill as pp
+
+        gemm = partial(pp.split_gemm, _block_lists)
+    elif (
+        mul_topk_weights_in_gemm2
+        and os.getenv("VLLM_DSV41_MOE_PREFILL_SPLIT", "0") == "1"
+        and topk_ids is not None
+    ):
+        from vllm.model_executor.layers.fused_moe import moe_prefill as pp
+
+        if pp.eligible(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_ids,
+            quant_type,
+            bias1,
+            bias2,
+            expert_map,
+            global_scale1=global_scale1,
+            global_scale2=global_scale2,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ):
+            block_lists = pp.lists(topk_ids, w1.size(0), expert_map)
+            if block_lists is not None:
+                gemm = partial(pp.split_gemm, block_lists)
+
+    intermediate_cache1 = gemm(
         hidden_states,
         intermediate_cache1,
         w1,
@@ -167,7 +207,7 @@ def _fused_marlin_moe(
     if output is None:
         output = intermediate_cache3
 
-    output = ops.moe_wna16_marlin_gemm(
+    output = gemm(
         intermediate_cache2,
         output,
         w2,
@@ -310,46 +350,135 @@ def fused_marlin_moe(
         if M * topk / E / block_size_m < 0.9:
             break
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    import os
+
+    prefill_block_lists = None
+    if (
+        mul_topk_weights_in_gemm2
+        and os.getenv("VLLM_DSV41_MOE_PREFILL_SPLIT", "0") == "1"
+    ):
+        from vllm.model_executor.layers.fused_moe import moe_prefill as pp
+
+        if pp.eligible(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_ids,
+            quant_type,
+            bias1,
+            bias2,
+            expert_map,
+            global_scale1=global_scale1,
+            global_scale2=global_scale2,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ):
+            prefill_block_lists = pp.lists(topk_ids, w1.size(0), expert_map)
+
+    if prefill_block_lists is not None:
+        _, sorted_token_ids, expert_ids, num_tokens_post_padded = prefill_block_lists[0]
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
-    moe_output = _fused_marlin_moe(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        bias1=bias1,
-        bias2=bias2,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        num_topk=topk,
-        quant_type=quant_type,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        expert_map=expert_map,
-        block_size_m=block_size_m,
-        sorted_token_ids=sorted_token_ids,
-        expert_ids=expert_ids,
-        num_tokens_post_padded=num_tokens_post_padded,
-        activation=activation,
-        activation_func=activation_func,
-        activation_config=activation_config,
-        global_scale1=global_scale1,
-        global_scale2=global_scale2,
-        w1_zeros=w1_zeros,
-        w2_zeros=w2_zeros,
-        workspace=workspace,
-        intermediate_cache13=intermediate_cache13,
-        intermediate_cache2=intermediate_cache2,
-        output=None,
-        mul_topk_weights_in_gemm2=mul_topk_weights_in_gemm2,
-    ).view(-1, topk, K)
+    moe_output = None
+    if (
+        mul_topk_weights_in_gemm2
+        and prefill_block_lists is None
+        and _dsv4_mxfp4_decode.enabled()
+    ):
+        # VLLM_DSV4_MXFP4_DECODE: weight-streaming MXFP4 decode kernels for
+        # eligible small batches; None keeps the Marlin path below.
+        if intermediate_cache13 is None:
+            intermediate_cache13 = torch.empty(
+                (hidden_states.size(0) * topk * max(2 * w2.size(1) * 16, K),),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        if intermediate_cache2 is None:
+            intermediate_cache2 = torch.empty(
+                (hidden_states.size(0) * topk * w2.size(1) * 16,),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        moe_output = _dsv4_mxfp4_decode.try_run(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            quant_type=quant_type,
+            bias1=bias1,
+            bias2=bias2,
+            global_scale1=global_scale1,
+            global_scale2=global_scale2,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            block_size_m=block_size_m,
+            activation=activation,
+            activation_func=activation_func,
+            activation_config=activation_config,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            intermediate_cache13=intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            moe_sum=moe_sum,
+            output=output,
+            global_num_experts=global_num_experts,
+        )
+        if moe_output is not None:
+            moe_output, summed = moe_output
+            if summed:
+                # v2 fused moe_sum already wrote the final [M, K] output.
+                return moe_output
+            moe_output = moe_output.view(-1, topk, K)
+    if moe_output is None:
+        moe_output = _fused_marlin_moe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            bias1=bias1,
+            bias2=bias2,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_topk=topk,
+            quant_type=quant_type,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_map=expert_map,
+            block_size_m=block_size_m,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            activation=activation,
+            activation_func=activation_func,
+            activation_config=activation_config,
+            global_scale1=global_scale1,
+            global_scale2=global_scale2,
+            w1_zeros=w1_zeros,
+            w2_zeros=w2_zeros,
+            workspace=workspace,
+            intermediate_cache13=intermediate_cache13,
+            intermediate_cache2=intermediate_cache2,
+            output=None,
+            mul_topk_weights_in_gemm2=mul_topk_weights_in_gemm2,
+            _block_lists=prefill_block_lists,
+        ).view(-1, topk, K)
 
     if output is None:
         output = torch.empty_like(hidden_states)
@@ -360,7 +489,8 @@ def fused_marlin_moe(
             return output
         return torch.sum(moe_output.view(-1, topk, K), dim=1, out=output)
     else:
-        return moe_sum(moe_output, output, topk_ids, expert_map)
+        res = moe_sum(moe_output, output, topk_ids, expert_map)
+        return output if res is None else res
 
 
 def batched_fused_marlin_moe(
@@ -735,7 +865,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 activation=activation,
                 activation_func=self.activation,
                 activation_config=self.activation_config,
-                moe_sum=finalize_expert_output,
+                moe_sum=finalize_expert_output if hooked else self.moe_sum,
                 expert_map=expert_map,
                 output=output,
                 # Workspaces are swapped in workspace_shapes() to account for proper

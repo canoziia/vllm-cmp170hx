@@ -392,17 +392,24 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend == Mxfp4MoeBackend.NONE:
             return
 
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        # Pass the raw tensors without holding local references so the staged
+        # Marlin repack can drop the raw GPU copy before allocating the packed
+        # tensor.
+        self._setup_kernel(
+            layer,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
 
     def get_fused_moe_quant_config(
         self, layer: RoutedExperts
@@ -921,22 +928,43 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 )
 
         # Convert weights to kernel format
-        w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
-            convert_weight_to_mxfp4_moe_kernel_format(
-                mxfp4_backend=self.mxfp4_backend,
-                layer=layer,
-                w13_weight=w13,
-                w2_weight=w2,
-                w13_weight_scale=w13_scale,
-                w2_weight_scale=w2_scale,
-                w13_bias=w13_bias,
-                w2_bias=w2_bias,
-                _cache_permute_indices=self._cache_permute_indices,
-                activation=self.moe.activation,
-                use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
-                activation_key=self.activation_key,
-            )
+        marlin_staged = self.mxfp4_backend in (
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
         )
+        if marlin_staged:
+            # Staged / in-place Marlin repack: drop local references here first
+            # so the helper can repack in-place (VLLM_DSV41_MARLIN_CLEAN_REPACK=1)
+            # or stage through host RAM without pinning raw + packed on GPU.
+            del w13, w2, w13_scale, w2_scale
+            from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (  # noqa: E501
+                prepare_moe_mxfp4_layer_for_marlin_staged,
+            )
+
+            prepare_moe_mxfp4_layer_for_marlin_staged(layer)
+            w13 = layer.w13_weight
+            w2 = layer.w2_weight
+            w13_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            w13_bias = getattr(layer, "w13_bias", None)
+            w2_bias = getattr(layer, "w2_bias", None)
+        else:
+            w13, w2, w13_scale, w2_scale, w13_bias, w2_bias = (
+                convert_weight_to_mxfp4_moe_kernel_format(
+                    mxfp4_backend=self.mxfp4_backend,
+                    layer=layer,
+                    w13_weight=w13,
+                    w2_weight=w2,
+                    w13_weight_scale=w13_scale,
+                    w2_weight_scale=w2_scale,
+                    w13_bias=w13_bias,
+                    w2_bias=w2_bias,
+                    _cache_permute_indices=self._cache_permute_indices,
+                    activation=self.moe.activation,
+                    use_separated_a4w4=self.moe.use_mxfp4_w4a4_dsv4,
+                    activation_key=self.activation_key,
+                )
+            )
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
@@ -949,20 +977,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         uses_triton_weight_format = self.mxfp4_backend in TRITON_BACKENDS or (
             self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250
         )
-        if not uses_triton_weight_format:
-            replace_parameter(layer, "w13_weight", w13)
-            replace_parameter(layer, "w2_weight", w2)
-            replace_parameter(layer, "w13_weight_scale", w13_scale)
-            replace_parameter(layer, "w2_weight_scale", w2_scale)
-        else:
-            layer.w13_weight_triton = w13
-            layer.w2_weight_triton = w2
-            self.w13_precision_config = w13_scale
-            self.w2_precision_config = w2_scale
+        if not marlin_staged:
+            if not uses_triton_weight_format:
+                replace_parameter(layer, "w13_weight", w13)
+                replace_parameter(layer, "w2_weight", w2)
+                replace_parameter(layer, "w13_weight_scale", w13_scale)
+                replace_parameter(layer, "w2_weight_scale", w2_scale)
+            else:
+                layer.w13_weight_triton = w13
+                layer.w2_weight_triton = w2
+                self.w13_precision_config = w13_scale
+                self.w2_precision_config = w2_scale
 
-        if w13_bias is not None and w2_bias is not None:
-            replace_parameter(layer, "w13_bias", w13_bias)
-            replace_parameter(layer, "w2_bias", w2_bias)
+            if w13_bias is not None and w2_bias is not None:
+                replace_parameter(layer, "w13_bias", w13_bias)
+                replace_parameter(layer, "w2_bias", w2_bias)
 
         # Build quant config
         self._build_moe_kernel(layer)
@@ -1042,14 +1071,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._setup_kernel_k3_situ_gfx942(layer)
             return
 
-        w13 = layer.w13_weight
-        w2 = layer.w2_weight
-        w13_scale = layer.w13_weight_scale
-        w2_scale = layer.w2_weight_scale
         w13_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
-        self._setup_kernel(layer, w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
+        # Pass the raw tensors without holding local references: the staged
+        # Marlin repack moves them to host RAM and drops the GPU copy, and a
+        # reference kept here would pin the raw weights through the repack.
+        self._setup_kernel(
+            layer,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
 
     def get_fused_moe_quant_config(
         self,
