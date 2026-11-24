@@ -8,7 +8,7 @@ source "$MODEL_DIR/manifests/source.env"
 ENGINE=${CONTAINER_ENGINE:-podman}
 PYTHON=${PYTHON:-python3}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
-WITH_LMCACHE=${WITH_LMCACHE:-0}
+WITH_LMCACHE=${WITH_LMCACHE:-1}
 VALIDATE_ONLY=${VALIDATE_ONLY:-0}
 # SOURCE_MODE:
 #   "vllm-branch" (default): build directly from this repo's `vllm` branch
