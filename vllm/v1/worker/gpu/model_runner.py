@@ -1773,7 +1773,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             or input_batch.num_reqs == 0
             or input_batch.logits_indices.shape[0] == 0
             or grammar_output is not None
-            or self.masked_token_ids is not None
+            or getattr(self, "masked_token_ids", None) is not None
             or self.sampler is None
             or self.sampler.compute_nans
             or self.sampler.return_sampling_mask
