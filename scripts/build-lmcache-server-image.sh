@@ -67,7 +67,7 @@ COPY lmcache-payload/ /opt/lmcache-patched/
 COPY test-lmcache-patches.py /opt/lmcache-patched/
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN python3 -m compileall -q /opt/lmcache-patched/lmcache && python3 -c 'import lmcache,sys,torch,lmcache.cuda_ops,lmcache.lmcache_native,lmcache.lmcache_fs; from lmcache.integration.vllm.lmcache_mp_connector import LMCacheMPConnector; assert lmcache.__version__ == "0.5.5"; assert lmcache.__file__.startswith("/opt/lmcache-patched/"); assert sys.version_info[:2] == (3,12); assert torch.version.cuda == "13.0"; print(lmcache.__version__, lmcache.__file__, torch.__version__, torch.version.cuda)' && python3 /opt/lmcache-patched/test-lmcache-patches.py
-LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \
+LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-sm80" \
       org.opencontainers.image.revision="$REVISION" \
       io.canoziia.lmcache.role="server" \
       io.canoziia.lmcache.payload-for="client images take /opt/lmcache-patched from here" \

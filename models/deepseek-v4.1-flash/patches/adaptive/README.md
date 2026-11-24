@@ -1,6 +1,6 @@
 # Adaptive Verification & Topology-Aware Fusion Series
 
-Base source: official `vllm-project/vllm` (pinned in `manifests/source.env`),
+Base source: official `vllm-project/vllm` (pinned in `manifests/vllm.env`),
 already integrated into this repository's `vllm` branch for default
 `SOURCE_MODE=vllm-branch` builds.
 

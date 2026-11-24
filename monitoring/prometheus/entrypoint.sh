@@ -97,7 +97,7 @@ global:
   scrape_interval: ${PROM_SCRAPE_INTERVAL:-10s}
   evaluation_interval: ${PROM_SCRAPE_INTERVAL:-10s}
   external_labels:
-    monitor: ${PROM_MONITOR_NAME:-vllm-cmp170hx}
+    monitor: ${PROM_MONITOR_NAME:-vllm-sm80}
 scrape_configs:
   - job_name: prometheus
     static_configs:

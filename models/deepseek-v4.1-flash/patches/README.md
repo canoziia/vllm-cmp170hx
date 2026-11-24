@@ -1,6 +1,6 @@
 # DeepSeek V4.1 Flash SM80 Patch Series
 
-Base source: official `vllm-project/vllm` (pinned in `manifests/source.env`).
+Base source: official `vllm-project/vllm` (pinned in `manifests/vllm.env`).
 
 > [!NOTE]
 > The default image build (`SOURCE_MODE=vllm-branch` in

@@ -10,10 +10,9 @@ x-podman:
 
 services:
   deepseek-v4.1-flash:
-    # Client image: built from this repository's `vllm` branch (official
-    # vllm-project/vllm@0e3c8db + SM80 optimizations) plus the exact patched
-    # official LMCache payload the server below runs. Keep both on one payload.
-    image: ${VLLM_IMAGE:-localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4}
+    # Unified SM80 vLLM image (official vLLM + SM80 kernels + patched LMCache).
+    # Keep client and server on the same LMCache payload version.
+    image: ${VLLM_IMAGE:-ghcr.io/canoziia/vllm-sm80:latest}
     container_name: deepseek-v4.1-flash
     restart: "no"
     network_mode: host
@@ -59,9 +58,9 @@ services:
       NCCL_ALGO: "Ring"
       NCCL_PROTO: "Simple"
       NCCL_IB_DISABLE: "1"
-      # One switch for the PP6 SM80 optimisation profile (`default` or
-      # `verification`); individual env switches still override it.
-      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-default}"
+      # One switch for the PP6 SM80 optimisation profile (`auto` resolves to
+      # `default` or `verification` based on adaptive verification config).
+      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-auto}"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
@@ -116,7 +115,7 @@ services:
     # Shared server image: built once by scripts/build-lmcache-server-image.sh from
     # the digest-pinned official LMCache release, and used by every model
     # deployment. The client images layer the identical patched payload.
-    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    image: ${LMCACHE_IMAGE:-ghcr.io/canoziia/vllm-sm80/lmcache-server:latest}
     container_name: deepseek-v4.1-flash-lmcache
     entrypoint: ["lmcache"]
     restart: "no"

@@ -1,16 +1,17 @@
-# DeepSeek-V4.1-Flash on 4x SM80 80G (TEP4: TP=4 + EP=4), built directly from
-# this repository's `vllm` branch (upstream vllm@0e3c8db + SM80 TEP4 fusions) via
-# `bash scripts/build-deepseek-v41-image.sh`, with LMCache L1+L2 KV tier.
+# DeepSeek-V4.1-Flash on 4x SM80 80G (TEP4: TP=4 + EP=4), running the unified
+# `ghcr.io/canoziia/vllm-sm80:latest` image (official vLLM + SM80 kernels,
+# `VLLM_DSV41_OPT_PROFILE=auto`) with LMCache L1+L2 KV tier.
 #
-# Topology-aware: automatically detects NVLink vs PCIe P2P at startup with zero
-# Python edits (`ampere_peer_topology()` -> "nvlink" uses full 192-row Lamport
-# collectives; "pcie" uses bounded low-M Lamport + Ring NCCL fallback).
+# Topology-aware: automatically detects parallelism (TEP4 -> `tep4_fused`) and
+# NVLink vs PCIe P2P at startup with zero edits (`ampere_peer_topology()` ->
+# "nvlink" uses full 192-row Lamport collectives; "pcie" uses bounded low-M
+# Lamport + Ring NCCL fallback).
 x-podman:
   in_pod: false
 
 services:
   deepseek-v4.1-flash-tep4:
-    image: ${VLLM_IMAGE:-localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4}
+    image: ${VLLM_IMAGE:-ghcr.io/canoziia/vllm-sm80:latest}
     container_name: deepseek-v4.1-flash-tep4
     restart: "no"
     network_mode: host
@@ -50,9 +51,9 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       NCCL_IB_DISABLE: "1"
       VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS: "192"
-      # Profiles: "tep4_fused" (default: topology-aware deep fusions, auto-detects
-      # NVLink vs PCIe P2P) or "tep4_verification" (baseline SM80 verification).
-      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-tep4_fused}"
+      # Profiles: "auto" (default: selects tep4_fused for TP4+EP and auto-detects
+      # NVLink vs PCIe P2P), "tep4_fused", "tep4_verification", or "off".
+      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-auto}"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
 
@@ -101,7 +102,7 @@ services:
       retries: 3
 
   deepseek-v4.1-flash-tep4-lmcache:
-    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    image: ${LMCACHE_IMAGE:-ghcr.io/canoziia/vllm-sm80/lmcache-server:latest}
     container_name: deepseek-v4.1-flash-tep4-lmcache
     entrypoint: ["lmcache"]
     restart: "no"

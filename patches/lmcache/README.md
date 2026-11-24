@@ -122,8 +122,10 @@ bash scripts/build-deepseek-v41-image.sh
 # Optional: REBUILD_LMCACHE_IMAGE=1 bash scripts/build-deepseek-v41-image.sh
 ```
 
-The DeepSeek client defaults to `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`;
-the shared server defaults to `localhost/lmcache-server:latest`. Override
+The vLLM SM80 client defaults to `localhost/vllm-sm80:latest` (published on GHCR as
+`ghcr.io/canoziia/vllm-sm80:latest`);
+the shared server defaults to `localhost/lmcache-server:latest` (published on GHCR as
+`ghcr.io/canoziia/vllm-sm80/lmcache-server:latest`). Override
 `OUTPUT_IMAGE` to build an immutable commit-tagged client without moving a
 deployment tag. Never replace a running deployment solely because the images
 build: first run the registration, complete-store, eviction, restore,

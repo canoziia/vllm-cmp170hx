@@ -6,7 +6,7 @@ SOURCE_TREE=$(realpath "$1")
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 # shellcheck disable=SC1091
-source "$MODEL_DIR/manifests/source.env"
+source "$REPO_ROOT/manifests/vllm.env"
 PYTHON=${PYTHON:-python3}
 
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {

@@ -1,9 +1,9 @@
 name: Docker
 
 # Validates the patched `vllm` branch offline on every push/PR, and builds &
-# publishes the DeepSeek-V4.1-Flash SM80 TEP4 image (and shared LMCache server
-# image when LMCache inputs change) to GHCR (plus Docker Hub when
-# DOCKER_USERNAME / DOCKER_PASSWORD secrets are configured).
+# publishes the unified SM80 vLLM image (and shared LMCache server image when
+# LMCache inputs change) to GHCR (plus Docker Hub when DOCKER_USERNAME /
+# DOCKER_PASSWORD secrets are configured).
 
 on:
   push:
@@ -12,8 +12,8 @@ on:
     branches: ["main"]
   workflow_dispatch:
     inputs:
-      build_deepseek_v41:
-        description: "Build and push DeepSeek-V4.1-Flash TEP4 image"
+      build_vllm:
+        description: "Build and push vLLM SM80 image"
         type: boolean
         default: true
       build_lmcache:
@@ -40,7 +40,7 @@ jobs:
     name: Validate vLLM branch and manifests
     runs-on: ubuntu-latest
     outputs:
-      build_deepseek_v41: ${{ steps.plan.outputs.build_deepseek_v41 }}
+      build_vllm: ${{ steps.plan.outputs.build_vllm }}
       build_lmcache: ${{ steps.plan.outputs.build_lmcache }}
       vllm_sha: ${{ steps.plan.outputs.vllm_sha }}
     steps:
@@ -65,21 +65,21 @@ jobs:
         run: |
           set -euo pipefail
           vllm_sha=$(git rev-parse --short=12 refs/heads/vllm)
-          build_dsv41=false
+          build_vllm=false
           build_lmc=false
 
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            build_dsv41="${{ inputs.build_deepseek_v41 }}"
+            build_vllm="${{ inputs.build_vllm }}"
             build_lmc="${{ inputs.build_lmcache }}"
           elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             if [[ "${GITHUB_REF_NAME}" == "vllm" ]]; then
-              build_dsv41=true
+              build_vllm=true
             else
               changed=$(git diff --name-only HEAD~1..HEAD 2>/dev/null || echo "")
               echo "Changed files on main:"
               echo "$changed"
-              if grep -qE '^(manifests/vllm\.env|manifests/lmcache\.env|patches/lmcache/|models/deepseek-v4\.1-flash/(manifests|native)/|scripts/build-deepseek-v41-image\.sh|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
-                build_dsv41=true
+              if grep -qE '^(manifests/vllm\.env|manifests/lmcache\.env|patches/lmcache/|models/deepseek-v4\.1-flash/native/|scripts/build-deepseek-v41-image\.sh|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
+                build_vllm=true
               fi
               if grep -qE '^(manifests/lmcache\.env|patches/lmcache/|scripts/(apply|build|ensure|test)-lmcache|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
                 build_lmc=true
@@ -89,10 +89,10 @@ jobs:
 
           {
             echo "vllm_sha=${vllm_sha}"
-            echo "build_deepseek_v41=${build_dsv41}"
+            echo "build_vllm=${build_vllm}"
             echo "build_lmcache=${build_lmc}"
           } >> "$GITHUB_OUTPUT"
-          echo "plan: vllm_sha=${vllm_sha} build_deepseek_v41=${build_dsv41} build_lmcache=${build_lmc}"
+          echo "plan: vllm_sha=${vllm_sha} build_vllm=${build_vllm} build_lmcache=${build_lmc}"
 
   build_lmcache:
     name: Push LMCache server image
@@ -211,10 +211,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  build_deepseek_v41:
-    name: Push DeepSeek-V4.1-Flash TEP4 image
+  build_vllm:
+    name: Push vLLM SM80 image
     needs: validate
-    if: github.event_name != 'pull_request' && needs.validate.outputs.build_deepseek_v41 == 'true'
+    if: github.event_name != 'pull_request' && needs.validate.outputs.build_vllm == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     permissions:
@@ -247,19 +247,17 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=1 origin refs/heads/vllm:refs/heads/vllm
 
-      - name: Prepare DeepSeek-V4.1-Flash build context
+      - name: Prepare vLLM SM80 build context
         run: |
           set -euo pipefail
           CONTAINER_ENGINE=docker \
           LMCACHE_PAYLOAD_SOURCE=payload-image \
           ALLOW_UNPINNED_VLLM_BRANCH=1 \
-          PREPARE_CONTEXT_ONLY="${RUNNER_TEMP}/context-dsv41" \
+          PREPARE_CONTEXT_ONLY="${RUNNER_TEMP}/context-vllm" \
           bash scripts/build-deepseek-v41-image.sh
 
       - name: Setup Docker buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -281,8 +279,8 @@ jobs:
             printf '%s\n' "${imgs[@]}"
             echo "__EOF__"
             echo "tags<<__EOF__"
-            echo "type=raw,value=deepseek-v4.1-flash-tep4"
-            echo "type=raw,value=deepseek-v4.1-flash-tep4-${VLLM_SHA}"
+            echo "type=raw,value=latest"
+            echo "type=raw,value=${VLLM_SHA}"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
@@ -307,16 +305,18 @@ jobs:
           images: ${{ steps.image.outputs.images }}
           tags: ${{ steps.image.outputs.tags }}
 
-      - name: Build and push DeepSeek-V4.1-Flash image
+      - name: Build and push vLLM SM80 image
         id: build-and-push
         uses: docker/build-push-action@v6
         with:
-          context: ${{ runner.temp }}/context-dsv41
-          file: ${{ runner.temp }}/context-dsv41/Containerfile
+          context: ${{ runner.temp }}/context-vllm
+          file: ${{ runner.temp }}/context-vllm/Containerfile
           platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=vllm-sm80
+          cache-to: type=gha,mode=min,scope=vllm-sm80
 
       - name: Sign the published Docker image
         env:
@@ -334,7 +334,7 @@ jobs:
           VLLM_SHA: ${{ needs.validate.outputs.vllm_sha }}
         run: |
           {
-            echo "### DeepSeek-V4.1-Flash TEP4 image published"
+            echo "### vLLM SM80 image published"
             echo
             echo "- \`vllm\` branch: \`${VLLM_SHA}\`"
             echo "- platforms: \`${PLATFORMS}\`"

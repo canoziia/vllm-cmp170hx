@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 # shellcheck disable=SC1091
-source "$MODEL_DIR/manifests/source.env"
+source "$REPO_ROOT/manifests/vllm.env"
 # shellcheck disable=SC1091
 source "$REPO_ROOT/manifests/lmcache.env"
 ENGINE=${CONTAINER_ENGINE:-podman}
@@ -29,7 +29,7 @@ LMCACHE_PAYLOAD_SOURCE=${LMCACHE_PAYLOAD_SOURCE:-auto}
 SOURCE_MODE=${SOURCE_MODE:-vllm-branch}
 VLLM_REF=${VLLM_REF:-$VLLM_BRANCH}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_OUTPUT_IMAGE}
-PATCH_LABEL="upstream-sm80-tep4"
+PATCH_LABEL="sm80"
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/dsv41-main-sm80-build.XXXXXX")
 PAYLOAD_CID=
@@ -243,11 +243,9 @@ INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
 cat >"$WORKDIR/context/Containerfile" <<CONTAINERFILE
 FROM $BASE_IMAGE
 USER root
-COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 COPY dsv4_moe/ /tmp/dsv4_moe/
 COPY dsv41_indexer/ /tmp/dsv41_indexer/
 COPY dsv41_dense_mxfp8/ /tmp/dsv41_dense_mxfp8/
-COPY dsv41_engram_cpu/ /tmp/dsv41_engram_cpu/
 COPY dsv41_swa/ /tmp/dsv41_swa/
 COPY dsv41_r2/ /tmp/dsv41_r2/
 RUN (command -v g++ >/dev/null || (apt-get update -y && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*)) \\
@@ -266,18 +264,13 @@ RUN (command -v g++ >/dev/null || (apt-get update -y && apt-get install -y --no-
     && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_swa_C.abi3.so \\
     && bash /tmp/dsv41_r2/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build_r2 /tmp/dsv41_r2 /root/.cache/torch_extensions \\
-    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_r2_C.abi3.so \\
-    && bash /tmp/dsv41_engram_cpu/build.sh /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common \\
-    && rm -rf /tmp/dsv41_engram_cpu \\
-    && test -f /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common/_dsv41_engram_cpu.so \\
-    && python3 -m compileall -f -q /usr/local/lib/python3.12/dist-packages/vllm
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_r2_C.abi3.so
 CONTAINERFILE
 
 if [[ $WITH_LMCACHE == 1 ]]; then
   cat >>"$WORKDIR/context/Containerfile" <<'CONTAINERFILE'
 COPY lmcache-payload/ /opt/lmcache-patched/
 COPY lmcache-ext-src/ /tmp/lmcache-ext-src/
-COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 ENV PYTHONPATH=/opt/lmcache-patched
 RUN (python3 -c 'import torch, lmcache.cuda_ops, lmcache.lmcache_native, lmcache.lmcache_fs, lmcache.lmcache_redis' 2>/dev/null \
         || (set -eu; \
@@ -298,8 +291,23 @@ RUN (python3 -c 'import torch, lmcache.cuda_ops, lmcache.lmcache_native, lmcache
                 rm -rf /var/lib/apt/lists/*; \
             fi)) \
     && rm -rf /tmp/lmcache-ext-src /root/.cache/torch_extensions \
-    && python3 -m compileall -q /opt/lmcache-patched/lmcache \
-    && (set -eu; \
+    && python3 -m compileall -q /opt/lmcache-patched/lmcache
+CONTAINERFILE
+fi
+
+cat >>"$WORKDIR/context/Containerfile" <<'CONTAINERFILE'
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+COPY dsv41_engram_cpu/ /tmp/dsv41_engram_cpu/
+RUN bash /tmp/dsv41_engram_cpu/build.sh /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common \
+    && rm -rf /tmp/dsv41_engram_cpu \
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common/_dsv41_engram_cpu.so \
+    && python3 -m compileall -f -q /usr/local/lib/python3.12/dist-packages/vllm
+CONTAINERFILE
+
+if [[ $WITH_LMCACHE == 1 ]]; then
+  cat >>"$WORKDIR/context/Containerfile" <<'CONTAINERFILE'
+COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
+RUN (set -eu; \
         CUDA_TEST_LIB=""; \
         if [ -f /usr/local/cuda/compat/libcuda.so.1 ]; then \
             CUDA_TEST_LIB="/usr/local/cuda/compat"; \
@@ -314,7 +322,8 @@ CONTAINERFILE
 fi
 
 cat >>"$WORKDIR/context/Containerfile" <<CONTAINERFILE
-LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \\
+ENV VLLM_DSV41_OPT_PROFILE=auto
+LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-sm80" \\
       org.opencontainers.image.revision="$SOURCE_COMMIT" \\
       io.canoziia.integration.revision="$INTEGRATION_REVISION" \\
       io.canoziia.vllm.source="$VLLM_SOURCE_LABEL" \\

@@ -1,20 +1,27 @@
-# vllm-cmp170hx
+# vllm-sm80
 
 **The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 200–500 tok/s single-stream and up to 10K tok/s prefill (8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
+
+## Prebuilt Images (GHCR)
+
+One unified SM80 vLLM image serves all DeepSeek parallelism splits (auto-selecting the optimal profile via `VLLM_DSV41_OPT_PROFILE=auto` and NVLink/PCIe topology detection) while leaving non-DeepSeek models on untouched official vLLM defaults:
+
+- **vLLM SM80**: `ghcr.io/canoziia/vllm-sm80:latest`
+- **Shared LMCache Server**: `ghcr.io/canoziia/vllm-sm80/lmcache-server:latest`
 
 ## Models
 
 ### DeepSeek V4.1 Flash
 
 See [`models/deepseek-v4.1-flash/README.md`](models/deepseek-v4.1-flash/README.md)
-for the complete architecture overview, optimization profiles, native extensions,
-deployment guide, and both 180 W & 250 W benchmarks.
+for build instructions, Compose deployments (4× 80G TEP4 & 6× CMP 170HX PP6),
+optimization profiles, native CUDA/C++ extensions, and full 180 W & 250 W benchmarks.
 
 #### Measured TEP4 Benchmarks (`4× 80G SM80 PCIe Gen4`, 250 W, `compose.yml` + LMCache)
 
 `TP=4 + EP=4`, unmodified official MXFP4/FP8 weights, `nvfp4_ds_mla` KV cache
 (`2,014,502` GPU KV tokens = `1.92× 1M` + LMCache `8 GiB` L1 RAM / `500 GiB`
-NVMe L2), `VLLM_DSV41_OPT_PROFILE=tep4_fused`, `enable_adaptive_verification=true`,
+NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tep4_fused`), `enable_adaptive_verification=true`,
 `0` OOM across full 1M prefill and 32-concurrency stress.
 
 **Cold Prefill (`tok/s`, `c=1`, `cached_tokens=0`)**
@@ -34,73 +41,21 @@ NVMe L2), `VLLM_DSV41_OPT_PROFILE=tep4_fused`, `enable_adaptive_verification=tru
 | **16** | **1,122.6** (`27.42 ms`, acc 1.93) | **2,343.9** (`37.18 ms`, acc 5.46) | **2,651.0** (`36.63 ms`, acc 5.88) |
 | **32** | **1,436.1** (`36.51 ms`, acc 1.64) | **2,894.7** (`59.31 ms`, acc 5.42) | **3,304.5** (`57.58 ms`, acc 5.88) |
 
-#### Validate & Build
-
-By default (`SOURCE_MODE=vllm-branch`), `scripts/build-deepseek-v41-image.sh`
-exports this repository's `vllm` branch, compiles all 6 self-contained native
-CUDA/C++ extensions, bundles the patched official LMCache payload from
-`localhost/lmcache-server:latest` (building it automatically if absent, or when
-`REBUILD_LMCACHE_IMAGE=1`), and runs the offline test gates:
-
-```bash
-# 1. Offline validation gate (11 test suites + py_compile, no container build)
-VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
-
-# 2. Build the complete production TEP4 image
-CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
-bash scripts/build-deepseek-v41-image.sh
-
-# Optional: rebuild by replaying models/deepseek-v4.1-flash/patches/ onto official upstream
-# SOURCE_MODE=patch-upstream bash scripts/build-deepseek-v41-image.sh
-```
-
-#### Deploy (Default: 4× 80G SM80 TEP4 — PCIe P2P or NVLink)
-
-`VLLM_DSV41_OPT_PROFILE=tep4_fused` automatically detects NVLink vs PCIe Gen4 P2P
-at worker startup (`ampere_peer_topology()`), requiring zero code or `.env` edits
-when moving between PCIe and NVLink SM80 hosts:
-
-```bash
-cd models/deepseek-v4.1-flash
-cp .env.example .env
-chmod 600 .env
-# Set a private VLLM_API_KEY, MODEL_ROOT, cache/LMCache paths, and DSV41_GPU_0..3.
-
-podman compose --podman-run-args=--ipc=host up -d
-```
-
-For the optional 6× CMP 170HX pipeline-parallel deployment (`PP=6`, `7,7,7,7,7,5`),
-use `.env.pp6.example` and `-f compose.pp6.yml`:
-
-```bash
-cd models/deepseek-v4.1-flash
-cp .env.pp6.example .env
-chmod 600 .env
-podman compose --podman-run-args=--ipc=host -f compose.pp6.yml up -d
-```
-
-Host paths in `.env*.example` and Compose defaults (`/srv/models`,
-`/srv/vllm-cache`, `/srv/lmcache`, ...) are generic examples; set the real paths
-for your host in `.env`. Variables marked `${VAR:?...}` have no default.
-
-Never commit `.env`, API keys, model weights, benchmark results, host addresses,
-or host disk UUIDs.
-
 ## Branch Architecture
 
 This repository uses a two-branch layout directly anchored to official
 `vllm-project/vllm`:
 
 - **`vllm` branch**: Complete patched vLLM source tree (official upstream
-  snapshot followed by feature-scoped SM80 / DeepSeek-V4.1 commits matching
+  snapshot followed by feature-scoped SM80 commits matching
   `models/deepseek-v4.1-flash/patches/`).
-- **`main` branch** (this branch): Deployment manifests, Compose files,
-  self-contained native CUDA/C++ extensions, LMCache patches, build/validation
-  scripts, offline tests, monitoring, and documentation.
+- **`main` branch** (this branch): Pinned upstream manifests, Compose
+  deployments, self-contained native CUDA/C++ extensions, LMCache patches,
+  build/validation scripts, offline tests, monitoring, and documentation.
 
 Exact upstream commits and Docker base image digests are pinned in
-`manifests/vllm.env` and `manifests/lmcache.env`.
+[`manifests/vllm.env`](manifests/vllm.env) and
+[`manifests/lmcache.env`](manifests/lmcache.env).
 
 ## Repository Layout
 
@@ -115,7 +70,7 @@ Exact upstream commits and Docker base image digests are pinned in
 │   ├── apply-deepseek-v41-patches.sh
 │   ├── apply-lmcache-patches.sh
 │   ├── benchmark-vllm.mjs          # decode, prefill, and counting benchmark client
-│   ├── build-deepseek-v41-image.sh # builds the full DeepSeek V4.1 image (+ LMCache)
+│   ├── build-deepseek-v41-image.sh # builds the unified SM80 vLLM image (+ LMCache)
 │   ├── build-lmcache-server-image.sh
 │   ├── ensure-lmcache-server-image.sh
 │   ├── test-lmcache-bounded-pd-groups.py
@@ -123,11 +78,11 @@ Exact upstream commits and Docker base image digests are pinned in
 │   └── test-vllm-common-patches.py
 └── models/
     └── deepseek-v4.1-flash/
-        ├── compose.yml             # default: 4x 80G SM80 TEP4 (TP=4 + EP=4 + LMCache, NVLink/PCIe auto)
+        ├── README.md               # DeepSeek V4.1 Flash build, deploy, and full benchmarks
+        ├── compose.yml             # default: 4x 80G SM80 TEP4 (TP=4 + EP=4 + LMCache)
         ├── .env.example            # default TEP4 environment template
         ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
         ├── .env.pp6.example        # optional PP6 environment template
-        ├── manifests/              # pinned vllm branch & upstream source metadata
         ├── native/                 # 6 self-contained SM80 CUDA/C++ extensions built from source
         ├── patches/                # auditable patch archive replaying onto official vLLM
         ├── scripts/                # DeepSeek-only diagnostics
@@ -161,12 +116,6 @@ rejects nonzero `cached_tokens`, uses server-reported usage counts, and records
 exact streamed `token_ids` when available. Decode output reports both token/s
 and speculative step/s.
 
-## Shared LMCache Baseline
-
-`manifests/lmcache.env` pins the official LMCache v0.5.5 CUDA 13.0 release and
-payload digests. Patch rationale and validation gates are documented in
-[`patches/lmcache/README.md`](patches/lmcache/README.md).
-
 ## Upstream Sources
 
 This repository builds directly on official upstream releases with no third-party
@@ -174,8 +123,8 @@ vLLM fork in the chain:
 
 | Upstream | What we take from it | Where it is pinned |
 | --- | --- | --- |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM engine, maintained on our `vllm` branch as feature commits on top of upstream | `models/deepseek-v4.1-flash/manifests/source.env` |
-| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache v0.5.5 server/payload images plus `patches/lmcache/0001..0010` | `manifests/lmcache.env` |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM engine & base image, maintained on our `vllm` branch as feature commits on top of upstream | [`manifests/vllm.env`](manifests/vllm.env) |
+| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache v0.5.5 server/payload images plus [`patches/lmcache/`](patches/lmcache/README.md) | [`manifests/lmcache.env`](manifests/lmcache.env) |
 
 ## License
 

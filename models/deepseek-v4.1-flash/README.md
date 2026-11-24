@@ -12,8 +12,9 @@ deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` built directly on officia
 
 ## Repository Branch Layout & Source
 
-This repository uses a two-branch layout (exact commits and image tags are pinned in
-`manifests/source.env` and `../../manifests/lmcache.env`):
+This repository uses a two-branch layout (exact upstream commits and Docker base
+image digests are pinned in [`../../manifests/vllm.env`](../../manifests/vllm.env)
+and [`../../manifests/lmcache.env`](../../manifests/lmcache.env)):
 
 - **`vllm` branch**: Complete patched vLLM source tree (official upstream snapshot followed
   by feature-scoped commits matching `patches/` 1:1).
@@ -22,8 +23,10 @@ This repository uses a two-branch layout (exact commits and image tags are pinne
   (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline
   test suites, and auditable patch archive (`patches/`).
 - **Shared LMCache layer**: official LMCache v0.5.5 + `../../patches/lmcache/0001..0010`
-  (including `0010-cached-request-resumed-req-ids-compat.patch` for upstream vLLM compatibility).
-- **Default TEP4 output image**: `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`
+  (client `.so` modules automatically rebuilt against the official vLLM base PyTorch ABI).
+- **Prebuilt GHCR images**:
+  - `ghcr.io/canoziia/vllm-sm80:latest` (unified SM80 vLLM image — works across TEP4, PP6, other DeepSeek splits, and non-DeepSeek models)
+  - `ghcr.io/canoziia/vllm-sm80/lmcache-server:latest` (shared LMCache server)
 
 ### Self-Contained Native Extensions (`models/deepseek-v4.1-flash/native/`)
 
@@ -48,46 +51,64 @@ max_num_batched_tokens=3072
 max_num_seqs=32
 KV=nvfp4_ds_mla (2,014,502 GPU KV tokens at 2.20 GB/rank = 1.92x 1M + LMCache 8 GiB L1 / 500 GiB L2)
 CPU Engram offload (2x 94.4 GiB packed 264B rows), CPU Vision offload
-VLLM_DSV41_OPT_PROFILE=tep4_fused
+VLLM_DSV41_OPT_PROFILE=auto   # auto-selects tep4_fused for TP=4+EP=4
 ```
 
-### Zero-Edit Migration Between PCIe P2P and NVLink Hardware
+### Zero-Edit Migration Between Parallelism Splits, PCIe P2P, and NVLink
 
-`VLLM_DSV41_OPT_PROFILE=tep4_fused` automatically queries `ampere_peer_topology()` at worker
-startup via `cudaDevP2PAttrPerformanceRank` / NVML:
+`VLLM_DSV41_OPT_PROFILE=auto` (baked into `ghcr.io/canoziia/vllm-sm80:latest` by default)
+inspects the model `config.json` and launch parallelism at startup:
 
-- **PCIe Gen4 P2P (`"pcie"`)**: bounds two-shot CuTe Lamport AllReduce to `<= 60` rows
-  (switching seamlessly to full-duplex Ring NCCL for `> 60` rows) and runs single-kernel
-  Lamport symmetric-memory exchange (`markov_symm.py`) across the 5 DSpark Markov steps.
-- **NVLink (`"nvlink"`)**: automatically unlocks full `MAX_ROWS = 192` two-shot CuTe
-  Lamport AllReduce and column AllGather across all decode batch sizes (`c=1..32`).
+- **Non-DeepSeek models**: completely untouched (100% standard upstream vLLM).
+- **DeepSeek-V4.1 `TP=4 + EP=4` (`PP=1`)**: automatically selects `tep4_fused`, which
+  queries `ampere_peer_topology()` at worker startup via `cudaDevP2PAttrPerformanceRank` / NVML:
+  - **PCIe Gen4 P2P (`"pcie"`)**: bounds two-shot CuTe Lamport AllReduce to `<= 60` rows
+    (switching seamlessly to full-duplex Ring NCCL for `> 60` rows) and runs single-kernel
+    Lamport symmetric-memory exchange (`markov_symm.py`) across the 5 DSpark Markov steps.
+  - **NVLink (`"nvlink"`)**: automatically unlocks full `MAX_ROWS = 192` two-shot CuTe
+    Lamport AllReduce and column AllGather across all decode batch sizes (`c=1..32`).
+- **DeepSeek-V4.1 `PP > 1` (e.g. 6x CMP 170HX PP6)**: automatically selects `default`
+  (or `verification` when `enable_adaptive_verification: true`).
+- **Other DeepSeek-V4.1 `TP > 1` splits (e.g. TP2 / TP8)**: automatically selects `tp_auto`
+  (or `tp_auto_verification`).
 
-Moving the same container image and `compose.yml` from PCIe 4x A100 to NVLink 4x A100
-requires **zero `.py` or `.env` changes**.
+Moving the same container image between TEP4 / PP6 or PCIe / NVLink SM80 hosts requires
+**zero `.py` changes**.
 
-### Build & Deploy (Default TEP4 / Optional PP6)
+### Quickstart (Prebuilt GHCR Images)
 
 ```bash
-# 1. Validate our `vllm` branch directly (all 11 offline test suites + py_compile):
-VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
-
-# 2. Build production TEP4 image directly from our `vllm` branch + 6 native CUDA/C++ extensions:
-CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
-bash scripts/build-deepseek-v41-image.sh
-# (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream + patches/)
-
-# 3. Deploy default 4x 80G SM80 TEP4 with Podman Compose:
+# Default: 4x 80G SM80 TEP4 (PCIe P2P or NVLink)
 cd models/deepseek-v4.1-flash
 cp .env.example .env
-# Edit VLLM_API_KEY, MODEL_ROOT, and DSV41_GPU_0..3 in .env
+chmod 600 .env
+# Edit VLLM_API_KEY, MODEL_ROOT, cache/LMCache paths, and DSV41_GPU_0..3 in .env
+
 podman compose --podman-run-args=--ipc=host up -d
 podman logs -f deepseek-v4.1-flash-tep4
 
-# Optional 6x CMP 170HX PP6 deployment:
+# Optional: 6x CMP 170HX PP6 (7,7,7,7,7,5)
 # cp .env.pp6.example .env
+# chmod 600 .env
 # podman compose -f compose.pp6.yml --podman-run-args=--ipc=host up -d
 ```
+
+### Validate & Build Locally (Optional)
+
+```bash
+# 1. Offline validation gate (all test suites + py_compile, no container build):
+VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
+
+# 2. Build the unified SM80 vLLM image locally from our `vllm` branch + 6 native extensions:
+CONTAINER_ENGINE=podman \
+OUTPUT_IMAGE=localhost/vllm-sm80:latest \
+bash scripts/build-deepseek-v41-image.sh
+# (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream + patches/)
+```
+
+Host paths in `.env*.example` and Compose defaults (`/srv/models`, `/root/app/...`) are
+examples; set the real paths for your host in `.env`. Never commit `.env`, API keys,
+model weights, benchmark results, host addresses, or host disk UUIDs.
 
 ## Optimisation Profiles (`vllm/dsv41_opt_profile.py`)
 
@@ -97,10 +118,13 @@ always take precedence:
 
 | profile | target topology | description |
 |---|---|---|
+| `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tep4_fused` for TEP4, `default`/`verification` for PP>1, `tp_auto` for other TP>1 |
 | `default` | PP6 / general SM80 | Base 1x-HBM MXFP8/MXFP4 decode & long-context prefill kernels |
 | `verification` | PP6 + DSpark | Adds sub-width & mixed-`spec_k` FULL CUDA graphs, metadata replay, live-load PP cohorts |
+| `tp_auto` / `tp_auto_verification` | General DeepSeek TP>1 | TP-safe SM80 optimisations (Engram NUMA interleave, FP8 `wo_a`, vision offload, cuBLAS MXFP8 prefill, topology-aware collectives) |
 | `tep4_verification` | 4x 80G TEP4 | Baseline SM80 adaptive-verification profile (`nvfp4_ds_mla`, CPU vision offload, `COST_MS_BASE`) |
 | `tep4_fused` | 4x 80G TEP4 (PCIe or NVLink) | Topology-aware deep-fusion profile: topology-aware Lamport collectives, `fused_gate_topk_align`, `w2_splitk_ep` + fused shared add, C++ `wo_a`, TP-local greedy verify, `dequant_marlin_mxfp8` cuBLAS prefill, `COST_MS_FUSED` |
+| `off` / `0` | Any | Disables all automatic profile overrides |
 
 ## Preserved API & Serving Contracts
 
