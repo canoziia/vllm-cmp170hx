@@ -1,7 +1,6 @@
 # vllm-cmp170hx
 
-Reproducible SM80 deployments of `deepseek-ai/DeepSeek-V4.1-Flash-1017` built
-directly on top of official `vllm-project/vllm` and `LMCache`.
+**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 200–500 tok/s single-stream and up to 10K tok/s prefill (8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
 
 ## Branch Architecture
 
