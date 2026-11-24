@@ -177,6 +177,58 @@ if [[ $WITH_LMCACHE == 1 ]]; then
     LMCACHE_LABEL="$LMCACHE_PAYLOAD_IMAGE+patches"
   fi
   cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
+
+  # Stage the pinned LMCache C++/CUDA extension sources (~750 KiB) so the
+  # container build can transparently recompile the native .so modules against
+  # BASE_IMAGE's PyTorch/CUDA ABI when the prebuilt LMCACHE_PAYLOAD_IMAGE .so
+  # binaries were built against a different PyTorch release (e.g. torch 2.13
+  # payload on a torch 2.14 official vLLM base image).
+  mkdir -p "$WORKDIR/lmcache-src" "$WORKDIR/context/lmcache-ext-src"
+  git -C "$WORKDIR/lmcache-src" init -q
+  git -C "$WORKDIR/lmcache-src" remote add origin "$LMCACHE_SOURCE_REPO"
+  git -C "$WORKDIR/lmcache-src" fetch --depth=1 origin "$LMCACHE_SOURCE_COMMIT"
+  git -C "$WORKDIR/lmcache-src" checkout -q --detach FETCH_HEAD
+  cp -a "$WORKDIR/lmcache-src/csrc" "$WORKDIR/context/lmcache-ext-src/csrc"
+  cp -a "$WORKDIR/lmcache-src/setup_extensions" "$WORKDIR/context/lmcache-ext-src/setup_extensions"
+  # Upstream LMCache PR #5564: drop hardcoded -std=c++17 so PyTorch >= 2.14
+  # BuildExtension selects C++20 automatically.
+  "$PYTHON" - "$WORKDIR/context/lmcache-ext-src" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for rel in ("setup_extensions/build_profiles/cuda.py", "setup_extensions/common_cpp.py"):
+    p = root / rel
+    txt = p.read_text()
+    txt = txt.replace(', "-std=c++17"', "").replace('"-std=c++17", ', "")
+    p.write_text(txt)
+PY
+  cat >"$WORKDIR/context/lmcache-ext-src/build_lmcache_exts.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+from setuptools import setup
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+os.chdir(ROOT)
+(ROOT / "lmcache").mkdir(exist_ok=True)
+
+from setup_extensions import BuildPolicy  # noqa: E402
+
+policy = BuildPolicy()
+profile = policy.resolve_profile()
+ext_modules, cmdclass, _ = policy.collect_extensions(profile)
+assert ext_modules, "No LMCache native extensions collected"
+setup(
+    name="lmcache-native-rebuild",
+    version="0.5.5",
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
+    script_args=["build_ext", "--inplace"],
+)
+PY
 fi
 
 # Copy only source Python/C++ files from clean vLLM tree (preserving _version.py,
@@ -224,9 +276,16 @@ CONTAINERFILE
 if [[ $WITH_LMCACHE == 1 ]]; then
   cat >>"$WORKDIR/context/Containerfile" <<'CONTAINERFILE'
 COPY lmcache-payload/ /opt/lmcache-patched/
+COPY lmcache-ext-src/ /tmp/lmcache-ext-src/
 COPY test-lmcache-patches.py /tmp/test-lmcache-patches.py
 ENV PYTHONPATH=/opt/lmcache-patched
-RUN python3 -m compileall -q /opt/lmcache-patched/lmcache \
+RUN (python3 -c 'import torch, lmcache.cuda_ops, lmcache.lmcache_native, lmcache.lmcache_fs, lmcache.lmcache_redis' 2>/dev/null \
+        || (cd /tmp/lmcache-ext-src \
+            && PYTHONPATH="" CUDA_HOME=/usr/local/cuda PATH="/usr/local/cuda/bin:$PATH" TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=4 NVCC_THREADS=1 BUILD_WITH_CUDA=1 python3 build_lmcache_exts.py \
+            && rm -f /opt/lmcache-patched/lmcache/*.so \
+            && cp -v /tmp/lmcache-ext-src/lmcache/*.so /opt/lmcache-patched/lmcache/)) \
+    && rm -rf /tmp/lmcache-ext-src /root/.cache/torch_extensions \
+    && python3 -m compileall -q /opt/lmcache-patched/lmcache \
     && python3 /tmp/test-lmcache-patches.py \
     && rm /tmp/test-lmcache-patches.py
 CONTAINERFILE
