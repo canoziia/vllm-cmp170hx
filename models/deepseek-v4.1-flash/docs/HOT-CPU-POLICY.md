@@ -8,7 +8,7 @@ execution profile does not select the algorithm.
 
 ## Production build (official `vllm @ 0e3c8db` baseline)
 
-This policy is integrated directly into the `vllm` branch (`5470fe0`, rebased on
+This policy is integrated directly into the `vllm` branch (`4e35eb0`, rebased on
 official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) and
 archived in `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
 The scheduler constructs `FixedHistoryPolicy`. There is no external Python

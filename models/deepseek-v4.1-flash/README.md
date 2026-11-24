@@ -14,11 +14,11 @@ deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` rebased onto official
 
 This repository uses a two-branch layout:
 
-- **`vllm` branch (`5470fe0`)**: Complete patched vLLM source tree (Commit 1 `ab629d9` = clean upstream `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`; Commit 2 `5470fe0` = DeepSeek-V4.1-Flash SM80 TEP4 topology-aware fusions and optimizations). Run `git diff vllm~1..vllm` to inspect every line changed over upstream.
+- **`vllm` branch (`4e35eb0`)**: Complete patched vLLM source tree (`ab629d9` = clean upstream `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`, followed by 10 feature-scoped commits `ab629d9..4e35eb0` matching `patches/` 1:1). Run `git log --oneline ab629d9..vllm` or `git diff ab629d9..vllm` to inspect every change over upstream.
 - **`main` branch**: Deployment compose files (default TEP4 `compose.yml`, optional PP6 `compose.pp6.yml`), self-contained native CUDA/C++ extensions (`native/`), build scripts (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline test suites, and auditable patch archive (`patches/`).
 
 - Upstream reference: `https://github.com/vllm-project/vllm.git @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`
-- Patched vLLM branch (`manifests/source.env`): `vllm @ 5470fe0735fa7719fb92819b4c9b4d136e331794`
+- Patched vLLM branch (`manifests/source.env`): `vllm @ 4e35eb0022a518f1289029bc056612797fd50670`
 - Shared LMCache baseline (`../../manifests/lmcache.env`): official `LMCache v0.5.5` (`05a013b2`) + `../../patches/lmcache/0001..0010` (including `0010-cached-request-resumed-req-ids-compat.patch` for official `vllm 0e3c8db`)
 - SM80 base image (`manifests/source.env`): `localhost/vllm-main-sm80:base-2054de0`
 - Default TEP4 output image: `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`

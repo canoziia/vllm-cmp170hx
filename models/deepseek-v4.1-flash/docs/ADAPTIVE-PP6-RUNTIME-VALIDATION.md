@@ -4,7 +4,7 @@
 > **Historical pre-rebase PP6 validation record.** The legacy branch/source
 > pins below predate rebasing this repository directly onto official
 > `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) via
-> the `vllm` branch (`5470fe0`). Preserved as historical engineering evidence;
+> the `vllm` branch (`4e35eb0`). Preserved as historical engineering evidence;
 > see `models/deepseek-v4.1-flash/README.md` for current builds and benchmarks.
 
 Historical status: **not performance-optimized / not production approved**.

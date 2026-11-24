@@ -4,7 +4,7 @@
 > **Historical pre-rebase PP6 diagnostic ledger (2026-09-21).** This raw
 > investigation record predates rebasing directly onto official
 > `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) via
-> the `vllm` branch (`5470fe0`) and predates the TEP4 deployment. Preserved
+> the `vllm` branch (`4e35eb0`) and predates the TEP4 deployment. Preserved
 > solely as historical debugging notes; see `models/deepseek-v4.1-flash/README.md`
 > for the current official-vLLM architecture and benchmarks.
 

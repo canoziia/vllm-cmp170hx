@@ -9,10 +9,10 @@ and official `LMCache` `v0.5.5` (`05a013b29da78cf2321b9b46ec5039dde2fb0bb0`).
 This repository uses a clean two-branch layout directly anchored to official
 upstream `vllm-project/vllm`:
 
-- **`vllm` branch (`5470fe0`)**: Complete patched vLLM source tree in two commits:
-  1. `ab629d9` — clean snapshot of official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`;
-  2. `5470fe0` — DeepSeek-V4.1-Flash SM80 TEP4 topology-aware fusions and optimizations.
-  Run `git diff vllm~1..vllm` to inspect every line changed over upstream.
+- **`vllm` branch (`4e35eb0`)**: Complete patched vLLM source tree anchored directly on official upstream:
+  - Base commit `ab629d9` — clean snapshot of official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`;
+  - Followed by 10 feature-scoped commits (`ab629d9..4e35eb0`, 1:1 with `models/deepseek-v4.1-flash/patches/`) covering SM80 compat, core async-PP/Mamba/structured-spec fixes, OpenAI thinking/1017 encoding, CPU Engram & vision offload, MXFP4 MoE, dense MXFP8 / thin `wo_a` / fast router, sparse attention / indexer / SWA / DSpark, optimization profiles, adaptive verification, and topology-aware SM80 TEP4 fusions.
+  Run `git log --oneline ab629d9..vllm` or `git diff ab629d9..vllm` to inspect every change over upstream.
 - **`main` branch** (this branch): Deployment manifests, Compose files,
   self-contained native CUDA/C++ extensions, LMCache patches, build/validation
   scripts, offline tests, monitoring, and documentation.
@@ -58,7 +58,7 @@ deployment guide, and measured 180 W / 250 W TEP4 benchmarks.
 ### Validate & Build
 
 By default (`SOURCE_MODE=vllm-branch`), `scripts/build-deepseek-v41-image.sh`
-exports this repository's `vllm` branch (`5470fe0`, rebased on official
+exports this repository's `vllm` branch (`4e35eb0`, 10 feature commits on official
 `vllm-project/vllm @ 0e3c8db`), compiles all 6 self-contained native CUDA/C++
 extensions, bundles the patched official LMCache payload from
 `localhost/lmcache-server:latest` (building it automatically if absent, or when
@@ -156,7 +156,7 @@ vLLM fork in the chain:
 
 | Upstream | What we take from it | Where it is pinned |
 | --- | --- | --- |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM `main` engine (`0e3c8db`), snapped as `vllm~1` on our `vllm` branch and patched in `vllm` (`5470fe0`) | `models/deepseek-v4.1-flash/manifests/source.env` |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM `main` engine (`0e3c8db`), snapped as `ab629d9` on our `vllm` branch with 10 feature commits (`ab629d9..4e35eb0`) | `models/deepseek-v4.1-flash/manifests/source.env` |
 | [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache `v0.5.5` (`05a013b2`) server/payload images plus `patches/lmcache/0001..0010` | `manifests/lmcache.env` |
 
 ## License

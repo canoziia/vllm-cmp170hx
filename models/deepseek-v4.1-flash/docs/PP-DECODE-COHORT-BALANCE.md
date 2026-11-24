@@ -4,7 +4,7 @@
 > The PP6 measurements below were recorded prior to rebasing this repository
 > directly onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`).
 > On the current official-vLLM baseline, this port of `vllm-project/vllm#57433`
-> is integrated into the `vllm` branch (`5470fe0`) and archived in
+> is integrated into the `vllm` branch (`4e35eb0`) and archived in
 > `models/deepseek-v4.1-flash/patches/0002-common-async-pp-mamba-and-structured-spec-fixes.patch`.
 > See `models/deepseek-v4.1-flash/README.md` for current TEP4 / PP6 builds.
 

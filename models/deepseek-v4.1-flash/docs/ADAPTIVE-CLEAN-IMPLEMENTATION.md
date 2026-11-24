@@ -5,7 +5,7 @@
 > below predate rebasing this repository directly onto official
 > `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`). The
 > resulting SM80 adaptive verification and sub-width CUDA graph implementation
-> now lives on the `vllm` branch (`5470fe0`) and in
+> now lives on the `vllm` branch (`4e35eb0`) and in
 > `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
 > See `models/deepseek-v4.1-flash/README.md` for current builds and benchmarks.
 
