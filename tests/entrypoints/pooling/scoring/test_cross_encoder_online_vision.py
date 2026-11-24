@@ -1,0 +1,586 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import json
+
+import pytest
+import requests
+
+from tests.utils import VLLM_PATH, RemoteOpenAIServer
+from vllm.entrypoints.pooling.scoring.protocol import RerankResponse, ScoreResponse
+from vllm.multimodal.utils import encode_image_url, fetch_image
+from vllm.platforms import current_platform
+
+MODEL_NAME = "Qwen/Qwen3-VL-Reranker-2B"
+HF_OVERRIDES = {
+    "architectures": ["Qwen3VLForSequenceClassification"],
+    "classifier_from_token": ["no", "yes"],
+    "is_original_qwen3_reranker": True,
+}
+
+ROCM_ATTN_BACKENDS = [
+    "ROCM_ATTN",
+    "ROCM_AITER_FA",
+    "TRITON_ATTN",
+    "FLEX_ATTENTION",
+]
+
+ATTN_BACKENDS = ROCM_ATTN_BACKENDS if current_platform.is_rocm() else ["auto"]
+
+
+# Match the legacy string parser: image placeholders first, then text.
+_RENDER_CONTENT = """
+{%- macro render_content(parts) -%}
+  {%- for part in parts if part.type == 'image' -%}
+    {{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+  {%- endfor -%}
+  {{- parts | selectattr('type', 'eq', 'text') | map(attribute='text') | join('\\n') -}}
+{%- endmacro -%}
+"""
+
+_STRUCTURED_CONTENT = (
+    _RENDER_CONTENT
+    + """
+{%- set ns = namespace(messages=[]) -%}
+{%- for message in messages -%}
+  {%- set ns.messages = ns.messages + [
+    dict(role=message.role, content=render_content(message.content))
+  ] -%}
+{%- endfor -%}
+{%- set messages = ns.messages -%}
+"""
+)
+
+# Exercise explicit openai with a block template detected as string.
+_EXPLICIT_STRUCTURED_CONTENT = (
+    _RENDER_CONTENT
+    + """
+{%- set query_content = messages | selectattr('role', 'eq', 'query')
+    | map(attribute='content') | first -%}
+{%- set document_content = messages | selectattr('role', 'eq', 'document')
+    | map(attribute='content') | first -%}
+{%- set messages = [
+    dict(role='query', content=render_content(query_content)),
+    dict(role='document', content=render_content(document_content))
+] -%}
+"""
+)
+
+# The absolute floor matters only for the low ~0.10 text-vs-text score, where a
+# few thousandths of drift would otherwise exceed the relative bound.
+REL_TOL = 0.05
+ABS_TOL = 0.007
+
+# ROCm: disable prefix caching and eliminate batch variance to reduce
+# test flakiness.
+ROCM_EXTRA_ARGS = (
+    ["--no-enable-prefix-caching", "--max-num-seqs", "1"]
+    if current_platform.is_rocm()
+    else []
+)
+
+
+def assert_score(actual: float, expected: float, backend: str, label: str):
+    tol = REL_TOL
+    abs_tol = ABS_TOL
+    diff = abs(actual - expected)
+    rel_diff = diff / abs(expected) if expected != 0 else diff
+    print(
+        f"[{backend}] {label}: actual={actual:.6f} expected={expected:.6f} "
+        f"diff={diff:.6f} rel_diff={rel_diff:.4f} tol={tol} abs_tol={abs_tol}"
+    )
+    assert actual == pytest.approx(expected, rel=tol, abs=abs_tol), (
+        f"[{backend}] {label}: score mismatch — "
+        f"actual={actual:.6f}, expected={expected:.6f}, "
+        f"rel_diff={rel_diff:.4f}, tol={tol}, abs_tol={abs_tol}"
+    )
+
+
+query = "A cat standing in the snow."
+document = "This product was excellent and exceeded my expectations."
+image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg"
+documents = [
+    {
+        "type": "text",
+        "text": document,
+    },
+    {
+        "type": "image_url",
+        "image_url": {"url": image_url},
+    },
+    {
+        "type": "image_url",
+        "image_url": {"url": encode_image_url(fetch_image(image_url))},
+    },
+]
+
+# One bf16 ULP in attention compounds to ~0.1% here, so ROCm backends each
+# settle differently; these are their midpoint across backends and archs.
+if current_platform.is_rocm():
+    TEXT_VS_TEXT = 0.105243
+    TEXT_VS_IMAGE = 0.742472
+    TEXT_VS_TEXT_PLUS_IMAGE = 0.544568
+else:
+    TEXT_VS_TEXT = 0.10040374100208282
+    TEXT_VS_IMAGE = 0.7423753142356873
+    TEXT_VS_TEXT_PLUS_IMAGE = 0.5298863053321838
+
+
+_SERVER_PARAMS = [
+    pytest.param((backend, None, None), id=backend) for backend in ATTN_BACKENDS
+]
+_STRUCTURED_SERVER_PARAM = pytest.param(
+    ("auto", "openai", _EXPLICIT_STRUCTURED_CONTENT), id="structured"
+)
+_DEFAULT_SERVER_PARAM = pytest.param(
+    ("auto", None, _STRUCTURED_CONTENT), id="structured-default"
+)
+
+
+@pytest.fixture(scope="module")
+def server(request, tmp_path_factory):
+    backend, content_format, template_prefix = request.param
+    template = VLLM_PATH / "examples/pooling/score/template/qwen3_vl_reranker.jinja"
+    if template_prefix is not None:
+        source_template = template.read_text()
+        template = tmp_path_factory.mktemp("scoring") / "score.jinja"
+        template.write_text(template_prefix + source_template)
+    print(f"\n=== Starting server with attention backend: {backend} ===")
+    args = [
+        "--enforce-eager",
+        "--max-model-len",
+        "8192",
+        "--chat-template",
+        str(template),
+        *ROCM_EXTRA_ARGS,
+    ]
+
+    if content_format is not None:
+        args += ["--chat-template-content-format", content_format]
+
+    env = dict()
+    if backend != "auto":
+        args += ["--attention-config", json.dumps({"backend": backend})]
+
+        if backend != "ROCM_AITER_FA":
+            env["VLLM_ROCM_USE_AITER"] = "0"
+
+    with RemoteOpenAIServer(
+        MODEL_NAME, args, override_hf_configs=HF_OVERRIDES, env_dict=env
+    ) as remote_server:
+        print(f"=== Server ready with backend: {backend} ===")
+        yield remote_server, backend
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_str(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": document,
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 1
+    assert score.usage.prompt_tokens == 81
+    assert_score(score.data[0].score, TEXT_VS_TEXT, backend, "text_vs_text")
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_text_content(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": {"content": [documents[0]]},
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 1
+    assert score.usage.prompt_tokens == 81
+    assert_score(score.data[0].score, TEXT_VS_TEXT, backend, "text_vs_text")
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_image_url_content(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": {"content": [documents[1]]},
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 1
+    assert score.usage.prompt_tokens == 98
+    assert_score(score.data[0].score, TEXT_VS_IMAGE, backend, "text_vs_image")
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_image_base64_content(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": {"content": [documents[2]]},
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 1
+    assert score.usage.prompt_tokens == 98
+    assert_score(score.data[0].score, TEXT_VS_IMAGE, backend, "text_vs_image_base64")
+
+
+@pytest.mark.parametrize(
+    "server", _SERVER_PARAMS + [_DEFAULT_SERVER_PARAM], indirect=True
+)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_image_url_plus_text_content(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": {"content": [documents[0], documents[1]]},
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 1
+    assert score.usage.prompt_tokens == 107
+    assert_score(
+        score.data[0].score, TEXT_VS_TEXT_PLUS_IMAGE, backend, "text_vs_text_plus_image"
+    )
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_str_documents_list(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": [
+                document,
+                {"content": [documents[0]]},
+                {"content": [documents[1]]},
+                {"content": [documents[0], documents[1]]},
+            ],
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 4
+    assert score.usage.prompt_tokens == 367
+    assert_score(score.data[0].score, TEXT_VS_TEXT, backend, "list[0]_text_vs_text")
+    assert_score(score.data[1].score, TEXT_VS_TEXT, backend, "list[1]_text_vs_text")
+    assert_score(score.data[2].score, TEXT_VS_IMAGE, backend, "list[2]_text_vs_image")
+    assert_score(
+        score.data[3].score,
+        TEXT_VS_TEXT_PLUS_IMAGE,
+        backend,
+        "list[3]_text_vs_text_plus_image",
+    )
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_rerank_api_queries_str_documents_list(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    rerank_response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": [
+                document,
+                {"content": [documents[0]]},
+                {"content": [documents[1]]},
+                {"content": [documents[0], documents[1]]},
+            ],
+        },
+    )
+    rerank_response.raise_for_status()
+    rerank = RerankResponse.model_validate(rerank_response.json())
+
+    assert rerank.id is not None
+    assert rerank.model is not None
+    assert rerank.usage is not None
+    assert len(rerank.results) == 4
+
+    rerank.results.sort(key=lambda x: x.index)
+    assert_score(
+        rerank.results[0].relevance_score,
+        TEXT_VS_TEXT,
+        backend,
+        "rerank[0]_text_vs_text",
+    )
+    assert_score(
+        rerank.results[1].relevance_score,
+        TEXT_VS_TEXT,
+        backend,
+        "rerank[1]_text_vs_text",
+    )
+    assert_score(
+        rerank.results[2].relevance_score,
+        TEXT_VS_IMAGE,
+        backend,
+        "rerank[2]_text_vs_image",
+    )
+    assert_score(
+        rerank.results[3].relevance_score,
+        TEXT_VS_TEXT_PLUS_IMAGE,
+        backend,
+        "rerank[3]_text_vs_text_plus_image",
+    )
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_queries_list_documents_list(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+    score_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": [query] * 4,
+            "documents": [
+                document,
+                {"content": [documents[0]]},
+                {"content": [documents[1]]},
+                {"content": [documents[0], documents[1]]},
+            ],
+        },
+    )
+    score_response.raise_for_status()
+    score = ScoreResponse.model_validate(score_response.json())
+
+    assert score.id is not None
+    assert score.data is not None
+    assert len(score.data) == 4
+    assert score.usage.prompt_tokens == 367
+    assert_score(score.data[0].score, TEXT_VS_TEXT, backend, "paired[0]_text_vs_text")
+    assert_score(score.data[1].score, TEXT_VS_TEXT, backend, "paired[1]_text_vs_text")
+    assert_score(score.data[2].score, TEXT_VS_IMAGE, backend, "paired[2]_text_vs_image")
+    assert_score(
+        score.data[3].score,
+        TEXT_VS_TEXT_PLUS_IMAGE,
+        backend,
+        "paired[3]_text_vs_text_plus_image",
+    )
+
+
+INSTRUCTION = (
+    "Given a multimodal retrieval query, retrieve candidates that "
+    "visually or textually match the requested scene, object, or action."
+)
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_score_api_instruction_field(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, _ = server
+
+    default_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": document,
+        },
+    )
+    default_response.raise_for_status()
+    default_score = ScoreResponse.model_validate(default_response.json())
+
+    instruction_response = requests.post(
+        remote_server.url_for("score"),
+        json={
+            "model": MODEL_NAME,
+            "queries": query,
+            "documents": document,
+            "instruction": INSTRUCTION,
+        },
+    )
+    instruction_response.raise_for_status()
+    instruction_score = ScoreResponse.model_validate(instruction_response.json())
+
+    assert instruction_score.id is not None
+    assert instruction_score.data is not None
+    assert len(instruction_score.data) == 1
+    assert instruction_score.usage.prompt_tokens > default_score.usage.prompt_tokens
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_rerank_api_instruction_field(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, _ = server
+
+    doc_list = [
+        document,
+        {"content": [documents[0]]},
+        {"content": [documents[1]]},
+        {"content": [documents[0], documents[1]]},
+    ]
+
+    default_response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": doc_list,
+        },
+    )
+    default_response.raise_for_status()
+    default_rerank = RerankResponse.model_validate(default_response.json())
+
+    instruction_response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": doc_list,
+            "instruction": INSTRUCTION,
+        },
+    )
+    instruction_response.raise_for_status()
+    instruction_rerank = RerankResponse.model_validate(instruction_response.json())
+
+    assert instruction_rerank.id is not None
+    assert instruction_rerank.model is not None
+    assert instruction_rerank.usage is not None
+    assert len(instruction_rerank.results) == len(default_rerank.results)
+    assert instruction_rerank.usage.prompt_tokens > default_rerank.usage.prompt_tokens
+
+
+@pytest.mark.parametrize("server", _SERVER_PARAMS, indirect=True)
+@pytest.mark.asyncio
+async def test_rerank_api_instruction_field_matches_chat_template_kwargs(
+    server: tuple[RemoteOpenAIServer, str],
+):
+    remote_server, backend = server
+
+    doc_list = [
+        document,
+        {"content": [documents[0]]},
+        {"content": [documents[1]]},
+        {"content": [documents[0], documents[1]]},
+    ]
+
+    field_response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": doc_list,
+            "instruction": INSTRUCTION,
+        },
+    )
+    field_response.raise_for_status()
+    field_rerank = RerankResponse.model_validate(field_response.json())
+
+    kwargs_response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": doc_list,
+            "chat_template_kwargs": {"instruction": INSTRUCTION},
+        },
+    )
+    kwargs_response.raise_for_status()
+    kwargs_rerank = RerankResponse.model_validate(kwargs_response.json())
+
+    assert kwargs_rerank.usage.prompt_tokens == field_rerank.usage.prompt_tokens
+
+    field_scores = [
+        r.relevance_score for r in sorted(field_rerank.results, key=lambda x: x.index)
+    ]
+    kwargs_scores = [
+        r.relevance_score for r in sorted(kwargs_rerank.results, key=lambda x: x.index)
+    ]
+    assert field_scores == pytest.approx(kwargs_scores, rel=REL_TOL, abs=ABS_TOL)
+
+
+@pytest.mark.parametrize("server", [_STRUCTURED_SERVER_PARAM], indirect=True)
+@pytest.mark.asyncio
+async def test_rerank_preserves_structured_text_and_image(server):
+    remote_server, backend = server
+    response = requests.post(
+        remote_server.url_for("rerank"),
+        json={
+            "model": MODEL_NAME,
+            "query": query,
+            "documents": [{"content": [documents[0], documents[1]]}],
+        },
+    )
+    response.raise_for_status()
+    rerank = RerankResponse.model_validate(response.json())
+
+    assert len(rerank.results) == 1
+    assert rerank.results[0].index == 0
+    assert rerank.usage is not None
+    assert rerank.usage.prompt_tokens == 107
+    assert_score(
+        rerank.results[0].relevance_score,
+        TEXT_VS_TEXT_PLUS_IMAGE,
+        backend,
+        "structured_text_and_image",
+    )
