@@ -99,14 +99,15 @@ This repository uses a two-branch layout directly anchored to official
   self-contained native CUDA/C++ extensions, LMCache patches, build/validation
   scripts, offline tests, monitoring, and documentation.
 
-Exact source revisions and image digests are pinned in `manifests/lmcache.env`
-and `models/deepseek-v4.1-flash/manifests/source.env`.
+Exact upstream commits and Docker base image digests are pinned in
+`manifests/vllm.env` and `manifests/lmcache.env`.
 
 ## Repository Layout
 
 ```text
 .
-├── manifests/                      # pinned shared LMCache metadata & patch checksums
+├── .github/workflows/              # automated validation & GHCR/Docker Hub image builds
+├── manifests/                      # pinned upstream vLLM & LMCache commits / Docker base digests
 ├── monitoring/                     # standalone Prometheus + Grafana stack
 ├── patches/
 │   └── lmcache/                    # official LMCache patch series (0001..0010)

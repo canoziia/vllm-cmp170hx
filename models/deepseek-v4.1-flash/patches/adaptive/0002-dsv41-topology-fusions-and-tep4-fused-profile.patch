@@ -1,3 +1,40 @@
+From 1afc9d9712415bd9273f756817a8e29a512d0105 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Tue, 24 Nov 2026 23:04:47 +0800
+Subject: [PATCH] feat(deepseek-v4.1): topology-aware SM80 collectives, native
+ fusions, and tep4_fused profile
+
+Add automatic NVLink vs PCIe P2P topology detection (ampere_peer_topology), CuTe Lamport AllReduce & Markov symmetric exchange, fused gate/top-k/align, w2_splitk_ep with fused shared add, C++ woa_mxfp8_splitk, TP-local greedy verify, dequant_marlin_mxfp8 cuBLAS prefill, in-graph text embed, and tep4_fused profile.
+---
+ .../device_communicators/cuda_communicator.py |  31 +
+ vllm/dsv41_opt_profile.py                     |  66 ++
+ .../kernels/linear/mxfp8/dispatch_table.py    |  45 +-
+ .../kernels/linear/mxfp8/dsv41_dense_mxfp8.py |  54 +-
+ .../layers/fused_moe/dsv4_mxfp4_decode.py     | 409 ++++++++++-
+ .../layers/fused_moe/experts/marlin_moe.py    |  75 +-
+ .../layers/fused_moe/router/dsv4_topk.py      |  73 +-
+ .../layers/fused_moe/runner/moe_runner.py     | 108 ++-
+ .../quantization/utils/marlin_utils_fp8.py    |  71 ++
+ vllm/models/deepseek_v41/attention.py         |  60 +-
+ vllm/models/deepseek_v41/nvidia/dspark.py     |  46 +-
+ vllm/models/deepseek_v41/nvidia/model.py      | 561 ++++++++++----
+ .../models/deepseek_v41/nvidia/model_state.py |  37 +
+ vllm/models/deepseek_v41/nvidia/ops/mhc.py    |  69 +-
+ .../specialized_decode/ampere/all_reduce.py   | 692 +++++++++++++++++-
+ .../specialized_decode/ampere/attention.py    |  22 +-
+ .../specialized_decode/ampere/columns.py      |  21 +-
+ .../specialized_decode/ampere/indexer.py      |  27 +-
+ .../specialized_decode/ampere/markov_symm.py  | 405 ++++++++++
+ vllm/platforms/interface.py                   |  11 +
+ vllm/v1/attention/ops/dsv41_thin_woa.py       | 420 ++++++++++-
+ vllm/v1/core/sched/dsv41_fixed_policy.py      |  32 +-
+ vllm/v1/core/sched/dsv41_measured_policy.py   |  60 +-
+ vllm/v1/worker/gpu/mm/encoder_runner.py       |  21 +-
+ vllm/v1/worker/gpu/model_runner.py            | 159 ++++
+ .../gpu/spec_decode/dspark/markov_argmax.py   |  47 ++
+ 26 files changed, 3286 insertions(+), 336 deletions(-)
+ create mode 100644 vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/markov_symm.py
+
 diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
 index 11c8de6..fac5cba 100644
 --- a/vllm/distributed/device_communicators/cuda_communicator.py
@@ -1288,7 +1325,7 @@ index ad3acef..836caaf 100644
              input=qr,
              weight=weight,
 diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
-index a4705ce..6f716b5 100644
+index d1a028a..657d407 100644
 --- a/vllm/models/deepseek_v41/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v41/nvidia/dspark.py
 @@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
@@ -1299,7 +1336,7 @@ index a4705ce..6f716b5 100644
  from typing import TYPE_CHECKING
  
  import regex as re
-@@ -300,17 +301,42 @@ class DSparkDeepseekV4Model(nn.Module):
+@@ -279,17 +280,42 @@ class DSparkDeepseekV4Model(nn.Module):
              return hidden_states
  
          residual = post_mix = res_mix = pre_mix = None
@@ -1353,7 +1390,7 @@ index a4705ce..6f716b5 100644
              hidden_states = boundary_all_reduce(hidden_states)
          hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
 diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
-index b3cabe3..2926f9f 100644
+index 81c5988..a100d54 100644
 --- a/vllm/models/deepseek_v41/nvidia/model.py
 +++ b/vllm/models/deepseek_v41/nvidia/model.py
 @@ -113,6 +113,7 @@ from ..common.engram import (
@@ -1373,7 +1410,7 @@ index b3cabe3..2926f9f 100644
              comm_buf = torch.empty((alloc_m, hidden_size), dtype=dtype, device=dev)
              st = (comm_stream, evs, comm_buf)
          _PREFILL_AR_STATE[idx] = st
-@@ -1104,7 +1105,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1097,7 +1098,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              self.column_gathers = supports_column_gathers(vllm_config)
          if self.column_gathers:
              self._init_engram_column_gathers(vllm_config)
@@ -1386,7 +1423,7 @@ index b3cabe3..2926f9f 100644
              # A MoE's top-k finalize folds into the next layer's first mHC
              # boundary, which the last local layer lacks and an engram layer
              # replaces with its own all-reduce. Experts with LoRA always
-@@ -1516,7 +1521,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1509,7 +1514,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              dev_comm = getattr(get_tp_group(), "device_communicator", None)
              cand = getattr(dev_comm, "pynccl_comm", None)
              if cand is not None and not getattr(cand, "disabled", True):
@@ -1395,7 +1432,7 @@ index b3cabe3..2926f9f 100644
                  if m0 >= 256 and (full_num_tokens - m0) >= 256:
                      return self._run_layers_prefill_ar_overlap(
                          layer_ids=layer_ids,
-@@ -1534,22 +1539,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1527,22 +1532,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          m0=m0,
                          pynccl=cand,
                      )
@@ -1456,7 +1493,7 @@ index b3cabe3..2926f9f 100644
              if previous_aux is not None:
                  # idx is the one-based id of the layer whose post this is.
                  if self.use_sequence_parallel:
-@@ -1589,8 +1618,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1582,8 +1611,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              self.config.hidden_size,
              hidden_states.dtype,
          )
@@ -1488,7 +1525,7 @@ index b3cabe3..2926f9f 100644
  
          try:
              for idx in layer_ids:
-@@ -1598,6 +1649,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1591,6 +1642,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  assert isinstance(layer, DeepseekV4DecoderLayer)
                  capture_aux = idx in self.aux_hidden_state_layers
                  did_split_attn_prep = False
@@ -1508,7 +1545,7 @@ index b3cabe3..2926f9f 100644
                  qr: typing.Any = None
                  qr_scale: torch.Tensor | None = None
                  kv: torch.Tensor | None = None
-@@ -1609,19 +1673,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1602,19 +1666,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  ):
                      w_ef0, w_ef1 = pending_ffn_ar
                      pending_ffn_ar = None
@@ -1556,7 +1593,7 @@ index b3cabe3..2926f9f 100644
                          layer.hc_attn_fn,
                          layer.hc_attn_scale,
                          layer.hc_attn_base,
-@@ -1630,7 +1712,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1623,7 +1705,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          layer.hc_eps,
                          layer.hc_post_alpha,
                          layer.hc_sinkhorn_iters,
@@ -1565,7 +1602,7 @@ index b3cabe3..2926f9f 100644
                          norm_weight=layer.attn_norm.weight,
                          norm_eps=layer.attn_norm.variance_epsilon,
                          capture_aux=capture_aux,
-@@ -1638,6 +1720,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1631,6 +1713,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          reduce_results=False,
                          boundary_weight=layer.hc_attn_boundary_weight,
                      )
@@ -1573,7 +1610,7 @@ index b3cabe3..2926f9f 100644
                      qr_kv0, kvs0, idxw0 = layer.attn._run_parallel_input_projections(
                          x_in0
                      )
-@@ -1645,9 +1728,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1638,9 +1721,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                      def_stream.wait_event(w_ef1)
                      res1, pm1, rm1, x_in1, apre1, aux1 = mhc_shifted_post_pre(
                          hidden_states[m0:],
@@ -1586,7 +1623,7 @@ index b3cabe3..2926f9f 100644
                          layer.hc_attn_fn,
                          layer.hc_attn_scale,
                          layer.hc_attn_base,
-@@ -1656,7 +1739,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1649,7 +1732,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          layer.hc_eps,
                          layer.hc_post_alpha,
                          layer.hc_sinkhorn_iters,
@@ -1595,7 +1632,7 @@ index b3cabe3..2926f9f 100644
                          norm_weight=layer.attn_norm.weight,
                          norm_eps=layer.attn_norm.variance_epsilon,
                          capture_aux=capture_aux,
-@@ -1664,19 +1747,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1657,19 +1740,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          reduce_results=False,
                          boundary_weight=layer.hc_attn_boundary_weight,
                      )
@@ -1624,7 +1661,7 @@ index b3cabe3..2926f9f 100644
                      del x_in0
  
                      qr_kv1, kvs1, idxw1 = layer.attn._run_parallel_input_projections(
-@@ -1699,8 +1781,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1692,8 +1774,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          else None
                      )
                      del idxw0, idxw1
@@ -1664,7 +1701,7 @@ index b3cabe3..2926f9f 100644
                      if pending_ffn_ar is not None:
                          def_stream.wait_event(pending_ffn_ar[0])
                          def_stream.wait_event(pending_ffn_ar[1])
-@@ -1837,14 +1950,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1830,14 +1943,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  )
                  del x_in, qr, qr_scale, kv, kv_score, indexer_weights
  
@@ -1696,7 +1733,7 @@ index b3cabe3..2926f9f 100644
                          ev_sync0.record(def_stream)
                          comm_stream.wait_event(ev_sync0)
                          pynccl.all_reduce(
-@@ -1852,10 +1979,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1845,10 +1972,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          )
                          ev_ar0.record(comm_stream)
  
@@ -1710,7 +1747,7 @@ index b3cabe3..2926f9f 100644
                          ev_sync1.record(def_stream)
                          comm_stream.wait_event(ev_sync1)
                          pynccl.all_reduce(
-@@ -1865,12 +1992,38 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1858,12 +1985,38 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                      finally:
                          layer.attn.wo_b.reduce_results = orig_wob_reduce
  
@@ -1752,7 +1789,7 @@ index b3cabe3..2926f9f 100644
                          layer.hc_ffn_fn,
                          layer.hc_ffn_scale,
                          layer.hc_ffn_base,
-@@ -1879,47 +2032,157 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1872,47 +2025,157 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                          layer.hc_eps,
                          layer.hc_post_alpha,
                          layer.hc_sinkhorn_iters,
@@ -1943,7 +1980,7 @@ index b3cabe3..2926f9f 100644
                      y_full = layer.attn._o_proj(attn_out, positions)
                      del attn_out
                      residual, post_mix, res_mix, x_ffn_in, pre_mix, _ = (
-@@ -1946,54 +2209,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1939,54 +2202,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                      )
                      del y_full, attn_pre
  
@@ -2036,7 +2073,7 @@ index b3cabe3..2926f9f 100644
          finally:
              def_stream.wait_event(ev_ar0)
              def_stream.wait_event(ev_ar1)
-@@ -2001,6 +2255,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1994,6 +2248,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  def_stream.wait_event(pending_ffn_ar[0])
                  def_stream.wait_event(pending_ffn_ar[1])
  
@@ -2051,7 +2088,7 @@ index b3cabe3..2926f9f 100644
          assert residual is not None and post_mix is not None
          assert res_mix is not None and pre_mix is not None
          return hidden_states, residual, post_mix, res_mix, pre_mix
-@@ -2078,14 +2340,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -2071,14 +2333,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          )
  
      def _init_engram_column_gathers(self, vllm_config: VllmConfig) -> None:
@@ -2071,7 +2108,7 @@ index b3cabe3..2926f9f 100644
          engrams = [
              layer.engram
              for layer in islice(self.layers, self.start_layer, self.end_layer)
-@@ -2094,19 +2358,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -2087,19 +2351,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              and layer.engram.embed_tokens.dp_size == 1
              and layer.engram._batch is None
          ]
@@ -3709,7 +3746,7 @@ index 0000000..cfcf0be
 +            current_cu_stream(),
 +        )
 diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
-index a213124..c156f84 100644
+index 3a165f1..9fc92a4 100644
 --- a/vllm/platforms/interface.py
 +++ b/vllm/platforms/interface.py
 @@ -1682,6 +1682,17 @@ class Platform:
@@ -4407,10 +4444,10 @@ index b34a6e5..b776931 100644
      def has_cudagraph(self) -> bool:
          return self.cudagraph_manager is not None
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index c192650..9a3fbad 100644
+index e87c058..8c29764 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1762,12 +1762,171 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1756,12 +1756,171 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          return block_tables, slot_mappings
  
@@ -4659,3 +4696,6 @@ index 74b3fc4..20e40b5 100644
              _markov_reduce_scatter[(num_reqs,)](
                  part,
                  pair,
+-- 
+2.56.0
+

@@ -24,6 +24,7 @@ REVISION=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)
 IMAGE_BASE=${LMCACHE_SERVER_IMAGE_BASE:-localhost/lmcache-server}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$IMAGE_BASE:$REVISION}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
+PREPARE_CONTEXT_ONLY=${PREPARE_CONTEXT_ONLY:-}
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/lmcache-server-build.XXXXXX")
 payload_cid=
 
@@ -75,6 +76,14 @@ LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx
       io.canoziia.lmcache.payload-image="$LMCACHE_PAYLOAD_IMAGE" \
       io.canoziia.lmcache.patch-series="patches/lmcache/series"
 CONTAINERFILE
+
+if [[ -n $PREPARE_CONTEXT_ONLY ]]; then
+  rm -rf "$PREPARE_CONTEXT_ONLY"
+  mkdir -p "$(dirname "$PREPARE_CONTEXT_ONLY")"
+  mv "$WORKDIR/context" "$PREPARE_CONTEXT_ONLY"
+  echo "Prepared LMCache server build context in $PREPARE_CONTEXT_ONLY"
+  exit 0
+fi
 
 if [[ $ENGINE == podman ]]; then
   "$ENGINE" build --format docker -f "$WORKDIR/context/Containerfile" -t "$OUTPUT_IMAGE" "$WORKDIR/context"

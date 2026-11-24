@@ -1,5 +1,25 @@
+From c5d03557749a2fc0d91ff9e44e45ea0b8bb8b187 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] dsv41: post-KV expandable segments, pinned host Engram + OpenMP gather, and Vision CPU offload
+Date: Tue, 24 Nov 2026 23:04:45 +0800
+Subject: [PATCH] feat(deepseek-v4.1): post-KV expandable allocator, packed CPU
+ Engram gather, and CPU vision offload
+
+Add post-KV expandable_segments memory activation (dsv41_memory.py), env_override profile bootstrap, NUMA-aware 264B packed host Engram offload with OpenMP+AVX2 CPU gather, and zero-GPU-HBM CPU-offloaded multimodal vision execution.
+
+# Conflicts:
+#	vllm/models/deepseek_v41/common/engram.py
+---
+ vllm/dsv41_memory.py                          |  156 +++
+ vllm/env_override.py                          |    5 +
+ vllm/models/deepseek_v4/common/vision.py      |   75 +-
+ vllm/models/deepseek_v41/common/engram.py     | 1022 ++++++++++++++++-
+ .../deepseek_v41/common/engram_cpu_gather.cpp |  334 ++++++
+ vllm/models/deepseek_v41/nvidia/vl_model.py   |   30 +-
+ vllm/v1/worker/gpu/buffer_utils.py            |   17 +
+ vllm/v1/worker/workspace.py                   |   14 +
+ 8 files changed, 1618 insertions(+), 35 deletions(-)
+ create mode 100644 vllm/dsv41_memory.py
+ create mode 100644 vllm/models/deepseek_v41/common/engram_cpu_gather.cpp
 
 diff --git a/vllm/dsv41_memory.py b/vllm/dsv41_memory.py
 new file mode 100644
@@ -318,10 +338,10 @@ index ddf3cfc..615fd2e 100644
              aligner(vision_model(item, h, w), h, w)
              for item, (h, w) in zip(patches.split(sizes), vit_grid, strict=True)
 diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
-index dad3b32..009d0a9 100644
+index 1d007ce..112b95b 100644
 --- a/vllm/models/deepseek_v41/common/engram.py
 +++ b/vllm/models/deepseek_v41/common/engram.py
-@@ -18,19 +18,26 @@ streams tokens chunk-by-chunk:
+@@ -18,21 +18,28 @@ streams tokens chunk-by-chunk:
  """
  
  import ctypes
@@ -338,6 +358,8 @@ index dad3b32..009d0a9 100644
  from collections.abc import Callable
 -from contextlib import ExitStack
 +from contextlib import ExitStack, contextmanager
+ from datetime import timedelta
+ from functools import cache
 +from pathlib import Path
  
  import numpy as np
@@ -349,7 +371,7 @@ index dad3b32..009d0a9 100644
  from vllm.compilation.breakable_cudagraph import eager_break_during_capture
  from vllm.config import VllmConfig, get_current_vllm_config
  from vllm.distributed import (
-@@ -496,6 +503,533 @@ class NgramHashState(nn.Module):
+@@ -498,6 +505,533 @@ class NgramHashState(nn.Module):
          return output
  
  
@@ -883,7 +905,7 @@ index dad3b32..009d0a9 100644
  def _engram_head_shard_weight_loader(
      param: torch.nn.Parameter, loaded_weight: torch.Tensor
  ) -> None:
-@@ -508,7 +1042,13 @@ def _engram_head_shard_weight_loader(
+@@ -510,7 +1044,13 @@ def _engram_head_shard_weight_loader(
      assert shard.shape == param.shape, (
          f"engram shard {tuple(shard.shape)} does not fit param {tuple(param.shape)}"
      )
@@ -898,7 +920,7 @@ index dad3b32..009d0a9 100644
  
  
  # Branching on SORTED at runtime intermittently crashes Triton 3.8's
-@@ -556,6 +1096,8 @@ def _engram_lookup_kernel(
+@@ -558,6 +1098,8 @@ def _engram_lookup_kernel(
      WORD: tl.constexpr = tl.uint8,
      PACKED_FP4: tl.constexpr = False,
      SOFTWARE_FP8: tl.constexpr = False,
@@ -907,7 +929,7 @@ index dad3b32..009d0a9 100644
  ):
      """Gather FP8 or MXFP4 rows as dequantized BF16, or FP8 rows as packed
      values/scales (copied WORD at a time).
-@@ -600,10 +1142,15 @@ def _engram_lookup_kernel(
+@@ -602,10 +1144,15 @@ def _engram_lookup_kernel(
              else:
                  row_weight = peer.to(tl.pointer_type(tl.float8e4nv))
              row_scales = (peer + PEER_ROWS * ROW_BYTES).to(tl.pointer_type(tl.uint8))
@@ -926,7 +948,7 @@ index dad3b32..009d0a9 100644
          if PACKED:
              # Copy values and scales WORD at a time: one memory request a word.
              word_bytes: tl.constexpr = WORD.primitive_bitwidth // 8
-@@ -673,6 +1220,48 @@ def _engram_lookup_kernel(
+@@ -675,6 +1222,48 @@ def _engram_lookup_kernel(
              )
  
  
@@ -975,10 +997,11 @@ index dad3b32..009d0a9 100644
  def engram_head_shard_rank() -> int:
      """This rank's slot among the hash-head shards of one engram table.
  
-@@ -1077,9 +1666,30 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1139,9 +1728,31 @@ class ParallelEngramEmbedding(nn.Module):
+             self.part_num_embeddings = min(
                  self.peer_rows, self.vocab_end_idx - row_start
              )
-         self._skip_layerwise_reload = self.cpu_offload and self.peer_rows == 0
++        self._skip_layerwise_reload = self.cpu_offload and self.peer_rows == 0
 +        self._device_index = torch.accelerator.current_device_index()
 +        self.local_valid_heads = max(
 +            0, min(self.n_hash_cols - self.head_start, self.part_n_hash_cols)
@@ -1007,7 +1030,7 @@ index dad3b32..009d0a9 100644
          weight, scales = self._allocate_weights()
          self.weight = nn.Parameter(weight, requires_grad=False)
          self.weight_scale_inv = nn.Parameter(scales, requires_grad=False)
-@@ -1178,23 +1788,61 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1252,23 +1863,61 @@ class ParallelEngramEmbedding(nn.Module):
                      packed[:weight_bytes].view(weight_dtype).view(-1, self.row_bytes),
                      packed[weight_bytes:].view(-1, scale_dim),
                  )
@@ -1085,7 +1108,7 @@ index dad3b32..009d0a9 100644
  
      def process_weights_after_loading(self) -> None:
          """Peers read this table's rows directly, so serve only once every GPU
-@@ -1230,16 +1878,293 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1311,16 +1960,293 @@ class ParallelEngramEmbedding(nn.Module):
              return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
          if not self.cpu_offload:
              return self.weight.data, self.weight_scale_inv.data
@@ -1384,7 +1407,7 @@ index dad3b32..009d0a9 100644
      def lookup(
          self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
      ) -> None:
-@@ -1252,6 +2177,9 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1333,6 +2259,9 @@ class ParallelEngramEmbedding(nn.Module):
          rows = indices.shape[0] * self.part_n_hash_cols
          if not rows:
              return
@@ -1394,7 +1417,7 @@ index dad3b32..009d0a9 100644
          weight, scales = self._storage()
          ids_stride_t, ids_stride_h = indices.stride()
          sort_min_rows, _ = _engram_lookup_thresholds(indices.device)
-@@ -1272,17 +2200,28 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1353,17 +2282,28 @@ class ParallelEngramEmbedding(nn.Module):
              dst = dst.int()
          # The table dwarfs TLB reach, so a persistent grid near the SM count
          # beats one program per row; halve it to leave SMs for the main stream.
@@ -1424,7 +1447,7 @@ index dad3b32..009d0a9 100644
          )
          grid = min(triton.cdiv(rows, block_r), max_grid)
          software_fp8 = (
-@@ -1314,6 +2253,8 @@ class ParallelEngramEmbedding(nn.Module):
+@@ -1395,6 +2335,8 @@ class ParallelEngramEmbedding(nn.Module):
              PEER_ROWS=self.peer_rows,
              PACKED_FP4=self.packed_fp4,
              SOFTWARE_FP8=software_fp8,
@@ -1433,7 +1456,7 @@ index dad3b32..009d0a9 100644
              WORD=tl.uint64 if wide else tl.uint8,
              num_warps=8 if block_r == 128 else 4,
          )
-@@ -1767,7 +2708,9 @@ class Engram(nn.Module):
+@@ -1854,7 +2796,9 @@ class Engram(nn.Module):
              return
          if self._prefetch_stream is None:
              self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
@@ -1443,7 +1466,7 @@ index dad3b32..009d0a9 100644
  
      def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
          """Look up, or prefetch from host memory, rows before the decoder layers
-@@ -1788,6 +2731,22 @@ class Engram(nn.Module):
+@@ -1875,6 +2819,22 @@ class Engram(nn.Module):
          if is_forward_context_available() and (dp := get_forward_context().dp_metadata):
              num_tokens = int(dp.num_tokens_across_dp_cpu.max())
          current = stream = torch.cuda.current_stream()
@@ -1466,7 +1489,7 @@ index dad3b32..009d0a9 100644
          # Big lookups stall persistent main-stream kernels anyway: run them inline.
          _, inline_min_tokens = _engram_lookup_thresholds(hash_ids.device)
          if inline_min_tokens is not None and num_tokens >= inline_min_tokens:
-@@ -1797,7 +2756,8 @@ class Engram(nn.Module):
+@@ -1884,7 +2844,8 @@ class Engram(nn.Module):
              assert stream is not None
              stream.wait_stream(current)
              # Keep temporary hash storage alive until lookup finishes reading it.
@@ -1476,7 +1499,7 @@ index dad3b32..009d0a9 100644
              with torch.cuda.stream(stream):
                  self.embed_tokens.lookup(hash_ids, rows, background=True)
          assert self._prefetch_done is not None
-@@ -1806,6 +2766,9 @@ class Engram(nn.Module):
+@@ -1893,6 +2854,9 @@ class Engram(nn.Module):
      @eager_break_during_capture
      def _finish_prefetch(self, event: torch.cuda.Event) -> None:
          # Wait for this layer's lookup only, not for later layers on the stream.
@@ -1929,3 +1952,6 @@ index 5abbcf5..18da345 100644
      def _get_workspace_id(self) -> int:
          lane = _workspace_lane.get()
          if lane >= self._num_lanes:
+-- 
+2.56.0
+

@@ -1,0 +1,346 @@
+name: Docker
+
+# Validates the patched `vllm` branch offline on every push/PR, and builds &
+# publishes the DeepSeek-V4.1-Flash SM80 TEP4 image (and shared LMCache server
+# image when LMCache inputs change) to GHCR (plus Docker Hub when
+# DOCKER_USERNAME / DOCKER_PASSWORD secrets are configured).
+
+on:
+  push:
+    branches: ["main", "vllm"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      build_deepseek_v41:
+        description: "Build and push DeepSeek-V4.1-Flash TEP4 image"
+        type: boolean
+        default: true
+      build_lmcache:
+        description: "Build and push shared LMCache server image"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+  PLATFORMS: linux/amd64
+  # Empty unless the repository defines DOCKER_USERNAME / DOCKER_PASSWORD
+  # secrets; the Docker Hub steps below are skipped in that case.
+  DOCKERHUB_USER: ${{ secrets.DOCKER_USERNAME }}
+
+jobs:
+  validate:
+    name: Validate vLLM branch and manifests
+    runs-on: ubuntu-latest
+    outputs:
+      build_deepseek_v41: ${{ steps.plan.outputs.build_deepseek_v41 }}
+      build_lmcache: ${{ steps.plan.outputs.build_lmcache }}
+      vllm_sha: ${{ steps.plan.outputs.vllm_sha }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - name: Fetch vllm branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin refs/heads/vllm:refs/heads/vllm
+
+      - name: Run offline vLLM & DeepSeek-V4.1 test gates
+        run: |
+          set -euo pipefail
+          VALIDATE_ONLY=1 ALLOW_UNPINNED_VLLM_BRANCH=1 bash scripts/build-deepseek-v41-image.sh
+
+      - name: Decide build targets
+        id: plan
+        run: |
+          set -euo pipefail
+          vllm_sha=$(git rev-parse --short=12 refs/heads/vllm)
+          build_dsv41=false
+          build_lmc=false
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            build_dsv41="${{ inputs.build_deepseek_v41 }}"
+            build_lmc="${{ inputs.build_lmcache }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "${GITHUB_REF_NAME}" == "vllm" ]]; then
+              build_dsv41=true
+            else
+              changed=$(git diff --name-only HEAD~1..HEAD 2>/dev/null || echo "")
+              echo "Changed files on main:"
+              echo "$changed"
+              if grep -qE '^(manifests/vllm\.env|manifests/lmcache\.env|patches/lmcache/|models/deepseek-v4\.1-flash/(manifests|native)/|scripts/build-deepseek-v41-image\.sh|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
+                build_dsv41=true
+              fi
+              if grep -qE '^(manifests/lmcache\.env|patches/lmcache/|scripts/(apply|build|ensure|test)-lmcache|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
+                build_lmc=true
+              fi
+            fi
+          fi
+
+          {
+            echo "vllm_sha=${vllm_sha}"
+            echo "build_deepseek_v41=${build_dsv41}"
+            echo "build_lmcache=${build_lmc}"
+          } >> "$GITHUB_OUTPUT"
+          echo "plan: vllm_sha=${vllm_sha} build_deepseek_v41=${build_dsv41} build_lmcache=${build_lmc}"
+
+  build_lmcache:
+    name: Push LMCache server image
+    needs: validate
+    if: github.event_name != 'pull_request' && needs.validate.outputs.build_lmcache == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Prepare patched LMCache server context
+        run: |
+          set -euo pipefail
+          CONTAINER_ENGINE=docker \
+          PREPARE_CONTEXT_ONLY="${RUNNER_TEMP}/context-lmcache" \
+          bash scripts/build-lmcache-server-image.sh
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Compute image names
+        id: image
+        run: |
+          set -euo pipefail
+          repo_lc="${IMAGE_NAME,,}"
+          imgs=("${REGISTRY}/${repo_lc}/lmcache-server")
+          if [[ -n "${DOCKERHUB_USER:-}" ]]; then
+            imgs+=("docker.io/${DOCKERHUB_USER,,}/${IMAGE_NAME##*/}-lmcache-server")
+          fi
+          {
+            echo "primary=${REGISTRY}/${repo_lc}/lmcache-server"
+            echo "images<<__EOF__"
+            printf '%s\n' "${imgs[@]}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.images }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push LMCache server image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context-lmcache
+          file: ${{ runner.temp }}/context-lmcache/Containerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign the published Docker image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          PRIMARY: ${{ steps.image.outputs.primary }}
+        run: |
+          test -n "$DIGEST"
+          cosign sign --yes "${PRIMARY}@${DIGEST}"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### LMCache server image published"
+            echo
+            echo "- digest: \`${DIGEST}\`"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build_deepseek_v41:
+    name: Push DeepSeek-V4.1-Flash TEP4 image
+    needs: validate
+    if: github.event_name != 'pull_request' && needs.validate.outputs.build_deepseek_v41 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Show available disk space
+        run: df -h
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Fetch vllm branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin refs/heads/vllm:refs/heads/vllm
+
+      - name: Prepare DeepSeek-V4.1-Flash build context
+        run: |
+          set -euo pipefail
+          CONTAINER_ENGINE=docker \
+          LMCACHE_PAYLOAD_SOURCE=payload-image \
+          ALLOW_UNPINNED_VLLM_BRANCH=1 \
+          PREPARE_CONTEXT_ONLY="${RUNNER_TEMP}/context-dsv41" \
+          bash scripts/build-deepseek-v41-image.sh
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Compute image names and tags
+        id: image
+        env:
+          VLLM_SHA: ${{ needs.validate.outputs.vllm_sha }}
+        run: |
+          set -euo pipefail
+          repo_lc="${IMAGE_NAME,,}"
+          imgs=("${REGISTRY}/${repo_lc}")
+          if [[ -n "${DOCKERHUB_USER:-}" ]]; then
+            imgs+=("docker.io/${DOCKERHUB_USER,,}/${IMAGE_NAME##*/}")
+          fi
+          {
+            echo "primary=${REGISTRY}/${repo_lc}"
+            echo "images<<__EOF__"
+            printf '%s\n' "${imgs[@]}"
+            echo "__EOF__"
+            echo "tags<<__EOF__"
+            echo "type=raw,value=deepseek-v4.1-flash-tep4"
+            echo "type=raw,value=deepseek-v4.1-flash-tep4-${VLLM_SHA}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.images }}
+          tags: ${{ steps.image.outputs.tags }}
+
+      - name: Build and push DeepSeek-V4.1-Flash image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context-dsv41
+          file: ${{ runner.temp }}/context-dsv41/Containerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign the published Docker image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          PRIMARY: ${{ steps.image.outputs.primary }}
+        run: |
+          test -n "$DIGEST"
+          cosign sign --yes "${PRIMARY}@${DIGEST}"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VLLM_SHA: ${{ needs.validate.outputs.vllm_sha }}
+        run: |
+          {
+            echo "### DeepSeek-V4.1-Flash TEP4 image published"
+            echo
+            echo "- \`vllm\` branch: \`${VLLM_SHA}\`"
+            echo "- platforms: \`${PLATFORMS}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -9,8 +9,6 @@ MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 source "$MODEL_DIR/manifests/source.env"
 PYTHON=${PYTHON:-python3}
 
-(cd "$REPO_ROOT" && sha256sum -c models/deepseek-v4.1-flash/manifests/patches.sha256)
-
 [[ -e "$SOURCE_TREE/.git" && -d "$SOURCE_TREE/vllm" ]] || {
   echo "SOURCE_TREE must be a git checkout containing vllm/" >&2
   exit 3

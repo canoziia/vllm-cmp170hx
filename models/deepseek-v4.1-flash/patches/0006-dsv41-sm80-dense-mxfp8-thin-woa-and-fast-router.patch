@@ -1,5 +1,25 @@
+From 8297c80f3b6d6332d77071c4e0746e7a1dc043e5 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] dsv41(dense): 1x-HBM dense MXFP8 decode, grouped thin_woa, 0-HBM fused wq_b+idx & fast router
+Date: Tue, 24 Nov 2026 23:04:46 +0800
+Subject: [PATCH] feat(deepseek-v4.1): SM80 dense MXFP8 decode, thin wo_a GEMM,
+ and fast MoE router
+
+Add 1x-HBM dense MXFP8 decode GEMM dispatch, fused wq_b + indexer.wq_b projection, thin-M grouped wo_a GEMM, and bitwise SM80 MoE router (gate GEMV + sqrtsoftplus top-k).
+---
+ .../kernels/linear/mxfp8/dispatch_table.py    |  42 ++
+ .../kernels/linear/mxfp8/dsv41_dense_mxfp8.py | 361 +++++++++++++
+ .../kernels/linear/mxfp8/emulation.py         |  17 +-
+ .../kernels/linear/mxfp8/marlin.py            |  19 +
+ .../layers/fused_moe/router/dsv4_topk.py      |  34 +-
+ .../router/fused_topk_bias_router.py          |   1 +
+ .../layers/fused_moe/router/gate_linear.py    |  19 +
+ vllm/models/deepseek_v41/attention.py         | 237 ++++++++-
+ .../deepseek_v41/nvidia/quantization.py       |  19 +-
+ vllm/v1/attention/ops/dsv41_thin_woa.py       | 480 ++++++++++++++++++
+ 10 files changed, 1208 insertions(+), 21 deletions(-)
+ create mode 100644 vllm/model_executor/kernels/linear/mxfp8/dispatch_table.py
+ create mode 100644 vllm/model_executor/kernels/linear/mxfp8/dsv41_dense_mxfp8.py
+ create mode 100644 vllm/v1/attention/ops/dsv41_thin_woa.py
 
 diff --git a/vllm/model_executor/kernels/linear/mxfp8/dispatch_table.py b/vllm/model_executor/kernels/linear/mxfp8/dispatch_table.py
 new file mode 100644
@@ -589,10 +609,10 @@ index e276910..cd95940 100644
  
          M, _ = hidden_states.size()
 diff --git a/vllm/model_executor/layers/fused_moe/router/gate_linear.py b/vllm/model_executor/layers/fused_moe/router/gate_linear.py
-index ffac461..edcef42 100644
+index 33f70d5..f267c90 100644
 --- a/vllm/model_executor/layers/fused_moe/router/gate_linear.py
 +++ b/vllm/model_executor/layers/fused_moe/router/gate_linear.py
-@@ -375,6 +375,25 @@ class GateLinear(ReplicatedLinear):
+@@ -374,6 +374,25 @@ class GateLinear(ReplicatedLinear):
                  output = bf16x3_router_gemm(x, self.weight)
              return self._return(output)
  
@@ -617,7 +637,7 @@ index ffac461..edcef42 100644
 +
          # Tier 6: cuBLAS bf16→fp32
          if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-             if self.cdna_version >= 4:
+             if self.is_gfx950:
 diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
 index a5823da..ad3acef 100644
 --- a/vllm/models/deepseek_v41/attention.py
@@ -1496,3 +1516,6 @@ index 0000000..103d270
 +    )
 +    _READY_FP8.add(key)
 +    return out
+-- 
+2.56.0
+

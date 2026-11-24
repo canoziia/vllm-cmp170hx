@@ -5,20 +5,31 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MODEL_DIR="$REPO_ROOT/models/deepseek-v4.1-flash"
 # shellcheck disable=SC1091
 source "$MODEL_DIR/manifests/source.env"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/manifests/lmcache.env"
 ENGINE=${CONTAINER_ENGINE:-podman}
 PYTHON=${PYTHON:-python3}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
 WITH_LMCACHE=${WITH_LMCACHE:-1}
 VALIDATE_ONLY=${VALIDATE_ONLY:-0}
+# PREPARE_CONTEXT_ONLY: when set to a directory path, populate the full build
+# context + Containerfile there and exit without invoking `$ENGINE build`
+# (used by GitHub Actions `docker/build-push-action`).
+PREPARE_CONTEXT_ONLY=${PREPARE_CONTEXT_ONLY:-}
+# LMCACHE_PAYLOAD_SOURCE:
+#   "auto" (default): reuse local lmcache-server:latest if already present,
+#       otherwise extract directly from the small LMCACHE_PAYLOAD_IMAGE (~19 MiB)
+#       and apply patches/lmcache/ without pulling the 17 GB server image.
+#   "payload-image": always extract & patch directly from LMCACHE_PAYLOAD_IMAGE.
+#   "server-image": ensure/build lmcache-server:latest and copy from it.
+LMCACHE_PAYLOAD_SOURCE=${LMCACHE_PAYLOAD_SOURCE:-auto}
 # SOURCE_MODE:
-#   "vllm-branch" (default): build directly from this repo's `vllm` branch
-#       (real upstream vllm@0e3c8db + SM80 TEP4 optimizations already applied).
-#   "patch-upstream": clone upstream vllm@0e3c8db and apply patches/ from scratch.
+#   "vllm-branch" (default): build directly from this repo's `vllm` branch.
+#   "patch-upstream": clone official upstream SOURCE_COMMIT and apply patches/.
 SOURCE_MODE=${SOURCE_MODE:-vllm-branch}
 VLLM_REF=${VLLM_REF:-$VLLM_BRANCH}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_OUTPUT_IMAGE}
-BASE_IMAGE=${BASE_IMAGE:-localhost/vllm-main-sm80:base-2054de0}
-PATCH_LABEL="upstream-0e3c8db-sm80-tep4"
+PATCH_LABEL="upstream-sm80-tep4"
 
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/dsv41-main-sm80-build.XXXXXX")
 PAYLOAD_CID=
@@ -38,7 +49,7 @@ req_cmds=(git "$PYTHON")
 if [[ $VALIDATE_ONLY != 1 ]]; then
   req_cmds+=("$ENGINE")
 fi
-if [[ $SOURCE_MODE == "patch-upstream" ]]; then
+if [[ $SOURCE_MODE == "patch-upstream" || $WITH_LMCACHE == 1 ]]; then
   req_cmds+=(patch)
 fi
 for command in "${req_cmds[@]}"; do
@@ -135,14 +146,37 @@ fi
 LMCACHE_LABEL="none"
 if [[ $WITH_LMCACHE == 1 ]]; then
   mkdir -p "$WORKDIR/context/lmcache-payload"
-  LMCACHE_SERVER_IMAGE=$("$REPO_ROOT/scripts/ensure-lmcache-server-image.sh")
-  LMCACHE_SERVER_ID=$("$ENGINE" image inspect --format '{{.Id}}' "$LMCACHE_SERVER_IMAGE" | cut -c1-12)
-  PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_SERVER_IMAGE")
-  "$ENGINE" cp "$PAYLOAD_CID:/opt/lmcache-patched/." "$WORKDIR/context/lmcache-payload/"
-  "$ENGINE" rm "$PAYLOAD_CID" >/dev/null
-  PAYLOAD_CID=
+  use_server_image=0
+  if [[ $LMCACHE_PAYLOAD_SOURCE == "server-image" ]]; then
+    use_server_image=1
+  elif [[ $LMCACHE_PAYLOAD_SOURCE == "auto" && ${REBUILD_LMCACHE_IMAGE:-0} != 1 ]]; then
+    LMCACHE_SERVER_TAG="${LMCACHE_SERVER_IMAGE_BASE:-localhost/lmcache-server}:latest"
+    if "$ENGINE" image exists "$LMCACHE_SERVER_TAG" >/dev/null 2>&1 || \
+       "$ENGINE" image inspect "$LMCACHE_SERVER_TAG" >/dev/null 2>&1; then
+      use_server_image=1
+    fi
+  fi
+
+  if [[ $use_server_image == 1 ]]; then
+    LMCACHE_SERVER_IMAGE=$(CONTAINER_ENGINE="$ENGINE" "$REPO_ROOT/scripts/ensure-lmcache-server-image.sh")
+    LMCACHE_SERVER_ID=$("$ENGINE" image inspect --format '{{.Id}}' "$LMCACHE_SERVER_IMAGE" | cut -c1-12)
+    PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_SERVER_IMAGE")
+    "$ENGINE" cp "$PAYLOAD_CID:/opt/lmcache-patched/." "$WORKDIR/context/lmcache-payload/"
+    "$ENGINE" rm "$PAYLOAD_CID" >/dev/null
+    PAYLOAD_CID=
+    LMCACHE_LABEL="$LMCACHE_SERVER_IMAGE ($LMCACHE_SERVER_ID)"
+  else
+    "$ENGINE" pull "$LMCACHE_PAYLOAD_IMAGE"
+    PAYLOAD_CID=$("$ENGINE" create --entrypoint /bin/true "$LMCACHE_PAYLOAD_IMAGE")
+    "$ENGINE" cp "$PAYLOAD_CID:/payload/." "$WORKDIR/context/lmcache-payload/"
+    "$ENGINE" rm "$PAYLOAD_CID" >/dev/null
+    PAYLOAD_CID=
+    PYTHON="$PYTHON" "$REPO_ROOT/scripts/apply-lmcache-patches.sh" "$WORKDIR/context/lmcache-payload"
+    "$PYTHON" "$REPO_ROOT/scripts/test-lmcache-bounded-pd-groups.py" \
+      "$WORKDIR/context/lmcache-payload/lmcache/v1/kv_layer_groups.py"
+    LMCACHE_LABEL="$LMCACHE_PAYLOAD_IMAGE+patches"
+  fi
   cp "$REPO_ROOT/scripts/test-lmcache-patches.py" "$WORKDIR/context/test-lmcache-patches.py"
-  LMCACHE_LABEL="$LMCACHE_SERVER_IMAGE ($LMCACHE_SERVER_ID)"
 fi
 
 # Copy only source Python/C++ files from clean vLLM tree (preserving _version.py,
@@ -164,7 +198,8 @@ COPY dsv41_dense_mxfp8/ /tmp/dsv41_dense_mxfp8/
 COPY dsv41_engram_cpu/ /tmp/dsv41_engram_cpu/
 COPY dsv41_swa/ /tmp/dsv41_swa/
 COPY dsv41_r2/ /tmp/dsv41_r2/
-RUN bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
+RUN (command -v g++ >/dev/null || (apt-get update -y && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*)) \\
+    && bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build /tmp/dsv4_moe /root/.cache/torch_extensions \\
     && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv4_moe_C.abi3.so \\
     && bash /tmp/dsv41_indexer/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
@@ -203,9 +238,18 @@ LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx
       io.canoziia.integration.revision="$INTEGRATION_REVISION" \\
       io.canoziia.vllm.source="$VLLM_SOURCE_LABEL" \\
       io.canoziia.upstream="$SOURCE_REPO@$SOURCE_COMMIT" \\
+      io.canoziia.base-image="$BASE_IMAGE" \\
       io.canoziia.patch="$PATCH_LABEL" \\
       io.canoziia.lmcache.payload-from="$LMCACHE_LABEL"
 CONTAINERFILE
+
+if [[ -n $PREPARE_CONTEXT_ONLY ]]; then
+  rm -rf "$PREPARE_CONTEXT_ONLY"
+  mkdir -p "$(dirname "$PREPARE_CONTEXT_ONLY")"
+  mv "$WORKDIR/context" "$PREPARE_CONTEXT_ONLY"
+  echo "Prepared build context in $PREPARE_CONTEXT_ONLY from $VLLM_SOURCE_LABEL"
+  exit 0
+fi
 
 build_args=(-t "$OUTPUT_IMAGE" -f "$WORKDIR/context/Containerfile")
 if [[ $ENGINE == podman ]]; then

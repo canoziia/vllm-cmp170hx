@@ -1,8 +1,44 @@
+From 86aeff01b00098686199e040c36aedaea9916ec2 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] vllm(common): async-PP Mamba reclaim, structured-output spec alignment, and NVFP4 amax
+Date: Tue, 24 Nov 2026 23:04:44 +0800
+Subject: [PATCH] fix(core): async-PP Mamba reclaim, cohort balance, structured
+ spec alignment, and NVFP4 amax
+
+Port shared runtime fixes and unit tests onto vllm@0e3c8db: async-PP Mamba state reclamation, resolved hybrid KV cache geometry, async-PP decode cohort balancing (vllm#57433), structured-output speculative draft alignment, and in-place NVFP4 Marlin scale amax.
+
+# Conflicts:
+#	vllm/v1/core/sched/async_scheduler.py
+#	vllm/v1/core/single_type_kv_cache_manager.py
+---
+ tests/v1/core/test_async_scheduler.py         |  76 ++++++++++
+ .../test_async_structured_draft_handoff.py    | 130 +++++++++++++++++
+ .../v1/worker/test_grammar_invalid_drafts.py  |  85 +++++++++++
+ vllm/envs.py                                  |   9 ++
+ .../quantization/utils/marlin_utils_fp4.py    | 135 ++++++++++++++++--
+ vllm/v1/core/kv_cache_utils.py                |  12 +-
+ vllm/v1/core/sched/async_scheduler.py         | 113 +++++++++++++--
+ vllm/v1/core/sched/output.py                  |   5 +
+ vllm/v1/core/sched/scheduler.py               |  60 +++++++-
+ vllm/v1/core/single_type_kv_cache_manager.py  |  61 ++++----
+ vllm/v1/engine/core.py                        |  54 ++++++-
+ vllm/v1/executor/abstract.py                  |   8 +-
+ vllm/v1/executor/multiproc_executor.py        |   5 +-
+ vllm/v1/executor/uniproc_executor.py          |   8 +-
+ vllm/v1/kv_cache_interface.py                 |  39 +++++
+ vllm/v1/worker/gpu/model_runner.py            |  68 ++++++++-
+ vllm/v1/worker/gpu/model_states/interface.py  |   5 +
+ .../worker/gpu/model_states/mamba_hybrid.py   |  30 +++-
+ vllm/v1/worker/gpu/sample/batch_shard.py      |   4 +
+ .../gpu/spec_decode/dflash/cudagraph.py       |   3 +-
+ .../gpu/spec_decode/dflash/speculator.py      |  30 ++++
+ .../gpu/spec_decode/rejection_sampler.py      |  17 ++-
+ vllm/v1/worker/gpu_worker.py                  |  56 +++++++-
+ 23 files changed, 933 insertions(+), 80 deletions(-)
+ create mode 100644 tests/v1/core/test_async_structured_draft_handoff.py
+ create mode 100644 tests/v1/worker/test_grammar_invalid_drafts.py
 
 diff --git a/tests/v1/core/test_async_scheduler.py b/tests/v1/core/test_async_scheduler.py
-index 2cada11..bb733d7 100644
+index ed0977c..0bdb323 100644
 --- a/tests/v1/core/test_async_scheduler.py
 +++ b/tests/v1/core/test_async_scheduler.py
 @@ -108,6 +108,82 @@ def test_no_spec_decode_padding_up_to_max_model_len():
@@ -316,10 +352,10 @@ index 0000000..6c85b88
 +    batch = _input_batch(["p"], [3])
 +    assert _invalid_rows(batch, ["g"], [0]) is None
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 83f31dc..5ccd2e0 100644
+index 400c7ac..e43d0cc 100644
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -49,6 +49,7 @@ if TYPE_CHECKING:
+@@ -50,6 +50,7 @@ if TYPE_CHECKING:
      VLLM_TRACE_FUNCTION: int = 0
      VLLM_USE_FLASHINFER_SAMPLER: bool = True
      VLLM_PP_LAYER_PARTITION: str | None = None
@@ -327,7 +363,7 @@ index 83f31dc..5ccd2e0 100644
      VLLM_CPU_KVCACHE_SPACE: int | None = None
      VLLM_CPU_OMP_THREADS_BIND: str = "auto"
      VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
-@@ -927,6 +928,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -953,6 +954,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
      ),
      # Pipeline stage partition strategy
      "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
@@ -511,10 +547,10 @@ index 1c7552f..2db6e5b 100644
      assert group_size > 0
      size_n, size_k = weight.shape
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 12c714a..d891ae7 100644
+index f84b8ee..7db05c2 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -1084,12 +1084,22 @@ def generate_scheduler_kv_cache_config(
+@@ -1095,12 +1095,22 @@ def generate_scheduler_kv_cache_config(
          [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
      )
      assert all(
@@ -539,7 +575,7 @@ index 12c714a..d891ae7 100644
  
  
 diff --git a/vllm/v1/core/sched/async_scheduler.py b/vllm/v1/core/sched/async_scheduler.py
-index 142c82e..5b08c39 100644
+index 1762f4d..5b08c39 100644
 --- a/vllm/v1/core/sched/async_scheduler.py
 +++ b/vllm/v1/core/sched/async_scheduler.py
 @@ -1,6 +1,8 @@
@@ -594,7 +630,7 @@ index 142c82e..5b08c39 100644
      def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
          super()._update_after_schedule(scheduler_output)
          spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
-@@ -23,40 +54,91 @@ class AsyncScheduler(Scheduler):
+@@ -23,39 +54,91 @@ class AsyncScheduler(Scheduler):
          pending_structured_output_tokens = (
              scheduler_output.pending_structured_output_tokens
          )
@@ -637,7 +673,6 @@ index 142c82e..5b08c39 100644
              request.num_output_placeholders += (
                  self.num_sampled_tokens_per_step + cur_num_spec_tokens
              )
--            request.num_output_placeholder_steps += 1
 +            if hasattr(request, "num_output_placeholder_steps"):
 +                request.num_output_placeholder_steps += 1
              # Add placeholders for the new draft/spec tokens.
@@ -703,10 +738,10 @@ index 142c82e..5b08c39 100644
 +                structured_output_spec_decode
 +            )
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 4c46c6c..3c6d974 100644
+index 21f2eb6..31fdf80 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
-@@ -355,3 +355,8 @@ class GrammarOutput:
+@@ -349,3 +349,8 @@ class GrammarOutput:
      structured_output_request_ids: list[str]
      # Bitmask ordered as structured_output_request_ids.
      grammar_bitmask: "npt.NDArray[np.int32]"
@@ -716,10 +751,10 @@ index 4c46c6c..3c6d974 100644
 +    # from this index on must not be accepted. None invalidates every draft.
 +    num_acceptable_drafts: list[int] | None = None
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 0373c64..bc06970 100644
+index f3e5a8f..65b8cea 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -86,7 +86,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+@@ -85,7 +85,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
  from vllm.v1.request import Request, RequestStatus, StreamingUpdate
  from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
  from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -731,7 +766,7 @@ index 0373c64..bc06970 100644
  from vllm.v1.token_buffer import extend_from_slice
  from vllm.v1.utils import record_function_or_nullcontext
  
-@@ -714,8 +717,15 @@ class Scheduler(SchedulerInterface):
+@@ -718,8 +721,15 @@ class Scheduler(SchedulerInterface):
  
          scheduled_new_reqs: list[Request] = []
          scheduled_running_reqs: list[Request] = []
@@ -747,7 +782,7 @@ index 0373c64..bc06970 100644
          iteration_details = None
          if (
              self.log_stats
-@@ -893,6 +903,11 @@ class Scheduler(SchedulerInterface):
+@@ -897,6 +907,11 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
@@ -759,7 +794,7 @@ index 0373c64..bc06970 100644
              # Schedule newly needed KV blocks for the request.
              with record_function_or_nullcontext("schedule: allocate_slots"):
                  while True:
-@@ -906,6 +921,17 @@ class Scheduler(SchedulerInterface):
+@@ -910,6 +925,17 @@ class Scheduler(SchedulerInterface):
                          # The request can be scheduled.
                          break
  
@@ -777,7 +812,7 @@ index 0373c64..bc06970 100644
                      if (
                          self.connector is not None
                          and self.connector.has_pending_block_frees()
-@@ -935,6 +961,7 @@ class Scheduler(SchedulerInterface):
+@@ -939,6 +965,7 @@ class Scheduler(SchedulerInterface):
                          if preempted_req in scheduled_running_reqs:
                              preempted_req_id = preempted_req.request_id
                              scheduled_running_reqs.remove(preempted_req)
@@ -785,7 +820,7 @@ index 0373c64..bc06970 100644
                              restored = num_scheduled_tokens.pop(preempted_req_id)
                              token_budget += restored
                              input_budget += restored + draft_slots
-@@ -988,6 +1015,8 @@ class Scheduler(SchedulerInterface):
+@@ -992,6 +1019,8 @@ class Scheduler(SchedulerInterface):
              request_id = request.request_id
              req_to_new_blocks[request_id] = new_blocks
              num_scheduled_tokens[request_id] = num_new_tokens
@@ -794,7 +829,7 @@ index 0373c64..bc06970 100644
              token_budget -= num_new_tokens
              input_budget -= num_new_tokens + draft_slots
              req_index += 1
-@@ -1451,6 +1480,18 @@ class Scheduler(SchedulerInterface):
+@@ -1455,6 +1484,18 @@ class Scheduler(SchedulerInterface):
                          skip_request(request_queue)
                          continue
  
@@ -813,7 +848,7 @@ index 0373c64..bc06970 100644
                  # During async KV load, no forward pass is run yet.
                  # Allocate speculative lookahead slots later to avoid
                  # mismatching local and remote block counts.
-@@ -1618,6 +1659,8 @@ class Scheduler(SchedulerInterface):
+@@ -1622,6 +1663,8 @@ class Scheduler(SchedulerInterface):
                      request_id
                  )
                  num_scheduled_tokens[request_id] = num_new_tokens
@@ -822,7 +857,7 @@ index 0373c64..bc06970 100644
                  token_budget -= num_new_tokens
                  input_budget -= num_new_tokens + draft_slots
                  request.status = RequestStatus.RUNNING
-@@ -1675,6 +1718,7 @@ class Scheduler(SchedulerInterface):
+@@ -1679,6 +1722,7 @@ class Scheduler(SchedulerInterface):
  
          assert token_budget >= 0
          assert input_budget >= 0
@@ -830,7 +865,7 @@ index 0373c64..bc06970 100644
          assert len(self.running) <= self.max_num_running_reqs
          # Since some requests in the RUNNING queue may not be scheduled in
          # this step, the total number of scheduled requests can be smaller than
-@@ -1815,6 +1859,9 @@ class Scheduler(SchedulerInterface):
+@@ -1819,6 +1863,9 @@ class Scheduler(SchedulerInterface):
              self._update_after_schedule(scheduler_output)
          return scheduler_output
  
@@ -840,7 +875,7 @@ index 0373c64..bc06970 100644
      def _build_kv_connector_meta(
          self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
      ) -> KVConnectorMetadata:
-@@ -1852,6 +1899,8 @@ class Scheduler(SchedulerInterface):
+@@ -1856,6 +1903,8 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -849,7 +884,7 @@ index 0373c64..bc06970 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -2329,7 +2378,14 @@ class Scheduler(SchedulerInterface):
+@@ -2291,7 +2340,14 @@ class Scheduler(SchedulerInterface):
              structured_output_request_ids,
              scheduler_output.scheduled_spec_decode_tokens,
          )
@@ -866,7 +901,7 @@ index 0373c64..bc06970 100644
      def update_from_output(
          self,
 diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
-index 84dfa53..bd24fe7 100644
+index 16e2f60..aeff41d 100644
 --- a/vllm/v1/core/single_type_kv_cache_manager.py
 +++ b/vllm/v1/core/single_type_kv_cache_manager.py
 @@ -2,7 +2,7 @@
@@ -878,10 +913,10 @@ index 84dfa53..bd24fe7 100644
  from collections.abc import Iterable, Sequence
  from dataclasses import dataclass
  from typing import TYPE_CHECKING, Any, ClassVar
-@@ -1938,9 +1938,9 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -2025,9 +2025,9 @@ class MambaManager(SingleTypeKVCacheManager):
          )
          self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
-         if self.prefix_caching:
+         if self.mamba_cache_mode == "align":
 -            # Mapping from request ID to the index of the block
 -            # allocated in the previous step
 -            self.last_state_block_idx: dict[str, int] = {}
@@ -891,10 +926,10 @@ index 84dfa53..bd24fe7 100644
              self._num_retired_blocks: dict[str, int] = {}
              # The set of the requests that have been allocated blocks
              self._allocated_block_reqs: set[str] = set()
-@@ -2131,23 +2131,23 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -2222,23 +2222,23 @@ class MambaManager(SingleTypeKVCacheManager):
              request_id, processed_computed_tokens, num_prompt_tokens
          )
-         if self.prefix_caching:
+         if self.mamba_cache_mode == "align":
 -            # `last_state_block_idx` refers to the block index allocated two steps ago.
 -            # The block allocated in the previous step is used to copy Mamba states
 -            # into the block allocated in the current step; the earlier block is
@@ -931,7 +966,7 @@ index 84dfa53..bd24fe7 100644
  
      def _needs_internal_checkpoint(
          self,
-@@ -2329,17 +2329,17 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -2421,17 +2421,17 @@ class MambaManager(SingleTypeKVCacheManager):
              else:
                  prev_block_len = len(req_blocks)
                  blocks_allocated = request_id in self._allocated_block_reqs
@@ -958,28 +993,28 @@ index 84dfa53..bd24fe7 100644
  
                  num_skipped_blocks = (
                      num_required_blocks - self.num_speculative_blocks - 1
-@@ -2447,7 +2447,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -2539,7 +2539,7 @@ class MambaManager(SingleTypeKVCacheManager):
      def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
-         if self.prefix_caching:
+         if self.mamba_cache_mode == "align":
              self._allocated_block_reqs.discard(request_id)
 -            self.last_state_block_idx.pop(request_id, None)
 +            self.pending_state_block_indices.pop(request_id, None)
              self._num_retired_blocks.pop(request_id, None)
              self._checkpoints.pop(request_id, None)
              self._req_chunk_ranges.pop(request_id, None)
-@@ -2628,6 +2628,7 @@ class MambaManager(SingleTypeKVCacheManager):
+@@ -2725,6 +2725,7 @@ class MambaManager(SingleTypeKVCacheManager):
              )
          if num_tokens <= 0 or num_tokens % hash_block_size != 0:
              return None
 +        # Global lookahead replaces legacy `if self.drop_eagle_checkpoint_block:`.
-         latest_prompt_hash_boundary = get_reusable_prefix_length(
+         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
              request.num_prompt_tokens,
-             num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
+             hash_block_size,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index 6c83d46..df8a15b 100644
+index 402ccac..4670966 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
-@@ -130,6 +130,10 @@ _R = TypeVar("_R")  # Return type for collective_rpc
+@@ -129,6 +129,10 @@ _R = TypeVar("_R")  # Return type for collective_rpc
  class EngineCore:
      """Inner loop of vLLM's Engine."""
  
@@ -990,7 +1025,7 @@ index 6c83d46..df8a15b 100644
      def __init__(
          self,
          vllm_config: VllmConfig,
-@@ -798,8 +802,14 @@ class EngineCore:
+@@ -790,8 +794,14 @@ class EngineCore:
                  future = cast(Future[ModelRunnerOutput], exec_future)
              else:
                  if not scheduler_output.pending_structured_output_tokens:
@@ -1007,7 +1042,7 @@ index 6c83d46..df8a15b 100644
                          if draft_token_ids is not None:
                              self.scheduler.update_draft_token_ids_in_output(
                                  draft_token_ids, scheduler_output
-@@ -833,6 +843,36 @@ class EngineCore:
+@@ -825,6 +835,36 @@ class EngineCore:
              # is non-empty.
              return None, False
  
@@ -1044,8 +1079,8 @@ index 6c83d46..df8a15b 100644
          # Block until the next result is available.
          future, scheduler_output, exec_model_fut = batch_queue.pop()
          with self.log_error_detail(scheduler_output):
-@@ -865,8 +905,14 @@ class EngineCore:
-             self.deferred_step = None
+@@ -851,8 +891,14 @@ class EngineCore:
+         if deferred_scheduler_output:
              # Update the deferred scheduler output before computing its grammar
              # bitmask.
 -            if deferred_scheduler_output.has_structured_output_spec_decode:
@@ -1062,10 +1097,10 @@ index 6c83d46..df8a15b 100644
                      # Update the draft token ids in the scheduler output while
                      # preserving the worker-provided draft slots.
 diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
-index 92186ab..282b5e3 100644
+index 24264e2..2b25414 100644
 --- a/vllm/v1/executor/abstract.py
 +++ b/vllm/v1/executor/abstract.py
-@@ -336,8 +336,12 @@ class Executor(ABC):
+@@ -332,8 +332,12 @@ class Executor(ABC):
          """Returns the iteration records the output worker has completed."""
          return self.collective_rpc("execute_dummy_batch")[0]
  
@@ -1119,10 +1154,10 @@ index 229879c..621aaea 100644
      def check_health(self) -> None:
          # UniProcExecutor will always be healthy as long as
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
-index 895cbb2..1ac2ca8 100644
+index c2d0865..56c8455 100644
 --- a/vllm/v1/kv_cache_interface.py
 +++ b/vllm/v1/kv_cache_interface.py
-@@ -725,6 +725,23 @@ class KVCacheGroup:
+@@ -733,6 +733,23 @@ class KVCacheGroup:
              **kwargs,
          )
  
@@ -1146,7 +1181,7 @@ index 895cbb2..1ac2ca8 100644
      @property
      def layer_names(self) -> list[str]:
          return list(self.kv_cache_specs)
-@@ -796,6 +813,28 @@ class KVCacheGroup:
+@@ -804,6 +821,28 @@ class KVCacheGroup:
          )
  
  
@@ -1176,7 +1211,7 @@ index 895cbb2..1ac2ca8 100644
      """KV cache groups looked up jointly for cache hits: they share a manager
      policy, block size and DCP sharding."""
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 46c3643..983a1a1 100644
+index 1f831da..3a6a146 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -116,7 +116,10 @@ from vllm.v1.worker.gpu.attn_utils import (
@@ -1191,7 +1226,7 @@ index 46c3643..983a1a1 100644
  from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
  from vllm.v1.worker.gpu.cudagraph_utils import (
      BatchExecutionDescriptor,
-@@ -880,6 +883,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -874,6 +877,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          self.kv_caches = [
              cache for cache in kv_caches_dict.values() if cache.device == self.device
          ]
@@ -1199,7 +1234,7 @@ index 46c3643..983a1a1 100644
          self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
          self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
              self.compilation_config.static_forward_context
-@@ -1770,6 +1774,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1761,6 +1765,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          # A diffusion prefill has no logit rows even when a bitmask row
          # arrived for it.
@@ -1207,7 +1242,7 @@ index 46c3643..983a1a1 100644
          if grammar_output is not None and logits.shape[0] > 0:
              # Apply grammar bitmask to the logits in-place.
              assert self.structured_outputs_worker is not None
-@@ -1779,6 +1784,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1770,6 +1775,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  grammar_output.structured_output_request_ids,
                  grammar_output.grammar_bitmask,
              )
@@ -1219,7 +1254,7 @@ index 46c3643..983a1a1 100644
  
          sampler_output: SamplerOutput | None
          if input_batch.num_reqs == 0:
-@@ -1797,6 +1807,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1788,6 +1798,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  input_batch,
                  # Draft logits are needed for probabilistic rejection sampling.
                  self.speculator.draft_logits,
@@ -1227,7 +1262,7 @@ index 46c3643..983a1a1 100644
              )
  
          if shard_metadata is not None:
-@@ -2495,8 +2506,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2486,8 +2497,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          num_verified = torch.minimum(num_in_forward, num_drafted)
          return num_drafted, num_verified
  
@@ -1252,7 +1287,7 @@ index 46c3643..983a1a1 100644
  
      @torch.inference_mode()
      @step_eplb_after()
-@@ -2679,3 +2704,40 @@ def sort_batch_req_ids(
+@@ -2670,3 +2695,40 @@ def sort_batch_req_ids(
          num,
      )
      return sorted(num_tokens_per_req, key=key)
@@ -1294,7 +1329,7 @@ index 46c3643..983a1a1 100644
 +    )
 +    return local_pos > row_limit
 diff --git a/vllm/v1/worker/gpu/model_states/interface.py b/vllm/v1/worker/gpu/model_states/interface.py
-index daaadc1..8317f91 100644
+index c1cc884..3b241b4 100644
 --- a/vllm/v1/worker/gpu/model_states/interface.py
 +++ b/vllm/v1/worker/gpu/model_states/interface.py
 @@ -137,6 +137,11 @@ class ModelState(ABC):
@@ -1310,16 +1345,16 @@ index daaadc1..8317f91 100644
          self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
      ) -> None:
 diff --git a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
-index c87fb34..682acad 100644
+index 715b039..bc5adae 100644
 --- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 +++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
 @@ -105,6 +105,7 @@ class MambaHybridModelState(DefaultModelState):
          )
-         if self.prefix_caching or self._use_replayssm_trackers:
+         if self._align_mode or self._use_replayssm_trackers:
              self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
 +            self._mamba_spec: MambaSpec | None = None
              self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
-         if self.prefix_caching:
+         if self._align_mode:
              self._mamba_state_idx_gpu = torch.zeros(
 @@ -117,16 +118,37 @@ class MambaHybridModelState(DefaultModelState):
                  self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -1343,7 +1378,7 @@ index c87fb34..682acad 100644
          super().add_request(req_index, new_req_data)
          # Must reset the speculative acceptance count in this idx which could be stale.
          self.num_accepted_tokens_gpu[req_index].fill_(1)
-         if self.prefix_caching:
+         if self._align_mode:
              # Seed the running state block from the resumed/prefilled position.
 -            # The column is in mamba blocks. cache_config.block_size is the
 -            # min over prefix-cacheable groups, so a drafter group with its own
@@ -1400,7 +1435,7 @@ index ca11b15..39eebcd 100644
 -        super().capture(create_forward_fn, progress_bar_desc)
 +        super().capture(create_forward_fn, progress_bar_desc, stream=stream)
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index c809eb9..5f77651 100644
+index 875646f..23256f1 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -1,6 +1,7 @@
@@ -1411,7 +1446,7 @@ index c809eb9..5f77651 100644
  from typing import Any
  
  import torch
-@@ -175,6 +176,11 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -184,6 +185,11 @@ class DFlashSpeculator(DraftModelSpeculator):
          # Capture must not write context K/V.
          self._context_slot_mappings.fill_(PAD_SLOT_ID)
          assert self.query_cudagraph_manager is not None
@@ -1423,7 +1458,7 @@ index c809eb9..5f77651 100644
          self.query_cudagraph_manager.capture(
              self._generate_draft,
              self.input_buffers,
-@@ -185,6 +191,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -194,6 +200,7 @@ class DFlashSpeculator(DraftModelSpeculator):
              causal=self._group_causal,
              prepare_forward=self._prepare_graph_forward,
              progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
@@ -1431,7 +1466,7 @@ index c809eb9..5f77651 100644
          )
  
      def _prepare_graph_forward(
-@@ -518,6 +525,29 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -527,6 +534,29 @@ class DFlashSpeculator(DraftModelSpeculator):
          self.draft_max_seq_len = min(
              max_seq_len + self.num_query_per_req, self.max_model_len
          )
@@ -1538,10 +1573,10 @@ index c1844c2..71bb6ba 100644
  
          num_sampled, num_rejected = get_num_sampled_and_rejected(
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 8cf4c22..2fa049a 100644
+index fdad9fb..bdaf36b 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -614,10 +614,55 @@ class Worker(WorkerBase):
+@@ -615,10 +615,55 @@ class Worker(WorkerBase):
          )
          with self._maybe_get_memory_pool_context(tag="runtime"):
              self.model_runner: GPUModelRunner = self._make_model_runner()
@@ -1597,7 +1632,7 @@ index 8cf4c22..2fa049a 100644
      def _make_model_runner(self) -> "GPUModelRunner":
          """Construct the platform's model runner; subclasses override this."""
          if self.vllm_config.is_mm_encoder_only:
-@@ -1014,6 +1059,10 @@ class Worker(WorkerBase):
+@@ -1015,6 +1060,10 @@ class Worker(WorkerBase):
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -1608,7 +1643,7 @@ index 8cf4c22..2fa049a 100644
      def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
          from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
              _find_simple_cpu_offload_connector,
-@@ -1115,6 +1164,7 @@ class Worker(WorkerBase):
+@@ -1116,6 +1165,7 @@ class Worker(WorkerBase):
                  randomize_inputs=self.randomize_dummy_inputs,
              )
          self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
@@ -1616,7 +1651,7 @@ index 8cf4c22..2fa049a 100644
  
          # Warmup and tune the kernels used during model execution before
          # cuda graph capture.
-@@ -1575,8 +1625,10 @@ class Worker(WorkerBase):
+@@ -1576,8 +1626,10 @@ class Worker(WorkerBase):
              return self.model_runner.pool()
          return None
  
@@ -1629,3 +1664,6 @@ index 8cf4c22..2fa049a 100644
  
      def profile(
          self,
+-- 
+2.56.0
+

@@ -1,5 +1,20 @@
+From 6facb5c78c20b2722597fec8479d92773a95d332 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] entrypoints/tokenizers: DeepSeek top-level thinking, SSE keep-alive, and exact 1017 encoding
+Date: Tue, 24 Nov 2026 23:04:45 +0800
+Subject: [PATCH] feat(openai): top-level DeepSeek thinking switch, SSE
+ keep-alive, and 1017 encoding
+
+Add top-level OpenAI thinking switch mapping (deepseek_thinking.py), SSE keep-alive interval support, and checkpoint-1017 DeepSeek-V4.1 prompt/tool-namespace encoding.
+---
+ .../chat_completion/deepseek_thinking.py      | 63 +++++++++++++
+ .../openai/chat_completion/serving.py         | 14 +++
+ vllm/entrypoints/openai/sse_keep_alive.py     | 10 ++
+ vllm/entrypoints/serve/utils/api_utils.py     | 24 ++++-
+ vllm/tokenizers/deepseek_v41.py               | 21 ++++-
+ vllm/tokenizers/deepseek_v41_encoding.py      | 91 ++++++++++++++-----
+ 6 files changed, 196 insertions(+), 27 deletions(-)
+ create mode 100644 vllm/entrypoints/openai/chat_completion/deepseek_thinking.py
+ create mode 100644 vllm/entrypoints/openai/sse_keep_alive.py
 
 diff --git a/vllm/entrypoints/openai/chat_completion/deepseek_thinking.py b/vllm/entrypoints/openai/chat_completion/deepseek_thinking.py
 new file mode 100644
@@ -71,7 +86,7 @@ index 0000000..fd636ee
 +        request.chat_template_kwargs = kwargs
 +    return None
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index 175fba3..f79170a 100644
+index 81b0ac1..9ef06e1 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
 @@ -42,6 +42,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -387,3 +402,6 @@ index 0ba68db..f8b45c2 100644
      ):
          # Normal generation: append Assistant + thinking token
          # (mid-conversation system messages also trigger the assistant header)
+-- 
+2.56.0
+

@@ -1,5 +1,23 @@
+From d5c07ae6ba2367d8e2195805a37a303b0e43b4f0 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] dsv41(moe): SM80 weight-streaming MXFP4 decode v1/v2, deterministic align & prefill split-list
+Date: Tue, 24 Nov 2026 23:04:45 +0800
+Subject: [PATCH] feat(deepseek-v4.1): SM80 MXFP4 MoE weight-streaming decode
+ and prefill split
+
+Add SM80 weight-streaming MXFP4 MoE decode dispatch, fused SwiGLU activation + top-k sum, single-CTA deterministic block alignment, and split-list MXFP4 MoE prefill.
+---
+ .../layers/fused_moe/dsv4_mxfp4_decode.py     | 834 ++++++++++++++++++
+ .../layers/fused_moe/experts/marlin_moe.py    | 214 ++++-
+ .../layers/fused_moe/fast_det_align.py        | 161 ++++
+ .../layers/fused_moe/moe_align_block_size.py  | 155 +++-
+ .../layers/fused_moe/moe_prefill.py           | 134 +++
+ .../layers/fused_moe/moe_split_align.py       | 293 ++++++
+ .../layers/quantization/mxfp4.py              | 112 ++-
+ 7 files changed, 1813 insertions(+), 90 deletions(-)
+ create mode 100644 vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+ create mode 100644 vllm/model_executor/layers/fused_moe/fast_det_align.py
+ create mode 100644 vllm/model_executor/layers/fused_moe/moe_prefill.py
+ create mode 100644 vllm/model_executor/layers/fused_moe/moe_split_align.py
 
 diff --git a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
 new file mode 100644
@@ -2052,3 +2070,6 @@ index a847f96..4b5d33f 100644
  
      def get_fused_moe_quant_config(
          self,
+-- 
+2.56.0
+

@@ -1,5 +1,30 @@
+From d43e63289d1563d9c292f6e67af5f59a1afb5f41 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] dsv41(attn/dspark): 1M indexer/MLA caps, SWA C++ dispatch, prefill AR overlap & Markov local argmax
+Date: Tue, 24 Nov 2026 23:04:46 +0800
+Subject: [PATCH] feat(deepseek-v4.1): SM80 sparse attention, bounded indexer,
+ ragged SWA, YoCo, and FP8 DSpark
+
+Add SM80 nvfp4_ds_mla sparse attention optimizations, bounded sequence-chunked decode indexer workspace, fast CUDA prefill indexer, ragged SWA metadata, YoCo prefill truncation, and FP8 DSpark draft head + Markov argmax.
+---
+ .../model_executor/layers/logits_processor.py |  30 +-
+ .../layers/sparse_attn_indexer.py             |  12 +-
+ vllm/model_executor/models/qwen3_dspark.py    |  69 +-
+ vllm/models/deepseek_v41/amd/rocm.py          |   9 +-
+ .../deepseek_v41/nvidia/dspark_fp8_head.py    | 120 ++++
+ vllm/models/deepseek_v41/nvidia/model.py      | 589 +++++++++++++++++-
+ .../specialized_decode/ampere/attention.py    |  91 ++-
+ .../specialized_decode/ampere/indexer.py      | 260 ++++++--
+ .../ampere/indexer_metadata.py                |  20 +-
+ .../specialized_decode/ampere/mqa_logits.py   |  62 +-
+ .../runtime/metadata_graphs.py                |  56 +-
+ .../specialized_decode/runtime/model_state.py |  35 +-
+ .../attention/backends/mla/flashmla_sparse.py |   2 +-
+ vllm/v1/attention/backends/mla/sparse_swa.py  |  46 +-
+ .../gpu/spec_decode/dspark/markov_argmax.py   | 441 +++++++++++++
+ .../v1/worker/gpu/spec_decode/dspark/utils.py |  10 +-
+ 16 files changed, 1709 insertions(+), 143 deletions(-)
+ create mode 100644 vllm/models/deepseek_v41/nvidia/dspark_fp8_head.py
+ create mode 100644 vllm/v1/worker/gpu/spec_decode/dspark/markov_argmax.py
 
 diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
 index 165160d..491bd34 100644
@@ -55,7 +80,7 @@ index 165160d..491bd34 100644
          local_max_vals, local_max_indices = logits.max(dim=-1)
  
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index 66e53d6..24a5415 100644
+index 90f7e17..9958ed8 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -1390,10 +1390,14 @@ class SparseAttnIndexer(CustomOp):
@@ -203,10 +228,10 @@ index f4266ec..bfc22b4 100644
  class DSparkConfidenceHead(nn.Module):
      """DSpark acceptance-confidence head."""
 diff --git a/vllm/models/deepseek_v41/amd/rocm.py b/vllm/models/deepseek_v41/amd/rocm.py
-index b89bce8..ff1a824 100644
+index ebdf3c0..56404a5 100644
 --- a/vllm/models/deepseek_v41/amd/rocm.py
 +++ b/vllm/models/deepseek_v41/amd/rocm.py
-@@ -622,8 +622,15 @@ class DeepseekV41RocmMxfp4Indexer(DeepseekV4Indexer):
+@@ -502,8 +502,15 @@ class DeepseekV41RocmMxfp4Indexer(DeepseekV4Indexer):
          indexer_weights: torch.Tensor,
          positions: torch.Tensor,
          rotary_emb: torch.nn.Module,
@@ -350,7 +375,7 @@ index 0000000..02bb9de
 +            + self.scale.numel() * self.scale.element_size()
 +        )
 diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
-index 238b5c8..b3cabe3 100644
+index 28deb43..81c5988 100644
 --- a/vllm/models/deepseek_v41/nvidia/model.py
 +++ b/vllm/models/deepseek_v41/nvidia/model.py
 @@ -1,5 +1,6 @@
@@ -412,7 +437,7 @@ index 238b5c8..b3cabe3 100644
  
  class DeepseekV4MoE(DeepseekV4MoEBase):
      def __init__(
-@@ -1149,9 +1195,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1142,9 +1188,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              self.norm = PPMissingLayer()
  
          spec_config = vllm_config.speculative_config
@@ -430,7 +455,7 @@ index 238b5c8..b3cabe3 100644
                  self.hc_dim,
                  dtype=vllm_config.model_config.dtype,
              )
-@@ -1397,7 +1450,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1390,7 +1443,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                  pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
              num_tokens = hidden_states.shape[0]
@@ -443,7 +468,7 @@ index 238b5c8..b3cabe3 100644
  
          # Collapse the hc copies with the pre-mix from the last layer's FFN
          # mixes — the mix the reference applies via
-@@ -1446,6 +1503,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1439,6 +1496,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          # hidden states are read back from there instead of recomputed.
          full_num_tokens = positions.shape[0]
          mega_gate_metadata = self._mega_gate_metadata(input_ids)
@@ -481,7 +506,7 @@ index 238b5c8..b3cabe3 100644
          for idx in layer_ids:
              hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
                  self.layers[idx](
-@@ -1471,6 +1559,452 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1464,6 +1552,452 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
          assert res_mix is not None and pre_mix is not None
          return hidden_states, residual, post_mix, res_mix, pre_mix
  
@@ -934,7 +959,7 @@ index 238b5c8..b3cabe3 100644
      def _collapse(
          self,
          hidden_states: torch.Tensor | MoEOutput,
-@@ -1635,7 +2169,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -1628,7 +2162,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
              and not self.use_sequence_parallel
          )
  
@@ -955,7 +980,7 @@ index 238b5c8..b3cabe3 100644
              if name.startswith(("vision.", "aligner.", "image_")):
                  # Vision weights are loaded by the outer multimodal wrapper.
                  logger.warning_once("Skipping non-text weight: %s", name)
-@@ -2029,9 +2576,11 @@ class DeepseekV41LLMForCausalLM(
+@@ -2022,9 +2569,11 @@ class DeepseekV41LLMForCausalLM(
          return hidden_states
  
      def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
@@ -970,7 +995,7 @@ index 238b5c8..b3cabe3 100644
          return getattr(self.model, "_mtp_hidden_buffer", None)
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-@@ -2039,6 +2588,9 @@ class DeepseekV41LLMForCausalLM(
+@@ -2032,6 +2581,9 @@ class DeepseekV41LLMForCausalLM(
          return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
  
      def process_weights_after_loading(self) -> None:
@@ -980,7 +1005,7 @@ index 238b5c8..b3cabe3 100644
          self.model.finalize_mhc_broadcast_weights()
          config = self.model.vllm_config
          if config.engram_config and config.engram_config.use_thp:
-@@ -2055,5 +2607,32 @@ class DeepseekV41LLMForCausalLM(
+@@ -2048,5 +2600,32 @@ class DeepseekV41LLMForCausalLM(
                  if layer.engram is not None:
                      layer.engram.embed_tokens.collapse_huge_pages()
  
@@ -2438,3 +2463,6 @@ index 6db3c6a..b1f966c 100644
              parallel_config=_get_dspark_parallel_config(
                  vllm_config.parallel_config,
                  speculative_config.draft_parallel_config.tensor_parallel_size,
+-- 
+2.56.0
+

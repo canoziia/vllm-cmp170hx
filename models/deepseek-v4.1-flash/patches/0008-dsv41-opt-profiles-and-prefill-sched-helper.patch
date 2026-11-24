@@ -1,5 +1,16 @@
+From 9e720fc2222e4453f48c42cef22b95505185ef12 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Subject: [PATCH] dsv41: unified SM80 optimisation profiles and YoCo/quadratic prefill scheduler helper
+Date: Tue, 24 Nov 2026 23:04:46 +0800
+Subject: [PATCH] feat(deepseek-v4.1): optimization profiles and quadratic
+ prefill scheduling helper
+
+Add vllm/dsv41_opt_profile.py (setdefault profile bootstrap) and vllm/v1/core/sched/dsv41_prefill_sched.py quadratic cost-chunking helper.
+---
+ vllm/dsv41_opt_profile.py                 | 173 ++++++++++++++++++++++
+ vllm/v1/core/sched/dsv41_prefill_sched.py | 169 +++++++++++++++++++++
+ 2 files changed, 342 insertions(+)
+ create mode 100644 vllm/dsv41_opt_profile.py
+ create mode 100644 vllm/v1/core/sched/dsv41_prefill_sched.py
 
 diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
 new file mode 100644
@@ -355,3 +366,6 @@ index 0000000..b764806
 +            new_computed_blocks, target_hit
 +        )
 +        return trimmed_blocks, target_hit, 0, False
+-- 
+2.56.0
+

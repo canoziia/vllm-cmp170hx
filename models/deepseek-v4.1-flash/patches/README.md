@@ -12,9 +12,10 @@ Base source: official `vllm-project/vllm` (pinned in `manifests/source.env`).
 
 Applied in order by `scripts/apply-deepseek-v41-patches.sh`:
 
-1. `0001-upstream-0e3c8db-compat-and-entrypoints.patch`
-   - Preserves SM80 / DeepSeek-V4.1 entrypoints, `vllm.env_override` profile bootstrap,
-     and `--sse-keep-alive-interval` CLI compatibility on upstream `vllm`.
+1. `0001-sm80-marlin-aux-locks-and-1m-indexer-metadata.patch`
+   - Adds lazy per-stream Marlin workspace locks for eager aux streams after
+     workspace lock (`marlin_utils.py`) and chunked 256-column 1M-context
+     indexer decode metadata copy (`vllm/v1/attention/ops/metadata.py`).
 2. `0002-common-async-pp-mamba-and-structured-spec-fixes.patch`
    - Ports all 4 shared runtime invariants verified by `scripts/test-vllm-common-patches.py`:
      async-PP Mamba state reclamation, resumed hybrid cache geometry restoration,
