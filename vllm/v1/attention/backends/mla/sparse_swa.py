@@ -508,29 +508,26 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self._layer_types.add(_layer_type_for(int(ratio)))
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
+        max_decode_tokens = max(
+            self.vllm_config.scheduler_config.max_num_seqs * self.decode_threshold,
+            self.vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+            1,
+        )
+        self._max_decode_tokens = max_decode_tokens
         self.token_to_req_indices = torch.zeros(
             max_tokens,
             dtype=torch.int32,
             device=self.device,
         )
         self.decode_swa_indices = torch.zeros(
-            max_tokens,
+            max_decode_tokens,
             1,
             self.window_size,
             dtype=torch.int32,
             device=self.device,
         )
         self.decode_swa_lens = torch.zeros(
-            max_tokens,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        # Allocated unconditionally — consumer picks paged-direct vs dequant
-        # at call time.
-        self.prefill_swa_indices = torch.zeros(
-            max_tokens,
-            1,
-            self.prefill_index_width,
+            max_decode_tokens,
             dtype=torch.int32,
             device=self.device,
         )
@@ -648,7 +645,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 )
                 if self.decode_swa_indices_noncausal is None:
                     self.decode_swa_indices_noncausal = torch.zeros(
-                        self._max_tokens,
+                        self._max_decode_tokens,
                         1,
                         self.noncausal_index_width,
                         dtype=torch.int32,
@@ -715,15 +712,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
+        prefill_swa_indices: torch.Tensor | None = None
+        prefill_swa_lens: torch.Tensor | None = None
         if num_prefill_tokens > 0:
             has_image = prefill_left_visible is not None
-            prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
+            prefill_width = (
+                self.prefill_index_width if has_image else self.window_size
+            )
+            prefill_swa_indices = torch.empty(
+                (num_prefill_tokens, 1, prefill_width),
+                dtype=torch.int32,
+                device=self.device,
+            )
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
             _COMPUTE_SWA_INDICES_AND_LENS_KERNEL(
                 prefill_swa_indices,
                 prefill_swa_lens,
                 self.window_size,
-                self.prefill_index_width,
+                prefill_width,
                 prefill_left_visible if has_image else prefill_swa_lens,
                 prefill_right_visible if has_image else prefill_swa_lens,
                 query_start_loc,
@@ -766,16 +772,8 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             decode_swa_indices=decode_swa_indices[:num_decode_tokens],
             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
             decode_swa_width=decode_swa_width,
-            prefill_swa_indices=(
-                self.prefill_swa_indices[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
-            ),
-            prefill_swa_lens=(
-                self.prefill_swa_lens[:num_prefill_tokens]
-                if num_prefill_tokens > 0
-                else None
-            ),
+            prefill_swa_indices=prefill_swa_indices,
+            prefill_swa_lens=prefill_swa_lens,
             prefill_left_visible=prefill_left_visible,
             prefill_right_visible=prefill_right_visible,
             replay_start=replay_start,

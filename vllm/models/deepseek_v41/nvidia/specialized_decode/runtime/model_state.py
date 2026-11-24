@@ -19,6 +19,7 @@ profiling).
 """
 
 from dataclasses import replace
+import os
 from typing import Any
 
 import numpy as np
@@ -208,21 +209,29 @@ class DeepseekV41MetadataGraphModelState(DeepseekV41ModelState):
     ) -> None:
         # Record the metadata build of every decode step the FULL decode graphs
         # serve, on dummy batches of that step's shape.
+        from contextlib import nullcontext
+
         self.graphs.release()
         if self.graphs.can_record(attn_groups):
-            for key in self.graphs.capture_keys():
-                self._recording = key
-                try:
-                    self.prepare_attn(
-                        padded_decode_batch(key, input_buffers, self.max_model_len),
-                        CUDAGraphMode.FULL,
-                        block_tables.get_dummy_block_tables(key[1]),
-                        block_tables.get_dummy_slot_mappings(key[3]),
-                        attn_groups,
-                        kv_cache_config,
-                    )
-                finally:
-                    self._recording = None
+            use_shared = (
+                stream is not None
+                and os.environ.get("VLLM_DSV41_SHARE_CAPTURE_STREAM", "1") == "1"
+            )
+            ctx = torch.cuda.stream(stream) if use_shared else nullcontext()
+            with ctx:
+                for key in self.graphs.capture_keys():
+                    self._recording = key
+                    try:
+                        self.prepare_attn(
+                            padded_decode_batch(key, input_buffers, self.max_model_len),
+                            CUDAGraphMode.FULL,
+                            block_tables.get_dummy_block_tables(key[1]),
+                            block_tables.get_dummy_slot_mappings(key[3]),
+                            attn_groups,
+                            kv_cache_config,
+                        )
+                    finally:
+                        self._recording = None
         super().capture_inner_cudagraphs(
             input_buffers, block_tables, attn_groups, kv_cache_config, stream
         )

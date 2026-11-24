@@ -1390,10 +1390,14 @@ class SparseAttnIndexer(CustomOp):
             )
             if workspace is not None:
                 self.dcp_direct_topk_max_rows = max_rows
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and type(self) is SparseAttnIndexer
+        ):
+            logger.warning_once(
+                "DeepGEMM not supported on this platform; "
+                "using Triton fallback for sparse attention indexer."
             )
 
         if vllm_config.kernel_config.enable_jit_warmup:

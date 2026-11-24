@@ -213,11 +213,31 @@ class LogitsProcessor(PluggableLayer):
         if cutoff < logits.shape[-1]:
             logits[..., max(cutoff, 0) :] = -float("inf")
 
+    def get_shard_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+        extra_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's slice of the logits, stopping before the vocab gather."""
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+        if extra_logits is not None:
+            logits = logits + extra_logits
+
+        self._mask_outside_vocab(logits, lm_head)
+        return logits
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
+        extra_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel argmax without all-gathering full logits.
 
@@ -232,13 +252,9 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = lm_head.tp_size
 
-        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
-        if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-        if self.scale != 1.0:
-            logits = logits * self.scale
-
-        self._mask_outside_vocab(logits, lm_head)
+        logits = self.get_shard_logits(
+            lm_head, hidden_states, embedding_bias, extra_logits
+        )
 
         local_max_vals, local_max_indices = logits.max(dim=-1)
 

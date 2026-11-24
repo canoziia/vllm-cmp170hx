@@ -35,6 +35,7 @@ An explicit backend keeps vLLM's shared candidate and top-k kernels.
 """
 
 from collections.abc import Callable
+import os
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -137,11 +138,6 @@ def _reserve_profile_memory(
     a decode step's (with its top-k workspace), and the TP row-shard
     exchange."""
     assert head_dim // 2 == _VALUE_BYTES
-    current_workspace_manager().get_simultaneous(
-        ((total_seq_lens, _VALUE_BYTES), torch.uint8),
-        ((total_seq_lens, _SCALE_BYTES), torch.uint8),
-        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-    )
     cfg = get_current_vllm_config_or_none()
     max_decode_tokens = 0
     if cfg is not None:
@@ -149,16 +145,27 @@ def _reserve_profile_memory(
             cfg.scheduler_config.max_num_seqs,
             cfg.scheduler_config.max_num_batched_tokens,
         ) * (1 + cfg.num_speculative_tokens)
-    decode_row_bytes = round_up(
-        max_model_len, 256
-    ) * torch.float32.itemsize + workspace_bytes(
-        max_model_len, topk_indices_buffer.shape[1]
+    logits_row_bytes = max(1, round_up(max_model_len, 256) * torch.float32.itemsize)
+    topk_ws_row_bytes = workspace_bytes(max_model_len, topk_indices_buffer.shape[1])
+    logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+    if os.environ.get("VLLM_DSV41_DECODE_LOGITS_CHUNK", "1") != "1":
+        logits_bytes = max(logits_bytes, max_decode_tokens * logits_row_bytes)
+    ws_keys = max(
+        total_seq_lens, max_model_len // 4, 262144 if max_model_len > 131072 else 0
     )
-    logits_bytes = max(
-        envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024,
-        max_decode_tokens * decode_row_bytes,
+    current_workspace_manager().get_simultaneous(
+        ((ws_keys, _VALUE_BYTES), torch.uint8),
+        ((ws_keys, _SCALE_BYTES), torch.uint8),
+        ((max(logits_bytes, RADIX_TOPK_WORKSPACE_SIZE) // 4,), torch.float32),
     )
-    _ = torch.empty(logits_bytes, dtype=torch.uint8, device=device)
+    max_chunk_rows = (
+        max(1, logits_bytes // logits_row_bytes)
+        if os.environ.get("VLLM_DSV41_DECODE_LOGITS_CHUNK", "1") == "1"
+        else max(1, max_decode_tokens)
+    )
+    _ = torch.empty(
+        max_chunk_rows * topk_ws_row_bytes, dtype=torch.uint8, device=device
+    )
     reserve_exchange_memory(topk_indices_buffer, device)
 
 
@@ -199,6 +206,7 @@ def _prefill_topk(
     q_scales: torch.Tensor,
     weights: torch.Tensor,
     topk_tokens: int,
+    head_dim: int,
     topk_indices_buffer: torch.Tensor,
     candidate_blocks: torch.Tensor | None,
     candidate_block_size: int,
@@ -209,21 +217,53 @@ def _prefill_topk(
     prefill = metadata.prefill
     assert prefill is not None
     num_decode_tokens = metadata.num_decode_tokens
-    # Sized for this step's largest chunk, at the workspace head.
-    max_keys = max(c.max_local_total_seq_lens for c in prefill.chunks)
-    k_values_all, k_scales_all = current_workspace_manager().get_simultaneous(
-        ((max_keys, _VALUE_BYTES), torch.uint8),
-        ((max_keys, _SCALE_BYTES), torch.uint8),
+    writer_fast = (
+        topk_backend == "auto"
+        and os.environ.get("VLLM_DSV41_INDEXER_WRITER_FAST", "0") == "1"
     )
+    reader_compact_env = (
+        writer_fast
+        and os.environ.get("VLLM_DSV41_INDEXER_READER_COMPACT", "0") == "1"
+    )
+    k_quant_view: torch.Tensor | None = None
+    # Sized for this step's largest chunk, at the workspace head.
+    # Pre-size to max_seq_len (up to 262,144 compressed keys = 17 MiB) once a
+    # prefill exceeds 32K keys so 1M prefill never grows the workspace 266x.
+    max_keys = max(c.max_local_total_seq_lens for c in prefill.chunks)
+    ws_keys = max(max_keys, metadata.max_seq_len, 262144) if max_keys > 32768 else max_keys
+    wm = current_workspace_manager()
+    logits_elems = (envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024) // 4
+    specs_with_logits = (
+        ((ws_keys, _VALUE_BYTES), torch.uint8),
+        ((ws_keys, _SCALE_BYTES), torch.uint8),
+        ((logits_elems,), torch.float32),
+    )
+    if not wm.is_locked() or wm.fits(*specs_with_logits):
+        k_values_all, k_scales_all, logits_ws = wm.get_simultaneous(*specs_with_logits)
+    else:
+        k_values_all, k_scales_all = wm.get_simultaneous(*specs_with_logits[:2])
+        logits_ws = None
     # The rows are split over the TP ranks, candidate rows included: the
     # candidate consumers read their source's index K cache, so they narrow
     # by the source's metadata, a rank's consumers read only the candidate
     # blocks its own source wrote, and only the top-k indices are exchanged.
     row_shard = PrefillRowShard.from_metadata(prefill, num_decode_tokens)
     for chunk in prefill.chunks:
+        use_compact_reader = (
+            reader_compact_env
+            and candidate_blocks is not None
+            and not candidate_write
+            and chunk.max_seqlen_k >= 32768
+            and chunk.block_table is not None
+            and chunk.block_table.shape[0] == 1
+        )
         k_values = k_values_all[: chunk.max_local_total_seq_lens]
         k_scales = k_scales_all[: chunk.max_local_total_seq_lens]
-        if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+        if (
+            not use_compact_reader
+            and not chunk.skip_kv_gather
+            and chunk.local_total_seq_lens > 0
+        ):
             assert chunk.block_table is not None
             assert chunk.local_cu_seq_lens is not None
             ops.cp_gather_indexer_k_quant_cache(
@@ -240,6 +280,48 @@ def _prefill_topk(
         if chunk.local_total_seq_lens == 0 or row_end == row_start:
             topk.fill_(-1)
             continue
+        if use_compact_reader:
+            assert candidate_blocks is not None and chunk.block_table is not None
+            if k_quant_view is None:
+                k_quant_view = kv_cache_as_quant_view(kv_cache, head_dim, True)
+            compact_step = max(
+                1,
+                (envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024)
+                // max(
+                    1,
+                    candidate_blocks.shape[1]
+                    * candidate_block_size
+                    * torch.float32.itemsize,
+                ),
+            )
+            for sub in range(0, row_end - row_start, compact_step):
+                rows = slice(sub, min(sub + compact_step, row_end - row_start))
+                tokens = slice(row_start + rows.start, row_start + rows.stop)
+                sub_rows = rows.stop - rows.start
+                row_ends = (row_ke[rows] - row_ks[rows]).contiguous()
+                logits, compact_lens = logits_kernels.candidate_mqa_logits(
+                    q_values[tokens],
+                    q_scales[tokens],
+                    k_quant_view,
+                    weights[tokens].contiguous(),
+                    row_ends,
+                    chunk.block_table,
+                    sub_rows,
+                    candidate_blocks[tokens],
+                    candidate_block_size,
+                    out_workspace=logits_ws,
+                )
+                decode_topk(
+                    logits,
+                    compact_lens,
+                    topk[rows],
+                    1,
+                    candidate_blocks[tokens],
+                    candidate_block_size,
+                    row_ends,
+                )
+                del logits, compact_lens
+            continue
         step = dense_logits_rows(chunk.max_seqlen_k)
         for sub in range(0, row_end - row_start, step):
             rows = slice(sub, min(sub + step, row_end - row_start))
@@ -254,8 +336,21 @@ def _prefill_topk(
                 row_ks[rows],
                 row_ke[rows],
                 chunk.max_seqlen_k,
+                out_workspace=logits_ws,
             )
             row_ends = row_ke[rows] - row_ks[rows]
+            if writer_fast and (candidate_blocks is None or candidate_write):
+                row_ends_c = row_ends.contiguous()
+                if candidate_blocks is not None and candidate_write:
+                    decode_topk(
+                        logits,
+                        row_ends_c,
+                        candidate_blocks[tokens],
+                        candidate_block_size,
+                    )
+                decode_topk(logits, row_ends_c, topk[rows])
+                del logits
+                continue
             _select(
                 logits,
                 row_ends,
@@ -313,7 +408,12 @@ def _decode_topk(
     shard = None
     if topk_backend == "auto" and metadata.num_prefills == 0:
         shard = _decode_row_shard(
-            rows, metadata.num_decodes, tp_group.world_size, tp_group.rank_in_group
+            rows,
+            metadata.num_decodes,
+            tp_group.world_size,
+            tp_group.rank_in_group,
+            decode_is_uniform=decode.decode_is_uniform,
+            max_buffer_rows=topk_indices_buffer.shape[0],
         )
     if shard is None:
         _decode_rows_topk(
@@ -410,22 +510,36 @@ def _gather_topk_shares(
 
 
 def _decode_row_shard(
-    rows: int, num_requests: int, world_size: int, rank: int
+    rows: int,
+    num_requests: int,
+    world_size: int,
+    rank: int,
+    decode_is_uniform: bool = True,
+    max_buffer_rows: int = 0,
 ) -> tuple[int, int, int] | None:
     """Rows `[start, end)` that `rank` scores in a pure-decode step and
     the rows of a full share, or None when the step stays replicated.
 
     Each rank takes `ceil(num_requests / world_size)` whole requests in
-    order, so the last ranks may take fewer or none. The split reads only
-    host state that every rank shares.
+    order on uniform steps, or `ceil(rows / world_size)` token rows on
+    varlen mixed-spec-k steps (`not decode_is_uniform`, where per-row
+    metadata is already expanded and `group == 1`).
     """
-    if world_size < 2 or num_requests < ROW_SHARD_MIN_REQUESTS or rows % num_requests:
+    if world_size < 2 or num_requests < ROW_SHARD_MIN_REQUESTS:
         return None
-    per_request = rows // num_requests
-    share = -(-num_requests // world_size)
-    first = min(rank * share, num_requests)
-    last = min(first + share, num_requests)
-    return first * per_request, last * per_request, share * per_request
+    if rows % num_requests == 0:
+        per_request = rows // num_requests
+        share = -(-num_requests // world_size)
+        first = min(rank * share, num_requests)
+        last = min(first + share, num_requests)
+        return first * per_request, last * per_request, share * per_request
+    if not decode_is_uniform and rows >= world_size:
+        share_rows = -(-rows // world_size)
+        if max_buffer_rows <= 0 or world_size * share_rows <= max_buffer_rows:
+            first = min(rank * share_rows, rows)
+            last = min(first + share_rows, rows)
+            return first, last, share_rows
+    return None
 
 
 def _decode_rows_topk(
@@ -453,6 +567,13 @@ def _decode_rows_topk(
     row_lens = lens.reshape(-1)
     block_table = decode.block_table[start:end]
     candidates = candidate_blocks[start:end] if candidate_blocks is not None else None
+    wm = current_workspace_manager()
+    logits_elems = (envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024) // 4
+    logits_ws = (
+        wm.get_simultaneous(((logits_elems,), torch.float32))[0]
+        if wm.fits(((logits_elems,), torch.float32))
+        else None
+    )
     own = topk_backend == "auto"
     if own and candidates is not None and not candidate_write:
         # A candidate consumer: the source listed each row's blocks in
@@ -467,6 +588,7 @@ def _decode_rows_topk(
             1,
             candidates,
             candidate_block_size,
+            out_workspace=logits_ws,
         )
         decode_topk(
             logits,
@@ -488,33 +610,49 @@ def _decode_rows_topk(
         and group * q_values.shape[1] <= logits_kernels.THREADS
     ):
         group = 1
-    logits = logits_kernels.paged_mqa_logits(
-        q_values,
-        q_scales,
-        kv_cache,
-        weights.contiguous(),
-        row_lens,
-        block_table,
-        1,
-        max_model_len,
-        group=group,
-    )
-    if not own:
-        _select(
-            logits,
-            row_lens,
-            candidates,
-            candidate_block_size,
-            candidate_write,
-            topk_backend,
+    max_chunk_rows = rows
+    if os.environ.get("VLLM_DSV41_DECODE_LOGITS_CHUNK", "1") == "1" and rows > 1:
+        cap_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
+        row_bytes = max(1, round_up(max_model_len, 256) * torch.float32.itemsize)
+        max_chunk_rows = max(1, cap_bytes // row_bytes)
+        if group > 1:
+            if max_chunk_rows >= group:
+                max_chunk_rows = (max_chunk_rows // group) * group
+            else:
+                group = 1
+    for r0 in range(0, rows, max_chunk_rows):
+        r1 = min(r0 + max_chunk_rows, rows)
+        sub_cands = candidates[r0:r1] if candidates is not None else None
+        logits = logits_kernels.paged_mqa_logits(
+            q_values[r0:r1],
+            q_scales[r0:r1],
+            kv_cache,
+            weights[r0:r1].contiguous(),
+            row_lens[r0:r1],
+            block_table[r0:r1],
+            1,
+            max_model_len,
+            group=group,
+            out_workspace=logits_ws,
         )
-        get_indexer_topk(topk_backend)(
-            logits, lens, 1, topk_out, topk_tokens, max_seq_len
-        )
-        return
-    if candidates is not None and candidate_write:
-        decode_topk(logits, row_lens, candidates, candidate_block_size)
-    decode_topk(logits, row_lens, topk_out)
+        if not own:
+            _select(
+                logits,
+                row_lens[r0:r1],
+                sub_cands,
+                candidate_block_size,
+                candidate_write,
+                topk_backend,
+            )
+            get_indexer_topk(topk_backend)(
+                logits, lens[r0:r1], 1, topk_out[r0:r1], topk_tokens, max_seq_len
+            )
+            del logits
+            continue
+        if sub_cands is not None and candidate_write:
+            decode_topk(logits, row_lens[r0:r1], sub_cands, candidate_block_size)
+        decode_topk(logits, row_lens[r0:r1], topk_out[r0:r1])
+        del logits
 
 
 @eager_break_during_capture
@@ -564,6 +702,12 @@ def dsv41_ampere_sparse_attn_indexer(
                 and not torch.cuda.is_current_stream_capturing()
             ):
                 return topk_indices_buffer
+    forward_context._dsv41_topk_ver = (
+        getattr(forward_context, "_dsv41_topk_ver", 0) + 1
+    )
+    topk_cache = getattr(forward_context, "_dsv41_topk_cache", None)
+    if topk_cache:
+        topk_cache.clear()
     # Decode rows are written whole by the default backend's top-k.
     first_unwritten = metadata.num_decode_tokens if topk_backend == "auto" else 0
     topk_indices_buffer[first_unwritten : hidden_states.shape[0]] = -1
@@ -577,6 +721,7 @@ def dsv41_ampere_sparse_attn_indexer(
             q_scales,
             weights,
             topk_tokens,
+            head_dim,
             topk_indices_buffer,
             *selection,
         )
@@ -719,10 +864,17 @@ class AmpereIndexer(DeepseekV4Indexer):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        *,
+        precomputed_index_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """MXFP4 indexer queries: values `[T, H, 64]`, scales as one int32
         per (token, head), and the FP32 head weights."""
-        q = self._wq_b_proj(qr, qr_scale).view(-1, self.n_head, self.head_dim)
+        q_raw = (
+            precomputed_index_q
+            if precomputed_index_q is not None
+            else self._wq_b_proj(qr, qr_scale)
+        )
+        q = q_raw.view(-1, self.n_head, self.head_dim)
         values, scales, weights = indexer_q_rope_quant(
             positions,
             q,

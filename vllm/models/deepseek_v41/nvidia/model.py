@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from functools import partial
@@ -142,6 +143,51 @@ if typing.TYPE_CHECKING:
     from .specialized_decode.runtime.decode import DecodeStep, SpecializedDecode
 
 logger = init_logger(__name__)
+
+_PREFILL_AR_STATE: dict[
+    int,
+    tuple[
+        torch.cuda.Stream,
+        list[torch.cuda.Event],
+        torch.Tensor,
+    ],
+] = {}
+
+
+def _get_prefill_ar_state(
+    dev: torch.device,
+    min_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+) -> tuple[
+    torch.cuda.Stream,
+    list[torch.cuda.Event],
+    torch.Tensor,
+]:
+    idx = dev.index or 0
+    st = _PREFILL_AR_STATE.get(idx)
+    alloc_m = max(min_tokens, 2048)
+    if st is None:
+        with torch.cuda.device(idx):
+            comm_stream = torch.cuda.Stream(device=dev)
+            evs = [torch.cuda.Event() for _ in range(6)]
+            comm_buf = torch.empty((alloc_m, hidden_size), dtype=dtype, device=dev)
+            st = (comm_stream, evs, comm_buf)
+        _PREFILL_AR_STATE[idx] = st
+    else:
+        comm_stream, evs, comm_buf = st
+        if (
+            comm_buf.shape[0] < min_tokens
+            or comm_buf.shape[1] != hidden_size
+            or comm_buf.dtype != dtype
+        ):
+            with torch.cuda.device(idx):
+                comm_stream.synchronize()
+                alloc_m = max(min_tokens, comm_buf.shape[0])
+                comm_buf = torch.empty((alloc_m, hidden_size), dtype=dtype, device=dev)
+                st = (comm_stream, evs, comm_buf)
+            _PREFILL_AR_STATE[idx] = st
+    return st
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -1142,9 +1188,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
 
         spec_config = vllm_config.speculative_config
+        self._mtp_eager_hidden: torch.Tensor | None = None
         if get_pp_group().is_last_rank and needs_mtp_hidden_buffer(spec_config):
+            max_decode_tokens = max(
+                vllm_config.scheduler_config.max_num_seqs
+                * (1 + (spec_config.num_speculative_tokens if spec_config else 0)),
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+                1,
+            )
             self._mtp_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
+                min(vllm_config.scheduler_config.max_num_batched_tokens, max_decode_tokens),
                 self.hc_dim,
                 dtype=vllm_config.model_config.dtype,
             )
@@ -1390,7 +1443,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
             num_tokens = hidden_states.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            if num_tokens <= self._mtp_hidden_buffer.shape[0]:
+                self._mtp_eager_hidden = None
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            else:
+                self._mtp_eager_hidden = hidden_states.flatten(1)
 
         # Collapse the hc copies with the pre-mix from the last layer's FFN
         # mixes — the mix the reference applies via
@@ -1439,6 +1496,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # hidden states are read back from there instead of recomputed.
         full_num_tokens = positions.shape[0]
         mega_gate_metadata = self._mega_gate_metadata(input_ids)
+        if (
+            full_num_tokens >= 1024
+            and len(layer_ids) > 0
+            and isinstance(hidden_states, torch.Tensor)
+            and not self.use_sequence_parallel
+            and not self.use_native_mega_moe
+            and not torch.cuda.is_current_stream_capturing()
+            and os.environ.get("VLLM_DSV41_PREFILL_AR_OVERLAP", "0") == "1"
+            and get_tensor_model_parallel_world_size() > 1
+        ):
+            dev_comm = getattr(get_tp_group(), "device_communicator", None)
+            cand = getattr(dev_comm, "pynccl_comm", None)
+            if cand is not None and not getattr(cand, "disabled", True):
+                m0 = ((full_num_tokens // 2) // 64) * 64
+                if m0 >= 256 and (full_num_tokens - m0) >= 256:
+                    return self._run_layers_prefill_ar_overlap(
+                        layer_ids=layer_ids,
+                        hidden_states=hidden_states,
+                        positions=positions,
+                        input_ids=input_ids,
+                        pre_mix=pre_mix,
+                        post_mix=post_mix,
+                        res_mix=res_mix,
+                        residual=residual,
+                        aux_hidden_by_layer=aux_hidden_by_layer,
+                        engram_hashes=engram_hashes,
+                        engram_mask=engram_mask,
+                        mega_gate_metadata=mega_gate_metadata,
+                        m0=m0,
+                        pynccl=cand,
+                    )
         for idx in layer_ids:
             hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
                 self.layers[idx](
@@ -1460,6 +1548,452 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 if self.use_sequence_parallel:
                     previous_aux = sp_all_gather(previous_aux)[:full_num_tokens]
                 aux_hidden_by_layer[idx] = previous_aux
+        assert residual is not None and post_mix is not None
+        assert res_mix is not None and pre_mix is not None
+        return hidden_states, residual, post_mix, res_mix, pre_mix
+
+    def _run_layers_prefill_ar_overlap(
+        self,
+        *,
+        layer_ids: range,
+        hidden_states: torch.Tensor | MoEOutput,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+        m0: int,
+        pynccl: typing.Any,
+    ) -> tuple[
+        torch.Tensor | MoEOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        assert isinstance(hidden_states, torch.Tensor)
+        full_num_tokens = positions.shape[0]
+        dev = hidden_states.device
+        def_stream = torch.cuda.current_stream(dev)
+        comm_stream, evs, comm_buf = _get_prefill_ar_state(
+            dev,
+            full_num_tokens,
+            self.config.hidden_size,
+            hidden_states.dtype,
+        )
+        ev_sync0, ev_sync1, ev_ar0, ev_ar1, ef0, ef1 = evs
+        pending_ffn_ar: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+
+        try:
+            for idx in layer_ids:
+                layer = self.layers[idx]
+                assert isinstance(layer, DeepseekV4DecoderLayer)
+                capture_aux = idx in self.aux_hidden_state_layers
+                did_split_attn_prep = False
+                qr: typing.Any = None
+                qr_scale: torch.Tensor | None = None
+                kv: torch.Tensor | None = None
+                kv_score: torch.Tensor | None = None
+                indexer_weights: torch.Tensor | None = None
+
+                if pending_ffn_ar is not None and (
+                    layer.engram is None or engram_hashes is None
+                ):
+                    w_ef0, w_ef1 = pending_ffn_ar
+                    pending_ffn_ar = None
+                    assert (
+                        isinstance(hidden_states, torch.Tensor)
+                        and residual is not None
+                        and post_mix is not None
+                        and res_mix is not None
+                        and pre_mix is not None
+                    )
+                    def_stream.wait_event(w_ef0)
+                    res0, pm0, rm0, x_in0, apre0, aux0 = mhc_shifted_post_pre(
+                        hidden_states[:m0],
+                        residual[:m0],
+                        post_mix[:m0],
+                        res_mix[:m0],
+                        layer.hc_attn_fn,
+                        layer.hc_attn_scale,
+                        layer.hc_attn_base,
+                        layer.rms_norm_eps,
+                        layer.hc_eps,
+                        layer.hc_eps,
+                        layer.hc_post_alpha,
+                        layer.hc_sinkhorn_iters,
+                        pre_mix=pre_mix[:m0],
+                        norm_weight=layer.attn_norm.weight,
+                        norm_eps=layer.attn_norm.variance_epsilon,
+                        capture_aux=capture_aux,
+                        stream=None,
+                        reduce_results=False,
+                        boundary_weight=layer.hc_attn_boundary_weight,
+                    )
+                    qr_kv0, kvs0, idxw0 = layer.attn._run_parallel_input_projections(
+                        x_in0
+                    )
+
+                    def_stream.wait_event(w_ef1)
+                    res1, pm1, rm1, x_in1, apre1, aux1 = mhc_shifted_post_pre(
+                        hidden_states[m0:],
+                        residual[m0:],
+                        post_mix[m0:],
+                        res_mix[m0:],
+                        layer.hc_attn_fn,
+                        layer.hc_attn_scale,
+                        layer.hc_attn_base,
+                        layer.rms_norm_eps,
+                        layer.hc_eps,
+                        layer.hc_eps,
+                        layer.hc_post_alpha,
+                        layer.hc_sinkhorn_iters,
+                        pre_mix=pre_mix[m0:],
+                        norm_weight=layer.attn_norm.weight,
+                        norm_eps=layer.attn_norm.variance_epsilon,
+                        capture_aux=capture_aux,
+                        stream=None,
+                        reduce_results=False,
+                        boundary_weight=layer.hc_attn_boundary_weight,
+                    )
+                    del residual, hidden_states, post_mix, res_mix, pre_mix
+                    residual = torch.cat([res0, res1], dim=0)
+                    del res0, res1
+                    post_mix = torch.cat([pm0, pm1], dim=0)
+                    del pm0, pm1
+                    res_mix = torch.cat([rm0, rm1], dim=0)
+                    del rm0, rm1
+                    attn_pre = torch.cat([apre0, apre1], dim=0)
+                    del apre0, apre1
+                    if capture_aux and aux0 is not None and aux1 is not None:
+                        aux_hidden_by_layer[idx] = torch.cat([aux0, aux1], dim=0)
+                    del aux0, aux1
+                    x_in = torch.cat([x_in0, x_in1], dim=0)
+                    del x_in0
+
+                    qr_kv1, kvs1, idxw1 = layer.attn._run_parallel_input_projections(
+                        x_in1
+                    )
+                    del x_in1
+                    qr_kv = torch.cat([qr_kv0, qr_kv1], dim=0)
+                    del qr_kv0, qr_kv1
+                    qr, qr_scale, kv = layer.attn._split_qkv_and_norm(qr_kv)
+                    del qr_kv
+                    kv_score = (
+                        torch.cat([kvs0, kvs1], dim=0)
+                        if kvs0 is not None and kvs1 is not None
+                        else None
+                    )
+                    del kvs0, kvs1
+                    indexer_weights = (
+                        torch.cat([idxw0, idxw1], dim=0)
+                        if idxw0 is not None and idxw1 is not None
+                        else None
+                    )
+                    del idxw0, idxw1
+                    did_split_attn_prep = True
+                else:
+                    if pending_ffn_ar is not None:
+                        def_stream.wait_event(pending_ffn_ar[0])
+                        def_stream.wait_event(pending_ffn_ar[1])
+                        pending_ffn_ar = None
+                        was_pre_reduced = True
+                    else:
+                        was_pre_reduced = False
+                    mhc_pre_fn = (
+                        partial(mhc_pre_delayed_ampere, stream=None)
+                        if layer.ampere_mhc
+                        else mhc_pre_delayed_tilelang
+                    )
+                    if residual is None:
+                        assert isinstance(hidden_states, torch.Tensor)
+                        if hidden_states.dim() == 2:
+                            assert layer.hc_attn_fn_broadcast is not None
+                            residual = hc_expand(hidden_states, layer.hc_mult)
+                            post_mix, res_mix, x_in, attn_pre = mhc_pre_fn(
+                                residual,
+                                layer.hc_attn_fn_broadcast,
+                                layer.hc_attn_scale,
+                                layer.hc_attn_base,
+                                layer.rms_norm_eps,
+                                layer.hc_eps,
+                                layer.hc_eps,
+                                layer.hc_post_alpha,
+                                layer.hc_sinkhorn_iters,
+                                x=hidden_states,
+                                norm_weight=layer.attn_norm.weight,
+                                norm_eps=layer.attn_norm.variance_epsilon,
+                            )
+                        else:
+                            residual = hidden_states
+                            if layer.engram is not None and engram_hashes is not None:
+                                residual = layer.engram(
+                                    residual,
+                                    engram_hashes[:, layer.engram.layer_hash_index],
+                                    engram_mask,
+                                )
+                            post_mix, res_mix, x_in, attn_pre = mhc_pre_fn(
+                                residual,
+                                layer.hc_attn_fn,
+                                layer.hc_attn_scale,
+                                layer.hc_attn_base,
+                                layer.rms_norm_eps,
+                                layer.hc_eps,
+                                layer.hc_eps,
+                                layer.hc_post_alpha,
+                                layer.hc_sinkhorn_iters,
+                                pre_mix=pre_mix,
+                                norm_weight=layer.attn_norm.weight,
+                                norm_eps=layer.attn_norm.variance_epsilon,
+                            )
+                        del hidden_states
+                        pre_mix = None
+                    elif layer.engram is not None and engram_hashes is not None:
+                        assert isinstance(hidden_states, torch.Tensor)
+                        if layer.fuse_mhc_all_reduce and not was_pre_reduced:
+                            hidden_states = boundary_all_reduce(hidden_states)
+                        previous_post = mhc_post_tilelang(
+                            hidden_states, residual, post_mix, res_mix
+                        )
+                        if capture_aux:
+                            aux_hidden_by_layer[idx] = previous_post.mean(dim=1)
+                        residual = layer.engram(
+                            previous_post,
+                            engram_hashes[:, layer.engram.layer_hash_index],
+                            engram_mask,
+                        )
+                        del previous_post, hidden_states, post_mix, res_mix
+                        post_mix, res_mix, x_in, attn_pre = mhc_pre_fn(
+                            residual,
+                            layer.hc_attn_fn,
+                            layer.hc_attn_scale,
+                            layer.hc_attn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            pre_mix=pre_mix,
+                            norm_weight=layer.attn_norm.weight,
+                            norm_eps=layer.attn_norm.variance_epsilon,
+                        )
+                        pre_mix = None
+                    else:
+                        residual, post_mix, res_mix, x_in, attn_pre, aux = (
+                            mhc_shifted_post_pre(
+                                hidden_states,
+                                residual,
+                                post_mix,
+                                res_mix,
+                                layer.hc_attn_fn,
+                                layer.hc_attn_scale,
+                                layer.hc_attn_base,
+                                layer.rms_norm_eps,
+                                layer.hc_eps,
+                                layer.hc_eps,
+                                layer.hc_post_alpha,
+                                layer.hc_sinkhorn_iters,
+                                pre_mix=pre_mix,
+                                norm_weight=layer.attn_norm.weight,
+                                norm_eps=layer.attn_norm.variance_epsilon,
+                                capture_aux=capture_aux,
+                                stream=None,
+                                reduce_results=layer.fuse_mhc_all_reduce
+                                and not was_pre_reduced,
+                                boundary_weight=layer.hc_attn_boundary_weight,
+                            )
+                        )
+                        if capture_aux and aux is not None:
+                            aux_hidden_by_layer[idx] = aux
+                        del hidden_states
+                        pre_mix = None
+
+                if not did_split_attn_prep:
+                    qr_kv, kv_score, indexer_weights = (
+                        layer.attn._run_parallel_input_projections(x_in)
+                    )
+                    qr, qr_scale, kv = layer.attn._split_qkv_and_norm(qr_kv)
+                    del qr_kv
+
+                attn_out = layer.attn._alloc_attn_out(full_num_tokens, x_in)
+                assert kv is not None
+                layer.attn._prepare_and_attn(
+                    x_in,
+                    qr,
+                    kv,
+                    qr_scale,
+                    kv_score,
+                    indexer_weights,
+                    positions,
+                    attn_out,
+                )
+                del x_in, qr, qr_scale, kv, kv_score, indexer_weights
+
+                if isinstance(attn_out, torch.Tensor) and layer.attn.gemm_rs is None:
+                    y_comm = comm_buf[:full_num_tokens]
+                    orig_wob_reduce = layer.attn.wo_b.reduce_results
+                    try:
+                        layer.attn.wo_b.reduce_results = False
+                        y0_tmp = layer.attn._o_proj(attn_out[:m0], positions[:m0])
+                        y_comm[:m0].copy_(y0_tmp)
+                        del y0_tmp
+                        ev_sync0.record(def_stream)
+                        comm_stream.wait_event(ev_sync0)
+                        pynccl.all_reduce(
+                            y_comm[:m0], y_comm[:m0], stream=comm_stream
+                        )
+                        ev_ar0.record(comm_stream)
+
+                        y1_tmp = layer.attn._o_proj(attn_out[m0:], positions[m0:])
+                        del attn_out
+                        y_comm[m0:].copy_(y1_tmp)
+                        del y1_tmp
+                        ev_sync1.record(def_stream)
+                        comm_stream.wait_event(ev_sync1)
+                        pynccl.all_reduce(
+                            y_comm[m0:], y_comm[m0:], stream=comm_stream
+                        )
+                        ev_ar1.record(comm_stream)
+                    finally:
+                        layer.attn.wo_b.reduce_results = orig_wob_reduce
+
+                    def_stream.wait_event(ev_ar0)
+                    fres0, fpm0, frm0, x_ffn0, fpre0, _ = mhc_shifted_post_pre(
+                        y_comm[:m0],
+                        residual[:m0],
+                        post_mix[:m0],
+                        res_mix[:m0],
+                        layer.hc_ffn_fn,
+                        layer.hc_ffn_scale,
+                        layer.hc_ffn_base,
+                        layer.rms_norm_eps,
+                        layer.hc_eps,
+                        layer.hc_eps,
+                        layer.hc_post_alpha,
+                        layer.hc_sinkhorn_iters,
+                        pre_mix=attn_pre[:m0],
+                        norm_weight=layer.ffn_norm.weight,
+                        norm_eps=layer.ffn_norm.variance_epsilon,
+                        stream=None,
+                        reduce_results=False,
+                        boundary_weight=layer.hc_ffn_boundary_weight,
+                    )
+
+                    def_stream.wait_event(ev_ar1)
+                    fres1, fpm1, frm1, x_ffn1, fpre1, _ = mhc_shifted_post_pre(
+                        y_comm[m0:],
+                        residual[m0:],
+                        post_mix[m0:],
+                        res_mix[m0:],
+                        layer.hc_ffn_fn,
+                        layer.hc_ffn_scale,
+                        layer.hc_ffn_base,
+                        layer.rms_norm_eps,
+                        layer.hc_eps,
+                        layer.hc_eps,
+                        layer.hc_post_alpha,
+                        layer.hc_sinkhorn_iters,
+                        pre_mix=attn_pre[m0:],
+                        norm_weight=layer.ffn_norm.weight,
+                        norm_eps=layer.ffn_norm.variance_epsilon,
+                        stream=None,
+                        reduce_results=False,
+                        boundary_weight=layer.hc_ffn_boundary_weight,
+                    )
+                    del residual, post_mix, res_mix, attn_pre, y_comm
+                    residual = torch.cat([fres0, fres1], dim=0)
+                    del fres0, fres1
+                    post_mix = torch.cat([fpm0, fpm1], dim=0)
+                    del fpm0, fpm1
+                    res_mix = torch.cat([frm0, frm1], dim=0)
+                    del frm0, frm1
+                    pre_mix = torch.cat([fpre0, fpre1], dim=0)
+                    del fpre0, fpre1
+                    x_ffn_in = torch.cat([x_ffn0, x_ffn1], dim=0)
+                    del x_ffn0, x_ffn1
+                else:
+                    y_full = layer.attn._o_proj(attn_out, positions)
+                    del attn_out
+                    residual, post_mix, res_mix, x_ffn_in, pre_mix, _ = (
+                        mhc_shifted_post_pre(
+                            y_full,
+                            residual,
+                            post_mix,
+                            res_mix,
+                            layer.hc_ffn_fn,
+                            layer.hc_ffn_scale,
+                            layer.hc_ffn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            pre_mix=attn_pre,
+                            norm_weight=layer.ffn_norm.weight,
+                            norm_eps=layer.ffn_norm.variance_epsilon,
+                            stream=None,
+                            reduce_results=layer.fuse_mhc_all_reduce,
+                            boundary_weight=layer.hc_ffn_boundary_weight,
+                        )
+                    )
+                    del y_full, attn_pre
+
+                moe_cfg = getattr(layer.ffn.experts, "moe_config", None)
+                next_layer = (
+                    self.layers[idx + 1] if (idx + 1) < layer_ids.stop else None
+                )
+                can_defer_ffn_ar = (
+                    moe_cfg is not None
+                    and next_layer is not None
+                    and (
+                        getattr(next_layer, "engram", None) is None
+                        or engram_hashes is None
+                    )
+                )
+                if can_defer_ffn_ar:
+                    orig_skip = moe_cfg.skip_final_all_reduce
+                    try:
+                        moe_cfg.skip_final_all_reduce = True
+                        h_raw = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
+                    finally:
+                        moe_cfg.skip_final_all_reduce = orig_skip
+                    del x_ffn_in
+                    h_comm = comm_buf[:full_num_tokens]
+                    h_comm.copy_(h_raw)
+                    del h_raw
+                    ev_sync0.record(def_stream)
+                    comm_stream.wait_event(ev_sync0)
+                    pynccl.all_reduce(
+                        h_comm[:m0], h_comm[:m0], stream=comm_stream
+                    )
+                    ef0.record(comm_stream)
+                    pynccl.all_reduce(
+                        h_comm[m0:], h_comm[m0:], stream=comm_stream
+                    )
+                    ef1.record(comm_stream)
+                    hidden_states = h_comm
+                    del h_comm
+                    pending_ffn_ar = (ef0, ef1)
+                else:
+                    if layer.fuse_mhc_all_reduce and layer.ffn.defers_finalize(
+                        x_ffn_in.shape[0]
+                    ):
+                        hidden_states = layer.ffn.forward_unfinalized(
+                            x_ffn_in, input_ids
+                        )
+                    else:
+                        hidden_states = layer.ffn(
+                            x_ffn_in, input_ids, mega_gate_metadata
+                        )
+                    del x_ffn_in
+        finally:
+            def_stream.wait_event(ev_ar0)
+            def_stream.wait_event(ev_ar1)
+            if pending_ffn_ar is not None:
+                def_stream.wait_event(pending_ffn_ar[0])
+                def_stream.wait_event(pending_ffn_ar[1])
+
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
@@ -1628,7 +2162,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and not self.use_sequence_parallel
         )
 
+        import time
+
+        last_log = time.monotonic()
+        loaded_count = 0
         for name, loaded_weight in weights:
+            loaded_count += 1
+            now = time.monotonic()
+            if now - last_log >= 15.0:
+                logger.info(
+                    "Loading weights: %d tensors processed so far (current: %s)",
+                    loaded_count,
+                    name,
+                )
+                last_log = now
             if name.startswith(("vision.", "aligner.", "image_")):
                 # Vision weights are loaded by the outer multimodal wrapper.
                 logger.warning_once("Skipping non-text weight: %s", name)
@@ -2022,9 +2569,11 @@ class DeepseekV41LLMForCausalLM(
         return hidden_states
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
-        """Pre-collapse residual stream buffer (max_num_batched_tokens,
-        hc_mult * hidden_size) for the MTP draft model. Populated by
-        forward(); valid after each target step."""
+        """Pre-collapse residual stream buffer (max_decode_tokens,
+        hc_mult * hidden_size) or zero-copy eager view for the MTP draft model."""
+        eager = getattr(self.model, "_mtp_eager_hidden", None)
+        if eager is not None:
+            return eager
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -2032,6 +2581,9 @@ class DeepseekV41LLMForCausalLM(
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
+        import gc
+        import os
+
         self.model.finalize_mhc_broadcast_weights()
         config = self.model.vllm_config
         if config.engram_config and config.engram_config.use_thp:
@@ -2047,6 +2599,33 @@ class DeepseekV41LLMForCausalLM(
             ):
                 if layer.engram is not None:
                     layer.engram.embed_tokens.collapse_huge_pages()
+
+        if (
+            os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1"
+            and isinstance(self.model.embed_tokens, VocabParallelEmbedding)
+            and self.model.embed_tokens.weight.is_cuda
+        ):
+            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+            from ..common.engram import _exact_pinned_tensor
+
+            w = self.model.embed_tokens.weight.data
+            dev_idx = w.device.index
+            pinned = _exact_pinned_tensor(tuple(w.shape), w.dtype, dev_idx)
+            if pinned is None:
+                pinned = torch.empty(w.shape, dtype=w.dtype, pin_memory=True)
+            pinned.copy_(w, non_blocking=False)
+            uva_view = get_accelerator_view_from_cpu_tensor(pinned)
+            self.model._pinned_embed_host = pinned
+            self.model.embed_tokens.weight = nn.Parameter(uva_view, requires_grad=False)
+            del w
+
+        if (
+            os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") == "1"
+            or os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1"
+        ):
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

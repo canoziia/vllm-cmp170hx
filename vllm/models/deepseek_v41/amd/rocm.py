@@ -502,8 +502,15 @@ class DeepseekV41RocmMxfp4Indexer(DeepseekV4Indexer):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: torch.nn.Module,
+        *,
+        precomputed_index_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        q = self._wq_b_proj(qr, qr_scale).view(-1, self.n_head, self.head_dim)
+        q_raw = (
+            precomputed_index_q
+            if precomputed_index_q is not None
+            else self._wq_b_proj(qr, qr_scale)
+        )
+        q = q_raw.view(-1, self.n_head, self.head_dim)
         (q, q_scale), weights = rocm_mxfp4_indexer_q_quant(
             positions,
             q,

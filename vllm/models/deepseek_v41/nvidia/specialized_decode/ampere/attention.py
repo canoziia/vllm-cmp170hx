@@ -20,6 +20,7 @@ paged-logits schedule: the SWA and indexer builders here plan neither.
 Prefill context parallelism is not supported.
 """
 
+import os
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -149,25 +150,53 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         """The index K cache with the SM80 indexer metadata."""
         return AmpereIndexerCache
 
+    def process_weights_after_loading(
+        self, act_dtype: torch.dtype | None = None
+    ) -> None:
+        super().process_weights_after_loading(act_dtype)
+        weight = self.wo_a.weight
+        if isinstance(weight, torch.Tensor) and weight.element_size() == 1 and weight.is_cuda:
+            from vllm.v1.attention.ops.dsv41_thin_woa import (
+                _scale_bf16_ok,
+                warmup_thin_woa_mxfp8,
+            )
+
+            _scale_bf16_ok(self.wo_a.weight_scale)
+            warmup_thin_woa_mxfp8(weight.device, self.n_local_groups)
+
     def _o_proj(
         self,
         attn_out: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """`wo_a` per head group as a BF16 batched GEMM, then `wo_b`.
+        """`wo_a` per head group (1x MXFP8 thin GEMM or BF16 batched GEMM), then `wo_b`.
 
-        `forward_mqa` already applied the inverse RoPE. `wo_a` is the
-        MXFP8 emulation kernel's BF16 weight `[groups * o_lora_rank, K]`.
+        `forward_mqa` already applied the inverse RoPE. `wo_a` is either the
+        1-byte MXFP8 weight `[groups * o_lora_rank, K]` (register-dequantized
+        in `thin_woa_mxfp8`) or the BF16 weight dequantized at load.
         """
+        import os
+
         assert isinstance(attn_out, torch.Tensor)
         weight = self.wo_a.weight
         assert isinstance(weight, torch.Tensor)
-        assert weight.dtype == torch.bfloat16, (
-            "the SM80 wo_a needs the BF16 weight the MXFP8 emulation kernel "
-            "dequantizes at load (VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD=1)"
-        )
         num_tokens = attn_out.shape[0]
         groups = self.n_local_groups
+        if weight.element_size() == 1:
+            from vllm.v1.attention.ops.dsv41_thin_woa import thin_woa_mxfp8
+
+            o = attn_out.view(num_tokens, groups, -1)
+            z = thin_woa_mxfp8(o, weight, self.wo_a.weight_scale)
+            return self._wo_b_proj(z.reshape(num_tokens, -1))
+        assert weight.dtype == torch.bfloat16, (
+            "the SM80 wo_a needs either 1-byte MXFP8 weight or BF16 weight"
+        )
+        if os.environ.get("VLLM_DSV41_THIN_WOA", "0") == "1":
+            from vllm.v1.attention.ops.dsv41_thin_woa import thin_woa
+
+            o = attn_out.view(num_tokens, groups, -1)
+            z = thin_woa(o, weight.view(groups, self.o_lora_rank, -1))
+            return self._wo_b_proj(z.reshape(num_tokens, -1))
         o = attn_out.view(num_tokens, groups, -1).transpose(0, 1)
         z = torch.bmm(o, weight.view(groups, self.o_lora_rank, -1).transpose(1, 2))
         return self._wo_b_proj(z.transpose(0, 1).reshape(num_tokens, -1))
@@ -180,7 +209,8 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         output: torch.Tensor,
     ) -> None:
         """Sparse MLA of every token over its window and selected keys."""
-        attn_metadata = get_forward_context().attn_metadata
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
         if not isinstance(attn_metadata, dict):
             # Profile run: no metadata and nothing to read.
             output.zero_()
@@ -228,15 +258,46 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
                 assert self.topk_indices_buffer is not None
                 assert swa_metadata.token_to_req_indices is not None
                 assert swa_metadata.is_valid_token is not None
-                compressed_indices, compressed_lens = (
-                    compute_global_topk_indices_and_lens(
-                        self.topk_indices_buffer[rows],
-                        swa_metadata.token_to_req_indices[rows],
-                        compressed_metadata.block_table,
-                        compressed_metadata.block_size // self.compress_ratio,
-                        swa_metadata.is_valid_token[rows],
-                    )
+                reuse_topk = (
+                    os.environ.get("VLLM_DSV41_TOPK_RAGGED_REUSE", "1") == "1"
                 )
+                blk_size = compressed_metadata.block_size // self.compress_ratio
+                topk_cache: dict | None = None
+                cache_key = None
+                if reuse_topk:
+                    topk_cache = getattr(forward_context, "_dsv41_topk_cache", None)
+                    if topk_cache is None:
+                        topk_cache = {}
+                        forward_context._dsv41_topk_cache = topk_cache
+                    cache_key = (
+                        getattr(forward_context, "_dsv41_topk_ver", 0),
+                        self.topk_indices_buffer.data_ptr(),
+                        start,
+                        count,
+                        swa_metadata.token_to_req_indices.data_ptr(),
+                        compressed_metadata.block_table.data_ptr(),
+                        blk_size,
+                        swa_metadata.is_valid_token.data_ptr(),
+                    )
+                cached_pair = (
+                    topk_cache.get(cache_key)
+                    if topk_cache is not None and cache_key is not None
+                    else None
+                )
+                if cached_pair is not None:
+                    compressed_indices, compressed_lens = cached_pair
+                else:
+                    compressed_indices, compressed_lens = (
+                        compute_global_topk_indices_and_lens(
+                            self.topk_indices_buffer[rows],
+                            swa_metadata.token_to_req_indices[rows],
+                            compressed_metadata.block_table,
+                            blk_size,
+                            swa_metadata.is_valid_token[rows],
+                        )
+                    )
+                    if topk_cache is not None and cache_key is not None:
+                        topk_cache[cache_key] = (compressed_indices, compressed_lens)
                 compressed_cache = self._compressed_kv_cache()
             sparse_mla(
                 q[rows],

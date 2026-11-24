@@ -21,9 +21,11 @@ K cache is always MXFP4 (`indexer_uses_fp4`).
 import torch
 
 import vllm.envs as envs
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.indexer import (
     DeepSeekV32IndexerDecodeMetadata,
@@ -55,6 +57,14 @@ _ROW_SHARD_MIN_WORK = 1 << 22
 class AmpereIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
     """The stock indexer metadata on the MXFP4 cache, with one decode row per
     token and no DeepGEMM schedule."""
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        return AttentionCGSupport.ALWAYS
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -211,9 +221,11 @@ class AmpereIndexerMetadataBuilder(DeepseekV32IndexerMetadataBuilder):
         decode_lens_cpu = torch.diff(m.query_start_loc_cpu[: num_decodes + 1])
         max_decode_len = int(decode_lens_cpu.max().item())
         uniform = max_decode_len == int(decode_lens_cpu.min().item())
-        if self.use_adaptive_verification:
-            # Graphs are captured for up to next_n tokens per request.
-            max_decode_len, uniform = 1 + self.num_speculative_tokens, False
+        if self.use_adaptive_verification or m.max_query_len > max_decode_len:
+            # Varlen graphs are captured for up to m.max_query_len (next_n)
+            # tokens per request while dummy decode_lens_cpu may be narrower.
+            max_decode_len = max(m.max_query_len, 1 + self.num_speculative_tokens)
+            uniform = False
         return DeepSeekV32IndexerDecodeMetadata(
             block_table=self.expanded_block_table_buffer[:num_decode_tokens],
             seq_lens=seq_lens.unsqueeze(-1),

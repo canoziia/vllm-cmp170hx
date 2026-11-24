@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
@@ -96,9 +98,15 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         vllm_config.attention_config.backend,
     )
 
-    draft_vllm_config = speculative_config.apply_draft_overrides(
+    draft_speculative_config = speculative_config
+    if speculative_config.uses_history_verification():
+        draft_speculative_config = copy.copy(speculative_config)
+        draft_speculative_config.enable_adaptive_verification = False
+
+    draft_vllm_config = draft_speculative_config.apply_draft_overrides(
         replace(
             vllm_config,
+            speculative_config=draft_speculative_config,
             parallel_config=_get_dspark_parallel_config(
                 vllm_config.parallel_config,
                 speculative_config.draft_parallel_config.tensor_parallel_size,

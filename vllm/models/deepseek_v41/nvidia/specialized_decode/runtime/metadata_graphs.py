@@ -18,6 +18,7 @@ FlashMLA and indexer builders they keep (`DeepseekV41MetadataGraphModelState`).
 
 from collections.abc import Callable, Sequence
 from functools import cache
+import os
 from typing import Any
 
 import torch
@@ -160,10 +161,53 @@ class AttnMetadataCudaGraphs:
                 for n in range(num_reqs, padded + 1)
             ]
             num_reqs = padded + 1
+        if os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1":
+            raw_spec = os.environ.get(
+                "VLLM_DSV41_SUBWIDTH_GRAPHS", "1:1-5;2:2-5;4,8,16,32:2-6"
+            ).strip()
+            max_seqs = self._vllm_config.scheduler_config.max_num_seqs
+            max_tokens = decode_cudagraph_capture_max_tokens(config)
+            by_width: dict[int, set[int]] = {}
+            if raw_spec and raw_spec.lower() not in ("0", "off", "none"):
+                for clause in raw_spec.split(";"):
+                    clause = clause.strip()
+                    if not clause:
+                        continue
+                    r_part, w_part = clause.split(":", 1)
+                    r_list = [int(x) for x in r_part.split(",") if x.strip()]
+                    w_list: list[int] = []
+                    for tok in w_part.split(","):
+                        tok = tok.strip()
+                        if "-" in tok:
+                            lo_s, hi_s = tok.split("-", 1)
+                            w_list.extend(range(int(lo_s), int(hi_s) + 1))
+                        elif tok:
+                            w_list.append(int(tok))
+                    for r in r_list:
+                        if r <= max_seqs:
+                            for w in w_list:
+                                if 1 <= w < query_len and r * w <= max_tokens:
+                                    by_width.setdefault(w, set()).add(r)
+            seen = set(keys)
+            expand_ranges = (
+                os.environ.get("VLLM_DSV41_METADATA_SUBWIDTH_RANGES", "0") == "1"
+            )
+            for w, r_set in sorted(by_width.items()):
+                n_lo = 1
+                for padded in sorted(r_set):
+                    n_iter = range(n_lo, padded + 1) if expand_ranges else (padded,)
+                    for n in n_iter:
+                        gk = (n, padded, n * w, padded * w)
+                        if gk not in seen:
+                            seen.add(gk)
+                            keys.append(gk)
+                    n_lo = padded + 1
         return keys[::-1]
 
     def can_record(self, attn_groups: list[list[AttentionGroup]]) -> bool:
         """Whether every metadata builder of `attn_groups` is recordable."""
+        if os.environ.get("VLLM_DSV41_METADATA_GRAPHS", "1") == "0":
+            return False
         if self._recordable is None:
             self._recordable = all(
                 type(group.get_metadata_builder()) in _recordable_builders()
@@ -183,11 +227,16 @@ class AttnMetadataCudaGraphs:
         FULL forward graphs and memory profiling use; returns its metadata."""
         self._forked_build(attn_groups, block_tables, build_fn)
         graph = torch.cuda.CUDAGraph()
+        cap_stream = (
+            current_stream()
+            if os.environ.get("VLLM_DSV41_SHARE_CAPTURE_STREAM", "1") == "1"
+            else None
+        )
         with (
             capture_pool(
                 current_platform.get_global_graph_pool(), self._vllm_config
             ) as pool,
-            torch.cuda.graph(graph, pool),
+            torch.cuda.graph(graph, pool, stream=cap_stream),
         ):
             attn_metadata = self._forked_build(attn_groups, block_tables, build_fn)
         self._graphs[key] = (graph, attn_metadata)
@@ -241,7 +290,10 @@ class AttnMetadataCudaGraphs:
                 after = len(branches)
                 branches.append((writers, None))
             branches += [([reader], after) for reader in readers]
-        if len(branches) < 2:
+        if (
+            len(branches) < 2
+            or os.environ.get("VLLM_DSV41_METADATA_FORK_STREAMS", "1") == "0"
+        ):
             return build_fn(attn_groups)
         # Reused, so a warm-up creates per-stream state (e.g. DeepGEMM's) on the
         # streams its capture records.

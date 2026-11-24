@@ -352,7 +352,7 @@ def get_prefill_workspace_size(vllm_config: VllmConfig) -> int:
     # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
     factor = vllm_config.attention_config.sparse_mla_prefill_workspace_factor
     assert factor is not None
-    return vllm_config.model_config.max_model_len * factor
+    return min(vllm_config.model_config.max_model_len, 131072) * factor
 
 
 class FlashMLASparseMetadataBuilder(

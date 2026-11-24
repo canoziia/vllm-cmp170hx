@@ -517,6 +517,7 @@ def mqa_logits(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     max_len: int,
+    out_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Ragged logits `[rows, max_len]` (FP32): row `m` scores keys
     `[row_starts[m], row_ends[m])` of `k_values [N, 64]` /
@@ -524,9 +525,22 @@ def mqa_logits(
     rows, heads = _check_query(q_values, q_scales, weights)
     assert k_values.is_contiguous() and k_scales.is_contiguous()
     assert row_starts.dtype == torch.int32 and row_ends.dtype == torch.int32
-    out = torch.empty(
-        (rows, max(max_len, 1)), dtype=torch.float32, device=q_values.device
-    )
+    width = max(max_len, 1)
+    padded_width = (width + 3) // 4 * 4
+    if (
+        out_workspace is not None
+        and out_workspace.dtype == torch.float32
+        and out_workspace.device == q_values.device
+        and out_workspace.is_contiguous()
+        and out_workspace.numel() >= rows * padded_width
+    ):
+        out = out_workspace.view(-1)[: rows * padded_width].view(rows, padded_width)[
+            :, :width
+        ]
+    else:
+        out = torch.empty(
+            (rows, padded_width), dtype=torch.float32, device=q_values.device
+        )[:, :width]
     splits = (max_len + KEYS * TILES_PER_CTA - 1) // (KEYS * TILES_PER_CTA)
     if rows == 0 or splits == 0:
         return out
@@ -567,6 +581,7 @@ def paged_mqa_logits(
     max_len: int,
     splits: int | None = None,
     group: int = 1,
+    out_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paged logits `[rows, max_len]` (FP32, rows 16-byte aligned): row
     `m` scores the first `lens[m]` keys of request `m // next_n` in the
@@ -578,9 +593,21 @@ def paged_mqa_logits(
     assert lens.dtype == torch.int32 and lens.numel() == rows
     assert block_table.dtype == torch.int32 and block_table.stride(1) == 1
     assert k_cache.dtype == torch.uint8 and k_cache.shape[1] * 68 <= k_cache.stride(0)
-    out = torch.empty(
-        (rows, (max_len + 3) // 4 * 4), dtype=torch.float32, device=q_values.device
-    )[:, :max_len]
+    padded_width = (max_len + 3) // 4 * 4
+    if (
+        out_workspace is not None
+        and out_workspace.dtype == torch.float32
+        and out_workspace.device == q_values.device
+        and out_workspace.is_contiguous()
+        and out_workspace.numel() >= rows * padded_width
+    ):
+        out = out_workspace.view(-1)[: rows * padded_width].view(rows, padded_width)[
+            :, :max_len
+        ]
+    else:
+        out = torch.empty(
+            (rows, padded_width), dtype=torch.float32, device=q_values.device
+        )[:, :max_len]
     if rows == 0 or max_len == 0:
         return out
     assert rows % group == 0 and group * heads <= THREADS
@@ -626,6 +653,7 @@ def candidate_mqa_logits(
     candidates: torch.Tensor,
     candidate_block_size: int,
     splits: int | None = None,
+    out_workspace: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compact paged logits of the candidate keys only, and the rows' compact
     lengths (int32 `[rows]`). `candidates` (int32 `[rows, count]`) lists
@@ -662,10 +690,24 @@ def candidate_mqa_logits(
     assert candidates.dtype == torch.int32 and candidates.stride(1) == 1
     assert candidates.shape[0] >= rows and KEYS % candidate_block_size == 0
     width = candidates.shape[1] * candidate_block_size
-    out = torch.empty(
-        (rows, (width + 3) // 4 * 4), dtype=torch.float32, device=q_values.device
-    )[:, :width]
-    compact_lens = torch.empty(rows, dtype=torch.int32, device=q_values.device)
+    padded_width = (width + 3) // 4 * 4
+    if (
+        out_workspace is not None
+        and out_workspace.dtype == torch.float32
+        and out_workspace.device == q_values.device
+        and out_workspace.is_contiguous()
+        and out_workspace.numel() >= rows * padded_width + rows
+    ):
+        flat = out_workspace.view(-1)
+        out = flat[: rows * padded_width].view(rows, padded_width)[:, :width]
+        compact_lens = flat[rows * padded_width : rows * padded_width + rows].view(
+            torch.int32
+        )
+    else:
+        out = torch.empty(
+            (rows, padded_width), dtype=torch.float32, device=q_values.device
+        )[:, :width]
+        compact_lens = torch.empty(rows, dtype=torch.int32, device=q_values.device)
     if rows == 0:
         return out, compact_lens
     if splits is None:
