@@ -54,11 +54,14 @@ sees the same input it would have seen from the eager path.
 """
 
 from dataclasses import dataclass
+import os
 
 import torch
 
+from vllm.distributed import get_tp_group
 from vllm.distributed.communication_op import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
@@ -329,6 +332,36 @@ class FusedMarkovSampler:
             (max_num_reqs, 2 * operands.tp_size), dtype=torch.float32, device=device
         )
         self.prev = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
+        self._symm_exchange = None
+        if (
+            operands.tp_size in (2, 4, 8)
+            and os.environ.get("VLLM_DSV41_MARKOV_SYMM_MEM", "0") == "1"
+            and current_platform.is_cuda()
+            and (
+                current_platform.is_device_capability(80)
+                or current_platform.is_device_capability(90)
+            )
+        ):
+            from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere.all_reduce import (
+                ampere_peer_topology,
+            )
+
+            topo = ampere_peer_topology()
+            if topo is not None:
+                from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere.markov_symm import (
+                    MarkovSymmExchange,
+                )
+
+                self._symm_exchange = MarkovSymmExchange(
+                    get_tp_group().device_group,
+                    max_num_reqs,
+                    d2t is not None,
+                    device,
+                )
+                logger.info_once(
+                    "DSpark: Markov head using single-kernel Lamport symm_mem exchange (%s).",
+                    topo,
+                )
 
     def sample(
         self,
@@ -369,6 +402,20 @@ class FusedMarkovSampler:
                 BLOCK_R=self.block_r,
                 BLOCK_N=self.block_n,
             )
+            if self._symm_exchange is not None:
+                self._symm_exchange.step(
+                    part,
+                    self.d2t,
+                    prev,
+                    draft_tokens,
+                    self.nblk,
+                    op.vocab_start,
+                    step,
+                    self.draft_limit,
+                    op.w1.shape[0],
+                    num_reqs,
+                )
+                continue
             _markov_reduce_scatter[(num_reqs,)](
                 part,
                 pair,

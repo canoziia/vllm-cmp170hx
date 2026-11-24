@@ -1756,12 +1756,171 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _try_tp_local_greedy_sample(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: GrammarOutput | None,
+    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor] | None:
+        lm_model = (
+            self.model.language_model
+            if hasattr(self.model, "language_model")
+            else self.model
+        )
+        if (
+            self.batch_sharder is not None
+            or os.environ.get("VLLM_DSV41_TP_LOCAL_GREEDY", "0") != "1"
+            or input_batch.num_reqs == 0
+            or input_batch.logits_indices.shape[0] == 0
+            or grammar_output is not None
+            or self.masked_token_ids is not None
+            or self.sampler is None
+            or self.sampler.compute_nans
+            or self.sampler.return_sampling_mask
+            or self.sampler.trace_replay_state is not None
+            or not hasattr(lm_model, "compute_logits_local")
+        ):
+            return None
+        lm_head = getattr(lm_model, "lm_head", None)
+        lp = getattr(lm_model, "logits_processor", None)
+        if (
+            lm_head is None
+            or getattr(lm_head, "tp_size", 1) <= 1
+            or lp is None
+            or not getattr(lp, "use_all_gather", True)
+            or getattr(lp, "logits_as_input", False)
+            or getattr(lp, "soft_cap", None) is not None
+            or getattr(lp, "scale", 1.0) <= 0.0
+        ):
+            return None
+        idx_np = input_batch.idx_mapping_np
+        if (
+            bool(np.any(self.sampler.needs_logits_processing[idx_np]))
+            or not bool(np.all(self.sampler.sampling_states.temperature.np[idx_np] == 0.0))
+            or self.sampler.get_logprobs_dims(idx_np) is not None
+        ):
+            return None
+        is_spec = input_batch.num_draft_tokens > 0 and self.rejection_sampler is not None
+        if is_spec:
+            assert self.rejection_sampler is not None
+            if (
+                self.rejection_sampler.watermark_key is not None
+                or self.rejection_sampler.synthetic_conditional_rates is not None
+                or self.rejection_sampler.fly_window_size > 0
+            ):
+                return None
+
+        from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import _ops_r2
+
+        r2 = _ops_r2()
+        if r2 is None or not hasattr(r2, "tp_greedy_local_argmax"):
+            return None
+
+        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        local_logits = lm_model.compute_logits_local(sample_hidden_states)
+        if local_logits.dtype not in (torch.bfloat16, torch.float32):
+            return None
+
+        num_logits = local_logits.shape[0]
+        tp_size = int(lm_head.tp_size)
+        shard_idx = lm_head.shard_indices
+        vocab_offset = int(shard_idx.padded_org_vocab_start_index)
+        valid_cols = min(
+            int(shard_idx.num_org_elements),
+            max(0, int(lp.org_vocab_size) - vocab_offset),
+        )
+        local_stats = torch.empty(
+            (num_logits, 4), dtype=torch.int32, device=local_logits.device
+        )
+        r2.tp_greedy_local_argmax(local_logits, valid_cols, vocab_offset, local_stats)
+        del local_logits
+
+        from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere.columns import (
+            all_gather_columns,
+        )
+        from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
+
+        gathered_stats = all_gather_columns(local_stats)
+
+        if not is_spec:
+            sampled = torch.empty(
+                (num_logits, 1), dtype=torch.int64, device=self.device
+            )
+            r2.tp_greedy_nonspec(gathered_stats, tp_size, sampled)
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                input_batch.seq_lens.new_ones(input_batch.num_reqs),
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.sampler.req_states.prefill_len.gpu,
+            )
+        else:
+            assert self.rejection_sampler is not None
+            from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+                gather_draft_sampled,
+            )
+
+            draft_sampled, _ = gather_draft_sampled(
+                input_batch.input_ids,
+                input_batch.positions,
+                input_batch.logits_indices,
+                input_batch.expanded_idx_mapping,
+                input_batch.expanded_local_pos,
+                self.sampler.req_states.prefill_len.gpu,
+            )
+            sampled = torch.empty(
+                (
+                    input_batch.num_reqs,
+                    self.rejection_sampler.num_speculative_steps + 1,
+                ),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            num_sampled = torch.empty(
+                input_batch.num_reqs, dtype=torch.int32, device=self.device
+            )
+            r2.tp_greedy_spec_verify(
+                gathered_stats,
+                draft_sampled,
+                input_batch.cu_num_logits,
+                tp_size,
+                sampled,
+                num_sampled,
+            )
+            num_sampled, num_rejected = get_num_sampled_and_rejected(
+                num_sampled,
+                input_batch.seq_lens,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                self.sampler.req_states.prefill_len.gpu,
+            )
+
+        out = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            sampling_mask_tensors=None,
+        )
+        logger.info_once(
+            "DSV41: TP-local greedy verification active (tp=%d, valid_cols=%d)",
+            tp_size,
+            valid_cols,
+        )
+        return out, num_sampled, num_rejected
+
     def sample(
         self,
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        fast_greedy = self._try_tp_local_greedy_sample(
+            hidden_states, input_batch, grammar_output
+        )
+        if fast_greedy is not None:
+            return fast_greedy
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:

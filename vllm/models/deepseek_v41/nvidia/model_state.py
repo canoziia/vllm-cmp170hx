@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
+import os
 from typing import Any
 
 import numpy as np
@@ -369,8 +370,44 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
 
+    @property
+    def _in_graph_text_embed(self) -> bool:
+        return (
+            self.prompt_embeds_state is None
+            and self.vllm_config.compilation_config.cudagraph_mode
+            == CUDAGraphMode.FULL_DECODE_ONLY
+            and os.environ.get("VLLM_DSV41_IN_GRAPH_TEXT_EMBED", "0") == "1"
+        )
+
+    def dummy_inputs_embeds(
+        self, num_tokens: int, input_ids: torch.Tensor | None = None
+    ) -> torch.Tensor | None:
+        if self._in_graph_text_embed and input_ids is None:
+            return None
+        return super().dummy_inputs_embeds(num_tokens, input_ids)
+
+    def prepare_inputs_embeds(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+        req_states: Any,
+    ) -> torch.Tensor | None:
+        if self._in_graph_text_embed and not scheduled_encoder_inputs:
+            if not input_batch.has_prefill:
+                return None
+            if self.encoder_cache is None or not any(
+                bool(self.encoder_cache.mm_features.get(rid))
+                for rid in input_batch.req_ids[: input_batch.num_reqs]
+            ):
+                return None
+        return super().prepare_inputs_embeds(
+            scheduled_encoder_inputs, input_batch, req_states
+        )
+
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if self._in_graph_text_embed:
+            model_inputs.pop("inputs_embeds", None)
         if self.lookback_token_ids is not None:
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)

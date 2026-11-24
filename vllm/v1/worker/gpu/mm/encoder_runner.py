@@ -57,9 +57,24 @@ class EncoderRunner:
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._timing_lock = threading.Lock()
 
-        self.inputs_embeds = torch.zeros(
-            max_num_tokens, hidden_size, dtype=dtype, device=device
-        )
+        self._inputs_embeds: torch.Tensor | None = None
+        import os
+
+        if os.environ.get("VLLM_DSV41_IN_GRAPH_TEXT_EMBED", "0") != "1":
+            self._inputs_embeds = torch.zeros(
+                max_num_tokens, hidden_size, dtype=dtype, device=device
+            )
+
+    @property
+    def inputs_embeds(self) -> torch.Tensor:
+        if self._inputs_embeds is None:
+            self._inputs_embeds = torch.zeros(
+                self.max_num_tokens,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        return self._inputs_embeds
 
     def has_cudagraph(self) -> bool:
         return self.cudagraph_manager is not None

@@ -37,7 +37,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.platforms import current_platform
 
 from .all_gather import AmpereAllGather
-from .all_reduce import FRAGMENT_BYTES, MAX_ROWS
+from .all_reduce import (
+    FRAGMENT_BYTES,
+    MAX_ROWS,
+    ampere_peer_topology,
+    default_ampere_ag_capacity,
+)
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.cuda_communicator import (
@@ -50,16 +55,14 @@ _gathers: dict[int, AmpereAllGather] = {}
 
 def supports_column_gathers(vllm_config: VllmConfig) -> bool:
     """Whether the model gathers its logits and Engram columns with the
-    Lamport kernel: on SM80 and SM90 at TP 2, 4 or 8 where vLLM's custom
-    all-reduce runs, so the GPUs are fully connected with peer access.
-    Collective decisions follow from it, so it holds on every rank or none."""
+    Lamport kernel: on SM80 and SM90 at TP 2, 4 or 8 over full NVLink or
+    opted-in PCIe P2P (`VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=1`)."""
     if vllm_config.parallel_config.tensor_parallel_size not in (2, 4, 8) or not (
         current_platform.is_device_capability(80)
         or current_platform.is_device_capability(90)
     ):
         return False
-    comm = cast("CudaCommunicator", get_tp_group().device_communicator).ca_comm
-    return comm is not None and not comm.disabled and comm.fully_connected
+    return ampere_peer_topology() is not None
 
 
 def column_gathers_ready() -> bool:
@@ -71,14 +74,16 @@ def column_gathers_ready() -> bool:
 
 def init_column_gathers(row_bytes: list[int]) -> None:
     """Build the side-by-side all-gathers for rows of these sizes, up to
-    `MAX_ROWS` rows a call; sizes that are not whole 16-byte fragments
+    topology-appropriate rows a call; sizes that are not whole 16-byte fragments
     keep the TP group's all-gather. Collective over the TP group: every rank
     calls it with the same sizes."""
     group = get_tp_group()
+    topo = ampere_peer_topology() or "pcie"
     for size in row_bytes:
         if size % FRAGMENT_BYTES == 0 and size not in _gathers:
+            cap = default_ampere_ag_capacity(topo, size, MAX_ROWS)
             _gathers[size] = AmpereAllGather(
-                group.device_group, size, MAX_ROWS, group.device, side_by_side=True
+                group.device_group, size, cap, group.device, side_by_side=True
             )
 
 

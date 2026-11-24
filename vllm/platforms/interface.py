@@ -1682,6 +1682,17 @@ class Platform:
                 continue
             if hint := envs.removed_environment_variables.get(env):
                 raise ValueError(f"{env} has been removed. {hint}")
+            if env.startswith(
+                (
+                    "VLLM_DSV4",
+                    "VLLM_DSPARK",
+                    "VLLM_PP_DECODE_COHORT",
+                    "VLLM_SPARSE_",
+                    "VLLM_INDEXER_",
+                    "VLLM_MXFP8_",
+                )
+            ):
+                continue
             if env.startswith("VLLM_") and env not in envs.environment_variables:
                 if hard_fail:
                     raise ValueError(

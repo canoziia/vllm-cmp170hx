@@ -158,22 +158,26 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         if isinstance(weight, torch.Tensor) and weight.element_size() == 1 and weight.is_cuda:
             from vllm.v1.attention.ops.dsv41_thin_woa import (
                 _scale_bf16_ok,
+                prepare_woa_mxfp8_marlin,
                 warmup_thin_woa_mxfp8,
             )
 
-            _scale_bf16_ok(self.wo_a.weight_scale)
-            warmup_thin_woa_mxfp8(weight.device, self.n_local_groups)
+            if not prepare_woa_mxfp8_marlin(self.wo_a, self.n_local_groups):
+                _scale_bf16_ok(self.wo_a.weight_scale)
+                warmup_thin_woa_mxfp8(weight.device, self.n_local_groups)
 
     def _o_proj(
         self,
         attn_out: "torch.Tensor | QuantizedActivation",
         positions: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`wo_a` per head group (1x MXFP8 thin GEMM or BF16 batched GEMM), then `wo_b`.
 
         `forward_mqa` already applied the inverse RoPE. `wo_a` is either the
         1-byte MXFP8 weight `[groups * o_lora_rank, K]` (register-dequantized
-        in `thin_woa_mxfp8`) or the BF16 weight dequantized at load.
+        in `thin_woa_mxfp8`), its in-place Marlin-8bit repack (`thin_woa_marlin`),
+        or the BF16 weight dequantized at load.
         """
         import os
 
@@ -182,12 +186,18 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
         assert isinstance(weight, torch.Tensor)
         num_tokens = attn_out.shape[0]
         groups = self.n_local_groups
+        if getattr(self.wo_a, "_woa_marlin", False):
+            from vllm.v1.attention.ops.dsv41_thin_woa import thin_woa_marlin
+
+            o = attn_out.view(num_tokens, groups, -1)
+            z = thin_woa_marlin(o, weight, self.wo_a.weight_scale)
+            return self._wo_b_proj(z.reshape(num_tokens, -1), out=out)
         if weight.element_size() == 1:
             from vllm.v1.attention.ops.dsv41_thin_woa import thin_woa_mxfp8
 
             o = attn_out.view(num_tokens, groups, -1)
             z = thin_woa_mxfp8(o, weight, self.wo_a.weight_scale)
-            return self._wo_b_proj(z.reshape(num_tokens, -1))
+            return self._wo_b_proj(z.reshape(num_tokens, -1), out=out)
         assert weight.dtype == torch.bfloat16, (
             "the SM80 wo_a needs either 1-byte MXFP8 weight or BF16 weight"
         )
@@ -196,10 +206,10 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
 
             o = attn_out.view(num_tokens, groups, -1)
             z = thin_woa(o, weight.view(groups, self.o_lora_rank, -1))
-            return self._wo_b_proj(z.reshape(num_tokens, -1))
+            return self._wo_b_proj(z.reshape(num_tokens, -1), out=out)
         o = attn_out.view(num_tokens, groups, -1).transpose(0, 1)
         z = torch.bmm(o, weight.view(groups, self.o_lora_rank, -1).transpose(1, 2))
-        return self._wo_b_proj(z.transpose(0, 1).reshape(num_tokens, -1))
+        return self._wo_b_proj(z.transpose(0, 1).reshape(num_tokens, -1), out=out)
 
     def forward_mqa(
         self,

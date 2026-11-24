@@ -353,6 +353,46 @@ def mxfp8_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     return marlin_scales
 
 
+_DEQUANT_BF16_SCRATCH: dict[tuple[int | None, int], torch.Tensor] = {}
+_DEQUANT_LAST_KEY: dict[tuple[int | None, int], tuple[int, int, int, int]] = {}
+
+
+def get_dequant_mxfp8_scratch(
+    dev: torch.device,
+    size_n: int,
+    size_k: int,
+    weight: torch.Tensor | None = None,
+    weight_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, bool]:
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    need = size_n * size_k
+    buf = _DEQUANT_BF16_SCRATCH.get(key)
+    w_tag = (
+        (weight.data_ptr(), weight_scale.data_ptr(), size_n, size_k)
+        if weight is not None and weight_scale is not None
+        else None
+    )
+    if buf is not None and buf.numel() >= need and w_tag is not None:
+        if _DEQUANT_LAST_KEY.get(key) == w_tag:
+            return buf[:need].view(size_n, size_k), True
+    if buf is None or buf.numel() < need:
+        # Cap initial/grown size on the default stream to cover largest TP=4
+        # DSV4.1 MXFP8 weight (5120 x 4096 = 20,971,520 bf16 = 40.0 MiB) in one
+        # allocation; auxiliary streams (e.g. 5.6 MiB compressor) allocate exact need.
+        is_def = (
+            torch.cuda.current_stream(dev).cuda_stream
+            == torch.cuda.default_stream(dev).cuda_stream
+        )
+        alloc = max(need, 20_971_520) if is_def else need
+        buf = torch.empty((alloc,), dtype=torch.bfloat16, device=dev)
+        _DEQUANT_BF16_SCRATCH[key] = buf
+    if w_tag is not None:
+        _DEQUANT_LAST_KEY[key] = w_tag
+    else:
+        _DEQUANT_LAST_KEY.pop(key, None)
+    return buf[:need].view(size_n, size_k), False
+
+
 def apply_mxfp8_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -362,9 +402,40 @@ def apply_mxfp8_marlin_linear(
     size_k: int,
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    import os
+
     reshaped_x = input.reshape(-1, input.shape[-1])
     out_shape = input.shape[:-1] + (size_n,)
+
+    if (
+        reshaped_x.shape[0] >= 768
+        and bias is None
+        and reshaped_x.dtype == torch.bfloat16
+        and reshaped_x.shape[1] == size_k
+        and os.environ.get("VLLM_DSV41_PREFILL_MXFP8_CUBLAS", "0") == "1"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import _ops_r2
+
+        r2 = _ops_r2()
+        if r2 is not None and hasattr(r2, "dequant_marlin_mxfp8"):
+            w_bf16, cached = get_dequant_mxfp8_scratch(
+                reshaped_x.device, size_n, size_k, weight, weight_scale
+            )
+            if not cached:
+                r2.dequant_marlin_mxfp8(weight, weight_scale, w_bf16, size_n, size_k)
+            if (
+                out is not None
+                and out.dtype == torch.bfloat16
+                and out.is_contiguous()
+                and out.numel() == reshaped_x.shape[0] * size_n
+            ):
+                torch.mm(reshaped_x, w_bf16.t(), out=out.view(reshaped_x.shape[0], size_n))
+                return out.reshape(out_shape)
+            output = torch.mm(reshaped_x, w_bf16.t())
+            return output.reshape(out_shape)
 
     padded_n, padded_k = marlin_repacked_nk(weight, num_bits=8)
     reshaped_x = marlin_pad_dim(reshaped_x, size_k, padded_k)

@@ -105,6 +105,37 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
+            import os
+
+            if (
+                os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
+                and "NCCL_PROTO" not in os.environ
+                and current_platform.is_cuda()
+            ):
+                try:
+                    from vllm.utils.import_utils import import_pynvml
+
+                    _nvml = import_pynvml()
+                    _nvml.nvmlInit()
+                    try:
+                        _phys = current_platform.visible_device_id_to_physical_device_id(
+                            self.device.index or 0
+                        )
+                        _hdl = _nvml.nvmlDeviceGetHandleByIndex(_phys)
+                        _has_nvl = False
+                        for _lnk in range(18):
+                            try:
+                                if _nvml.nvmlDeviceGetNvLinkState(_hdl, _lnk):
+                                    _has_nvl = True
+                                    break
+                            except Exception:
+                                break
+                        if not _has_nvl:
+                            os.environ["NCCL_PROTO"] = "Simple"
+                    finally:
+                        _nvml.nvmlShutdown()
+                except Exception:
+                    pass
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,

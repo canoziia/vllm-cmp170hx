@@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
 """
 
 from collections.abc import Iterable
+import os
 from typing import TYPE_CHECKING
 
 import regex as re
@@ -279,17 +280,42 @@ class DSparkDeepseekV4Model(nn.Module):
             return hidden_states
 
         residual = post_mix = res_mix = pre_mix = None
-        for layer in self.layers:
-            hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
-                hidden_states,
-                positions,
-                input_ids,
-                pre_mix,
-                post_mix,
-                res_mix,
-                residual,
-                mega_gate_metadata=mega_gate_metadata,
+        can_defer_w2 = (
+            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
+            and not self.use_sequence_parallel
+            and 3 <= full_num_tokens <= 32
+            and ampere_all_reduce_ready()
+        )
+        _set_defer = None
+        if can_defer_w2:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                set_defer_w2_sum as _set_defer,
             )
+        dev = positions.device
+        n_layers = len(self.layers)
+        for i, layer in enumerate(self.layers):
+            defer_this = (
+                _set_defer is not None
+                and (i + 1) < n_layers
+                and self.layers[i + 1].engram is None
+                and self.layers[i + 1].fuse_mhc_all_reduce
+            )
+            if defer_this:
+                _set_defer(dev, True)
+            try:
+                hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    mega_gate_metadata=mega_gate_metadata,
+                )
+            finally:
+                if defer_this:
+                    _set_defer(dev, False)
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)

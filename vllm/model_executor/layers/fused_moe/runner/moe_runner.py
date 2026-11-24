@@ -675,20 +675,57 @@ class MoERunner(MoERunnerInterface):
         else:
             assert hidden_states_scale is None
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if isinstance(router_logits, tuple):
+                topk_weights, topk_ids = router_logits
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
+            import os
+
+            push_se = (
+                self._shared_experts is not None
+                and os.environ.get("VLLM_DSV41_FUSED_SHARED_ADD", "0") == "1"
+                and 0 < hidden_states.shape[0] <= 64
+                and not self._fused_output_is_reduced
+                and self.routed_output_transform is None
+                and self.routed_scaling_factor == 1.0
+                and not self.moe_config.should_defer_moe_finalize(
+                    hidden_states.shape[0]
+                )
             )
+            if push_se:
+                from vllm.model_executor.layers.fused_moe import (
+                    dsv4_mxfp4_decode as _dsv4_dec,
+                )
+
+                _dsv4_dec.push_shared_experts(
+                    hidden_states.device,
+                    self._shared_experts,
+                    shared_experts_overlapping,
+                )
+            try:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
+            finally:
+                if push_se or isinstance(router_logits, tuple):
+                    from vllm.model_executor.layers.fused_moe import (
+                        dsv4_mxfp4_decode as _dsv4_dec,
+                    )
+
+                    if push_se:
+                        _dsv4_dec.clear_shared_experts(hidden_states.device)
+                    if isinstance(router_logits, tuple):
+                        _dsv4_dec.clear_prealigned(hidden_states.device)
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
@@ -835,7 +872,22 @@ class MoERunner(MoERunnerInterface):
         fused_output = self.apply_routed_output_transform(fused_output)
 
         if shared_output is not None:
-            result = shared_output + fused_output
+            import os
+
+            fused_add_done = False
+            if (
+                os.environ.get("VLLM_DSV41_FUSED_SHARED_ADD", "0") == "1"
+                and og_hidden_dim_pre_xform is None
+                and not fused_output_is_reduced
+                and self.routed_output_transform is None
+                and self.routed_scaling_factor == 1.0
+            ):
+                from vllm.model_executor.layers.fused_moe import (
+                    dsv4_mxfp4_decode as _dsv4_dec,
+                )
+
+                fused_add_done = _dsv4_dec.pop_fused_shared(fused_output, shared_output)
+            result = fused_output if fused_add_done else (shared_output + fused_output)
         else:
             result = fused_output
 
@@ -974,6 +1026,32 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
+        # Launch single-kernel fused_gate_topk_align before enqueueing async
+        # shared_experts stream-K GEMMs so the router runs uncontended across
+        # all SMs (~6 us instead of ~32 us) and shared_experts then overlaps
+        # underneath routed w13 + w2.
+        pre_routed = None
+        if (
+            self.gate is not None
+            and not self._fse_fuse_gate
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size <= 1
+            and not self.routed_experts.quant_method.is_monolithic
+            and 0 < hidden_states.shape[0] <= 8
+        ):
+            from vllm.model_executor.layers.fused_moe import (
+                dsv4_mxfp4_decode as _dsv4_dec,
+            )
+
+            pre_routed = _dsv4_dec.try_fused_gate_topk_align(
+                hidden_states,
+                self.gate,
+                self.router,
+                self.routed_experts,
+                self._quant_method.topk_indices_dtype,
+                input_ids,
+            )
+
         # If using multi-stream overlap for shared experts, we must launch it
         # before routed expert dispatch.
         shared_experts_overlapping = False
@@ -986,7 +1064,9 @@ class MoERunner(MoERunnerInterface):
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
         if self.gate is not None:
-            if self._fse_fuse_gate:
+            if pre_routed is not None:
+                router_logits = pre_routed  # type: ignore[assignment]
+            elif self._fse_fuse_gate:
                 router_logits = dispatch_unquantized_gemm()(
                     self, hidden_states, self._combined_gate_weight, None
                 )

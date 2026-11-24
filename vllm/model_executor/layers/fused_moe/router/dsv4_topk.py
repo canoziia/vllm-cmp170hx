@@ -147,23 +147,64 @@ def dsv4_topk(
         assert bias_vl.dtype == torch.float32 and bias_vl.is_contiguous()
         assert bias_vl.shape == (num_experts,)
         assert input_ids.is_contiguous()
-    if num_tokens > 0 and topk == _TOPK and is_padding is None:
-        try:
-            from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
-        except ImportError:
-            dsv41_dense_mxfp8 = None  # type: ignore[assignment]
-        if dsv41_dense_mxfp8 is not None:
-            fast_res = dsv41_dense_mxfp8.try_dsv4_topk(
-                gating_output,
-                correction_bias,
-                indices_dtype,
-                routed_scaling_factor,
-                input_ids=input_ids,
-                bias_vl=bias_vl,
-                image_sentinel_lo=image_sentinel_lo,
+    if num_tokens > 0:
+        if topk == _TOPK and is_padding is None:
+            try:
+                from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+            except ImportError:
+                dsv41_dense_mxfp8 = None  # type: ignore[assignment]
+            if dsv41_dense_mxfp8 is not None:
+                fast_res = dsv41_dense_mxfp8.try_dsv4_topk(
+                    gating_output,
+                    correction_bias,
+                    indices_dtype,
+                    routed_scaling_factor,
+                    input_ids=input_ids,
+                    bias_vl=bias_vl,
+                    image_sentinel_lo=image_sentinel_lo,
+                )
+                if fast_res is not None:
+                    return fast_res
+        if (
+            (num_experts, topk) in ((128, 3), (256, 6), (384, 6))
+            and gating_output.is_cuda
+            and gating_output.is_contiguous()
+            and gating_output.dtype == torch.float32
+            and correction_bias.is_cuda
+            and correction_bias.is_contiguous()
+            and correction_bias.dtype == torch.float32
+            and (
+                indices_dtype in (torch.int32, torch.int64)
+                or (indices_dtype == torch.uint32 and is_padding is None)
             )
-            if fast_res is not None:
-                return fast_res
+        ):
+            import os
+
+            if os.environ.get("VLLM_DSV41_FAST_GATE_TOPK", "0") == "1":
+                from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                    _ops_r2,
+                )
+
+                r2 = _ops_r2()
+                if r2 is not None and hasattr(r2, "dsv4_topk_v2"):
+                    topk_weights = gating_output.new_empty(
+                        (num_tokens, topk), dtype=torch.float32
+                    )
+                    topk_ids = gating_output.new_empty(
+                        (num_tokens, topk), dtype=indices_dtype
+                    )
+                    r2.dsv4_topk_v2(
+                        gating_output,
+                        correction_bias,
+                        topk_weights,
+                        topk_ids,
+                        float(routed_scaling_factor),
+                        input_ids if has_vl else None,
+                        bias_vl if has_vl else None,
+                        int(image_sentinel_lo) if has_vl else 0,
+                        is_padding,
+                    )
+                    return topk_weights, topk_ids
     shape = (num_tokens, topk)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)

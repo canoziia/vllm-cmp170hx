@@ -7,6 +7,7 @@ ineligible. Feedback recurrence is CPU-visible cadence, not GPU kernel time.
 """
 
 import math
+import os
 import time
 from types import SimpleNamespace
 from .dsv41_measured_policy import Policy
@@ -64,15 +65,25 @@ class FixedHistoryPolicy:
             self.warned = True
 
     def retained_limits(self, requests):
-        return {
+        result = {
             r.request_id: self.active[r.request_id].k
             for r in requests
             if r.request_id in self.active
             and getattr(r, "verification_draft_limit", None) is None
         }
+        if (
+            len(result) >= 2
+            and os.environ.get("VLLM_DSV41_COHORT_UNIFORM_K", "0") == "1"
+        ):
+            sorted_ks = sorted(result.values())
+            cohort_k = sorted_ks[(len(sorted_ks) - 1) // 2]
+            for rid in list(result):
+                result[rid] = cohort_k
+        return result
 
     def choose(self, requests, concurrency, residents=None):
         result = {}
+        newly_trimmed = []
         for r in requests:
             entry = self.active.get(r.request_id)
             if (
@@ -81,6 +92,7 @@ class FixedHistoryPolicy:
             ):
                 continue
             if not self.is_disabled(entry) and entry.fresh:
+                was_trimmed = bool(getattr(entry.plugin, "trimmed", False))
                 try:
                     k = entry.plugin.choose(
                         dict(
@@ -104,9 +116,27 @@ class FixedHistoryPolicy:
                     )
                     entry.k = k
                     entry.fresh = False
+                    if not was_trimmed and bool(getattr(entry.plugin, "trimmed", False)):
+                        newly_trimmed.append(entry)
                 except Exception as exc:
                     self.fail(r.request_id, entry, exc)
             result[r.request_id] = entry.k
+        if (
+            len(result) >= 2
+            and os.environ.get("VLLM_DSV41_COHORT_UNIFORM_K", "0") == "1"
+        ):
+            sorted_ks = sorted(result.values())
+            cohort_k = sorted_ks[(len(sorted_ks) - 1) // 2]
+            if cohort_k == 5:
+                for entry in newly_trimmed:
+                    entry.plugin.trimmed = False
+            for r in requests:
+                rid = r.request_id
+                if rid in result:
+                    entry = self.active.get(rid)
+                    if entry is not None and not self.is_disabled(entry):
+                        entry.k = cohort_k
+                    result[rid] = cohort_k
         return result
 
     def scheduled(self, output, residents, concurrency):

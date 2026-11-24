@@ -150,6 +150,62 @@ PROFILES["tep4_dcp4_verification"] = {
 PROFILES["tep4"] = PROFILES["tep4_dcp4"]
 PROFILES["tep4_verification"] = PROFILES["tep4_dcp4_verification"]
 
+# Topology-aware deep fusion profile for 4x SM80 TEP4 (auto-detects NVLink vs PCIe P2P).
+PROFILES["tep4_fused"] = {
+    **PROFILES["tep4_dcp4_verification"],
+    "VLLM_DSV41_AMPERE_PCIE_COLLECTIVES": "1",
+    "VLLM_DSV41_MARKOV_SYMM_MEM": "1",
+    "VLLM_DSV41_IN_GRAPH_TEXT_EMBED": "1",
+    "VLLM_DSV41_MOE_PREFILL_CHUNK_TOKENS": "0",
+    "VLLM_DSV41_MOE_PREFILL_SPLIT": "1",
+    "VLLM_DSV41_PREFILL_MXFP8_CUBLAS": "1",
+    "VLLM_DSV41_COHORT_UNIFORM_K": "1",
+    "VLLM_DSV41_MIXED_SPEC_FULL_GRAPH": "0",
+    "VLLM_DSV41_DECODE_REQ_SIZES": "1,2,4,8,16,32",
+    "VLLM_DSV41_SUBWIDTH_GRAPHS": "1,2,4,8,16,32:2-5",
+    "VLLM_DSV41_COST_MS_FUSED": "1",
+    "VLLM_DSV41_TP_LOCAL_GREEDY": "1",
+    "VLLM_DSV41_WOA_CPP": "1",
+    "VLLM_DSV41_WOA_MARLIN": "1",
+    "VLLM_DSV41_DENSE_SPLITK_M8": "1",
+    "VLLM_DSV41_DENSE_KSPLIT_NOBAR": "1",
+    "VLLM_DSV4_MXFP4_DQ": "3",
+    "VLLM_DSV41_FUSED_SHARED_ADD": "1",
+    "VLLM_DSV41_FUSED_W2_AR": "1",
+}
+
+
+def _has_active_nvlink_nvml() -> bool:
+    """Query host NVML via ctypes without initializing CUDA or loading libnccl."""
+    import ctypes
+
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+        if nvml.nvmlInit_v2() != 0:
+            return False
+        try:
+            count = ctypes.c_uint(0)
+            if nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+                return False
+            for idx in range(int(count.value)):
+                handle = ctypes.c_void_p()
+                if nvml.nvmlDeviceGetHandleByIndex_v2(idx, ctypes.byref(handle)) != 0:
+                    continue
+                for link in range(18):
+                    active = ctypes.c_uint(0)
+                    rc = nvml.nvmlDeviceGetNvLinkState(
+                        handle, link, ctypes.byref(active)
+                    )
+                    if rc != 0:
+                        break
+                    if active.value:
+                        return True
+            return False
+        finally:
+            nvml.nvmlShutdown()
+    except Exception:
+        return False
+
 
 def apply() -> None:
     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
@@ -161,6 +217,16 @@ def apply() -> None:
             )
         for key, value in PROFILES[name].items():
             os.environ.setdefault(key, value)
+
+    # Set NCCL_PROTO=Simple BEFORE torch/libnccl is imported when running on
+    # PCIe-only GPUs (zero active NVLinks), avoiding 50% LL flag overhead on
+    # multi-MB prefill Ring collectives while leaving NVLink untouched.
+    if (
+        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
+        and "NCCL_PROTO" not in os.environ
+        and not _has_active_nvlink_nvml()
+    ):
+        os.environ["NCCL_PROTO"] = "Simple"
 
     # Whenever dense MXFP8 decode is enabled (via profile or standalone env),
     # keep MXFP8 weights as 1-byte MXFP8 on GPU instead of 2x BF16 at load.

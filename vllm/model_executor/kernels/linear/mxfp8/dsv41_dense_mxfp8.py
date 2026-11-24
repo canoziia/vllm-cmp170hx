@@ -55,10 +55,32 @@ TUNED = {
     (2304, 5120): (3, 70),    # shared w2
     # TP=4 shapes (tuned for 108-SM bottleneck rank GPU 3)
     (1280, 8192): (3, 96),    # q_b (TP=4)
-    (1280, 12288): (3, 108),  # fused wq_b + indexer.wq_b (TP=4)
+    (1280, 12288): (3, 96),   # fused wq_b + indexer.wq_b (TP=4; streamk_split takes cfg 3 only)
     (2048, 5120): (3, 108),   # o (TP=4)
-    (5120, 1152): (2, 72),    # shared w13 (TP=4)
+    (5120, 1152): (2, 72),    # shared w13 (TP=4; N/64=18 requires W=2)
     (576, 5120): (2, 64),     # shared w2 (TP=4)
+    # DSpark draft projections (replicated on TP=4)
+    (15360, 5120): (1, 108),  # DSpark main_proj
+    (5120, 1536): (3, 72),    # DSpark context_wkv_proj
+}
+# Shapes where static split-K beats stream-K even at M <= 8 (cold-L2 on 108-SM GA100):
+SPLITK_M8 = {
+    (5120, 1792): (21, 10),   # 12.24 vs 13.23 us (-1.0 us x 43 layers!)
+    (15360, 5120): (22, 10),  # 47.13 vs 50.10 us
+    (5120, 1536): (21, 10),   # 11.85 vs 12.28 us
+}
+# Round 8 no-barrier warp K-split (M <= 8, 16-layer cold-L2 CUDA Graph on 108-SM GA100):
+#   qkv_a 15.26->10.11us, wo_b 13.75->9.05us, wq_b+idx 14.75->12.10us,
+#   shared_w13 12.43->7.39us, shared_w2 7.05->4.80us (-0.63ms/step, 0 extra HBM!)
+KSPLIT_NOBAR_M8 = {
+    (5120, 1792): 0,   # qkv_a: W8 TP1 ST3 GPU1 S=2 (56 CTAs)
+    (5120, 1536): 0,   # context_wkv_proj: W8 TP1 ST3 GPU1 S=2 (48 CTAs)
+    (2048, 5120): 1,   # wo_b: W4 TP1 ST4 GPU1 S=1 (80 CTAs, 0-part)
+    (1280, 12288): 2,  # wq_b+idx: W4 TP2 ST3 GPU2 S=1 (96 CTAs, 0-part, supports SPLIT)
+    (1280, 8192): 2,   # wq_b: W4 TP2 ST3 GPU2 S=1 (64 CTAs, 0-part)
+    (5120, 1152): 3,   # shared_w13: W4 TP1 ST4 GPU1 S=6 (108 CTAs)
+    (576, 5120): 4,    # shared_w2: W4 TP1 ST3 GPU1 S=1 (80 CTAs, 0-part)
+    (15360, 5120): 5,  # main_proj: W8 TP1 ST3 GPU1 S=1 (80 CTAs, 0-part)
 }
 MAX_WARPS = 128 * 2 * 4
 _SCRATCH: dict[tuple[int | None, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -124,10 +146,16 @@ def scratch(device: torch.device):
 
 
 def select(M: int, K: int, N: int):
-    """-> ("streamk"|"splitk"|"splitk_wide", cfg, arg) or None (use Marlin)."""
+    """-> ("ksplit_nobar"|"streamk"|"splitk"|"splitk_wide", cfg, arg) or None (use Marlin)."""
     if not any(lo <= M <= hi for lo, hi in _T.RANGES.get((K, N), ())):
         return None
     if M <= 8:
+        kn = KSPLIT_NOBAR_M8.get((K, N))
+        if kn is not None and os.environ.get("VLLM_DSV41_DENSE_KSPLIT_NOBAR", "0") == "1":
+            return ("ksplit_nobar", kn, 0)
+        sp8 = SPLITK_M8.get((K, N))
+        if sp8 is not None and os.environ.get("VLLM_DSV41_DENSE_SPLITK_M8", "1") == "1":
+            return ("splitk",) + sp8
         e = TUNED.get((K, N))
         return ("streamk",) + e if e else None
     tab, kind = (_T.SPLITK_TIERS, "splitk") if M <= 64 else (_T.SPLITK_WIDE_TIERS, "splitk_wide")
@@ -141,6 +169,12 @@ def select(M: int, K: int, N: int):
 def prepare(layer) -> None:
     """Call once after prepare_mxfp8_layer_for_marlin(layer)."""
     K, N = layer.input_size_per_partition, layer.output_size_per_partition
+    try:
+        from vllm.model_executor.layers.fused_moe import dsv4_mxfp4_decode
+
+        dsv4_mxfp4_decode.warmup_device(layer.weight.device)
+    except Exception:
+        pass
     layer._dense_mxfp8_ok = enabled() and (K, N) in _T.RANGES and layer_ok(layer.weight_scale)
     if layer._dense_mxfp8_ok:
         dev = layer.weight.device
@@ -189,7 +223,9 @@ def try_apply(x: torch.Tensor, layer, size_n: int, size_k: int, bias):
         return None
     out = torch.empty(M, size_n, dtype=torch.bfloat16, device=x2.device)
     w, s = layer.weight, layer.weight_scale.view(torch.uint8)
-    if kind == "streamk":
+    if kind == "ksplit_nobar" and hasattr(ops, "ksplit_nobarrier"):
+        ops.ksplit_nobarrier(x2, w, s, out, part, cfg)
+    elif kind == "streamk":
         ops.streamk(x2, w, s, out, part, cnt, cfg, arg)
     elif kind == "splitk":
         ops.splitk(x2, w, s, out, part4, cfg, arg)
@@ -237,7 +273,9 @@ def try_apply_split(
     lead = x.shape[:-1]
     if M == 1 or not hasattr(ops, "streamk_split"):
         out = torch.empty(M, size_n, dtype=torch.bfloat16, device=x2.device)
-        if kind == "streamk":
+        if kind == "ksplit_nobar" and hasattr(ops, "ksplit_nobarrier"):
+            ops.ksplit_nobarrier(x2, weight, s, out, part, cfg)
+        elif kind == "streamk":
             ops.streamk(x2, weight, s, out, part, cnt, cfg, arg)
         elif kind == "splitk":
             ops.splitk(x2, weight, s, out, part4, cfg, arg)
@@ -248,7 +286,9 @@ def try_apply_split(
         return o0, o1
     out0 = torch.empty(M, size_n0, dtype=torch.bfloat16, device=x2.device)
     out1 = torch.empty(M, size_n1, dtype=torch.bfloat16, device=x2.device)
-    if kind == "streamk":
+    if kind == "ksplit_nobar" and hasattr(ops, "ksplit_nobarrier_split"):
+        ops.ksplit_nobarrier_split(x2, weight, s, out0, out1, part, cfg)
+    elif kind == "streamk":
         ops.streamk_split(x2, weight, s, out0, out1, part, cnt, cfg, arg)
     elif kind == "splitk":
         ops.splitk_split(x2, weight, s, out0, out1, part4, cfg, arg)
@@ -320,7 +360,7 @@ def try_dsv4_topk(
         return None
     M, E = gating_output.shape
     if (
-        M < 9
+        M < 1
         or E not in (256, 384)
         or correction_bias.shape != (E,)
         or gating_output.data_ptr() % 16 != 0

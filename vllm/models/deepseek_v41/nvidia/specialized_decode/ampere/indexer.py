@@ -108,14 +108,23 @@ def init_ampere_all_gather(vllm_config: VllmConfig) -> None:
     access) it needs."""
     global _ampere_all_gather
     from .all_gather import AmpereAllGather
-    from .all_reduce import MAX_ROWS
+    from .all_reduce import (
+        MAX_ROWS,
+        ampere_peer_topology,
+        default_ampere_ag_capacity,
+    )
 
     group = get_tp_group()
+    topo = ampere_peer_topology() or "pcie"
+    row_bytes = vllm_config.model_config.hf_config.index_topk * 4
+    share_cap = default_ampere_ag_capacity(
+        topo, row_bytes, MAX_ROWS // group.world_size
+    )
     # int32 indices; a rank's share of at most MAX_ROWS rows.
     _ampere_all_gather = AmpereAllGather(
         group.device_group,
-        vllm_config.model_config.hf_config.index_topk * 4,
-        MAX_ROWS // group.world_size,
+        row_bytes,
+        share_cap,
         group.device,
     )
 
@@ -225,6 +234,9 @@ def _prefill_topk(
         writer_fast
         and os.environ.get("VLLM_DSV41_INDEXER_READER_COMPACT", "0") == "1"
     )
+    reader_min_k = max(
+        2048, int(os.environ.get("VLLM_DSV41_INDEXER_READER_MIN_N", "32768"))
+    )
     k_quant_view: torch.Tensor | None = None
     # Sized for this step's largest chunk, at the workspace head.
     # Pre-size to max_seq_len (up to 262,144 compressed keys = 17 MiB) once a
@@ -253,7 +265,7 @@ def _prefill_topk(
             reader_compact_env
             and candidate_blocks is not None
             and not candidate_write
-            and chunk.max_seqlen_k >= 32768
+            and chunk.max_seqlen_k >= reader_min_k
             and chunk.block_table is not None
             and chunk.block_table.shape[0] == 1
         )
@@ -339,7 +351,12 @@ def _prefill_topk(
                 out_workspace=logits_ws,
             )
             row_ends = row_ke[rows] - row_ks[rows]
-            if writer_fast and (candidate_blocks is None or candidate_write):
+            if writer_fast and (
+                candidate_blocks is None
+                or candidate_write
+                or chunk.max_seqlen_k
+                <= candidate_blocks.shape[1] * candidate_block_size
+            ):
                 row_ends_c = row_ends.contiguous()
                 if candidate_blocks is not None and candidate_write:
                     decode_topk(

@@ -78,6 +78,7 @@ vLLM's own top-k sum by rounding.
 """
 
 from functools import cache
+import os
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -116,9 +117,9 @@ from .mhc import (
 # BF16 values per fragment (one 16-byte store) and bytes per fragment.
 VEC = 8
 FRAGMENT_BYTES = 16
-# The most rows a call takes: decode steps of up to 21 requests with five
-# drafts each (B16 is 96 rows).
-MAX_ROWS = 128
+# The most rows a call takes: decode steps of up to 32 requests with five
+# drafts each (B32 x 6 = 192 rows).
+MAX_ROWS = 192
 
 
 def _asm(result, operands, text, constraints, side_effects, loc, ip):
@@ -192,6 +193,21 @@ def poll(address: Int64, words: cute.Tensor):
         dirty = fragment_has_negative_zero(words)
     sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
     store_fragment(address, [sentinel] * 4)
+
+
+@cute.jit
+def poll_no_reset(address: Int64, words: cute.Tensor):
+    """Wait until the slot at `address` holds no sentinel and read it into
+    `words`, deferring the sentinel reset off the critical path."""
+    fragment = load_fragment(address, volatile=True)
+    for i in cutlass.range_constexpr(4):
+        words[i] = fragment[i]
+    dirty = fragment_has_negative_zero(words)
+    while dirty:
+        fragment = load_fragment(address, volatile=True)
+        for i in cutlass.range_constexpr(4):
+            words[i] = fragment[i]
+        dirty = fragment_has_negative_zero(words)
 
 
 class TwoShotAllReduce:
@@ -424,24 +440,270 @@ class TwoShotAllReducePostCollapse(TwoShotAllReduce):
         storage = smem.allocate(Storage)
         sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
         ctas, _, _ = cute.arch.grid_dim()
+        local = load_u64(peers + Int64(rank) * 8)
+        owner = tid // self.slice_fragments
+        owner_peer = load_u64(peers + Int64(owner) * 8)
+        source = tid % self.world
+        source_peer = load_u64(peers + Int64(source) * 8)
+        sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
         # Rows in increasing order, ``ctas`` apart (see the module docstring).
         while row < rows:
             generation_address = generations + Int64(row) * 4
             generation = load_s32(generation_address)
-            # The row's streams, mixes and norm weight do not depend on the sum.
+            partial = load_fragment(
+                x + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
+            )
+            # Push scatter immediately so PCIe flight overlaps local collapse load_row.
+            store_fragment(
+                owner_peer
+                + self.scatter_slot(generation, rank, row, tid % self.slice_fragments),
+                [sanitize_negative_zero_u32(word) for word in partial],
+            )
             loaded = self.collapse.load_row(
                 residual, post, comb, pre, pre_stride, weight, row, tid
             )
             words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
-            partial = load_fragment(
-                x + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
+            sc_addr = local + self.scatter_slot(generation, source, row, tid // self.world)
+            poll_no_reset(sc_addr, words)
+            sums = [
+                bf16_low(words[i // 2]) if i % 2 == 0 else bf16_high(words[i // 2])
+                for i in range(VEC)
+            ]
+            offset = 1
+            for _ in cutlass.range_constexpr(self.world.bit_length() - 1):
+                sums = [
+                    value + cute.arch.shuffle_sync_bfly(value, offset=offset)
+                    for value in sums
+                ]
+                offset *= 2
+            reduced = [
+                sanitize_negative_zero_u32(pack_bf16x2(sums[2 * i], sums[2 * i + 1]))
+                for i in range(4)
+            ]
+            # Push gather immediately before resetting scatter sentinel.
+            store_fragment(
+                source_peer
+                + self.gather_slot(
+                    generation, row, rank * self.slice_fragments + tid // self.world
+                ),
+                reduced,
             )
-            self.reduce_row(partial, peers, rank, generation, row, tid, words)
+            store_fragment(sc_addr, [sentinel] * 4)
+            ga_addr = local + self.gather_slot(generation, row, tid)
+            poll_no_reset(ga_addr, words)
             xs = unpack([words[i] for i in range(4)])
             self.collapse.finish_row(
                 xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
             )
+            store_fragment(ga_addr, [sentinel] * 4)
             # Every thread has read the generation; advance it for the next call.
+            cute.arch.barrier()
+            if tid == 0:
+                store_u32(
+                    generation_address,
+                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
+                )
+            row += ctas
+
+
+class TwoShotAllReduceW2SplitKPostCollapse(TwoShotAllReducePostCollapse):
+    """Fuses MXFP4 MoE W2 split-K + top-k + shared-expert reduction directly
+    into push-first `TwoShotAllReducePostCollapse`, eliminating `w2_ks_moe_sum_ep`
+    and its `[M, H]` BF16 round-trip."""
+
+    def __init__(
+        self,
+        hidden: int,
+        world: int,
+        capacity: int,
+        write_aux: bool,
+        top_k: int,
+        ks: int,
+    ):
+        super().__init__(hidden, world, capacity, write_aux)
+        self.top_k = top_k
+        self.ks = ks
+
+    @cute.jit
+    def __call__(
+        self,
+        part2: Int64,
+        topk_w: Int64,
+        topk_ids: Int64,
+        emap: Int64,
+        shared: Int64,
+        global_e: Int32,
+        ks_stride_bytes: Int64,
+        peers: Int64,
+        generations: Int64,
+        rank: Int32,
+        residual: Int64,
+        post: Int64,
+        comb: Int64,
+        pre: Int64,
+        pre_stride: Int32,
+        weight: Int64,
+        residual_out: Int64,
+        layer_input: Int64,
+        aux: Int64,
+        rows: Int32,
+        ctas: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class Storage:
+            sums: cute.struct.MemRange[Float32, self.collapse.warps]
+
+        self.kernel(
+            part2,
+            topk_w,
+            topk_ids,
+            emap,
+            shared,
+            global_e,
+            ks_stride_bytes,
+            peers,
+            generations,
+            rank,
+            residual,
+            post,
+            comb,
+            pre,
+            pre_stride,
+            weight,
+            residual_out,
+            layer_input,
+            aux,
+            rows,
+            eps,
+            Storage,
+        ).launch(grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        part2: Int64,
+        topk_w: Int64,
+        topk_ids: Int64,
+        emap: Int64,
+        shared: Int64,
+        global_e: Int32,
+        ks_stride_bytes: Int64,
+        peers: Int64,
+        generations: Int64,
+        rank: Int32,
+        residual: Int64,
+        post: Int64,
+        comb: Int64,
+        pre: Int64,
+        pre_stride: Int32,
+        weight: Int64,
+        residual_out: Int64,
+        layer_input: Int64,
+        aux: Int64,
+        rows: Int32,
+        eps: Float32,
+        Storage: cutlass.Constexpr,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
+        ctas, _, _ = cute.arch.grid_dim()
+        local = load_u64(peers + Int64(rank) * 8)
+        owner = tid // self.slice_fragments
+        owner_peer = load_u64(peers + Int64(owner) * 8)
+        source = tid % self.world
+        source_peer = load_u64(peers + Int64(source) * 8)
+        sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
+        top_k = self.top_k
+        row_bytes_f32 = Int64(self.hidden) * 4
+        col_bytes_f32 = Int64(tid) * 32
+        while row < rows:
+            generation_address = generations + Int64(row) * 4
+            generation = load_s32(generation_address)
+            shared_words = load_fragment(
+                shared + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
+            )
+            acc = unpack(shared_words)
+            for k in cutlass.range_constexpr(top_k):
+                slot = row * top_k + k
+                raw = load_s32(topk_ids + Int64(slot) * 4)
+                valid = (raw >= Int32(0)) and (raw < global_e)
+                if valid:
+                    le = load_s32(emap + Int64(raw) * 4)
+                    if le >= Int32(0):
+                        w = f32_from_bits(load_u32(topk_w + Int64(slot) * 4))
+                        base_p = part2 + Int64(slot) * row_bytes_f32 + col_bytes_f32
+                        f0 = load_fragment(base_p)
+                        f1 = load_fragment(base_p + Int64(16))
+                        s = [
+                            f32_from_bits(f0[0]),
+                            f32_from_bits(f0[1]),
+                            f32_from_bits(f0[2]),
+                            f32_from_bits(f0[3]),
+                            f32_from_bits(f1[0]),
+                            f32_from_bits(f1[1]),
+                            f32_from_bits(f1[2]),
+                            f32_from_bits(f1[3]),
+                        ]
+                        for ks_i in cutlass.range_constexpr(1, self.ks):
+                            p = base_p + Int64(ks_i) * ks_stride_bytes
+                            g0 = load_fragment(p)
+                            g1 = load_fragment(p + Int64(16))
+                            s[0] = s[0] + f32_from_bits(g0[0])
+                            s[1] = s[1] + f32_from_bits(g0[1])
+                            s[2] = s[2] + f32_from_bits(g0[2])
+                            s[3] = s[3] + f32_from_bits(g0[3])
+                            s[4] = s[4] + f32_from_bits(g1[0])
+                            s[5] = s[5] + f32_from_bits(g1[1])
+                            s[6] = s[6] + f32_from_bits(g1[2])
+                            s[7] = s[7] + f32_from_bits(g1[3])
+                        acc = [fma(s[e], w, acc[e]) for e in range(VEC)]
+            partial = pack(acc)
+            store_fragment(
+                owner_peer
+                + self.scatter_slot(generation, rank, row, tid % self.slice_fragments),
+                [sanitize_negative_zero_u32(word) for word in partial],
+            )
+            loaded = self.collapse.load_row(
+                residual, post, comb, pre, pre_stride, weight, row, tid
+            )
+            words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
+            sc_addr = local + self.scatter_slot(generation, source, row, tid // self.world)
+            poll_no_reset(sc_addr, words)
+            sums = [
+                bf16_low(words[i // 2]) if i % 2 == 0 else bf16_high(words[i // 2])
+                for i in range(VEC)
+            ]
+            offset = 1
+            for _ in cutlass.range_constexpr(self.world.bit_length() - 1):
+                sums = [
+                    value + cute.arch.shuffle_sync_bfly(value, offset=offset)
+                    for value in sums
+                ]
+                offset *= 2
+            reduced = [
+                sanitize_negative_zero_u32(pack_bf16x2(sums[2 * i], sums[2 * i + 1]))
+                for i in range(4)
+            ]
+            store_fragment(
+                source_peer
+                + self.gather_slot(
+                    generation, row, rank * self.slice_fragments + tid // self.world
+                ),
+                reduced,
+            )
+            store_fragment(sc_addr, [sentinel] * 4)
+            ga_addr = local + self.gather_slot(generation, row, tid)
+            poll_no_reset(ga_addr, words)
+            xs = unpack([words[i] for i in range(4)])
+            self.collapse.finish_row(
+                xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
+            )
+            store_fragment(ga_addr, [sentinel] * 4)
             cute.arch.barrier()
             if tid == 0:
                 store_u32(
@@ -585,6 +847,210 @@ class TwoShotAllReduceFinalizePostCollapse(TwoShotAllReducePostCollapse):
             row += ctas
 
 
+class OneShotAllReducePostCollapse:
+    """One-shot push Lamport all-reduce fused with `PostCollapse` for tiny row
+    counts (`rows <= 2`) on PCIe P2P, saving one full peer-to-peer PCIe hop
+    versus two-shot scatter+gather while preserving bitwise-identical FP32
+    butterfly reduction order."""
+
+    def __init__(
+        self,
+        hidden: int,
+        world: int,
+        capacity: int,
+        write_aux: bool,
+        slot_base: int = 0,
+    ):
+        assert world in (2, 4, 8)
+        self.hidden = hidden
+        self.world = world
+        self.capacity = capacity
+        self.fragments = hidden // VEC
+        self.slot_base = slot_base
+        self.collapse = PostCollapse(hidden, has_post=True, write_aux=write_aux)
+
+    def mailbox_bytes(self) -> int:
+        return LAMPORT_GENERATIONS * self.world * self.capacity * self.hidden * 2
+
+    @cute.jit
+    def slot(
+        self, generation: Int32, source: Int32, row: Int32, fragment: Int32
+    ) -> Int64:
+        return self.slot_base + (
+            ((Int64(generation) * self.world + source) * self.capacity + row)
+            * self.fragments
+            + fragment
+        ) * FRAGMENT_BYTES
+
+    @cute.jit
+    def __call__(
+        self,
+        x: Int64,
+        peers: Int64,
+        generations: Int64,
+        rank: Int32,
+        residual: Int64,
+        post: Int64,
+        comb: Int64,
+        pre: Int64,
+        pre_stride: Int32,
+        weight: Int64,
+        residual_out: Int64,
+        layer_input: Int64,
+        aux: Int64,
+        rows: Int32,
+        ctas: Int32,
+        eps: Float32,
+        stream: cuda.CUstream,
+    ):
+        @cute.struct
+        class Storage:
+            sums: cute.struct.MemRange[Float32, self.collapse.warps]
+
+        self.kernel(
+            x,
+            peers,
+            generations,
+            rank,
+            residual,
+            post,
+            comb,
+            pre,
+            pre_stride,
+            weight,
+            residual_out,
+            layer_input,
+            aux,
+            rows,
+            eps,
+            Storage,
+        ).launch(grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: Int64,
+        peers: Int64,
+        generations: Int64,
+        rank: Int32,
+        residual: Int64,
+        post: Int64,
+        comb: Int64,
+        pre: Int64,
+        pre_stride: Int32,
+        weight: Int64,
+        residual_out: Int64,
+        layer_input: Int64,
+        aux: Int64,
+        rows: Int32,
+        eps: Float32,
+        Storage: cutlass.Constexpr,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        row, _, _ = cute.arch.block_idx()
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
+        ctas, _, _ = cute.arch.grid_dim()
+        while row < rows:
+            generation_address = generations + Int64(row) * 4
+            generation = load_s32(generation_address)
+            partial = load_fragment(
+                x + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
+            )
+            sanitized = [sanitize_negative_zero_u32(word) for word in partial]
+            # Issue peer PCIe DMA stores first so they overlap local load_row.
+            for p_off in cutlass.range_constexpr(1, self.world):
+                dst = (rank + p_off) % self.world
+                store_fragment(
+                    load_u64(peers + Int64(dst) * 8)
+                    + self.slot(generation, rank, row, tid),
+                    sanitized,
+                )
+            loaded = self.collapse.load_row(
+                residual, post, comb, pre, pre_stride, weight, row, tid
+            )
+            local = load_u64(peers + Int64(rank) * 8)
+            words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
+            s01 = [Float32(0.0)] * VEC
+            s23 = [Float32(0.0)] * VEC
+            s45 = [Float32(0.0)] * VEC
+            s67 = [Float32(0.0)] * VEC
+            for src in cutlass.range_constexpr(self.world):
+                vals = [Float32(0.0)] * VEC
+                if src == rank:
+                    vals = unpack(sanitized)
+                else:
+                    poll(local + self.slot(generation, src, row, tid), words)
+                    vals = unpack([words[i] for i in range(4)])
+                if cutlass.const_expr(src == 0):
+                    s01 = vals
+                elif cutlass.const_expr(src == 1):
+                    s01 = [s01[e] + vals[e] for e in range(VEC)]
+                elif cutlass.const_expr(src == 2):
+                    s23 = vals
+                elif cutlass.const_expr(src == 3):
+                    s23 = [s23[e] + vals[e] for e in range(VEC)]
+                elif cutlass.const_expr(src == 4):
+                    s45 = vals
+                elif cutlass.const_expr(src == 5):
+                    s45 = [s45[e] + vals[e] for e in range(VEC)]
+                elif cutlass.const_expr(src == 6):
+                    s67 = vals
+                elif cutlass.const_expr(src == 7):
+                    s67 = [s67[e] + vals[e] for e in range(VEC)]
+            sums = s01
+            if cutlass.const_expr(self.world >= 4):
+                sums = [sums[e] + s23[e] for e in range(VEC)]
+            if cutlass.const_expr(self.world == 8):
+                s47 = [s45[e] + s67[e] for e in range(VEC)]
+                sums = [sums[e] + s47[e] for e in range(VEC)]
+            reduced = [
+                sanitize_negative_zero_u32(
+                    pack_bf16x2(sums[2 * i], sums[2 * i + 1])
+                )
+                for i in range(4)
+            ]
+            xs = unpack(reduced)
+            self.collapse.finish_row(
+                xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
+            )
+            cute.arch.barrier()
+            if tid == 0:
+                store_u32(
+                    generation_address,
+                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
+                )
+            row += ctas
+
+
+@cache
+def _oneshot_collapse_kernel(
+    device_index: int,
+    hidden: int,
+    world: int,
+    capacity: int,
+    write_aux: bool,
+    slot_base: int,
+):
+    """`OneShotAllReducePostCollapse` compiled for a device and variant."""
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            OneShotAllReducePostCollapse(
+                hidden, world, capacity, write_aux, slot_base
+            ),
+            *(Int64(0),) * 3,
+            Int32(0),
+            *(Int64(0),) * 4,
+            Int32(4),
+            *(Int64(0),) * 4,
+            Int32(1),
+            Int32(1),
+            Float32(1e-6),
+            make_fake_stream(),
+        )
+
+
 @cache
 def _kernel(device_index: int, hidden: int, world: int, capacity: int):
     """`TwoShotAllReduce` compiled for a device and shape."""
@@ -647,6 +1113,101 @@ def _finalize_kernel(
         )
 
 
+@cache
+def _w2_splitk_kernel(
+    device_index: int,
+    hidden: int,
+    world: int,
+    capacity: int,
+    write_aux: bool,
+    top_k: int,
+    ks: int,
+):
+    """`TwoShotAllReduceW2SplitKPostCollapse` compiled for a device and variant."""
+    with torch.accelerator.device_index(device_index):
+        return cute.compile(
+            TwoShotAllReduceW2SplitKPostCollapse(
+                hidden, world, capacity, write_aux, top_k, ks
+            ),
+            *(Int64(0),) * 5,
+            Int32(384),
+            Int64(0),
+            *(Int64(0),) * 2,
+            Int32(0),
+            *(Int64(0),) * 4,
+            Int32(4),
+            *(Int64(0),) * 4,
+            Int32(1),
+            Int32(1),
+            Float32(1e-6),
+            make_fake_stream(),
+        )
+
+
+def ampere_peer_topology() -> str | None:
+    """Return `'nvlink'` when vLLM's custom all-reduce reports full NVLink
+    connectivity, `'pcie'` when PCIe P2P collectives are opted in and every TP
+    peer pair on the node has direct CUDA P2P access, or `None` otherwise.
+    Collective over the TP group so all ranks agree."""
+    from vllm.distributed import get_tp_group
+
+    tp_group = get_tp_group()
+    comm = getattr(tp_group.device_communicator, "ca_comm", None)
+    if comm is not None and not comm.disabled and comm.fully_connected:
+        return "nvlink"
+    if os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") != "1":
+        return None
+    world_size = tp_group.world_size
+    if world_size < 2 or world_size > torch.cuda.device_count():
+        return None
+    local_dev = torch.cuda.current_device()
+    dev_tensor = torch.empty(world_size, dtype=torch.int32, device=tp_group.device)
+    my_dev = torch.tensor([local_dev], dtype=torch.int32, device=tp_group.device)
+    dist.all_gather_into_tensor(dev_tensor, my_dev, group=tp_group.device_group)
+    peer_devs = [int(x) for x in dev_tensor.cpu().tolist()]
+    ok = int(len(set(peer_devs)) == world_size)
+    if ok:
+        for d in peer_devs:
+            if d != local_dev and not torch.cuda.can_device_access_peer(local_dev, d):
+                ok = 0
+                break
+    flag = torch.tensor([ok], dtype=torch.int32, device=tp_group.device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.device_group)
+    return "pcie" if int(flag.item()) == 1 else None
+
+
+def default_ampere_ar_capacity(topology: str) -> int:
+    """Default max rows for `AmpereAllReduce`: full `MAX_ROWS` (192) on NVLink,
+    or 60 rows on PCIe Gen4 x16 (where push Lamport wins M<=60 and Ring NCCL
+    wins M>=64). Overridable via `VLLM_DSV41_AMPERE_AR_MAX_ROWS`."""
+    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_MAX_ROWS", "").strip()
+    if raw:
+        return max(1, min(MAX_ROWS, int(raw)))
+    return MAX_ROWS if topology == "nvlink" else min(MAX_ROWS, 60)
+
+
+def default_ampere_ag_capacity(
+    topology: str, row_bytes: int, max_rows: int = MAX_ROWS
+) -> int:
+    """Default max rows for `AmpereAllGather`: full `max_rows` on NVLink (or
+    tiny <=64B control/argmax rows on PCIe), else bounded by
+    `VLLM_DSV41_AMPERE_AG_MAX_BYTES` (default 384 KiB/rank) on PCIe."""
+    if topology == "nvlink" or row_bytes <= 64:
+        return max_rows
+    max_bytes = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_BYTES", "393216"))
+    pcie_row_cap = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_ROWS", "64"))
+    return max(1, min(max_rows, pcie_row_cap, max_bytes // max(1, row_bytes)))
+
+
+def default_ampere_ar_oneshot_max_rows(topology: str) -> int:
+    """Default max rows for 1-hop `OneShotAllReducePostCollapse`: 2 rows on
+    PCIe Gen4 x16 (saving one full PCIe hop at M=1,2), 0 on NVLink."""
+    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_ONESHOT_ROWS", "").strip()
+    if raw:
+        return max(0, min(MAX_ROWS, int(raw)))
+    return 2 if topology == "pcie" else 0
+
+
 class AmpereAllReduce:
     """The mailbox and per-row generations of `TwoShotAllReduce` for one TP
     group; construction is collective over the group.
@@ -658,6 +1219,8 @@ class AmpereAllReduce:
         capacity: The most rows a call takes (`MAX_ROWS` by default).
         top_k: Routes a token of the MoE outputs `finalize_post_collapse`
             takes; None compiles no finalize kernels.
+        oneshot_capacity: Optional tiny-row threshold (`<= capacity`) routed to
+            1-hop `OneShotAllReducePostCollapse` inside `post_collapse`.
 
     """
 
@@ -668,12 +1231,18 @@ class AmpereAllReduce:
         device: torch.device,
         capacity: int = MAX_ROWS,
         top_k: int | None = None,
+        oneshot_capacity: int = 0,
     ):
         self.world = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
         self.hidden = hidden
         self.capacity = capacity
         self.top_k = top_k
+        self.oneshot_capacity = (
+            min(capacity, oneshot_capacity)
+            if oneshot_capacity > 0 and self.world in (2, 4, 8)
+            else 0
+        )
         # The most CTAs a call launches, one per SM (see the module docstring).
         self.ctas = current_platform.num_compute_units(device.index)
         self.kernel = _kernel(device.index, hidden, self.world, capacity)
@@ -681,6 +1250,25 @@ class AmpereAllReduce:
             _collapse_kernel(device.index, hidden, self.world, capacity, write_aux)
             for write_aux in (False, True)
         ]
+        two_shot_bytes = TwoShotAllReduce(hidden, self.world, capacity).mailbox_bytes()
+        if self.oneshot_capacity > 0:
+            self.oneshot_collapse_kernels = [
+                _oneshot_collapse_kernel(
+                    device.index,
+                    hidden,
+                    self.world,
+                    self.oneshot_capacity,
+                    write_aux,
+                    two_shot_bytes,
+                )
+                for write_aux in (False, True)
+            ]
+            oneshot_bytes = OneShotAllReducePostCollapse(
+                hidden, self.world, self.oneshot_capacity, False, two_shot_bytes
+            ).mailbox_bytes()
+        else:
+            self.oneshot_collapse_kernels = []
+            oneshot_bytes = 0
         # Compiled here: the first finalize may come while a CUDA graph is
         # being captured.
         self.finalize_kernels = (
@@ -693,13 +1281,36 @@ class AmpereAllReduce:
                 for write_aux in (False, True)
             ]
         )
-        nbytes = TwoShotAllReduce(hidden, self.world, capacity).mailbox_bytes()
+        self.w2_splitk_kernels = {}
+        if (
+            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
+            and hidden == 5120
+        ):
+            for write_aux in (False, True):
+                for tk in (6, 3):
+                    for ks_val in (4, 3):
+                        self.w2_splitk_kernels[(write_aux, tk, ks_val)] = (
+                            _w2_splitk_kernel(
+                                device.index,
+                                hidden,
+                                self.world,
+                                capacity,
+                                write_aux,
+                                tk,
+                                ks_val,
+                            )
+                        )
+        nbytes = two_shot_bytes + oneshot_bytes
         self.mailbox = symm_mem.empty(nbytes // 2, dtype=torch.bfloat16, device=device)
         handle = symm_mem.rendezvous(self.mailbox, group)
         self.peers = torch.tensor(handle.buffer_ptrs, dtype=torch.int64, device=device)
         # Every slot starts as the sentinel, BF16 negative zero.
         self.mailbox.view(torch.int16).fill_(-32768)
-        self.generations = torch.zeros(capacity, dtype=torch.int32, device=device)
+        self.generations_all = torch.zeros(
+            capacity + self.oneshot_capacity, dtype=torch.int32, device=device
+        )
+        self.generations = self.generations_all[:capacity]
+        self.oneshot_generations = self.generations_all[capacity:]
         torch.accelerator.synchronize()
         dist.barrier(group=group)
 
@@ -749,10 +1360,25 @@ class AmpereAllReduce:
         `[rows, 4, 1]`, `comb_mix` `[rows, 4, 4]`; `pre_mix` None
         selects stream zero."""
         assert self.supports(x)
+        use_oneshot = x.shape[0] <= self.oneshot_capacity
         streams, layer_input, aux, args, _inputs = self._collapse_args(
-            x.shape[0], residual, post_mix, comb_mix, pre_mix, norm_weight, write_aux
+            x.shape[0],
+            residual,
+            post_mix,
+            comb_mix,
+            pre_mix,
+            norm_weight,
+            write_aux,
+            generations=(
+                self.oneshot_generations if use_oneshot else self.generations
+            ),
         )
-        self.collapse_kernels[int(write_aux)](
+        kern = (
+            self.oneshot_collapse_kernels[int(write_aux)]
+            if use_oneshot
+            else self.collapse_kernels[int(write_aux)]
+        )
+        kern(
             Int64(x.data_ptr()),
             *args,
             Float32(norm_eps),
@@ -800,6 +1426,46 @@ class AmpereAllReduce:
         )
         return streams, layer_input, aux
 
+    def w2_splitk_post_collapse(
+        self,
+        part2: torch.Tensor,
+        topk_w: torch.Tensor,
+        topk_ids: torch.Tensor,
+        emap: torch.Tensor,
+        shared: torch.Tensor,
+        ks: int,
+        top_k: int,
+        global_e: int,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        pre_mix: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        write_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused W2 split-K + top-k + shared add + TwoShotAllReduce + PostCollapse."""
+        rows = shared.shape[0]
+        assert self.supports(shared)
+        kern = self.w2_splitk_kernels[(bool(write_aux), int(top_k), int(ks))]
+        streams, layer_input, aux, args, _inputs = self._collapse_args(
+            rows, residual, post_mix, comb_mix, pre_mix, norm_weight, write_aux
+        )
+        ks_stride_bytes = rows * top_k * self.hidden * 4
+        kern(
+            Int64(part2.data_ptr()),
+            Int64(topk_w.data_ptr()),
+            Int64(topk_ids.data_ptr()),
+            Int64(emap.data_ptr()),
+            Int64(shared.data_ptr()),
+            Int32(global_e),
+            Int64(ks_stride_bytes),
+            *args,
+            Float32(norm_eps),
+            current_cu_stream(),
+        )
+        return streams, layer_input, aux
+
     def _collapse_args(
         self,
         rows: int,
@@ -809,12 +1475,14 @@ class AmpereAllReduce:
         pre_mix: torch.Tensor | None,
         norm_weight: torch.Tensor,
         write_aux: bool,
+        generations: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple, tuple]:
         """The outputs of a collapsing call of `rows` rows, its kernel
         arguments after the sublayer output up to the CTA count, and the
         mixes those point to, which the caller keeps until the launch (they
         may be contiguous copies)."""
         device = residual.device
+        gens = self.generations if generations is None else generations
         assert residual.shape == (rows, HC, self.hidden)
         assert residual.dtype == torch.bfloat16 and residual.is_contiguous()
         assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
@@ -838,7 +1506,7 @@ class AmpereAllReduce:
         )
         args = (
             Int64(self.peers.data_ptr()),
-            Int64(self.generations.data_ptr()),
+            Int64(gens.data_ptr()),
             Int32(self.rank),
             Int64(residual.data_ptr()),
             Int64(post_mix.data_ptr()),

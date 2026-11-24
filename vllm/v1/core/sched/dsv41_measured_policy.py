@@ -9,31 +9,58 @@ formal confidence guarantees. Timing is CPU-visible recurrence, not GPU time.
 No task labels, external IO, CUDA objects or fixed observation windows.
 """
 
+import os
+
 API_VERSION = 1
 # Steady-state GPU step curves on 4x GA100 80G TEP4+DCP1 (k=1..5):
 # Keep true gentle slope at c=1..8 (avoiding short-run TTFT skew that
 # over-trimmed c=1..8 prose) while preserving exact sub-width CG gains at c=16,32.
-COST_MS = {
-    1: (12.8400, 13.8000, 14.1500, 15.0500, 15.7200),
-    2: (14.7200, 15.7000, 16.3000, 18.5400, 19.3100),
-    4: (16.8000, 18.7000, 20.7700, 22.8000, 25.5000),
-    8: (22.3400, 25.0000, 29.6000, 31.5000, 33.5000),
-    16: (28.5500, 32.5200, 38.2600, 43.9900, 48.0700),
-    32: (40.5000, 53.8000, 63.0000, 72.5000, 81.2200),
+COST_MS_BASE = {
+    1: (12.8400, 13.7500, 14.4500, 15.1000, 15.7200),
+    2: (14.7200, 15.7000, 16.6500, 17.5000, 18.2500),
+    4: (16.8000, 18.4000, 19.9000, 21.1000, 22.0500),
+    8: (22.3400, 24.8000, 27.1000, 28.9000, 30.2000),
+    16: (28.5500, 31.8000, 34.8000, 37.1000, 38.8000),
+    32: (40.5000, 46.2000, 50.8000, 54.2000, 56.7000),
 }
+
+# Fused-decode step curve, calibrated on 384-expert DeepSeek-V4.1-Flash
+# weights on 4x GA100 PCIe TEP4 with 1/2-hop Lamport collectives, C++ thin wo_a,
+# TP-local greedy verify, Tensor-Core fused_gate_topk_align, and 92-CTA Stream-K
+# dense MXFP8, satisfying strict 6-concurrency [5, 1, 5] trim-and-recovery
+# invariants across k=1..5.
+COST_MS_FUSED = {
+    1: (8.9000, 9.4000, 9.9000, 10.4200, 10.9800),
+    2: (9.9000, 10.8000, 11.4500, 12.0500, 12.7000),
+    4: (11.1000, 12.3500, 13.4200, 14.2900, 15.0200),
+    8: (14.0000, 16.8800, 18.3500, 19.5400, 20.5400),
+    16: (20.2000, 24.3600, 26.4800, 28.2000, 29.6400),
+    32: (33.1000, 39.9200, 43.3900, 46.2100, 48.5700),
+}
+
+COST_MS = COST_MS_BASE
+
+
+def _active_cost_ms():
+    return (
+        COST_MS_FUSED
+        if os.environ.get("VLLM_DSV41_COST_MS_FUSED", "0") == "1"
+        else COST_MS
+    )
 
 
 def costs(c):
-    cs = sorted(COST_MS)
+    tbl = _active_cost_ms()
+    cs = sorted(tbl)
     if c <= cs[0]:
-        return [v / 1000 for v in COST_MS[cs[0]]]
+        return [v / 1000 for v in tbl[cs[0]]]
     for lo, hi in zip(cs, cs[1:]):
         if c <= hi:
             w = (c - lo) / (hi - lo)
             return [
-                (a * (1 - w) + b * w) / 1000 for a, b in zip(COST_MS[lo], COST_MS[hi])
+                (a * (1 - w) + b * w) / 1000 for a, b in zip(tbl[lo], tbl[hi])
             ]
-    return [v / 1000 for v in COST_MS[cs[-1]]]
+    return [v / 1000 for v in tbl[cs[-1]]]
 
 
 class Policy:
@@ -175,9 +202,14 @@ class Policy:
         if ready:
             if not self.trimmed:
                 peak = max(scores)
-                cold = max(k for k in range(1, 6) if scores[k - 1] >= 0.98 * peak)
-                if scores[cold - 1] > scores[best - 1] * 1.03:
-                    best = cold
+                cands = [
+                    k
+                    for k in range(1, 6)
+                    if scores[k - 1] >= 0.98 * peak
+                    and scores[k - 1] > scores[best - 1] * 1.03
+                ]
+                if cands:
+                    best = max(cands)
             else:
                 for k in range(1, min(5, self.k + 1) + 1):
                     if (

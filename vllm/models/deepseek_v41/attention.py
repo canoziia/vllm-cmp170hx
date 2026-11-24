@@ -1023,7 +1023,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             gemm_rs.warn_incompatible_projection()
 
-    def _wo_b_proj(self, z: torch.Tensor | QuantizedActivation) -> torch.Tensor:
+    def _wo_b_proj(
+        self,
+        z: torch.Tensor | QuantizedActivation,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Apply `wo_b`; with GEMM-RS bound, also reduce-scatter the result.
 
         Every `_o_proj` implementation projects through this so the decoder
@@ -1032,7 +1036,35 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         unreduced TP partial.
         """
         if self.gemm_rs is None:
-            return self.wo_b(z)
+            if (
+                out is not None
+                and isinstance(z, torch.Tensor)
+                and z.shape[0] >= 768
+                and not self.wo_b.reduce_results
+                and getattr(self.wo_b, "bias", None) is None
+                and hasattr(self.wo_b, "weight_scale")
+                and os.environ.get("VLLM_DSV41_PREFILL_MXFP8_CUBLAS", "0") == "1"
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+                    apply_mxfp8_marlin_linear,
+                )
+
+                return apply_mxfp8_marlin_linear(
+                    input=z,
+                    weight=self.wo_b.weight,
+                    weight_scale=self.wo_b.weight_scale,
+                    workspace=getattr(self.wo_b, "workspace", None),
+                    size_n=self.wo_b.output_size_per_partition,
+                    size_k=self.wo_b.input_size_per_partition,
+                    bias=None,
+                    out=out,
+                )
+            res = self.wo_b(z)
+            if out is not None:
+                out.copy_(res)
+                return out
+            return res
         if isinstance(z, torch.Tensor) and self.gemm_rs.should_run(z):
             return self.gemm_rs.apply(z, self.wo_b)
         # Small batches stay on the unfused path, which is faster there.
@@ -1242,7 +1274,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return split_out
         from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
             apply_mxfp8_marlin_linear,
+            get_dequant_mxfp8_scratch,
         )
+
+        qr_2d = qr.reshape(-1, size_k)
+        if (
+            qr_2d.shape[0] >= 768
+            and qr_2d.dtype == torch.bfloat16
+            and os.environ.get("VLLM_DSV41_PREFILL_MXFP8_CUBLAS", "0") == "1"
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import _ops_r2
+
+            r2 = _ops_r2()
+            if r2 is not None and hasattr(r2, "dequant_marlin_mxfp8"):
+                w_bf16, cached = get_dequant_mxfp8_scratch(
+                    qr.device, n1 + n2, size_k, weight, weight_scale
+                )
+                if not cached:
+                    r2.dequant_marlin_mxfp8(
+                        weight, weight_scale, w_bf16, n1 + n2, size_k
+                    )
+                lead = qr.shape[:-1]
+                q = torch.mm(qr_2d, w_bf16[:n1].t()).reshape(lead + (n1,))
+                idx_q = torch.mm(qr_2d, w_bf16[n1:].t()).reshape(lead + (n2,))
+                return q, idx_q
 
         out = apply_mxfp8_marlin_linear(
             input=qr,

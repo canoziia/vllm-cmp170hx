@@ -113,6 +113,7 @@ from ..common.engram import (
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
+    ampere_all_reduce_ready,
     ampere_mhc_max_tokens,
     ampere_projection_splits,
     boundary_all_reduce,
@@ -170,7 +171,7 @@ def _get_prefill_ar_state(
     if st is None:
         with torch.cuda.device(idx):
             comm_stream = torch.cuda.Stream(device=dev)
-            evs = [torch.cuda.Event() for _ in range(6)]
+            evs = [torch.cuda.Event() for _ in range(8)]
             comm_buf = torch.empty((alloc_m, hidden_size), dtype=dtype, device=dev)
             st = (comm_stream, evs, comm_buf)
         _PREFILL_AR_STATE[idx] = st
@@ -1097,7 +1098,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.column_gathers = supports_column_gathers(vllm_config)
         if self.column_gathers:
             self._init_engram_column_gathers(vllm_config)
-        if self.fuse_mhc_all_reduce and vllm_config.lora_config is None:
+        if (
+            self.fuse_mhc_all_reduce
+            and not self.parallel_config.enable_expert_parallel
+            and vllm_config.lora_config is None
+        ):
             # A MoE's top-k finalize folds into the next layer's first mHC
             # boundary, which the last local layer lacks and an engram layer
             # replaces with its own all-reduce. Experts with LoRA always
@@ -1509,7 +1514,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dev_comm = getattr(get_tp_group(), "device_communicator", None)
             cand = getattr(dev_comm, "pynccl_comm", None)
             if cand is not None and not getattr(cand, "disabled", True):
-                m0 = ((full_num_tokens // 2) // 64) * 64
+                m0 = ((full_num_tokens // 3) // 64) * 64
                 if m0 >= 256 and (full_num_tokens - m0) >= 256:
                     return self._run_layers_prefill_ar_overlap(
                         layer_ids=layer_ids,
@@ -1527,22 +1532,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         m0=m0,
                         pynccl=cand,
                     )
-        for idx in layer_ids:
-            hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
-                self.layers[idx](
-                    hidden_states,
-                    positions,
-                    input_ids,
-                    pre_mix,
-                    post_mix,
-                    res_mix,
-                    residual,
-                    engram_hashes,
-                    engram_mask,
-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
-                    mega_gate_metadata=mega_gate_metadata,
-                )
+        can_defer_w2 = (
+            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
+            and not self.use_sequence_parallel
+            and 3 <= full_num_tokens <= 32
+            and ampere_all_reduce_ready()
+        )
+        _set_defer = None
+        if can_defer_w2:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                set_defer_w2_sum as _set_defer,
             )
+        dev = positions.device
+        for idx in layer_ids:
+            defer_this = (
+                _set_defer is not None
+                and (idx + 1) < layer_ids.stop
+                and getattr(self.layers[idx + 1], "engram", True) is None
+                and getattr(self.layers[idx + 1], "fuse_mhc_all_reduce", False)
+            )
+            if defer_this:
+                _set_defer(dev, True)
+            try:
+                hidden_states, residual, post_mix, res_mix, pre_mix, previous_aux = (
+                    self.layers[idx](
+                        hidden_states,
+                        positions,
+                        input_ids,
+                        pre_mix,
+                        post_mix,
+                        res_mix,
+                        residual,
+                        engram_hashes,
+                        engram_mask,
+                        capture_previous_aux=idx in self.aux_hidden_state_layers,
+                        mega_gate_metadata=mega_gate_metadata,
+                    )
+                )
+            finally:
+                if defer_this:
+                    _set_defer(dev, False)
             if previous_aux is not None:
                 # idx is the one-based id of the layer whose post this is.
                 if self.use_sequence_parallel:
@@ -1582,8 +1611,30 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.config.hidden_size,
             hidden_states.dtype,
         )
-        ev_sync0, ev_sync1, ev_ar0, ev_ar1, ef0, ef1 = evs
+        (
+            ev_sync0,
+            ev_sync1,
+            ev_ar0,
+            ev_ar1,
+            ev_fsync0,
+            ev_fsync1,
+            ef0,
+            ef1,
+        ) = evs
         pending_ffn_ar: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        split_mhc: (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+            | None
+        ) = None
 
         try:
             for idx in layer_ids:
@@ -1591,6 +1642,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 assert isinstance(layer, DeepseekV4DecoderLayer)
                 capture_aux = idx in self.aux_hidden_state_layers
                 did_split_attn_prep = False
+                split_attn_mhc: (
+                    tuple[
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                        torch.Tensor,
+                    ]
+                    | None
+                ) = None
                 qr: typing.Any = None
                 qr_scale: torch.Tensor | None = None
                 kv: torch.Tensor | None = None
@@ -1602,19 +1666,37 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ):
                     w_ef0, w_ef1 = pending_ffn_ar
                     pending_ffn_ar = None
-                    assert (
-                        isinstance(hidden_states, torch.Tensor)
-                        and residual is not None
-                        and post_mix is not None
-                        and res_mix is not None
-                        and pre_mix is not None
-                    )
+                    assert isinstance(hidden_states, torch.Tensor)
+                    if split_mhc is not None:
+                        (
+                            fres0,
+                            fres1,
+                            fpm0,
+                            fpm1,
+                            frm0,
+                            frm1,
+                            fpre0,
+                            fpre1,
+                        ) = split_mhc
+                        split_mhc = None
+                    else:
+                        assert (
+                            residual is not None
+                            and post_mix is not None
+                            and res_mix is not None
+                            and pre_mix is not None
+                        )
+                        fres0, fres1 = residual[:m0], residual[m0:]
+                        fpm0, fpm1 = post_mix[:m0], post_mix[m0:]
+                        frm0, frm1 = res_mix[:m0], res_mix[m0:]
+                        fpre0, fpre1 = pre_mix[:m0], pre_mix[m0:]
+                        residual = post_mix = res_mix = pre_mix = None
                     def_stream.wait_event(w_ef0)
                     res0, pm0, rm0, x_in0, apre0, aux0 = mhc_shifted_post_pre(
                         hidden_states[:m0],
-                        residual[:m0],
-                        post_mix[:m0],
-                        res_mix[:m0],
+                        fres0,
+                        fpm0,
+                        frm0,
                         layer.hc_attn_fn,
                         layer.hc_attn_scale,
                         layer.hc_attn_base,
@@ -1623,7 +1705,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         layer.hc_eps,
                         layer.hc_post_alpha,
                         layer.hc_sinkhorn_iters,
-                        pre_mix=pre_mix[:m0],
+                        pre_mix=fpre0,
                         norm_weight=layer.attn_norm.weight,
                         norm_eps=layer.attn_norm.variance_epsilon,
                         capture_aux=capture_aux,
@@ -1631,6 +1713,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         reduce_results=False,
                         boundary_weight=layer.hc_attn_boundary_weight,
                     )
+                    del fres0, fpm0, frm0, fpre0
                     qr_kv0, kvs0, idxw0 = layer.attn._run_parallel_input_projections(
                         x_in0
                     )
@@ -1638,9 +1721,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     def_stream.wait_event(w_ef1)
                     res1, pm1, rm1, x_in1, apre1, aux1 = mhc_shifted_post_pre(
                         hidden_states[m0:],
-                        residual[m0:],
-                        post_mix[m0:],
-                        res_mix[m0:],
+                        fres1,
+                        fpm1,
+                        frm1,
                         layer.hc_attn_fn,
                         layer.hc_attn_scale,
                         layer.hc_attn_base,
@@ -1649,7 +1732,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         layer.hc_eps,
                         layer.hc_post_alpha,
                         layer.hc_sinkhorn_iters,
-                        pre_mix=pre_mix[m0:],
+                        pre_mix=fpre1,
                         norm_weight=layer.attn_norm.weight,
                         norm_eps=layer.attn_norm.variance_epsilon,
                         capture_aux=capture_aux,
@@ -1657,19 +1740,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         reduce_results=False,
                         boundary_weight=layer.hc_attn_boundary_weight,
                     )
-                    del residual, hidden_states, post_mix, res_mix, pre_mix
-                    residual = torch.cat([res0, res1], dim=0)
-                    del res0, res1
-                    post_mix = torch.cat([pm0, pm1], dim=0)
-                    del pm0, pm1
-                    res_mix = torch.cat([rm0, rm1], dim=0)
-                    del rm0, rm1
-                    attn_pre = torch.cat([apre0, apre1], dim=0)
-                    del apre0, apre1
+                    del fres1, fpm1, frm1, fpre1, hidden_states
                     if capture_aux and aux0 is not None and aux1 is not None:
                         aux_hidden_by_layer[idx] = torch.cat([aux0, aux1], dim=0)
                     del aux0, aux1
-                    x_in = torch.cat([x_in0, x_in1], dim=0)
+                    if layer.attn.indexer is not None:
+                        x_in = torch.cat([x_in0, x_in1], dim=0)
+                    else:
+                        x_in = torch.empty(
+                            (0, x_in0.shape[1]),
+                            dtype=x_in0.dtype,
+                            device=x_in0.device,
+                        )
                     del x_in0
 
                     qr_kv1, kvs1, idxw1 = layer.attn._run_parallel_input_projections(
@@ -1692,8 +1774,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         else None
                     )
                     del idxw0, idxw1
+                    split_attn_mhc = (
+                        res0,
+                        res1,
+                        pm0,
+                        pm1,
+                        rm0,
+                        rm1,
+                        apre0,
+                        apre1,
+                    )
+                    del res0, res1, pm0, pm1, rm0, rm1, apre0, apre1
                     did_split_attn_prep = True
                 else:
+                    if split_mhc is not None:
+                        (
+                            fres0,
+                            fres1,
+                            fpm0,
+                            fpm1,
+                            frm0,
+                            frm1,
+                            fpre0,
+                            fpre1,
+                        ) = split_mhc
+                        split_mhc = None
+                        residual = torch.cat([fres0, fres1], dim=0)
+                        del fres0, fres1
+                        post_mix = torch.cat([fpm0, fpm1], dim=0)
+                        del fpm0, fpm1
+                        res_mix = torch.cat([frm0, frm1], dim=0)
+                        del frm0, frm1
+                        pre_mix = torch.cat([fpre0, fpre1], dim=0)
+                        del fpre0, fpre1
                     if pending_ffn_ar is not None:
                         def_stream.wait_event(pending_ffn_ar[0])
                         def_stream.wait_event(pending_ffn_ar[1])
@@ -1830,14 +1943,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 del x_in, qr, qr_scale, kv, kv_score, indexer_weights
 
+                moe_cfg = getattr(layer.ffn.experts, "moe_config", None)
+                next_layer = (
+                    self.layers[idx + 1] if (idx + 1) < layer_ids.stop else None
+                )
+                can_defer_ffn_ar = (
+                    moe_cfg is not None
+                    and next_layer is not None
+                    and (
+                        getattr(next_layer, "engram", None) is None
+                        or engram_hashes is None
+                    )
+                )
+                did_split_ffn = False
+
                 if isinstance(attn_out, torch.Tensor) and layer.attn.gemm_rs is None:
                     y_comm = comm_buf[:full_num_tokens]
                     orig_wob_reduce = layer.attn.wo_b.reduce_results
                     try:
                         layer.attn.wo_b.reduce_results = False
-                        y0_tmp = layer.attn._o_proj(attn_out[:m0], positions[:m0])
-                        y_comm[:m0].copy_(y0_tmp)
-                        del y0_tmp
+                        layer.attn._o_proj(
+                            attn_out[:m0], positions[:m0], out=y_comm[:m0]
+                        )
                         ev_sync0.record(def_stream)
                         comm_stream.wait_event(ev_sync0)
                         pynccl.all_reduce(
@@ -1845,10 +1972,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                         ev_ar0.record(comm_stream)
 
-                        y1_tmp = layer.attn._o_proj(attn_out[m0:], positions[m0:])
+                        layer.attn._o_proj(
+                            attn_out[m0:], positions[m0:], out=y_comm[m0:]
+                        )
                         del attn_out
-                        y_comm[m0:].copy_(y1_tmp)
-                        del y1_tmp
                         ev_sync1.record(def_stream)
                         comm_stream.wait_event(ev_sync1)
                         pynccl.all_reduce(
@@ -1858,12 +1985,38 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     finally:
                         layer.attn.wo_b.reduce_results = orig_wob_reduce
 
+                    if split_attn_mhc is not None:
+                        (
+                            ares0,
+                            ares1,
+                            apm0,
+                            apm1,
+                            arm0,
+                            arm1,
+                            aapre0,
+                            aapre1,
+                        ) = split_attn_mhc
+                        split_attn_mhc = None
+                    else:
+                        assert (
+                            residual is not None
+                            and post_mix is not None
+                            and res_mix is not None
+                            and attn_pre is not None
+                        )
+                        ares0, ares1 = residual[:m0], residual[m0:]
+                        apm0, apm1 = post_mix[:m0], post_mix[m0:]
+                        arm0, arm1 = res_mix[:m0], res_mix[m0:]
+                        aapre0, aapre1 = attn_pre[:m0], attn_pre[m0:]
+                        del attn_pre
+                        residual = post_mix = res_mix = None
+
                     def_stream.wait_event(ev_ar0)
                     fres0, fpm0, frm0, x_ffn0, fpre0, _ = mhc_shifted_post_pre(
                         y_comm[:m0],
-                        residual[:m0],
-                        post_mix[:m0],
-                        res_mix[:m0],
+                        ares0,
+                        apm0,
+                        arm0,
                         layer.hc_ffn_fn,
                         layer.hc_ffn_scale,
                         layer.hc_ffn_base,
@@ -1872,47 +2025,157 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         layer.hc_eps,
                         layer.hc_post_alpha,
                         layer.hc_sinkhorn_iters,
-                        pre_mix=attn_pre[:m0],
+                        pre_mix=aapre0,
                         norm_weight=layer.ffn_norm.weight,
                         norm_eps=layer.ffn_norm.variance_epsilon,
                         stream=None,
                         reduce_results=False,
                         boundary_weight=layer.hc_ffn_boundary_weight,
                     )
+                    del ares0, apm0, arm0, aapre0
 
-                    def_stream.wait_event(ev_ar1)
-                    fres1, fpm1, frm1, x_ffn1, fpre1, _ = mhc_shifted_post_pre(
-                        y_comm[m0:],
-                        residual[m0:],
-                        post_mix[m0:],
-                        res_mix[m0:],
-                        layer.hc_ffn_fn,
-                        layer.hc_ffn_scale,
-                        layer.hc_ffn_base,
-                        layer.rms_norm_eps,
-                        layer.hc_eps,
-                        layer.hc_eps,
-                        layer.hc_post_alpha,
-                        layer.hc_sinkhorn_iters,
-                        pre_mix=attn_pre[m0:],
-                        norm_weight=layer.ffn_norm.weight,
-                        norm_eps=layer.ffn_norm.variance_epsilon,
-                        stream=None,
-                        reduce_results=False,
-                        boundary_weight=layer.hc_ffn_boundary_weight,
-                    )
-                    del residual, post_mix, res_mix, attn_pre, y_comm
-                    residual = torch.cat([fres0, fres1], dim=0)
-                    del fres0, fres1
-                    post_mix = torch.cat([fpm0, fpm1], dim=0)
-                    del fpm0, fpm1
-                    res_mix = torch.cat([frm0, frm1], dim=0)
-                    del frm0, frm1
-                    pre_mix = torch.cat([fpre0, fpre1], dim=0)
-                    del fpre0, fpre1
-                    x_ffn_in = torch.cat([x_ffn0, x_ffn1], dim=0)
-                    del x_ffn0, x_ffn1
+                    if can_defer_ffn_ar and mega_gate_metadata is None:
+                        assert moe_cfg is not None
+                        ids_ok = (
+                            input_ids is not None
+                            and input_ids.shape[0] == full_num_tokens
+                        )
+                        ids0 = input_ids[:m0] if ids_ok else None
+                        ids1 = input_ids[m0:] if ids_ok else None
+                        orig_skip = moe_cfg.skip_final_all_reduce
+                        try:
+                            moe_cfg.skip_final_all_reduce = True
+                            # Overlap Half-0 MoE FFN with Half-1 Attention PCIe AR!
+                            h0 = layer.ffn(x_ffn0, ids0, None)
+                            del x_ffn0
+                            y_comm[:m0].copy_(h0)
+                            del h0
+                            ev_fsync0.record(def_stream)
+                            comm_stream.wait_event(ev_fsync0)
+                            pynccl.all_reduce(
+                                y_comm[:m0], y_comm[:m0], stream=comm_stream
+                            )
+                            ef0.record(comm_stream)
+
+                            def_stream.wait_event(ev_ar1)
+                            fres1, fpm1, frm1, x_ffn1, fpre1, _ = mhc_shifted_post_pre(
+                                y_comm[m0:],
+                                ares1,
+                                apm1,
+                                arm1,
+                                layer.hc_ffn_fn,
+                                layer.hc_ffn_scale,
+                                layer.hc_ffn_base,
+                                layer.rms_norm_eps,
+                                layer.hc_eps,
+                                layer.hc_eps,
+                                layer.hc_post_alpha,
+                                layer.hc_sinkhorn_iters,
+                                pre_mix=aapre1,
+                                norm_weight=layer.ffn_norm.weight,
+                                norm_eps=layer.ffn_norm.variance_epsilon,
+                                stream=None,
+                                reduce_results=False,
+                                boundary_weight=layer.hc_ffn_boundary_weight,
+                            )
+                            del ares1, apm1, arm1, aapre1
+
+                            # Overlap Half-1 MoE FFN with Half-0 FFN PCIe AR!
+                            h1 = layer.ffn(x_ffn1, ids1, None)
+                            del x_ffn1
+                            y_comm[m0:].copy_(h1)
+                            del h1
+                            ev_fsync1.record(def_stream)
+                            comm_stream.wait_event(ev_fsync1)
+                            pynccl.all_reduce(
+                                y_comm[m0:], y_comm[m0:], stream=comm_stream
+                            )
+                            ef1.record(comm_stream)
+                        finally:
+                            moe_cfg.skip_final_all_reduce = orig_skip
+
+                        hidden_states = y_comm
+                        del y_comm
+                        pending_ffn_ar = (ef0, ef1)
+                        split_mhc = (
+                            fres0,
+                            fres1,
+                            fpm0,
+                            fpm1,
+                            frm0,
+                            frm1,
+                            fpre0,
+                            fpre1,
+                        )
+                        del fres0, fres1, fpm0, fpm1, frm0, frm1, fpre0, fpre1
+                        did_split_ffn = True
+                    else:
+                        def_stream.wait_event(ev_ar1)
+                        fres1, fpm1, frm1, x_ffn1, fpre1, _ = mhc_shifted_post_pre(
+                            y_comm[m0:],
+                            ares1,
+                            apm1,
+                            arm1,
+                            layer.hc_ffn_fn,
+                            layer.hc_ffn_scale,
+                            layer.hc_ffn_base,
+                            layer.rms_norm_eps,
+                            layer.hc_eps,
+                            layer.hc_eps,
+                            layer.hc_post_alpha,
+                            layer.hc_sinkhorn_iters,
+                            pre_mix=aapre1,
+                            norm_weight=layer.ffn_norm.weight,
+                            norm_eps=layer.ffn_norm.variance_epsilon,
+                            stream=None,
+                            reduce_results=False,
+                            boundary_weight=layer.hc_ffn_boundary_weight,
+                        )
+                        del ares1, apm1, arm1, aapre1, y_comm
+                        x_ffn_in = torch.cat([x_ffn0, x_ffn1], dim=0)
+                        del x_ffn0, x_ffn1
+                        if can_defer_ffn_ar:
+                            split_mhc = (
+                                fres0,
+                                fres1,
+                                fpm0,
+                                fpm1,
+                                frm0,
+                                frm1,
+                                fpre0,
+                                fpre1,
+                            )
+                            del fres0, fres1, fpm0, fpm1, frm0, frm1, fpre0, fpre1
+                        else:
+                            residual = torch.cat([fres0, fres1], dim=0)
+                            del fres0, fres1
+                            post_mix = torch.cat([fpm0, fpm1], dim=0)
+                            del fpm0, fpm1
+                            res_mix = torch.cat([frm0, frm1], dim=0)
+                            del frm0, frm1
+                            pre_mix = torch.cat([fpre0, fpre1], dim=0)
+                            del fpre0, fpre1
                 else:
+                    if split_attn_mhc is not None:
+                        (
+                            ares0,
+                            ares1,
+                            apm0,
+                            apm1,
+                            arm0,
+                            arm1,
+                            aapre0,
+                            aapre1,
+                        ) = split_attn_mhc
+                        split_attn_mhc = None
+                        residual = torch.cat([ares0, ares1], dim=0)
+                        del ares0, ares1
+                        post_mix = torch.cat([apm0, apm1], dim=0)
+                        del apm0, apm1
+                        res_mix = torch.cat([arm0, arm1], dim=0)
+                        del arm0, arm1
+                        attn_pre = torch.cat([aapre0, aapre1], dim=0)
+                        del aapre0, aapre1
                     y_full = layer.attn._o_proj(attn_out, positions)
                     del attn_out
                     residual, post_mix, res_mix, x_ffn_in, pre_mix, _ = (
@@ -1939,60 +2202,59 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     )
                     del y_full, attn_pre
 
-                moe_cfg = getattr(layer.ffn.experts, "moe_config", None)
-                next_layer = (
-                    self.layers[idx + 1] if (idx + 1) < layer_ids.stop else None
-                )
-                can_defer_ffn_ar = (
-                    moe_cfg is not None
-                    and next_layer is not None
-                    and (
-                        getattr(next_layer, "engram", None) is None
-                        or engram_hashes is None
-                    )
-                )
-                if can_defer_ffn_ar:
-                    orig_skip = moe_cfg.skip_final_all_reduce
-                    try:
-                        moe_cfg.skip_final_all_reduce = True
-                        h_raw = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
-                    finally:
-                        moe_cfg.skip_final_all_reduce = orig_skip
-                    del x_ffn_in
-                    h_comm = comm_buf[:full_num_tokens]
-                    h_comm.copy_(h_raw)
-                    del h_raw
-                    ev_sync0.record(def_stream)
-                    comm_stream.wait_event(ev_sync0)
-                    pynccl.all_reduce(
-                        h_comm[:m0], h_comm[:m0], stream=comm_stream
-                    )
-                    ef0.record(comm_stream)
-                    pynccl.all_reduce(
-                        h_comm[m0:], h_comm[m0:], stream=comm_stream
-                    )
-                    ef1.record(comm_stream)
-                    hidden_states = h_comm
-                    del h_comm
-                    pending_ffn_ar = (ef0, ef1)
-                else:
-                    if layer.fuse_mhc_all_reduce and layer.ffn.defers_finalize(
-                        x_ffn_in.shape[0]
-                    ):
-                        hidden_states = layer.ffn.forward_unfinalized(
-                            x_ffn_in, input_ids
-                        )
+                if not did_split_ffn:
+                    if can_defer_ffn_ar:
+                        h_comm = comm_buf[:full_num_tokens]
+                        orig_skip = moe_cfg.skip_final_all_reduce
+                        try:
+                            moe_cfg.skip_final_all_reduce = True
+                            h_raw = layer.ffn(
+                                x_ffn_in, input_ids, mega_gate_metadata
+                            )
+                            del x_ffn_in
+                            h_comm.copy_(h_raw)
+                            del h_raw
+                            ev_fsync0.record(def_stream)
+                            comm_stream.wait_event(ev_fsync0)
+                            pynccl.all_reduce(
+                                h_comm[:m0], h_comm[:m0], stream=comm_stream
+                            )
+                            ef0.record(comm_stream)
+                            pynccl.all_reduce(
+                                h_comm[m0:], h_comm[m0:], stream=comm_stream
+                            )
+                            ef1.record(comm_stream)
+                        finally:
+                            moe_cfg.skip_final_all_reduce = orig_skip
+                        hidden_states = h_comm
+                        del h_comm
+                        pending_ffn_ar = (ef0, ef1)
                     else:
-                        hidden_states = layer.ffn(
-                            x_ffn_in, input_ids, mega_gate_metadata
-                        )
-                    del x_ffn_in
+                        if layer.fuse_mhc_all_reduce and layer.ffn.defers_finalize(
+                            x_ffn_in.shape[0]
+                        ):
+                            hidden_states = layer.ffn.forward_unfinalized(
+                                x_ffn_in, input_ids
+                            )
+                        else:
+                            hidden_states = layer.ffn(
+                                x_ffn_in, input_ids, mega_gate_metadata
+                            )
+                        del x_ffn_in
         finally:
             def_stream.wait_event(ev_ar0)
             def_stream.wait_event(ev_ar1)
             if pending_ffn_ar is not None:
                 def_stream.wait_event(pending_ffn_ar[0])
                 def_stream.wait_event(pending_ffn_ar[1])
+
+        if split_mhc is not None:
+            fres0, fres1, fpm0, fpm1, frm0, frm1, fpre0, fpre1 = split_mhc
+            split_mhc = None
+            residual = torch.cat([fres0, fres1], dim=0)
+            post_mix = torch.cat([fpm0, fpm1], dim=0)
+            res_mix = torch.cat([frm0, frm1], dim=0)
+            pre_mix = torch.cat([fpre0, fpre1], dim=0)
 
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
@@ -2071,14 +2333,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
 
     def _init_engram_column_gathers(self, vllm_config: VllmConfig) -> None:
-        """All-gather the TP-sharded Engram layers' heads and wkv output with
-        the side-by-side Lamport kernel (`columns.py`). Collective over the
-        TP group."""
+        """All-gather the TP-sharded Engram layers' heads and wkv output (plus
+        16-byte TP-local greedy argmax stats) with the side-by-side Lamport
+        kernel (`columns.py`). Collective over the TP group."""
         from .specialized_decode.ampere.columns import (
             all_gather_columns,
             init_column_gathers,
+            supports_column_gathers,
         )
 
+        row_sizes: list[int] = [16] if supports_column_gathers(vllm_config) else []
         engrams = [
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)
@@ -2087,19 +2351,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and layer.engram.embed_tokens.dp_size == 1
             and layer.engram._batch is None
         ]
-        if not engrams:
-            return
-        dtype = vllm_config.model_config.dtype
-        assert isinstance(dtype, torch.dtype)
-        dtype_bytes = dtype.itemsize
-        table = engrams[0].embed_tokens
-        init_column_gathers(
-            [
-                # The staged BF16 rows of a rank's heads, and its wkv columns.
-                table.part_n_hash_cols * table.dim * 2,
-                engrams[0].wkv.output_size_per_partition * dtype_bytes,
-            ]
-        )
+        if engrams:
+            dtype = vllm_config.model_config.dtype
+            assert isinstance(dtype, torch.dtype)
+            dtype_bytes = dtype.itemsize
+            table = engrams[0].embed_tokens
+            row_sizes.extend(
+                [
+                    # The staged BF16 rows of a rank's heads, and its wkv columns.
+                    table.part_n_hash_cols * table.dim * 2,
+                    engrams[0].wkv.output_size_per_partition * dtype_bytes,
+                ]
+            )
+        if row_sizes:
+            init_column_gathers(row_sizes)
         for engram in engrams:
             engram.set_column_gather(all_gather_columns)
 

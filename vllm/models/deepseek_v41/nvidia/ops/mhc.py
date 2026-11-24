@@ -375,21 +375,20 @@ def init_mhc_all_reduce(vllm_config: VllmConfig) -> None:
 def supports_ampere_all_reduce(vllm_config: VllmConfig) -> bool:
     """Whether the SM80 mHC boundaries take the TP all-reduce with their own
     kernel (`AmpereAllReduce`, a two-shot all-reduce that stores through
-    peer mappings): on SM80, which has no NVLink multicast, at TP 2, 4 or 8
-    where vLLM's custom all-reduce runs, so the GPUs are fully connected
-    with peer access."""
+    peer mappings): on SM80 at TP 2, 4 or 8 over full NVLink (`ca_comm`) or
+    opted-in full PCIe P2P (`VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=1`)."""
     parallel = vllm_config.parallel_config
     config = vllm_config.model_config.hf_config
     tp_size = parallel.tensor_parallel_size
     if (
         not current_platform.is_device_capability(80)
         or tp_size not in (2, 4, 8)
-        or parallel.enable_expert_parallel
         or config.hidden_size % (8 * tp_size)
     ):
         return False
-    comm = cast("CudaCommunicator", get_tp_group().device_communicator).ca_comm
-    return comm is not None and not comm.disabled and comm.fully_connected
+    from ..specialized_decode.ampere.all_reduce import ampere_peer_topology
+
+    return ampere_peer_topology() is not None
 
 
 def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
@@ -397,19 +396,34 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
     so every rank must call it, and only when `supports_ampere_all_reduce`
     holds."""
     global _ampere_all_reduce
-    from ..specialized_decode.ampere.all_reduce import AmpereAllReduce
+    from ..specialized_decode.ampere.all_reduce import (
+        AmpereAllReduce,
+        ampere_peer_topology,
+        default_ampere_ar_capacity,
+        default_ampere_ar_oneshot_max_rows,
+    )
 
     group = get_tp_group()
     config = vllm_config.model_config.hf_config
+    parallel = vllm_config.parallel_config
+    topo = ampere_peer_topology() or "pcie"
+    capacity = default_ampere_ar_capacity(topo)
+    oneshot_capacity = default_ampere_ar_oneshot_max_rows(topo)
+    top_k = None if parallel.enable_expert_parallel else config.num_experts_per_tok
     _ampere_all_reduce = AmpereAllReduce(
         group.device_group,
         config.hidden_size,
         group.device,
-        top_k=config.num_experts_per_tok,
+        capacity=capacity,
+        top_k=top_k,
+        oneshot_capacity=oneshot_capacity,
     )
     logger.info_once(
-        "DSV4.1 mHC: CuTe DSL two-shot Lamport all-reduce for up to %d tokens.",
+        "DSV4.1 mHC: CuTe DSL Lamport all-reduce (%s) for up to %d tokens "
+        "(oneshot <= %d).",
+        topo,
         _ampere_all_reduce.capacity,
+        _ampere_all_reduce.oneshot_capacity,
     )
 
 
@@ -683,16 +697,35 @@ def mhc_shifted_post_pre(
                     capture_aux,
                 )
             else:
-                residual, layer_input, aux = _ampere_all_reduce.post_collapse(
-                    x.contiguous(),
-                    residual,
-                    post_layer_mix,
-                    comb_res_mix,
-                    pre_mix,
-                    norm_weight,
-                    norm_eps,
-                    capture_aux,
+                from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                    pop_deferred_w2_splitk,
                 )
+
+                w2_defer = pop_deferred_w2_splitk(x)
+                if w2_defer is not None and _ampere_all_reduce.w2_splitk_kernels:
+                    residual, layer_input, aux = (
+                        _ampere_all_reduce.w2_splitk_post_collapse(
+                            *w2_defer,
+                            residual,
+                            post_layer_mix,
+                            comb_res_mix,
+                            pre_mix,
+                            norm_weight,
+                            norm_eps,
+                            capture_aux,
+                        )
+                    )
+                else:
+                    residual, layer_input, aux = _ampere_all_reduce.post_collapse(
+                        x.contiguous(),
+                        residual,
+                        post_layer_mix,
+                        comb_res_mix,
+                        pre_mix,
+                        norm_weight,
+                        norm_eps,
+                        capture_aux,
+                    )
             post, comb, pre = mhc_coefficients(
                 None,
                 residual,

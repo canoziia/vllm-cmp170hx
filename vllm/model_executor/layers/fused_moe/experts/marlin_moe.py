@@ -380,6 +380,10 @@ def fused_marlin_moe(
 
     if prefill_block_lists is not None:
         _, sorted_token_ids, expert_ids, num_tokens_post_padded = prefill_block_lists[0]
+    elif (
+        pre_aligned := _dsv4_mxfp4_decode.pop_prealigned(topk_ids, E, block_size_m)
+    ) is not None:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = pre_aligned
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
@@ -772,6 +776,19 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    def _prefill_chunk_tokens(self, M: int) -> int:
+        import os
+
+        chunk_m = int(os.environ.get("VLLM_DSV41_MOE_PREFILL_CHUNK_TOKENS", "0"))
+        if (
+            chunk_m > 0
+            and M > chunk_m
+            and not self._uses_post_gemm2_hook(M)
+            and self._lora_context is None
+        ):
+            return chunk_m
+        return M
+
     def workspace_shapes(
         self,
         M: int,
@@ -783,23 +800,13 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         activation: MoEActivation,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        # Modular Kernel provisions output buffer from workspace1. However in
-        # the fused_marlin_moe() function, the final torch.sum(), is defined
-        # essentially as,
-        # `torch.sum(workspace1, dim=1, out=output)`
-        # Having overlapping input and output tensors for torch.sum seems
-        # error prone and depends on how the torch.sum is implemented.
-        # For this reason we swap let the output buffer provision from
-        # workspace2.
-
-        # Workspace/IntermediateCache allocation matching fused_marlin_moe()
-        # workspace1 = (M * topk * max(2 * N, K),)
-        # workspace2 = (M * topk, N)
-
-        # Workspace/IntermediateCache allocation accounting for output buffer
-        # provisioning
-        workspace1 = (M * topk, max(N, K))
-        workspace2 = (M * topk * max(2 * N, K),)
+        # Modular Kernel provisions output buffer from workspace1 (unless
+        # output_alias is used on CUDA). Account for output (M, K) without
+        # multiplying topk * K when N < K, and cap intermediate caches to
+        # _prefill_chunk_tokens(M) when prefill token chunking is enabled.
+        m_eff = self._prefill_chunk_tokens(M)
+        workspace1 = (max(m_eff * topk * N, M * K),)
+        workspace2 = (m_eff * topk * max(2 * N, K),)
         output = (M, K)
 
         return (workspace1, workspace2, output)
@@ -844,6 +851,40 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                     )
                     return
                 self.moe_sum(input, output, topk_ids, expert_map)
+
+            chunk_m = self._prefill_chunk_tokens(hidden_states.shape[0])
+            if not hooked and hidden_states.shape[0] > chunk_m:
+                M_total = hidden_states.shape[0]
+                for s in range(0, M_total, chunk_m):
+                    e = min(s + chunk_m, M_total)
+                    fused_marlin_moe(
+                        hidden_states=hidden_states[s:e],
+                        w1=w1,
+                        w2=w2,
+                        bias1=self.w1_bias,
+                        bias2=self.w2_bias,
+                        w1_scale=self.w1_scale,
+                        w2_scale=self.w2_scale,
+                        topk_weights=topk_weights[s:e],
+                        topk_ids=topk_ids[s:e],
+                        global_scale1=self.g1_alphas,
+                        global_scale2=self.g2_alphas,
+                        w1_zeros=self.w1_zp,
+                        w2_zeros=self.w2_zp,
+                        quant_type_id=self.quant_type_id,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        global_num_experts=global_num_experts,
+                        activation=activation,
+                        activation_func=self.activation,
+                        activation_config=self.activation_config,
+                        moe_sum=self.moe_sum,
+                        expert_map=expert_map,
+                        output=output[s:e],
+                        intermediate_cache13=workspace2,
+                        intermediate_cache2=workspace13,
+                        mul_topk_weights_in_gemm2=True,
+                    )
+                return
 
             fused_marlin_moe(
                 hidden_states=hidden_states,
