@@ -299,8 +299,17 @@ RUN (python3 -c 'import torch, lmcache.cuda_ops, lmcache.lmcache_native, lmcache
             fi)) \
     && rm -rf /tmp/lmcache-ext-src /root/.cache/torch_extensions \
     && python3 -m compileall -q /opt/lmcache-patched/lmcache \
-    && python3 /tmp/test-lmcache-patches.py \
-    && rm /tmp/test-lmcache-patches.py
+    && (set -eu; \
+        CUDA_TEST_LIB=""; \
+        if [ -f /usr/local/cuda/compat/libcuda.so.1 ]; then \
+            CUDA_TEST_LIB="/usr/local/cuda/compat"; \
+        elif [ -f /usr/local/cuda/lib64/stubs/libcuda.so ]; then \
+            mkdir -p /tmp/cuda-stub; \
+            ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1; \
+            CUDA_TEST_LIB="/tmp/cuda-stub"; \
+        fi; \
+        LD_LIBRARY_PATH="${CUDA_TEST_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" python3 /tmp/test-lmcache-patches.py) \
+    && rm -rf /tmp/test-lmcache-patches.py /tmp/cuda-stub
 CONTAINERFILE
 fi
 
