@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepseekV4 MLA Attention Layer"""
 
+import ctypes
 import math
+import os
+import pathlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from functools import cached_property
@@ -60,6 +63,27 @@ from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+_DSV41_SWA_OPS: Any = None
+
+
+def _dsv41_swa_ops() -> Any:
+    global _DSV41_SWA_OPS
+    if _DSV41_SWA_OPS is not None:
+        return _DSV41_SWA_OPS
+    if not hasattr(torch.ops, "_dsv41_swa_C") or not hasattr(
+        torch.ops._dsv41_swa_C, "fused_deepseek_v4_kv_rope_insert"
+    ):
+        so_path = pathlib.Path(__file__).resolve().parents[2] / "_dsv41_swa_C.abi3.so"
+        if so_path.exists():
+            ctypes.CDLL(str(so_path), ctypes.RTLD_GLOBAL)
+    if hasattr(torch.ops, "_dsv41_swa_C") and hasattr(
+        torch.ops._dsv41_swa_C, "fused_deepseek_v4_kv_rope_insert"
+    ):
+        _DSV41_SWA_OPS = torch.ops._dsv41_swa_C
+    else:
+        _DSV41_SWA_OPS = torch.ops._C
+    return _DSV41_SWA_OPS
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
@@ -173,6 +197,32 @@ def _pad_interleaved_q(q: torch.Tensor, out: torch.Tensor) -> DispatchSpec:
         BLOCK_ROWS=block_rows,
         num_warps=4,
     )
+
+
+def _fused_wqb_idx_enabled() -> bool:
+    return os.environ.get("VLLM_DSV41_FUSED_WQB_IDX", "0") == "1"
+
+
+class _FusedWqBIdxHolder:
+    """Lightweight holder for fused (wq_b + indexer.wq_b) Marlin MXFP8 weights."""
+
+    def __init__(
+        self,
+        size_k: int,
+        n1: int,
+        n2: int,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        workspace: torch.Tensor | None = None,
+    ) -> None:
+        self.input_size_per_partition = size_k
+        self.output_size_per_partition = n1 + n2
+        self.n1 = n1
+        self.n2 = n2
+        self.weight = weight
+        self.weight_scale = weight_scale
+        self.workspace = workspace
+        self._dense_mxfp8_ok = False
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -772,6 +822,114 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                 _COMBINE_TOPK_SWA_INDICES_KERNEL.register_warmup()
 
+        # VLLM_DSV41_FUSED_WQB_IDX=1 (default off): populated in
+        # process_weights_after_loading on index-source layers.
+        self._wq_b_idx_fused: bool = False
+        self._wq_b_idx_layer: _FusedWqBIdxHolder | None = None
+        self.register_buffer("_wq_b_idx_weight", None, persistent=False)
+        self.register_buffer("_wq_b_idx_scale", None, persistent=False)
+
+    def process_weights_after_loading(
+        self, act_dtype: torch.dtype | None = None
+    ) -> None:
+        del act_dtype
+        if (
+            not _fused_wqb_idx_enabled()
+            or self._wq_b_idx_fused
+            or self.indexer is None
+        ):
+            return
+        from vllm.model_executor.utils import (
+            is_weights_pre_processed,
+            replace_parameter,
+        )
+
+        if is_weights_pre_processed():
+            return
+        from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+        from vllm.model_executor.kernels.linear.mxfp8.marlin import (
+            MarlinMxfp8LinearKernel,
+        )
+
+        qm1 = getattr(self.wq_b, "quant_method", None)
+        qm2 = getattr(self.indexer.wq_b, "quant_method", None)
+        k1 = getattr(qm1, "kernel", None)
+        k2 = getattr(qm2, "kernel", None)
+        if not (
+            isinstance(k1, MarlinMxfp8LinearKernel)
+            and isinstance(k2, MarlinMxfp8LinearKernel)
+        ):
+            return
+
+        size_k = self.wq_b.input_size_per_partition
+        n1 = self.wq_b.output_size_per_partition
+        n2 = self.indexer.wq_b.output_size_per_partition
+        if (
+            size_k != self.indexer.wq_b.input_size_per_partition
+            or size_k % 128 != 0
+            or n1 % 64 != 0
+            or n2 % 64 != 0
+            or getattr(self.wq_b, "bias", None) is not None
+            or getattr(self.indexer.wq_b, "bias", None) is not None
+            or self.wq_b.weight.shape != (size_k // 16, 4 * n1)
+            or self.indexer.wq_b.weight.shape != (size_k // 16, 4 * n2)
+            or self.wq_b.weight_scale.shape != (size_k // 32, n1)
+            or self.indexer.wq_b.weight_scale.shape != (size_k // 32, n2)
+        ):
+            return
+
+        dev = self.wq_b.weight.device
+        scale_dtype = self.wq_b.weight_scale.dtype
+        workspace = getattr(self.wq_b, "workspace", None)
+
+        # Stage repacked Marlin weights/scales through CPU RAM and free both
+        # separate GPU tensors BEFORE allocating the concatenated GPU tensor so
+        # both peak and resident GPU HBM increase by 0 bytes.
+        w1_cpu = self.wq_b.weight.data.cpu()
+        w2_cpu = self.indexer.wq_b.weight.data.cpu()
+        s1_cpu = self.wq_b.weight_scale.data.view(torch.uint8).cpu()
+        s2_cpu = self.indexer.wq_b.weight_scale.data.view(torch.uint8).cpu()
+
+        empty_w = torch.empty(0, dtype=torch.int32, device=dev)
+        empty_s = torch.empty(0, dtype=torch.uint8, device=dev).view(scale_dtype)
+        replace_parameter(self.wq_b, "weight", empty_w)
+        replace_parameter(self.wq_b, "weight_scale", empty_s)
+        replace_parameter(self.indexer.wq_b, "weight", empty_w.clone())
+        replace_parameter(self.indexer.wq_b, "weight_scale", empty_s.clone())
+        self.wq_b.weight.data = empty_w
+        self.wq_b.weight_scale.data = empty_s
+        self.indexer.wq_b.weight.data = empty_w.clone()
+        self.indexer.wq_b.weight_scale.data = empty_s.clone()
+        if hasattr(self.indexer.wq_b, "workspace"):
+            self.indexer.wq_b.workspace = torch.empty(0, dtype=torch.int32, device=dev)
+
+        w_fused_cpu = torch.cat([w1_cpu, w2_cpu], dim=1)
+        s_fused_cpu = torch.cat([s1_cpu, s2_cpu], dim=1)
+        del w1_cpu, w2_cpu, s1_cpu, s2_cpu
+
+        s_fused_gpu = s_fused_cpu.to(device=dev).view(scale_dtype)
+        del s_fused_cpu
+
+        holder = _FusedWqBIdxHolder(
+            size_k=size_k,
+            n1=n1,
+            n2=n2,
+            weight=empty_w,
+            weight_scale=s_fused_gpu,
+            workspace=workspace,
+        )
+        # Validate scales / pre-warm scratch while the freed weight HBM is
+        # still unoccupied so peak HBM delta stays strictly <= 0 bytes.
+        dsv41_dense_mxfp8.prepare(holder)
+
+        w_fused_gpu = w_fused_cpu.to(device=dev)
+        del w_fused_cpu
+        holder.weight = w_fused_gpu
+        self._wq_b_idx_weight = w_fused_gpu
+        self._wq_b_idx_scale = s_fused_gpu
+        self._wq_b_idx_layer = holder
+        self._wq_b_idx_fused = True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -823,7 +981,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 assert swa_metadata.cache_positions is not None
                 slot_mapping = swa_metadata.cache_slot_mapping
                 cache_positions = swa_metadata.cache_positions
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            _dsv41_swa_ops().fused_deepseek_v4_kv_rope_insert(
                 cache_kv,
                 cache,
                 slot_mapping,
@@ -956,10 +1114,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         compressor = self.compressor
         aux_streams = self.aux_stream_list
 
+        precomputed_index_q: torch.Tensor | None = None
+
         def project_query_and_cache_kv() -> torch.Tensor:
-            q = self._wq_b_proj(qr, qr_scale).view(
-                -1, self.n_local_heads, self.head_dim
-            )
+            nonlocal precomputed_index_q
+            if self._wq_b_idx_fused:
+                q_raw, precomputed_index_q = self._wq_b_idx_proj(qr, qr_scale)
+            else:
+                q_raw = self._wq_b_proj(qr, qr_scale)
+            q = q_raw.view(-1, self.n_local_heads, self.head_dim)
             return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         index_q: torch.Tensor | None = None
@@ -1007,6 +1170,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 qr_scale,
                 cache_latent=cache_latent,
                 cache_positions=cache_positions,
+                precomputed_index_q=precomputed_index_q,
             )
 
         if compressor is not None:
@@ -1053,6 +1217,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Project normalized Q, bypassing quantization when already fused."""
         assert qr_scale is None, "ROCm-only path"
         return self.wq_b(qr)
+
+    def _wq_b_idx_proj(
+        self,
+        qr: torch.Tensor | QuantizedActivation,
+        qr_scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused wq_b + indexer.wq_b projection returning contiguous (q, idx_q)."""
+        assert qr_scale is None, "ROCm-only path"
+        assert isinstance(qr, torch.Tensor)
+        holder = self._wq_b_idx_layer
+        weight = self._wq_b_idx_weight
+        weight_scale = self._wq_b_idx_scale
+        assert holder is not None and weight is not None and weight_scale is not None
+        n1, n2 = holder.n1, holder.n2
+        size_k = holder.input_size_per_partition
+        if getattr(holder, "_dense_mxfp8_ok", False):
+            from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+
+            split_out = dsv41_dense_mxfp8.try_apply_split(
+                qr, weight, weight_scale, n1, n2, size_k
+            )
+            if split_out is not None:
+                return split_out
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+            apply_mxfp8_marlin_linear,
+        )
+
+        out = apply_mxfp8_marlin_linear(
+            input=qr,
+            weight=weight,
+            weight_scale=weight_scale,
+            workspace=holder.workspace,
+            size_n=n1 + n2,
+            size_k=size_k,
+            bias=None,
+        )
+        return out[..., :n1].contiguous(), out[..., n1:].contiguous()
 
     def _run_parallel_input_projections(
         self, hidden_states: torch.Tensor
@@ -1180,7 +1381,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_kv = get_pcp_group().all_gather(kv.contiguous(), dim=0)
             assert swa_metadata.cache_slot_mapping is not None
             assert swa_metadata.cache_positions is not None
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            _dsv41_swa_ops().fused_deepseek_v4_kv_rope_insert(
                 cache_kv,
                 swa_kv_cache,
                 swa_metadata.cache_slot_mapping,
@@ -1217,7 +1418,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and q.shape[0] >= _Q_PAD_COPY_MIN_TOKENS
                 and not torch.cuda.is_current_stream_capturing()
             )
-            q_padded = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q_padded = _dsv41_swa_ops().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,
                 swa_kv_cache_2d,
@@ -1249,7 +1450,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert swa_kv_cache.shape[1:] == (block_size, self.head_dim)
         swa_kv_cache_3d = swa_kv_cache
         if cache_dtype == torch.bfloat16:
-            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            _dsv41_swa_ops().fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
                 q,
                 kv,
                 swa_kv_cache_3d,
@@ -1264,7 +1465,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # per-tensor fp8 (torch.float8_e4m3fn)
         q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
-        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
+        _dsv41_swa_ops().fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             q,
             kv,
             q_fp8,
@@ -1639,13 +1840,19 @@ class DeepseekV4Indexer(nn.Module):
         indexer_weights: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
+        *,
+        precomputed_index_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """Build the indexer queries: wq_b over qr plus fused RoPE/quant.
 
         Split out so the ROCm layer can schedule it apart from
         `_produce_k` (e.g. on an aux stream once `qr` is ready).
         """
-        q = self._wq_b_proj(qr, qr_scale)
+        q = (
+            precomputed_index_q
+            if precomputed_index_q is not None
+            else self._wq_b_proj(qr, qr_scale)
+        )
         q = q.view(-1, self.n_head, self.head_dim)
         q_quant, weights = fused_indexer_q_rope_quant(
             positions,
@@ -1674,6 +1881,7 @@ class DeepseekV4Indexer(nn.Module):
         *,
         cache_latent: torch.Tensor | None = None,
         cache_positions: torch.Tensor | None = None,
+        precomputed_index_q: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if cache_latent is None:
             cache_latent = latent
@@ -1711,7 +1919,14 @@ class DeepseekV4Indexer(nn.Module):
             # (skip_k_cache_insert=True).
             self._produce_k(cache_latent, cache_positions, rotary_emb)
 
-        return self.forward_q(qr, qr_scale, indexer_weights, positions, rotary_emb)
+        return self.forward_q(
+            qr,
+            qr_scale,
+            indexer_weights,
+            positions,
+            rotary_emb,
+            precomputed_index_q=precomputed_index_q,
+        )
 
     def _wq_b_proj(
         self,
@@ -1729,6 +1944,8 @@ def autotune_indexer_wq_b(model: nn.Module, num_tokens: int) -> None:
     """Short-context dummy runs skip wq_b, so tune it directly."""
     for module in model.modules():
         if isinstance(module, DeepseekV4Indexer):
+            if module.wq_b.weight.numel() == 0:
+                continue
             # Run every wq_b: FlashInfer keys on op, runner, shapes and dtype,
             # and skips profiling on a cache hit, so duplicates are cheap.
             qr = torch.randn(

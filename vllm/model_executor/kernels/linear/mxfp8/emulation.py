@@ -64,9 +64,24 @@ class EmulationMxfp8LinearKernel(Mxfp8LinearKernel):
         # scale is kept for the dtype/ndim asserts but is otherwise unused.
         # Opt out (VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD=0) to keep the MXFP8
         # weight and dequant per-step in apply_weights instead.
+        import os
+
         import vllm.envs as envs
 
-        if envs.VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD:
+        skip_woa_dequant = (
+            os.environ.get("VLLM_DSV41_WOA_FP8", "0") == "1"
+            and K == 4096
+            and N in (1024, 2048, 4096, 8192, 16384)
+        )
+        dense_mxfp8 = (
+            os.environ.get("VLLM_DSV41_DENSE_MXFP8", "0") == "1"
+            or os.environ.get("VLLM_DSV41_DENSE_MXFP8_DECODE", "0") == "1"
+        )
+        if (
+            envs.VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD
+            and not skip_woa_dequant
+            and not dense_mxfp8
+        ):
             weight = dequant_mxfp8_to_bf16(weight.contiguous(), weight_scale)
         replace_parameter(layer, "weight", weight.contiguous())
         replace_parameter(layer, "weight_scale", weight_scale)

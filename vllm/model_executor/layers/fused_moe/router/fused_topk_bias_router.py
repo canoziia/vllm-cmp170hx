@@ -196,6 +196,7 @@ def fused_topk_bias(
                 input_ids=input_tokens,
                 bias_vl=bias_vl,
                 image_sentinel_lo=image_sentinel_lo,
+                topk=topk,
             )
 
         M, _ = hidden_states.size()

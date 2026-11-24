@@ -65,6 +65,12 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
         )
 
         prepare_mxfp8_layer_for_marlin(layer)
+        # stream-K/split-K/wide split-K decode kernels (default off:
+        # VLLM_DSV41_DENSE_MXFP8_DECODE=1 or VLLM_DSV41_DENSE_MXFP8=1 enables);
+        # load-time eligibility check, never inside graph capture.
+        from . import dsv41_dense_mxfp8
+
+        dsv41_dense_mxfp8.prepare(layer)
 
     def apply_weights(
         self,
@@ -76,6 +82,19 @@ class MarlinMxfp8LinearKernel(Mxfp8LinearKernel):
             apply_mxfp8_marlin_linear,
         )
 
+        if getattr(layer, "_dense_mxfp8_ok", False):
+            from . import dsv41_dense_mxfp8
+
+            # per-M dispatch; None -> Marlin (M outside the measured-faster ranges)
+            out = dsv41_dense_mxfp8.try_apply(
+                x,
+                layer,
+                layer.output_size_per_partition,
+                layer.input_size_per_partition,
+                bias,
+            )
+            if out is not None:
+                return out
         return apply_mxfp8_marlin_linear(
             input=x,
             weight=layer.weight,

@@ -374,6 +374,25 @@ class GateLinear(ReplicatedLinear):
                 output = bf16x3_router_gemm(x, self.weight)
             return self._return(output)
 
+        # Pre-Hopper CUDA fast single-launch gate GEMV (M<=8, VLLM_DSV41_FAST_GATE_TOPK=1).
+        if (
+            not self.allow_specialized_router_gemm
+            and self._router_gemm_no_bias
+            and self.weight.dtype == torch.bfloat16
+            and x.dtype == torch.bfloat16
+            and 0 < x.shape[0] <= 8
+        ):
+            try:
+                from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+            except ImportError:
+                dsv41_dense_mxfp8 = None  # type: ignore[assignment]
+            if dsv41_dense_mxfp8 is not None:
+                fast_out = dsv41_dense_mxfp8.try_gate_gemv(
+                    x, self.weight, self.out_dtype
+                )
+                if fast_out is not None:
+                    return self._return(fast_out)
+
         # Tier 6: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             if self.is_gfx950:

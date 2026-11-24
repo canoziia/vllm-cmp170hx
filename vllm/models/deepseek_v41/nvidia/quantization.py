@@ -54,10 +54,23 @@ logger = init_logger(__name__)
 def mxfp8_linear_as_bf16() -> bool:
     """Whether the MXFP8 linear layers run as BF16 GEMMs: on A100 (SM80) and
     H100 (SM90), whose MXFP8 kernels (Marlin, Humming) are slower than cuBLAS
-    on the weights dequantized once at load at decode sizes. SM80 always does
-    (its attention reads the BF16 `wo_a` weight); SM90 only when no MXFP8
-    linear backend is requested explicitly."""
+    on the weights dequantized once at load at decode sizes. SM80 opts out when
+    1x-HBM dense MXFP8 (`VLLM_DSV41_DENSE_MXFP8*` or
+    `VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD=0`) is requested so weights stay 1x
+    Marlin MXFP8 (`wo_a` as 1x FP8 via `thin_woa_mxfp8`) instead of allocating
+    both a 2x BF16 copy and a 1x packed GEMV copy (3x HBM); SM90 only uses BF16
+    when no MXFP8 linear backend is requested explicitly."""
     if current_platform.is_device_capability(80):
+        import os
+
+        import vllm.envs as envs
+
+        if (
+            os.environ.get("VLLM_DSV41_DENSE_MXFP8_DECODE", "0") == "1"
+            or os.environ.get("VLLM_DSV41_DENSE_MXFP8", "0") == "1"
+            or not envs.VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD
+        ):
+            return False
         return True
     if not current_platform.is_device_capability(90):
         return False

@@ -23,15 +23,15 @@ def can_use_dsv4_topk(
         current_platform.is_cuda()
         and gating_output.dtype == torch.float32
         and gating_output.ndim == 2
-        and gating_output.shape[1] in (256, 384)
+        and gating_output.shape[1] in (128, 256, 384)
         and gating_output.is_contiguous()
         and correction_bias is not None
         and correction_bias.dtype == torch.float32
         and correction_bias.shape == (gating_output.shape[1],)
         and correction_bias.is_contiguous()
-        and topk == _TOPK
+        and topk in (3, _TOPK)
         and renormalize
-        and indices_dtype in (torch.int32, torch.int64)
+        and indices_dtype in (torch.int32, torch.uint32, torch.int64)
     )
 
 
@@ -50,6 +50,7 @@ if current_platform.is_cuda():
         image_sentinel_lo,
         NUM_EXPERTS: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        TOPK: tl.constexpr,
         HAS_PADDING: tl.constexpr,
         HAS_VL: tl.constexpr,
         launch_pdl: tl.constexpr,
@@ -89,7 +90,7 @@ if current_platform.is_cuda():
         topk_offsets = tl.arange(0, 8)
         selected_weights = tl.zeros([8], dtype=tl.float32)
         selected_ids = tl.zeros([8], dtype=tl.int32)
-        for slot in tl.static_range(6):
+        for slot in tl.static_range(TOPK):
             max_value = tl.max(current, axis=0)
             candidate = tl.where(current == max_value, expert_offsets, NUM_EXPERTS)
             expert_id = tl.min(candidate, axis=0).to(tl.int32)
@@ -105,8 +106,8 @@ if current_platform.is_cuda():
         selected_weights *= routed_scaling_factor / tl.where(
             weight_sum > 0.0, weight_sum, 1.0
         )
-        output_mask = topk_offsets < 6
-        output_offsets = row * 6 + topk_offsets
+        output_mask = topk_offsets < TOPK
+        output_offsets = row * TOPK + topk_offsets
 
         if HAS_PADDING:
             is_padding = tl.load(is_padding_ptr + row)
@@ -129,6 +130,7 @@ def dsv4_topk(
     input_ids: torch.Tensor | None = None,
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
+    topk: int = _TOPK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens, num_experts = gating_output.shape
     if is_padding is not None:
@@ -145,7 +147,24 @@ def dsv4_topk(
         assert bias_vl.dtype == torch.float32 and bias_vl.is_contiguous()
         assert bias_vl.shape == (num_experts,)
         assert input_ids.is_contiguous()
-    shape = (num_tokens, _TOPK)
+    if num_tokens > 0 and topk == _TOPK and is_padding is None:
+        try:
+            from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+        except ImportError:
+            dsv41_dense_mxfp8 = None  # type: ignore[assignment]
+        if dsv41_dense_mxfp8 is not None:
+            fast_res = dsv41_dense_mxfp8.try_dsv4_topk(
+                gating_output,
+                correction_bias,
+                indices_dtype,
+                routed_scaling_factor,
+                input_ids=input_ids,
+                bias_vl=bias_vl,
+                image_sentinel_lo=image_sentinel_lo,
+            )
+            if fast_res is not None:
+                return fast_res
+    shape = (num_tokens, topk)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
     if num_tokens > 0:
@@ -161,6 +180,7 @@ def dsv4_topk(
             image_sentinel_lo,
             NUM_EXPERTS=num_experts,
             BLOCK_N=triton.next_power_of_2(num_experts),
+            TOPK=topk,
             HAS_PADDING=is_padding is not None,
             HAS_VL=has_vl,
             num_warps=1,
