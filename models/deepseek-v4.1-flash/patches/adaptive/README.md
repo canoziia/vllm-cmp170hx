@@ -1,5 +1,10 @@
 # Adaptive Verification & Topology-Aware Fusion Series
 
+Base source: official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`),
+already integrated into this repository's `vllm` branch (`5470fe0`) for default
+`SOURCE_MODE=vllm-branch` builds.
+
+When rebuilding from upstream via `SOURCE_MODE=patch-upstream`,
 `patches/adaptive/series` is applied by `scripts/apply-deepseek-v41-patches.sh` by
 default (`ENABLE_ADAPTIVE_VERIFICATION=1`). All runtime features stay inert unless
 explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.

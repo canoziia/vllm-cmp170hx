@@ -68,10 +68,9 @@ use the same format (jobs `vllm-router`, `lmcache`, `gpu`); empty means no
 targets. Unreachable targets just show `up == 0`.
 
 **Auth**: vLLM's `--api-key` middleware only guards paths under `/v1`
-(`vllm/entrypoints/serve/middleware/authenticate.py`, checked on our 0.13.1
-images; `curl /metrics` without a key returns 200). The vllm-router
-(patches/router/0002) requires the key on every path except `/health`,
-including `/metrics`. Put the key in a 0600 file and set
+(`vllm/entrypoints/serve/middleware/authenticate.py`; `curl /metrics` without a
+key returns 200). An optional external `vllm-router` or reverse proxy may
+require the key on `/metrics` as well. Put the key in a 0600 file and set
 `VLLM_METRICS_TOKEN_FILE`; it is mounted read-only and used as
 `Authorization: Bearer` for the `vllm` and `vllm-router` jobs.
 

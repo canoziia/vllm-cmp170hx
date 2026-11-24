@@ -1,223 +1,163 @@
 # vllm-cmp170hx
 
-Reproducible CMP 170HX deployments built from pinned upstream/model sources.
+Reproducible SM80 deployments of `deepseek-ai/DeepSeek-V4.1-Flash-1017` built
+directly on top of official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
+and official `LMCache` `v0.5.5` (`05a013b29da78cf2321b9b46ec5039dde2fb0bb0`).
 
-This `main` branch separates shared infrastructure from model-specific files:
+## Branch Architecture
+
+This repository uses a clean two-branch layout directly anchored to official
+upstream `vllm-project/vllm`:
+
+- **`vllm` branch (`5470fe0`)**: Complete patched vLLM source tree in two commits:
+  1. `ab629d9` — clean snapshot of official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`;
+  2. `5470fe0` — DeepSeek-V4.1-Flash SM80 TEP4 topology-aware fusions and optimizations.
+  Run `git diff vllm~1..vllm` to inspect every line changed over upstream.
+- **`main` branch** (this branch): Deployment manifests, Compose files,
+  self-contained native CUDA/C++ extensions, LMCache patches, build/validation
+  scripts, offline tests, monitoring, and documentation.
+
+## Repository Layout
 
 ```text
 .
-├── manifests/                  # pinned shared dependency/image metadata
-├── monitoring/                 # standalone Prometheus + Grafana for all nodes
+├── manifests/                      # pinned shared LMCache metadata & patch checksums
+├── monitoring/                     # standalone Prometheus + Grafana stack
 ├── patches/
-│   ├── lmcache/                # shared LMCache patch series
-│   ├── router/                 # vllm-router (production-stack) patch series
-│   └── vllm/                   # shared vLLM runtime fixes
+│   └── lmcache/                    # official LMCache v0.5.5 patch series (0001..0010)
 ├── scripts/
+│   ├── apply-deepseek-v41-patches.sh
 │   ├── apply-lmcache-patches.sh
-│   ├── build-deepseek-v41-image.sh
-│   ├── build-glm53-dflash2-image.sh          # GLM W4A16 + DFlash2 image
-│   ├── build-mimo-v26-image.sh               # MiMo-V2.6-Flash image
-│   ├── build-lmcache-server-image.sh         # shared LMCache server image
-│   ├── build-qwen38-image.sh
-│   ├── build-router-image.sh   # patched vllm-router image
-│   ├── benchmark-vllm.mjs      # decode, prefill, and counting benchmarks
+│   ├── benchmark-vllm.mjs          # decode, prefill, and counting benchmark client
+│   ├── build-deepseek-v41-image.sh # builds the full DeepSeek V4.1 image (+ LMCache)
+│   ├── build-lmcache-server-image.sh
+│   ├── ensure-lmcache-server-image.sh
+│   ├── test-lmcache-bounded-pd-groups.py
 │   ├── test-lmcache-patches.py
-│   └── test-router-patches.py
+│   └── test-vllm-common-patches.py
 └── models/
-    ├── deepseek-v4.1-flash/
-    │   ├── compose*.yml
-    │   ├── manifests/          # pinned DeepSeek source/base image
-    │   ├── patches/            # DeepSeek-only vLLM patches
-    │   ├── scripts/            # DeepSeek-only diagnostics
-    │   └── docs/
-    ├── deepseek-v4-flash/      # PD pair on the DeepSeek V4.1 image
-    │   └── compose.pd.yml
-    ├── glm-5.3-flash/          # NVFP4 PD pair on the DeepSeek V4.1 image;
-    │   │                       # W4A16 + DFlash2 PP4 on its own image
-    │   ├── compose.pd.yml, compose.w4a16-dflash2.yml
-    │   ├── manifests/          # GLM pins + SHA256 of the dflash2 stack
-    │   ├── patches/dflash2/    # GLM DFlash2 vLLM series (on top of DeepSeek's)
-    │   ├── native/ampere_marlin/  # compiled sm_80 Marlin decode (Apache-2.0)
-    │   └── tests/
-    ├── mimo-v2.6-flash/        # PP4 engine on the DeepSeek V4.1 source stack
-    │   ├── compose.yml, .env.example
-    │   ├── manifests/          # model pin + SHA256 of the MiMo series
-    │   ├── patches/            # MiMo-only vLLM series (fused FP8 qkv loader)
-    │   └── tests/
-    └── qwen3.8-flash-next-nvfp4/
-        ├── compose.yml
-        ├── compose.pd.yml      # prefill + decode + LMCache + router
-        ├── manifests/          # pinned Qwen source/base image
-        ├── patches/            # Qwen-only PLE/NVMe implementation
-        └── native/
+    └── deepseek-v4.1-flash/
+        ├── compose.yml             # default: 4x 80G SM80 TEP4 (TP=4 + EP=4 + LMCache, NVLink/PCIe auto)
+        ├── .env.example            # default TEP4 environment template
+        ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
+        ├── .env.pp6.example        # optional PP6 environment template
+        ├── manifests/              # pinned vllm branch & official upstream 0e3c8db metadata
+        ├── native/                 # 6 self-contained SM80 CUDA/C++ extensions built from source
+        ├── patches/                # auditable patch archive replaying onto official 0e3c8db
+        ├── scripts/                # DeepSeek-only diagnostics
+        ├── tests/                  # offline unit & encoding test suites
+        └── docs/                   # design notes and historical PP6 investigation records
 ```
 
-## Shared versus model-specific changes
+## DeepSeek V4.1 Flash
 
-Put a change in root `patches/` when the same source patch is intended for all
-models using that component. Shared official LMCache patches are listed in
-`patches/lmcache/series`; shared vLLM runtime fixes are listed in
-`patches/vllm/series`.
+See [`models/deepseek-v4.1-flash/README.md`](models/deepseek-v4.1-flash/README.md)
+for the complete architecture overview, optimization profiles, native extensions,
+deployment guide, and measured 180 W / 250 W TEP4 benchmarks.
 
-Put model implementation patches, Compose files, source pins, and diagnostics
-under `models/<model>/`. DeepSeek's vLLM patch series is therefore under
-`models/deepseek-v4.1-flash/patches/`.
+### Validate & Build
 
-Build entry points stay in root `scripts/` under their existing names so
-existing automation continues to work after the model directory rename. The
-host cache and L2 paths retain their existing locations; renaming a repository
-folder or container must not silently abandon persistent data.
-
-## DeepSeek V4.1
-
-See [`models/deepseek-v4.1-flash/README.md`](models/deepseek-v4.1-flash/README.md) for the
-complete build, deployment, safety, and debugging guide.
-
-Build the pinned DeepSeek image from the repository root:
+By default (`SOURCE_MODE=vllm-branch`), `scripts/build-deepseek-v41-image.sh`
+exports this repository's `vllm` branch (`5470fe0`, rebased on official
+`vllm-project/vllm @ 0e3c8db`), compiles all 6 self-contained native CUDA/C++
+extensions, bundles the patched official LMCache payload from
+`localhost/lmcache-server:latest` (building it automatically if absent, or when
+`REBUILD_LMCACHE_IMAGE=1`), and runs the offline test gates:
 
 ```bash
+# 1. Offline validation gate (11 test suites + py_compile, no container build)
+VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
+
+# 2. Build the complete production TEP4 image
 CONTAINER_ENGINE=podman \
-OUTPUT_IMAGE=localhost/vllm-backport:deepseek-v4.1-flash \
+OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
 bash scripts/build-deepseek-v41-image.sh
+
+# Optional: rebuild by replaying models/deepseek-v4.1-flash/patches/ onto official 0e3c8db
+# SOURCE_MODE=patch-upstream bash scripts/build-deepseek-v41-image.sh
 ```
 
-The DeepSeek build produces the complete client image in one run: it reuses
-`lmcache-server:latest` (building it only if absent, or when
-`REBUILD_LMCACHE_IMAGE=1`) and copies that image's patched payload. There is
-no separate client-payload build step.
+### Deploy (Default: 4x 80G SM80 TEP4 — PCIe P2P or NVLink)
 
-Create a private deployment environment and start it:
+`VLLM_DSV41_OPT_PROFILE=tep4_fused` automatically detects NVLink vs PCIe Gen4 P2P
+at worker startup (`ampere_peer_topology()`), requiring zero code or `.env` edits
+when moving between PCIe and NVLink SM80 hosts:
 
 ```bash
 cd models/deepseek-v4.1-flash
 cp .env.example .env
 chmod 600 .env
-# Set a private VLLM_API_KEY and host paths in .env.
+# Set a private VLLM_API_KEY, MODEL_ROOT, cache/LMCache paths, and DSV41_GPU_0..3.
 
-podman compose --podman-run-args=--ipc=host \
-  -f compose.yml up -d
+podman compose --podman-run-args=--ipc=host up -d
 ```
 
-The repository model directories and Compose service/container names are
-`deepseek-v4.1-flash` and `qwen3.8-flash-next-nvfp4`. On an existing host,
-move each ignored `.env` into its renamed `models/<model>/` directory before
-using Compose; retain its private values. Existing host cache, checkpoint and
-L2 paths are intentionally unchanged. Old Podman containers keep their former
-names/commands until explicitly replaced; changing Compose alone does not
-upgrade or remove them.
-
-Host paths in `.env.example` files and Compose defaults (`/srv/models`,
-`/srv/vllm-cache`, `/srv/lmcache`, ...) are generic examples; set the real
-paths for your host in `.env`. Variables marked `${VAR:?...}` have no default.
-
-Never commit `.env`, API keys, model weights, benchmark results, host
-addresses or host disk UUIDs.
-
-## Qwen3.8 Flash Next
-
-See [`models/qwen3.8-flash-next-nvfp4/README.md`](models/qwen3.8-flash-next-nvfp4/README.md).
-The complete image is built reproducibly from the same pinned author source,
-the shared vLLM and LMCache series, and Qwen's model-specific process-isolated
-NVMe PLE patch:
+For the optional 6x CMP 170HX pipeline-parallel deployment (`PP=6`, `7,7,7,7,7,5`),
+use `.env.pp6.example` and `-f compose.pp6.yml`:
 
 ```bash
-bash scripts/build-qwen38-image.sh
+cd models/deepseek-v4.1-flash
+cp .env.pp6.example .env
+chmod 600 .env
+podman compose --podman-run-args=--ipc=host -f compose.pp6.yml up -d
 ```
 
-## GLM-5.3 Flash
+Host paths in `.env*.example` and Compose defaults (`/srv/models`,
+`/srv/vllm-cache`, `/srv/lmcache`, ...) are generic examples; set the real paths
+for your host in `.env`. Variables marked `${VAR:?...}` have no default.
 
-See [`models/glm-5.3-flash/README.md`](models/glm-5.3-flash/README.md).
-`nvidia/GLM-5.3-Flash-NVFP4` runs as a PP4 prefill/decode pair on the DeepSeek
-V4.1 image: the pinned author source already implements `glm5next`, and the
-image's shared vLLM series carries the NVFP4 load fix the model needs
-(`patches/vllm/0007-nvfp4-marlin-scale-factor-amax.patch`).
+Never commit `.env`, API keys, model weights, benchmark results, host addresses,
+or host disk UUIDs.
 
 ## Monitoring
 
-See [`monitoring/README.md`](monitoring/README.md). One Prometheus + Grafana
-stack (podman compose, host network) scrapes the `/metrics` of every vLLM
-engine, vllm-router and LMCache server listed in `.env`
-(`VLLM_METRICS_TARGETS=name=host:port,...`) and provisions a throughput
-overview (per instance and PD-deduplicated totals) plus the upstream vLLM
-dashboards with `server`/`role`/`instance` variables.
+See [`monitoring/README.md`](monitoring/README.md). One standalone Prometheus +
+Grafana stack (`podman compose`, host network) scrapes `/metrics` from vLLM
+engines, LMCache servers, and optional GPU exporters listed in `.env`
+(`VLLM_METRICS_TARGETS=name=host:port,...`), provisioning a throughput overview
+and upstream vLLM dashboards with `server` / `role` / `instance` selectors.
 
-## Benchmark client
+## Benchmark Client
 
 `scripts/benchmark-vllm.mjs` requires Node.js 18+ and has no npm dependencies.
-Its file header documents the three standard test modes in copyable commands:
+It supports three standard modes documented in its header:
 
-1. ordinary short-input decode: about 16 user tokens, 500 output tokens,
-   `ignore_eos`;
-2. prefill: approximately N input tokens and exactly one output token;
+1. ordinary short-input decode: ~16 user tokens, 500 output tokens, `ignore_eos`;
+2. cold prefill: approximately N input tokens and 1 output token;
 3. deterministic counting output for near-full speculative acceptance.
-
-Show all options:
 
 ```bash
 node scripts/benchmark-vllm.mjs --help
 ```
 
-The client requires `VLLM_API_KEY`, assigns a unique `cache_salt` to every
-request, rejects nonzero `cached_tokens`, uses server-reported usage counts, and
-records exact streamed `token_ids` when available. Decode output includes both
-token/s and speculative step/s.
+The client requires `VLLM_API_KEY`, assigns a unique `cache_salt` per request,
+rejects nonzero `cached_tokens`, uses server-reported usage counts, and records
+exact streamed `token_ids` when available. Decode output reports both token/s
+and speculative step/s.
 
-## Current shared LMCache baseline
+## Shared LMCache Baseline
 
-The shared manifest `manifests/lmcache.env` pins:
+`manifests/lmcache.env` pins the official LMCache release:
 
 ```text
 LMCache v0.5.5
 source commit 05a013b29da78cf2321b9b46ec5039dde2fb0bb0
-Python 3.12 / CUDA 13.0 official image payloads by digest
+Python 3.12 / CUDA 13.0 official image payloads by immutable digest
 ```
 
-Patch rationale and validation gates are documented in
+Patch rationale (including `0010-cached-request-resumed-req-ids-compat.patch` for
+official `vllm 0e3c8db` compatibility) and validation gates are documented in
 [`patches/lmcache/README.md`](patches/lmcache/README.md).
 
-## Upstream sources
+## Upstream Sources
 
-This repository is a deployment layer: it pins upstream sources and adds only the
-patches described above. The two repositories it is built from are:
-
-| Upstream | What we take from it | Where it is pinned |
-| --- | --- | --- |
-| [`344303947/dsv41-flash-pp5-170hx`](https://github.com/344303947/dsv41-flash-pp5-170hx) | the CMP 170HX vLLM backport source that both model images are built from, together with its model/PP deployment recipes | `SOURCE_REPO` / `SOURCE_COMMIT` in `models/*/manifests/source.env` (commit `d63af5a4`) |
-| [`vllm-project/production-stack`](https://github.com/vllm-project/production-stack) | **vllm-router**, the community-maintained single OpenAI-compatible endpoint in front of a prefill/decode pair | `manifests/router.env` (`vllm-stack-0.1.13`) |
-
-The rest of the stack, pinned the same way:
+This repository builds directly on official upstream releases with no third-party
+vLLM fork in the chain:
 
 | Upstream | What we take from it | Where it is pinned |
 | --- | --- | --- |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | the engine itself, through the backport source above | `models/*/manifests/source.env` |
-| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | the KV cache engine; `localhost/lmcache-server` plus the shared patch series in `patches/lmcache/` | `manifests/lmcache.env` (v0.5.5, `05a013b2`) |
-| [`ai-dynamo/nixl`](https://github.com/ai-dynamo/nixl) | NIXL 1.5.0 (the `nixl-cu13` wheel), the transfer engine vLLM's `NixlConnector` uses for a PD handoff; layered on as an overlay image | `scripts/build-nixl-overlay-image.sh` (`NIXL_VERSION`) |
-
-### What we add on top of vllm-router
-
-Each model directory carries a disaggregated deployment
-(`models/<model>/compose.pd.yml`): one prefill engine, one decode engine, the
-LMCache server both roles share, and a router that presents them as a single
-endpoint.
-
-We do not run upstream's router unmodified. `patches/router/` is applied on top
-of the pinned release and the result ships as our own image (built by
-`scripts/build-router-image.sh`, self-tested by `scripts/test-router-patches.py`):
-
-* the prefill hop is capped in both response families. The Responses API ignores
-  `max_tokens`, so without an explicit `max_output_tokens=1` the prefill engine
-  generated the whole answer before the decode hop was asked to start, and the
-  client waited for both generations;
-* both hops' usage is merged into the standard fields the client sees
-  (`cached_tokens` = `min(prefill, decode)`), with the raw per-hop numbers
-  attached under `router_hops` for billing;
-* client authentication (port of upstream PR #937): with `VLLM_API_KEY` set
-  (comma-separated for several keys) every endpoint except `/health`, including
-  `/v1/models` and `/metrics`, requires `Authorization: Bearer <key>`. Upstream
-  0.1.13 accepted unauthenticated requests on a 0.0.0.0 port.
-
-The router must be started with `--routing-logic disaggregated_prefill`; see the
-model READMEs for the measured behaviour and the pitfalls of the alternatives.
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM `main` engine (`0e3c8db`), snapped as `vllm~1` on our `vllm` branch and patched in `vllm` (`5470fe0`) | `models/deepseek-v4.1-flash/manifests/source.env` |
+| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache `v0.5.5` (`05a013b2`) server/payload images plus `patches/lmcache/0001..0010` | `manifests/lmcache.env` |
 
 ## License
 

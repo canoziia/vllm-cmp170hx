@@ -1,0 +1,162 @@
+# Optional DeepSeek-V4.1-Flash deployment on six CMP 170HX (PP6), with LMCache
+# as the KV tier. Default 4x 80G SM80 TEP4 deployment lives in compose.yml.
+#
+# LMCache is not optional here: this file defines both the engine and the
+# lmcache server, and the engine is started with the LMCacheMPConnector against
+# it. Copy .env.pp6.example to .env before running:
+#   podman compose -f compose.pp6.yml --podman-run-args=--ipc=host up -d
+x-podman:
+  in_pod: false
+
+services:
+  deepseek-v4.1-flash:
+    # Client image: built from this repository's `vllm` branch (official
+    # vllm-project/vllm@0e3c8db + SM80 optimizations) plus the exact patched
+    # official LMCache payload the server below runs. Keep both on one payload.
+    image: ${VLLM_IMAGE:-localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4}
+    container_name: deepseek-v4.1-flash
+    restart: "no"
+    network_mode: host
+    # Required for LMCache CUDA-IPC tensor sharing. The pod path can ignore this
+    # and expose only 64 MiB /dev/shm, so start with --podman-run-args=--ipc=host
+    # as well (see README).
+    ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
+
+    devices:
+      - nvidia.com/gpu=${DSV41_GPU_0:-0}
+      - nvidia.com/gpu=${DSV41_GPU_1:-1}
+      - nvidia.com/gpu=${DSV41_GPU_2:-2}
+      - nvidia.com/gpu=${DSV41_GPU_3:-3}
+      - nvidia.com/gpu=${DSV41_GPU_4:-4}
+      - nvidia.com/gpu=${DSV41_GPU_5:-5}
+
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+    environment:
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_PP_LAYER_PARTITION: "7,7,7,7,7,5"
+      VLLM_CPU_OFFLOAD_GB_PER_RANK: "0,0,0,0,0,0"
+      VLLM_USE_BREAKABLE_CUDAGRAPH: "1"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "128"
+      # Ported from vllm-project/vllm#57433: spread established decodes over the
+      # pp_size in-flight pipeline batches. 1 = upstream behaviour.
+      VLLM_PP_DECODE_COHORT_BALANCE: "${VLLM_PP_DECODE_COHORT_BALANCE:-1}"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      NCCL_ALGO: "Ring"
+      NCCL_PROTO: "Simple"
+      NCCL_IB_DISABLE: "1"
+      # One switch for the PP6 SM80 optimisation profile (`default` or
+      # `verification`); individual env switches still override it.
+      VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-default}"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+
+    volumes:
+      - ${MODEL_ROOT:-/srv/models}:/models:ro
+      - ${VLLM_CACHE:-/srv/deepseek-v41/cache}:/root/.cache
+
+    command:
+      - /models/${DSV41_MODEL_DIR:-DeepSeek-V4.1-Flash-1017}
+      - --host=0.0.0.0
+      - --port=8000
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
+      - --served-model-name=deepseek-ai/DeepSeek-V4.1-Flash
+      - --pipeline-parallel-size=6
+      - --tensor-parallel-size=1
+      - --max-model-len=1048576
+      - --max-num-batched-tokens=4096
+      - --max-num-seqs=32
+      - --kv-cache-dtype=fp8_ds_mla
+      # 6 GiB GPU KV per rank with max_num_seqs=32.
+      - --kv-cache-memory=6442450944
+      - --prefix-cache-retention-interval=1024
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5556}}'
+      - --trust-remote-code
+      - --disable-custom-all-reduce
+      - --enable-prefix-caching
+      - '--engram-config={"cpu_offload":true}'
+      # Deliberately omit --compilation-config. vLLM derives DSpark-aware CUDA
+      # Graph sizes from the six-token target verification width, max_num_seqs,
+      # and the platform capture ceiling.
+      # Public algorithm switch: true enables CPU history-based automatic k;
+      # false keeps fixed depth. The optimisation profile does not enable it.
+      # Manual request spec_k overrides automatic selection.
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true,"enable_adaptive_verification":${VLLM_ADAPTIVE_VERIFICATION:-false},"adaptive_verification_decay":${VLLM_ADAPTIVE_VERIFICATION_DECAY:-0.95}}'
+      - --per-request-spec-decode-metrics=detailed
+      - --tokenizer-mode=deepseek_v41
+      - --enable-auto-tool-choice
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --tool-call-parser=deepseek_v41
+      - --reasoning-parser=deepseek_v41
+      - --enable-prompt-tokens-details
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY in .env}
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 3
+
+  deepseek-v4.1-flash-lmcache:
+    # Shared server image: built once by scripts/build-lmcache-server-image.sh from
+    # the digest-pinned official LMCache release, and used by every model
+    # deployment. The client images layer the identical patched payload.
+    image: ${LMCACHE_IMAGE:-localhost/lmcache-server:latest}
+    container_name: deepseek-v4.1-flash-lmcache
+    entrypoint: ["lmcache"]
+    restart: "no"
+    network_mode: host
+    ipc: host
+    # host PIDs: CUDA interprocess-event pools live in the shared /dev/shm as
+    # cuda.shm.0.<pid>; containers with private PID namespaces reuse the same
+    # PIDs and overwrite each other's pools (LMCache then waits on the wrong event)
+    pid: host
+    devices:
+      - nvidia.com/gpu=${DSV41_GPU_0:-0}
+      - nvidia.com/gpu=${DSV41_GPU_1:-1}
+      - nvidia.com/gpu=${DSV41_GPU_2:-2}
+      - nvidia.com/gpu=${DSV41_GPU_3:-3}
+      - nvidia.com/gpu=${DSV41_GPU_4:-4}
+      - nvidia.com/gpu=${DSV41_GPU_5:-5}
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+    environment:
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:-/srv/lmcache/deepseek-v41}:/lmcache-l2
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=5556
+      - --http-host=127.0.0.1
+      - --http-port=18556
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1024}
+      - --separate-object-groups
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-64}
+      - --eviction-policy=LRU
+      - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":500,"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18556/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30

@@ -3,6 +3,13 @@
 Base source: official `https://github.com/vllm-project/vllm.git` at
 `0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`.
 
+> [!NOTE]
+> The default image build (`SOURCE_MODE=vllm-branch` in
+> `scripts/build-deepseek-v41-image.sh`) exports this repository's `vllm` branch
+> (`5470fe0`, rebased directly onto official `vllm-project/vllm @ 0e3c8db`).
+> This directory preserves the auditable patch series used by
+> `SOURCE_MODE=patch-upstream` and `scripts/apply-deepseek-v41-patches.sh`.
+
 ## Base Series (`patches/series`)
 
 Applied in order by `scripts/apply-deepseek-v41-patches.sh`:

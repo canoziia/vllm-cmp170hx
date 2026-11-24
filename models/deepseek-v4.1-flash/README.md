@@ -4,20 +4,22 @@ Reproducible patch series, self-contained native CUDA/C++ extensions, and Podman
 deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` rebased onto official
 `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) for SM80 GPUs:
 
-- **4x 80G SM80 (`compose.tep4.yml`)**: `TP=4 + EP=4, DCP=1, PP=1` (`nvfp4_ds_mla` KV cache,
-  `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` + LMCache 8 GiB L1 / 500 GiB L2,
-  topology-aware NVLink / PCIe P2P collectives).
-- **6x CMP 170HX (`compose.yml`)**: `TP=1 x PP=6` (`7,7,7,7,7,5`, LMCache KV tier, CPU Engram offload).
+- **Default — 4x 80G SM80 TEP4 (`compose.yml` / `.env.example`)**: `TP=4 + EP=4, DCP=1, PP=1`
+  (`nvfp4_ds_mla` KV cache, `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` +
+  LMCache 8 GiB L1 / 500 GiB L2, topology-aware NVLink / PCIe P2P collectives).
+- **Optional — 6x CMP 170HX PP6 (`compose.pp6.yml` / `.env.pp6.example`)**: `TP=1 x PP=6`
+  (`7,7,7,7,7,5`, LMCache KV tier, CPU Engram offload).
 
 ## Repository Branch Layout & Source
 
 This repository uses a two-branch layout:
 
 - **`vllm` branch (`5470fe0`)**: Complete patched vLLM source tree (Commit 1 `ab629d9` = clean upstream `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`; Commit 2 `5470fe0` = DeepSeek-V4.1-Flash SM80 TEP4 topology-aware fusions and optimizations). Run `git diff vllm~1..vllm` to inspect every line changed over upstream.
-- **`main` branch**: Deployment compose files (`compose.tep4.yml`, `compose.yml`), self-contained native CUDA/C++ extensions (`native/`), build scripts (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline test suites, and auditable patch archive (`patches/`).
+- **`main` branch**: Deployment compose files (default TEP4 `compose.yml`, optional PP6 `compose.pp6.yml`), self-contained native CUDA/C++ extensions (`native/`), build scripts (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline test suites, and auditable patch archive (`patches/`).
 
 - Upstream reference: `https://github.com/vllm-project/vllm.git @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`
 - Patched vLLM branch (`manifests/source.env`): `vllm @ 5470fe0735fa7719fb92819b4c9b4d136e331794`
+- Shared LMCache baseline (`../../manifests/lmcache.env`): official `LMCache v0.5.5` (`05a013b2`) + `../../patches/lmcache/0001..0010` (including `0010-cached-request-resumed-req-ids-compat.patch` for official `vllm 0e3c8db`)
 - SM80 base image (`manifests/source.env`): `localhost/vllm-main-sm80:base-2054de0`
 - Default TEP4 output image: `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`
 
@@ -58,10 +60,10 @@ startup via `cudaDevP2PAttrPerformanceRank` / NVML:
 - **NVLink (`"nvlink"`)**: automatically unlocks full `MAX_ROWS = 192` two-shot CuTe
   Lamport AllReduce and column AllGather across all decode batch sizes (`c=1..32`).
 
-Moving the same container image and `compose.tep4.yml` from PCIe 4x A100 to NVLink 4x A100
+Moving the same container image and `compose.yml` from PCIe 4x A100 to NVLink 4x A100
 requires **zero `.py` or `.env` changes**.
 
-### Build & Deploy TEP4
+### Build & Deploy (Default TEP4 / Optional PP6)
 
 ```bash
 # 1. Validate our `vllm` branch directly (all 11 offline test suites + py_compile):
@@ -73,12 +75,16 @@ OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
 bash scripts/build-deepseek-v41-image.sh
 # (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream 0e3c8db + patches/)
 
-# 3. Deploy with Podman Compose:
+# 3. Deploy default 4x 80G SM80 TEP4 with Podman Compose:
 cd models/deepseek-v4.1-flash
-cp .env.tep4.example .env
+cp .env.example .env
 # Edit VLLM_API_KEY, MODEL_ROOT, and DSV41_GPU_0..3 in .env
-podman compose -f compose.tep4.yml --podman-run-args=--ipc=host up -d
+podman compose --podman-run-args=--ipc=host up -d
 podman logs -f deepseek-v4.1-flash-tep4
+
+# Optional 6x CMP 170HX PP6 deployment:
+# cp .env.pp6.example .env
+# podman compose -f compose.pp6.yml --podman-run-args=--ipc=host up -d
 ```
 
 ## Optimisation Profiles (`vllm/dsv41_opt_profile.py`)
@@ -110,9 +116,9 @@ always take precedence:
 - **SSE Keep-Alive & Detailed Spec Metrics**: `--sse-keep-alive-interval` and
   `--per-request-spec-decode-metrics=detailed` supported out of the box.
 
-## Measured TEP4 Benchmarks (`4x 80G SM80 PCIe Gen4`, `compose.tep4.yml` + LMCache)
+## Measured TEP4 Benchmarks (`4x 80G SM80 PCIe Gen4`, `compose.yml` + LMCache)
 
-Measured on the live `compose.tep4.yml` stack (`TP=4 + EP=4`, `nvfp4_ds_mla`,
+Measured on the live `compose.yml` stack (`TP=4 + EP=4`, `nvfp4_ds_mla`,
 `VLLM_KV_CACHE_MEMORY=2200000000` -> `2,014,502` GPU KV tokens = `1.92x 1M`,
 LMCache `8 GiB` L1 RAM + `500 GiB` NVMe L2, `max_num_batched_tokens=3072`,
 `VLLM_DSV41_OPT_PROFILE=tep4_fused`, `enable_adaptive_verification=true`, `0` OOM across

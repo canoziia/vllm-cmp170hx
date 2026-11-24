@@ -1,9 +1,16 @@
-# PP6 clean adaptive runtime validation (in progress)
+# PP6 clean adaptive runtime validation (historical archive)
 
-Status: **not performance-optimized / not production approved**. Candidate
-`dspark-adaptive-clean-20260924`, from local main `b9bbba3`, clean pinned
-source `d63af5a`. Production original image retained but stopped during
-candidate runs. Qwen remains untouched. All candidate images are test-only.
+> [!NOTE]
+> **Historical pre-rebase PP6 validation record.** The legacy branch/source
+> pins below predate rebasing this repository directly onto official
+> `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) via
+> the `vllm` branch (`5470fe0`). Preserved as historical engineering evidence;
+> see `models/deepseek-v4.1-flash/README.md` for current builds and benchmarks.
+
+Historical status: **not performance-optimized / not production approved**.
+Candidate `dspark-adaptive-clean-20260924`, from legacy main `b9bbba3`, legacy
+backport snapshot `d63af5a`. Production original image retained but stopped
+during candidate runs. All candidate images were test-only.
 
 ## Feature OFF gate
 

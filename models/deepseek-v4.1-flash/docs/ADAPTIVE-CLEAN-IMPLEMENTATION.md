@@ -1,6 +1,15 @@
 # Clean SM80 adaptive verification implementation
 
-Branch: `dspark-adaptive-clean-20260924`, from local main `b9bbba3`.
+> [!NOTE]
+> **Historical pre-rebase design record (PP6 era).** The branch and image hashes
+> below predate rebasing this repository directly onto official
+> `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`). The
+> resulting SM80 adaptive verification and sub-width CUDA graph implementation
+> now lives on the `vllm` branch (`5470fe0`) and in
+> `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
+> See `models/deepseek-v4.1-flash/README.md` for current builds and benchmarks.
+
+Historical branch: `dspark-adaptive-clean-20260924`, from local main `b9bbba3`.
 The previous `dspark-varlen-20260924` prototype remains intact as investigation
 history. No experimental patch stack is inherited into this branch.
 

@@ -1,4 +1,10 @@
-# Minimal PP contract under review (not implemented / not enabled)
+# Minimal PP contract (historical PP6 design proposal)
+
+> [!NOTE]
+> **Historical pre-rebase design record.** This proposal predates the direct
+> rebase onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
+> and the current `vllm` branch (`5470fe0`). See `models/deepseek-v4.1-flash/README.md`
+> and `patches/adaptive/README.md` for the current implementation.
 
 ## Keep from existing vLLM
 

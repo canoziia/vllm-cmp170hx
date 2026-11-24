@@ -1,4 +1,12 @@
-# PP decode-cohort balancing (shared patch `patches/vllm/0003`)
+# PP decode-cohort balancing (`VLLM_PP_DECODE_COHORT_BALANCE`)
+
+> [!NOTE]
+> The PP6 measurements below were recorded prior to rebasing this repository
+> directly onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`).
+> On the current official-vLLM baseline, this port of `vllm-project/vllm#57433`
+> is integrated into the `vllm` branch (`5470fe0`) and archived in
+> `models/deepseek-v4.1-flash/patches/0002-common-async-pp-mamba-and-structured-spec-fixes.patch`.
+> See `models/deepseek-v4.1-flash/README.md` for current TEP4 / PP6 builds.
 
 ## What it changes
 
@@ -10,9 +18,8 @@ those in-flight batches, so requests whose prefills complete together lock into
 one cadence group, advance together, then starve together while the other batches
 run nearly empty. #50853 lists this as an open gap.
 
-`patches/vllm/0003-balance-async-pp-decode-batches.patch` is a **port of
-vllm-project/vllm#57433**, which caps one scheduler step to
-`ceil(max_num_seqs / pp_size)` *established decode* requests
+This change is a **port of vllm-project/vllm#57433**, which caps one scheduler
+step to `ceil(max_num_seqs / pp_size)` *established decode* requests
 (`num_computed_tokens >= num_prompt_tokens`, evaluated before scheduling).
 Prefill, chunked prefill and the chunk that completes a prompt are never capped,
 a deferred request simply stays eligible, established decodes resumed from
@@ -20,16 +27,11 @@ a deferred request simply stays eligible, established decodes resumed from
 the step ends with `assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes`.
 The cadence, the ring and the collective order are untouched.
 
-One deviation from upstream, recorded in the patch header: #57433 applies this
-unconditionally for MRV2 + AsyncScheduler + PP>1, while here it is gated behind
-`VLLM_PP_DECODE_COHORT_BALANCE`. The switch now defaults to `1`, on the strength
-of the A/B below, and `=0` restores upstream behaviour, so rollback is one env var
-plus a restart.
-
-Recorded honestly: the Qwen PP2 deployment runs with the switch enabled and has not
-been measured against it switched off, so its numbers are not evidence about this
-patch - on PP2 the cap is about running/2 rather than running/6, and the effect
-there is unquantified. The default rests entirely on the PP6 measurement.
+One deviation from upstream: #57433 applies this unconditionally for
+MRV2 + AsyncScheduler + PP>1, while here it is gated behind
+`VLLM_PP_DECODE_COHORT_BALANCE`. The switch defaults to `1` on the strength of
+the PP6 A/B below, and `=0` restores upstream behaviour, so rollback is one env
+var plus a restart.
 
 ## A/B result on the port — same image, only the flag differing
 
@@ -103,8 +105,7 @@ Measured, on the port build with the flag on:
   See `docs/GREEDY-OUTPUT-ARGMAX-AUDIT.md` for why exact token equality is not a
   usable gate on this stack and what that audit does and does not prove.
 
-Remaining: the Qwen PP2 build of this shared series is unmeasured (the flag stays
-off there), and the c32 argmax audit was stopped part-way rather than reported.
+Remaining: the c32 argmax audit was stopped part-way rather than reported.
 
 ## Upstream references
 

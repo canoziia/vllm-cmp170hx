@@ -1,10 +1,20 @@
 # Remaining DeepSeek V4.1 optimisation candidates
 
-These are investigation candidates, **not demonstrated gains**. The historical
-profile in `/tmp/ds-src/CONTEXT.md` predates small-kernel fusion, mHC v2,
-MXFP4 activation/sum fusion, FP8 draft head, thin wo_a, prefill kernels, dense
-MXFP8 decode kernels and the verification/cohort/metadata optimisations. Do not use
-its timings as the current bottleneck ranking.
+> [!NOTE]
+> **Historical pre-rebase backlog (PP6 era).** This document was written prior
+> to rebasing directly onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
+> and implementing the TEP4 SM80 fusion stack (`tep4_fused`, `native/dsv41_r2`,
+> topology-aware NVLink/PCIe Lamport collectives, fused gate/top-k/align,
+> `w2_splitk_ep` + fused shared add, C++ `wo_a`, TP-local greedy verification,
+> and zero-HBM `dequant_marlin_mxfp8` cuBLAS prefill). See
+> `models/deepseek-v4.1-flash/README.md` for the current architecture and
+> measured TEP4 benchmarks.
+
+These are investigation candidates, **not demonstrated gains**. Early PP6
+profiles predate small-kernel fusion, mHC v2, MXFP4 activation/sum fusion, FP8
+draft head, thin `wo_a`, prefill kernels, dense MXFP8 decode kernels,
+verification/cohort/metadata optimisations, and the TEP4 fusion pass. Do not
+use historical timings as the current bottleneck ranking.
 
 ## First: obtain a current profile
 
@@ -35,9 +45,8 @@ from actual remaining time rather than implementing every item below.
 - Long-context decode may change the best width and cost balance. Small targeted
   checks can establish whether current selection remains useful; configured 1M
   context support is not itself a performance validation.
-- Shared scheduler/metadata improvements may benefit GLM or Qwen, but their
-  images/configurations require separate compatibility review. Do not enable
-  DeepSeek-specific paths on other models without evidence.
+- Keep DeepSeek-specific runtime paths gated behind model/profile checks so
+  shared upstream vLLM code paths stay clean and easy to rebase.
 
 ## Completed or rejected directions (avoid duplicate work)
 

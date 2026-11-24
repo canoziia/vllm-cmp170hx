@@ -1,5 +1,13 @@
 # Adaptive verification on PP6 — first live run
 
+> [!NOTE]
+> **Historical pre-rebase PP6 validation log (2026-09-26).** This measurement
+> record predates rebasing directly onto official `vllm-project/vllm` `main`
+> (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) and the current `vllm` branch
+> (`5470fe0`). Preserved for methodology and measurement history; see
+> `models/deepseek-v4.1-flash/README.md` for current TEP4 / PP6 builds and
+> benchmarks.
+
 2026-09-26. Image `localhost/deepseek-v41-cmp170hx:latest-debug` (built from
 main `8fddd4c`: model series + shared series incl. the #57433 cohort port + the
 adaptive series + the tracing package), PP6, DSpark K=5, `max_num_seqs=32`,

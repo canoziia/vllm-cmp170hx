@@ -1,8 +1,7 @@
-# Official LMCache patch series
+# Official LMCache Patch Series
 
-This directory patches the **official LMCache v0.5.5 CUDA 13.0 release**. It
-must not be applied to the LMCache wheel bundled by the third-party DeepSeek
-base image.
+This directory patches the **official LMCache v0.5.5 CUDA 13.0 release** for use
+with our official `vllm-project/vllm` (`0e3c8db`) SM80 deployments.
 
 Pinned inputs are in `manifests/lmcache.env`:
 
@@ -10,7 +9,7 @@ Pinned inputs are in `manifests/lmcache.env`:
 - official server image digest `sha256:59b350...`;
 - official payload image digest `sha256:0dd644...`.
 
-Two scripts carry this package, so every role runs the same tree:
+Two scripts carry this package, so server and client always run the same tree:
 
 - `scripts/build-lmcache-server-image.sh` builds the shared server image from the
   official server image plus the patched payload. The server is model-agnostic,
@@ -22,15 +21,14 @@ Two scripts carry this package, so every role runs the same tree:
   which revision produced the image, and notes (without rebuilding) when `:latest`
   came from a different revision.
 
-Both client builds (`scripts/build-deepseek-v41-image.sh` and
-`scripts/build-qwen38-image.sh`) copy `/opt/lmcache-patched` from the shared
-server image into the final client image. Neither extracts or patches the
-official payload again. Only the server build touches the official payload
-image and applies `series`.
+`scripts/build-deepseek-v41-image.sh` copies `/opt/lmcache-patched` from the
+shared server image into the final client image. It does not extract or patch the
+official payload again: only the server build touches the official payload image
+and applies `series`.
 
 The payload is selected with `PYTHONPATH=/opt/lmcache-patched`, so it replaces
-rather than mixes with the base image's bundled LMCache package. Verify at
-runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
+rather than mixes with any base image package. Verify at runtime that
+`lmcache.__file__` begins with `/opt/lmcache-patched/`.
 
 ## Patches
 
@@ -49,7 +47,7 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
    - reserves L2 prefetch buffers by rank and object group;
    - retains integer-key fallback layouts for homogeneous/legacy consumers.
 
-   This is required by the formal PP6 partition `7,7,7,7,7,5`; using one
+   This is required by the PP6 partition `7,7,7,7,7,5`; using one
    `(model_name, world_size)` layout caused half-size reads such as
    `expected 733184, got 366592`.
 
@@ -60,11 +58,9 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
 
 4. `0004-vllm-unified-kv-compatibility.patch`
    - carries the vLLM unified-layout compatibility required by the pinned
-     engines: excludes non-prefix-cacheable scratch rings (including zero-span
-     block slicing), resolves logical vs physical KV views, and enforces
-     recurrent-state checkpoints;
-   - this is an explicit compatibility patch, not an implicit dependency on
-     the third-party LMCache wheel.
+     official vLLM engine: excludes non-prefix-cacheable scratch rings
+     (including zero-span block slicing), resolves logical vs physical KV views,
+     and enforces recurrent-state checkpoints.
 
 5. `0005-registration-heartbeat-lifecycle.patch`
    - starts worker heartbeat immediately after KV registration, so an idle
@@ -95,12 +91,19 @@ runtime that `lmcache.__file__` begins with `/opt/lmcache-patched/`.
    - `LMCACHE_MERGE_BOUNDED_PD=1` (default off; client and server must both
      set it) groups regular KV layer groups into object buckets by their
      cross-chunk window instead of by attention/recurrent kind, so PP ranks
-     that differ only by an extra bounded group (the GLM-5.3 DFlash2 drafter
-     on the last rank) register the same object-group description. Kernel
-     groups, layer membership, block IDs, physical layout and transfer
-     windows are unchanged; registry validation stays on.
+     that differ only by an extra bounded drafter group register the same
+     object-group description. Kernel groups, layer membership, block IDs,
+     physical layout and transfer windows are unchanged; registry validation
+     stays on.
    - only for plain PD store/retrieve: `enable_full_sw_kv` (CacheBlend)
      rejects it. All ranks must still have identical window buckets.
+
+10. `0010-cached-request-resumed-req-ids-compat.patch`
+    - guards `getattr(cached_reqs, "resumed_req_ids", ())` in
+      `lmcache/integration/vllm/lmcache_mp_connector.py` so official LMCache
+      v0.5.5 runs cleanly against official `vllm-project/vllm @ 0e3c8db` (where
+      `CachedRequestData.resumed_req_ids` was removed upstream) without adding
+      compatibility shims to vLLM's core scheduler output.
 
 The server-image build runs `scripts/test-lmcache-patches.py`. It checks native
 extension ABI, salt isolation, mixed-size native-FS round trips, six-rank
@@ -115,19 +118,17 @@ here.
 
 ## Build
 
-Build either complete client image in one command. Each reuses the shared
+Build the complete DeepSeek client image in one command. It reuses the shared
 server `:latest` image, building it only if absent or if explicitly forced:
 
 ```bash
-scripts/build-deepseek-v41-image.sh
-scripts/build-qwen38-image.sh
-# Optional: REBUILD_LMCACHE_IMAGE=1 scripts/build-deepseek-v41-image.sh
+bash scripts/build-deepseek-v41-image.sh
+# Optional: REBUILD_LMCACHE_IMAGE=1 bash scripts/build-deepseek-v41-image.sh
 ```
 
-The DeepSeek client defaults to `localhost/vllm-backport:deepseek-v4.1-flash`
-(or `:deepseek-v4.1-flash-debug` when `ENABLE_PERF_DEBUG=1`); the shared
-server defaults to `localhost/lmcache-server:latest`. Override `OUTPUT_IMAGE`
-to build an immutable commit-tagged client without moving a deployment tag.
-Never replace a running deployment solely because the images build: first run
-the registration, complete-store, eviction, restore, restart-adoption, and
-corrupt-file fallback acceptance tests.
+The DeepSeek client defaults to `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`;
+the shared server defaults to `localhost/lmcache-server:latest`. Override
+`OUTPUT_IMAGE` to build an immutable commit-tagged client without moving a
+deployment tag. Never replace a running deployment solely because the images
+build: first run the registration, complete-store, eviction, restore,
+restart-adoption, and corrupt-file fallback acceptance tests.

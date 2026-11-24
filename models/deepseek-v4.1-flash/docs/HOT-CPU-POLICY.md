@@ -1,23 +1,26 @@
-# Fixed measured policy and debug-only hot experiments
+# Fixed measured verification policy (`dsv41_measured_policy.py`)
 
-With `enable_adaptive_verification=true`, DeepSeek uses the compiled request-local
-measured policy. Other DSpark models keep the GPU confidence allocator; manual
-`vllm_xargs.spec_k` takes priority. Disabling the public switch retains the fixed
-full-width path. The verification execution profile does not select the algorithm.
+With `enable_adaptive_verification=true`, DeepSeek V4.1 uses the compiled
+request-local measured policy (`dsv41_measured_policy.py`). Other DSpark models
+keep the GPU confidence allocator; manual `vllm_xargs.spec_k` takes priority.
+Disabling the public switch retains the fixed full-width path. The verification
+execution profile does not select the algorithm.
 
-## Production build
+## Production build (official `vllm @ 0e3c8db` baseline)
 
-`ENABLE_PERF_DEBUG=0` (default) applies `adaptive/0009-measured-verification-policy.patch`.
+This policy is integrated directly into the `vllm` branch (`5470fe0`, rebased on
+official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) and
+archived in `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
 The scheduler constructs `FixedHistoryPolicy`. There is no external Python
 loader, capability admission, file polling or per-step trace IO. Selected widths
 are retained even when a request is ineligible for a fresh decision.
 
-Statistics discount evidence at the configured decay (default0.95); empirical
+Statistics discount evidence at the configured decay (default 0.95); empirical
 speeds do not decay. Candidate predictions share current output/time calibration.
 Per-width measured evidence blends with one predicted pseudoblock. Measured-ratio
-and paired-prefix uncertainty gates plus a3% improvement tolerance reduce marginal
-reversals. Cold selection prefers the widest candidate within2% of the maximum,
-provided it beats full width by3%. Upward changes are at most one width; downward
+and paired-prefix uncertainty gates plus a 3% improvement tolerance reduce marginal
+reversals. Cold selection prefers the widest candidate within 2% of the maximum,
+provided it beats full width by 3%. Upward changes are at most one width; downward
 changes may jump. These tolerances and uncertainty estimates are engineering
 heuristics, not formal confidence guarantees. No prompt labels or new cohort
 coordination are used.
@@ -25,10 +28,17 @@ coordination are used.
 Feedback carries the actual scheduled width and request generation. First,
 transition, prefill, load-change, invalid and terminal periods do not train
 measured timing. CPU-visible recurrence includes pipeline cadence and queueing,
-NOT GPU kernel time. Invalid policy decisions fail closed to full5 for that
+NOT GPU kernel time. Invalid policy decisions fail closed to full 5 for that
 request. Finishing/aborting removes its state.
 
-## Debug build
+## Historical debug-only hot policy notes (pre-rebase archive)
+
+> [!NOTE]
+> The legacy `ENABLE_PERF_DEBUG=1` / `optional/0002-hot-perf-debug.patch` /
+> `optional/0003-hot-cpu-policy-debug.patch` hot-loader mechanism described
+> below predates the rebase onto official `vllm-project/vllm @ 0e3c8db` and is
+> **not shipped** in the current `vllm` branch or `patches/` series. It is
+> preserved here solely as historical design documentation.
 
 `ENABLE_PERF_DEBUG=1` additionally applies `optional/0002-hot-perf-debug.patch` and
 `optional/0003-hot-cpu-policy-debug.patch`. The latter adds `HotHistoryPolicy`
