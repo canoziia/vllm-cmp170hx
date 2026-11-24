@@ -734,6 +734,23 @@ class KVCacheGroup:
         )
 
     @property
+    def kv_cache_spec(self) -> KVCacheGroup:
+        """Backward-compatible group spec view for external KV connectors."""
+        return self
+
+    @property
+    def tokens_per_state(self) -> int | Fraction:
+        distinct = self.distinct_specs
+        if len(distinct) == 1:
+            return distinct[0].tokens_per_state
+        return 1
+
+    @property
+    def sliding_window(self) -> int | None:
+        reach = self.sliding_window_reach
+        return reach if reach > 0 and math.isfinite(reach) else None
+
+    @property
     def layer_names(self) -> list[str]:
         return list(self.kv_cache_specs)
 
@@ -802,6 +819,28 @@ class KVCacheGroup:
             self.block_size,
             token_alignment=self.manager_cls.block_table_token_alignment,
         )
+
+
+KVCacheGroupSpec = KVCacheGroup
+
+
+def get_kv_cache_spec_kind(
+    kv_cache_spec: KVCacheSpec | KVCacheGroup,
+) -> KVCacheSpecKind:
+    """Backward-compatible spec kind helper for external KV connectors."""
+    if isinstance(kv_cache_spec, KVCacheGroup):
+        from vllm.v1.core.single_type_kv_cache_manager import get_kv_cache_kind
+
+        return get_kv_cache_kind(
+            kv_cache_spec.manager_config, kv_cache_spec.distinct_specs
+        )
+    if isinstance(kv_cache_spec, MambaSpec):
+        return KVCacheSpecKind.MAMBA
+    if isinstance(kv_cache_spec, MLAAttentionSpec):
+        return KVCacheSpecKind.MLA_ATTENTION
+    if isinstance(kv_cache_spec, AttentionSpec):
+        return KVCacheSpecKind.FULL_ATTENTION
+    return KVCacheSpecKind.UNKNOWN
 
 
 class PrefixLookupGroup(NamedTuple):

@@ -108,6 +108,82 @@ def test_no_spec_decode_padding_up_to_max_model_len():
     assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
 
 
+def test_async_pp_balances_decode_batches_without_throttling_prefills(monkeypatch):
+    # Upstream #57433 applies this policy unconditionally for MRV2 + async PP;
+    # our port keeps it behind VLLM_PP_DECODE_COHORT_BALANCE, so enable it here.
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", True)
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=32,
+        max_num_batched_tokens=8192,
+        num_speculative_tokens=7,
+        speculative_method="ngram_gpu",
+    )
+    # Emulate PP at the scheduler level. Constructing with PP=2 requires two
+    # visible GPUs, but this policy only depends on the pipeline size.
+    scheduler.pp_size = 2
+    scheduler.use_pp = True
+
+    requests = create_requests(
+        num_requests=32,
+        num_tokens=1,
+        max_tokens=10,
+        ignore_eos=True,
+    )
+    for request in requests:
+        scheduler.add_request(request)
+
+    prefill = scheduler.schedule()
+    bubble = scheduler.schedule()
+    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
+    first_decode = scheduler.schedule()
+    scheduler.update_from_output(bubble, _make_model_runner_output(bubble))
+    second_decode = scheduler.schedule()
+    scheduler.update_from_output(first_decode, _make_model_runner_output(first_decode))
+    third_decode = scheduler.schedule()
+
+    # every prompt completes in the first step: prefill is never throttled
+    assert len(prefill.num_scheduled_tokens) == 32
+    assert not bubble.num_scheduled_tokens
+    first_ids = set(first_decode.num_scheduled_tokens)
+    second_ids = set(second_decode.num_scheduled_tokens)
+    third_ids = set(third_decode.num_scheduled_tokens)
+    # 32 seqs over a 2-step cadence -> two disjoint cohorts of 16, alternating
+    assert len(first_ids) == len(second_ids) == 16
+    assert first_ids.isdisjoint(second_ids)
+    assert third_ids == first_ids
+
+
+def test_async_pp_balance_is_off_by_default(monkeypatch):
+    # The deviation from upstream is opt-in only: with the flag unset the step
+    # keeps taking the whole running set, so no existing deployment changes.
+    import vllm.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_PP_DECODE_COHORT_BALANCE", False)
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        max_num_seqs=32,
+        max_num_batched_tokens=8192,
+        num_speculative_tokens=7,
+        speculative_method="ngram_gpu",
+    )
+    scheduler.pp_size = 2
+    scheduler.use_pp = True
+    assert scheduler._get_max_num_scheduled_decodes() == 32
+
+    requests = create_requests(
+        num_requests=32, num_tokens=1, max_tokens=10, ignore_eos=True
+    )
+    for request in requests:
+        scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    scheduler.update_from_output(prefill, _make_model_runner_output(prefill))
+    first_decode = scheduler.schedule()
+    assert len(first_decode.num_scheduled_tokens) == 32
+
+
 def test_abort():
     scheduler = create_scheduler(async_scheduling=True)
     requests = create_requests(num_requests=10, max_tokens=20)

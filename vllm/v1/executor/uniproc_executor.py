@@ -141,8 +141,12 @@ class UniProcExecutor(Executor):
             single_value=True,
         )
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.collective_rpc("take_draft_token_ids", single_value=True)
+    def take_draft_token_ids(
+        self, req_ids: list[str] | None = None
+    ) -> DraftTokenIds | None:
+        return self.collective_rpc(
+            "take_draft_token_ids", args=(req_ids,), single_value=True
+        )
 
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as

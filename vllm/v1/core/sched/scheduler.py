@@ -85,7 +85,10 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
-from vllm.v1.structured_output import StructuredOutputManager
+from vllm.v1.structured_output import (
+    StructuredOutputManager,
+    strip_speculative_padding,
+)
 from vllm.v1.token_buffer import extend_from_slice
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -718,7 +721,14 @@ class Scheduler(SchedulerInterface):
 
         scheduled_new_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
+        scheduled_decode_req_ids: set[str] = set()
         preempted_reqs: list[Request] = []
+
+        # Async PP assigns each request to a decode cadence group based on the
+        # step where its prefill completes. Limiting each step to an equal share
+        # of the runner capacity keeps those groups balanced. Prefills remain
+        # uncapped because mixed batches need token-aware balancing instead.
+        max_num_scheduled_decodes = self._get_max_num_scheduled_decodes()
 
         iteration_details = None
         if (
@@ -897,6 +907,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            is_decode = request.num_computed_tokens >= request.num_prompt_tokens
+            if is_decode and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes:
+                req_index += 1
+                continue
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -908,6 +923,17 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        break
+
+                    # With asynchronous pipeline scheduling, a lone request can
+                    # temporarily retain blocks needed by unfinished PP steps.
+                    # Let one result drain instead of preempting and replaying
+                    # that same request from its prefix checkpoint.
+                    if (
+                        len(self.running) == 1
+                        and self.running[0] is request
+                        and request.num_in_flight_tokens > 0
+                    ):
                         break
 
                     if (
@@ -939,6 +965,7 @@ class Scheduler(SchedulerInterface):
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
+                            scheduled_decode_req_ids.discard(preempted_req_id)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             token_budget += restored
                             input_budget += restored + draft_slots
@@ -992,6 +1019,8 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
+            if is_decode:
+                scheduled_decode_req_ids.add(request_id)
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
@@ -1455,6 +1484,18 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
+                is_decode = (
+                    not load_kv_async
+                    and num_computed_tokens >= request.num_prompt_tokens
+                )
+                if (
+                    is_decode
+                    and len(scheduled_decode_req_ids) >= max_num_scheduled_decodes
+                ):
+                    # Requeue via skip_request (replaces step_skipped_waiting.prepend_request(request))
+                    skip_request(request_queue)
+                    continue
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1622,6 +1663,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if is_decode:
+                    scheduled_decode_req_ids.add(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1679,6 +1722,7 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert input_budget >= 0
+        assert len(scheduled_decode_req_ids) <= max_num_scheduled_decodes
         assert len(self.running) <= self.max_num_running_reqs
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
@@ -1819,6 +1863,9 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    def _get_max_num_scheduled_decodes(self) -> int:
+        return self.max_num_running_reqs
+
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1856,6 +1903,8 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        if hasattr(request, "decode_cohort_phase"):
+            request.decode_cohort_phase = None
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2291,7 +2340,14 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_acceptable_drafts = [
+            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
+            for req_id in structured_output_request_ids
+        ]
+        return GrammarOutput(
+            structured_output_request_ids, bitmask, num_acceptable_drafts
+        )
 
     def update_from_output(
         self,

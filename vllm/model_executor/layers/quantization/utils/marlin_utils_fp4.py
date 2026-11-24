@@ -45,13 +45,14 @@ def _nvfp4_compute_scale_factor(
     if a_dtype is not None and a_dtype == torch.half:
         return 1.0
 
-    ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
-        if max_val < 448 * (2**7):
-            sf = (448 * (2**7) / max_val).log2().floor().exp2()
-            return sf.item()
+    # Whenever a positive value exists it is also the overall maximum, so
+    # reduce in place rather than build a float copy, a mask and a boolean
+    # gather: the gather materialises int64 [nnz, ndim] indices, ~6.7 GiB for
+    # one MoE layer of a 288-expert model at load time.
+    max_val = marlin_scales.amax().float() * (2**7)
+    if max_val > 0 and max_val < 448 * (2**7):
+        sf = (448 * (2**7) / max_val).log2().floor().exp2()
+        return sf.item()
     return 1.0
 
 
@@ -265,7 +266,13 @@ def _repack_marlin_experts(
     size_k: int,
 ) -> torch.Tensor:
     """Repack each expert to marlin format into a preallocated output."""
+    import os
+
     num_experts = weight.shape[0]
+    inplace = (
+        os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") == "1"
+        and weight.is_contiguous()
+    )
     out: torch.Tensor | None = None
     for i in range(num_experts):
         qweight = weight[i].view(torch.int32).T.contiguous()
@@ -276,11 +283,16 @@ def _repack_marlin_experts(
             num_bits=4,
         )
         if out is None:
-            out = torch.empty(
-                (num_experts, *marlin_qweight.shape),
-                dtype=marlin_qweight.dtype,
-                device=marlin_qweight.device,
-            )
+            if inplace and weight.nbytes == num_experts * marlin_qweight.nbytes:
+                out = weight.data.view(marlin_qweight.dtype).view(
+                    num_experts, *marlin_qweight.shape
+                )
+            else:
+                out = torch.empty(
+                    (num_experts, *marlin_qweight.shape),
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
         out[i] = marlin_qweight
     assert out is not None
     return out
@@ -581,6 +593,105 @@ def prepare_moe_mxfp4_layer_for_marlin(
     w2_bias = permute_bias(w2_bias)
 
     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
+
+
+def _repack_marlin_experts_staged(
+    layer: torch.nn.Module,
+    name: str,
+    size_n: int,
+    size_k: int,
+) -> torch.Tensor:
+    import os
+
+    raw = getattr(layer, name)
+    device = raw.device
+    e = raw.shape[0]
+    assert raw.shape == (e, size_n, size_k // 2), raw.shape
+    if (
+        os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") == "1"
+        and raw.is_contiguous()
+    ) or hasattr(raw, "_ckpt"):
+        return _repack_marlin_experts(raw, size_n, size_k)
+    # Pageable on purpose: torch's pinned-host allocator caches freed blocks
+    # for the life of the process, which would keep the host RAM locked.
+    host = torch.empty(raw.shape, dtype=raw.dtype, device="cpu")
+    host.copy_(raw.data)
+    torch.cuda.synchronize(device)
+    # Drop the layer's GPU storage reference before allocating packed output.
+    raw.data = torch.empty(0, dtype=raw.dtype, device=device)
+    del raw
+    torch.cuda.empty_cache()
+    out: torch.Tensor | None = None
+    stage = torch.empty(host.shape[1:], dtype=host.dtype, device=device)
+    for i in range(e):
+        stage.copy_(host[i])
+        qweight = stage.view(torch.int32).T.contiguous()
+        packed = ops.gptq_marlin_repack(
+            b_q_weight=qweight,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+        )
+        if out is None:
+            out = torch.empty((e, *packed.shape), dtype=packed.dtype, device=device)
+        out[i] = packed
+    del stage, host
+    assert out is not None
+    return out
+
+
+def prepare_moe_mxfp4_layer_for_marlin_staged(layer: torch.nn.Module) -> None:
+    import os
+
+    group_size = 32  # MXFP4 block size
+
+    w13 = layer.w13_weight
+    e, n2, khalf = w13.shape
+    n, k = n2 // 2, khalf * 2
+    param_dtype = layer.params_dtype
+    del w13
+
+    for name, size_n, size_k in (("w13_weight", n * 2, k), ("w2_weight", k, n)):
+        packed = _repack_marlin_experts_staged(layer, name, size_n, size_k)
+        replace_parameter(layer, name, packed)
+        del packed
+        if os.environ.get("VLLM_DSV41_MARLIN_CLEAN_REPACK", "0") != "1":
+            torch.cuda.empty_cache()
+
+    for name, size_n, size_k in (("w13", n * 2, k), ("w2", k, n)):
+        scales = (
+            getattr(layer, name + "_weight_scale")
+            .view(torch.float8_e8m0fnu)
+            .to(param_dtype)
+        )
+        tensor_list = []
+        for i in range(e):
+            marlin_scales = marlin_permute_scales(
+                s=scales[i].T,
+                size_k=size_k,
+                size_n=size_n,
+                group_size=group_size,
+            )
+            tensor_list.append(mxfp4_marlin_process_scales(marlin_scales))
+        replace_parameter(
+            layer,
+            name + "_weight_scale",
+            torch.cat([x.unsqueeze(0) for x in tensor_list], 0),
+        )
+        del scales, tensor_list
+
+    for name in ("w13_bias", "w2_bias"):
+        bias = getattr(layer, name, None)
+        if bias is None:
+            continue
+        bias = bias.to(param_dtype)
+        replace_parameter(
+            layer,
+            name,
+            torch.cat(
+                [marlin_permute_bias(bias[i]).unsqueeze(0) for i in range(e)], 0
+            ),
+        )
 
 
 def rand_marlin_weight_nvfp4_like(weight, group_size):

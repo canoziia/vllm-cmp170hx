@@ -1095,12 +1095,22 @@ def generate_scheduler_kv_cache_config(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
     assert all(
-        cfg.hisparse_host_num_blocks == kv_cache_configs[0].hisparse_host_num_blocks
+        getattr(cfg, "hisparse_host_num_blocks", None)
+        == getattr(kv_cache_configs[0], "hisparse_host_num_blocks", None)
         for cfg in kv_cache_configs
     )
     # Worker configs share scheduler geometry and the resolved zeroing
     # decision, so use an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
+    for worker_cfg in kv_cache_configs:
+        if len(worker_cfg.kv_cache_groups) != len(cfg.kv_cache_groups):
+            raise ValueError("PP workers disagree on global KV cache group count")
+    for index, group in enumerate(cfg.kv_cache_groups):
+        if hasattr(group, "is_eagle_group"):
+            group.is_eagle_group = any(
+                getattr(worker_cfg.kv_cache_groups[index], "is_eagle_group", False)
+                for worker_cfg in kv_cache_configs
+            )
     return cfg
 
 

@@ -137,6 +137,11 @@ class ModelState(ABC):
     def apply_staged_writes(self) -> None:
         return None
 
+    def set_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Hook run once the runner binds a KV cache config, before any
+        request is added. No-op by default."""
+        return None
+
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
     ) -> None:

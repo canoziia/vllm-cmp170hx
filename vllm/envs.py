@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_DECODE_COHORT_BALANCE: bool = True
     VLLM_CPU_KVCACHE_SPACE: int | None = None
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -953,6 +954,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Balance established decode requests across the `pp_size` in-flight
+    # pipeline batches of Model Runner V2 + PP + async scheduling
+    # (vllm-project/vllm#57433). Upstream applies it unconditionally; we keep an
+    # opt-in so a single image can serve an A/B and so the default of every
+    # existing deployment is unchanged until it is measured per model.
+    "VLLM_PP_DECODE_COHORT_BALANCE": lambda: bool(
+        int(os.getenv("VLLM_PP_DECODE_COHORT_BALANCE", "1"))
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

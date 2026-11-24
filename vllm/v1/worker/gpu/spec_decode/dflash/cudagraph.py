@@ -87,6 +87,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
         causal: bool | Mapping[int, bool],
         prepare_forward: Callable[[int, dict[str, Any] | None], None],
         progress_bar_desc: str = "Capturing CUDA graphs",
+        stream: torch.cuda.Stream | None = None,
     ) -> None:
         """`prepare_forward(num_reqs, attn_metadata)` is captured ahead of the
         query forward."""
@@ -128,4 +129,4 @@ class DFlashCudaGraphManager(CudaGraphManager):
 
             return forward
 
-        super().capture(create_forward_fn, progress_bar_desc)
+        super().capture(create_forward_fn, progress_bar_desc, stream=stream)

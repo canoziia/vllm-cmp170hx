@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 import torch
@@ -184,6 +185,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Capture must not write context K/V.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
         assert self.query_cudagraph_manager is not None
+        shared_stream = (
+            getattr(self, "_shared_capture_stream", None)
+            if os.environ.get("VLLM_DSV41_SHARE_CAPTURE_STREAM", "1") == "1"
+            else None
+        )
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,
@@ -194,6 +200,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             prepare_forward=self._prepare_graph_forward,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+            stream=shared_stream,
         )
 
     def _prepare_graph_forward(
@@ -527,6 +534,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_max_seq_len = min(
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
+        if (
+            not dummy_run
+            and not is_profile
+            and input_batch.has_prefill
+            and os.environ.get("VLLM_DSV41_YOCO_PREFILL_TRUNC", "0") == "1"
+            and getattr(self.draft_model_config.hf_config, "model_type", "")
+            in ("deepseek_v4", "deepseek_v41")
+            and num_reqs > 0
+            and input_batch.num_draft_tokens == 0
+            and bool(input_batch.is_prefilling_np[:num_reqs].all())
+        ):
+            c_end = (
+                input_batch.num_computed_prefill_tokens_np[:num_reqs]
+                + input_batch.num_scheduled_tokens[:num_reqs]
+            )
+            sw = int(getattr(self.draft_model_config.hf_config, "sliding_window", 512))
+            max_cg = int(
+                self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            )
+            if int((input_batch.prefill_len_np[:num_reqs] - c_end).min()) >= (
+                max_cg + 2 * sw
+            ):
+                return self.draft_tokens[:num_reqs]
 
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and

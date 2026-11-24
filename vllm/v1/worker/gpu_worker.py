@@ -615,9 +615,54 @@ class Worker(WorkerBase):
         )
         with self._maybe_get_memory_pool_context(tag="runtime"):
             self.model_runner: GPUModelRunner = self._make_model_runner()
+
+        # Initialize persistent PP communication resources before model and
+        # KV allocation. This makes first-use NCCL allocations deterministic
+        # and lets later memory profiling account for their steady-state cost.
+        self._prime_pp_communicators()
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def _prime_pp_communicators(self) -> None:
+        """Initialize all lazy PP communicators before model/KV allocation."""
+        if getattr(self, "_pp_communicators_primed", False):
+            return
+        pp_group = get_pp_group()
+        if pp_group.world_size <= 1:
+            self._pp_communicators_primed = True
+            return
+        primer = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+        # vLLM/PyNCCL point-to-point communicator.
+        if not pp_group.is_first_rank:
+            pp_group.recv(primer.shape, primer.dtype)
+        if not pp_group.is_last_rank:
+            pp_group.send(primer)
+        torch.accelerator.synchronize()
+
+        # torch ProcessGroupNCCL point-to-point edge communicators.
+        rank = pp_group.rank_in_group
+        if not pp_group.is_first_rank:
+            torch.distributed.recv(
+                primer, src=pp_group.ranks[rank - 1], group=pp_group.device_group
+            )
+        if not pp_group.is_last_rank:
+            torch.distributed.send(
+                primer, dst=pp_group.ranks[rank + 1], group=pp_group.device_group
+            )
+        torch.accelerator.synchronize()
+
+        # Sibling communicator used to broadcast sampled/draft tokens from
+        # the last PP rank back to the earlier ranks.
+        handler = getattr(self.model_runner, "pp_handler", None)
+        if handler is not None:
+            torch.distributed.broadcast(
+                primer, src=handler.last_rank, group=handler.broadcast_group
+            )
+            torch.accelerator.synchronize()
+        self._pp_communicators_primed = True
 
     def _make_model_runner(self) -> "GPUModelRunner":
         """Construct the platform's model runner; subclasses override this."""
@@ -1015,6 +1060,10 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+        from vllm.dsv41_memory import maybe_enable_expandable_after_kv
+
+        maybe_enable_expandable_after_kv()
+
     def get_simple_cpu_offload_num_cpu_blocks(self) -> int | None:
         from vllm.distributed.kv_transfer.kv_connector.v1.simple_cpu_offload_connector import (  # noqa: E501
             _find_simple_cpu_offload_connector,
@@ -1116,6 +1165,7 @@ class Worker(WorkerBase):
                 randomize_inputs=self.randomize_dummy_inputs,
             )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        self._prime_pp_communicators()
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
@@ -1576,8 +1626,10 @@ class Worker(WorkerBase):
             return self.model_runner.pool()
         return None
 
-    def take_draft_token_ids(self) -> DraftTokenIds | None:
-        return self.model_runner.take_draft_token_ids()
+    def take_draft_token_ids(
+        self, req_ids: list[str] | None = None
+    ) -> DraftTokenIds | None:
+        return self.model_runner.take_draft_token_ids(req_ids)
 
     def profile(
         self,

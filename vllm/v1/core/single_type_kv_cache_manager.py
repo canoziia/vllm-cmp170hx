@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -2025,9 +2025,9 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
-            # Mapping from request ID to the index of the block
-            # allocated in the previous step
-            self.last_state_block_idx: dict[str, int] = {}
+            # Async PP may allocate several chunks before an older source state
+            # becomes safe to reclaim, so preserve every pending source index.
+            self.pending_state_block_indices: dict[str, deque[int]] = {}
             self._num_retired_blocks: dict[str, int] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
@@ -2222,23 +2222,23 @@ class MambaManager(SingleTypeKVCacheManager):
             request_id, processed_computed_tokens, num_prompt_tokens
         )
         if self.mamba_cache_mode == "align":
-            # `last_state_block_idx` refers to the block index allocated two steps ago.
-            # The block allocated in the previous step is used to copy Mamba states
-            # into the block allocated in the current step; the earlier block is
-            # no longer needed and should be freed here.
-            last_state_block_idx = self.last_state_block_idx.get(request_id)
-            # Blocks allocated during prefill may be non-contiguous. Use
-            # `last_state_block_idx` to free the appropriate block and replace it
-            # with a null block.
-            if (
-                last_state_block_idx is not None
-                and last_state_block_idx
-                < cdiv(processed_computed_tokens, self.block_size) - 1
-            ):
+            pending = self.pending_state_block_indices.get(request_id)
+            if pending:
+                safe_before = cdiv(processed_computed_tokens, self.block_size) - 1
                 blocks = self.req_to_blocks[request_id]
-                if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
-                    blocks[last_state_block_idx] = self._null_block
+                retained: deque[int] = deque()
+                while pending:
+                    state_block_idx = pending.popleft()
+                    if state_block_idx < safe_before:
+                        if blocks[state_block_idx] != self._null_block:
+                            self.block_pool.free_blocks([blocks[state_block_idx]])
+                            blocks[state_block_idx] = self._null_block
+                    else:
+                        retained.append(state_block_idx)
+                if retained:
+                    self.pending_state_block_indices[request_id] = retained
+                else:
+                    self.pending_state_block_indices.pop(request_id, None)
 
     def _needs_internal_checkpoint(
         self,
@@ -2421,17 +2421,17 @@ class MambaManager(SingleTypeKVCacheManager):
             else:
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
-                # Record the last state block
+                state_block_idx = None
                 if blocks_allocated:
-                    # We always save the running state at the last
-                    # (1 + num_speculative_blocks) block
-                    self.last_state_block_idx[request_id] = (
-                        prev_block_len - 1 - self.num_speculative_blocks
-                    )
+                    # The running state precedes the speculative scratch blocks.
+                    state_block_idx = prev_block_len - 1 - self.num_speculative_blocks
                 elif prev_block_len > 0:
-                    # When a new request hits the prefix cache, the last block
-                    # saves the hit state.
-                    self.last_state_block_idx[request_id] = prev_block_len - 1
+                    # A new prefix hit resumes from its final cached state block.
+                    state_block_idx = prev_block_len - 1
+                if state_block_idx is not None:
+                    self.pending_state_block_indices.setdefault(
+                        request_id, deque()
+                    ).append(state_block_idx)
 
                 num_skipped_blocks = (
                     num_required_blocks - self.num_speculative_blocks - 1
@@ -2539,7 +2539,7 @@ class MambaManager(SingleTypeKVCacheManager):
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
-            self.last_state_block_idx.pop(request_id, None)
+            self.pending_state_block_indices.pop(request_id, None)
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._req_chunk_ranges.pop(request_id, None)
@@ -2725,6 +2725,7 @@ class MambaManager(SingleTypeKVCacheManager):
             )
         if num_tokens <= 0 or num_tokens % hash_block_size != 0:
             return None
+        # Global lookahead replaces legacy `if self.drop_eagle_checkpoint_block:`.
         latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
             request.num_prompt_tokens,
             hash_block_size,
