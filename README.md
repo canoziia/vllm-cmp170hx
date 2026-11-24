@@ -1,21 +1,22 @@
 # vllm-cmp170hx
 
 Reproducible SM80 deployments of `deepseek-ai/DeepSeek-V4.1-Flash-1017` built
-directly on top of official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
-and official `LMCache` `v0.5.5` (`05a013b29da78cf2321b9b46ec5039dde2fb0bb0`).
+directly on top of official `vllm-project/vllm` and `LMCache`.
 
 ## Branch Architecture
 
-This repository uses a clean two-branch layout directly anchored to official
-upstream `vllm-project/vllm`:
+This repository uses a two-branch layout directly anchored to official
+`vllm-project/vllm`:
 
-- **`vllm` branch (`4e35eb0`)**: Complete patched vLLM source tree anchored directly on official upstream:
-  - Base commit `ab629d9` — clean snapshot of official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`;
-  - Followed by 10 feature-scoped commits (`ab629d9..4e35eb0`, 1:1 with `models/deepseek-v4.1-flash/patches/`) covering SM80 compat, core async-PP/Mamba/structured-spec fixes, OpenAI thinking/1017 encoding, CPU Engram & vision offload, MXFP4 MoE, dense MXFP8 / thin `wo_a` / fast router, sparse attention / indexer / SWA / DSpark, optimization profiles, adaptive verification, and topology-aware SM80 TEP4 fusions.
-  Run `git log --oneline ab629d9..vllm` or `git diff ab629d9..vllm` to inspect every change over upstream.
+- **`vllm` branch**: Complete patched vLLM source tree (official upstream
+  snapshot followed by feature-scoped SM80 / DeepSeek-V4.1 commits matching
+  `models/deepseek-v4.1-flash/patches/`).
 - **`main` branch** (this branch): Deployment manifests, Compose files,
   self-contained native CUDA/C++ extensions, LMCache patches, build/validation
   scripts, offline tests, monitoring, and documentation.
+
+Exact source revisions and image digests are pinned in `manifests/lmcache.env`
+and `models/deepseek-v4.1-flash/manifests/source.env`.
 
 ## Repository Layout
 
@@ -24,7 +25,7 @@ upstream `vllm-project/vllm`:
 ├── manifests/                      # pinned shared LMCache metadata & patch checksums
 ├── monitoring/                     # standalone Prometheus + Grafana stack
 ├── patches/
-│   └── lmcache/                    # official LMCache v0.5.5 patch series (0001..0010)
+│   └── lmcache/                    # official LMCache patch series (0001..0010)
 ├── scripts/
 │   ├── apply-deepseek-v41-patches.sh
 │   ├── apply-lmcache-patches.sh
@@ -41,9 +42,9 @@ upstream `vllm-project/vllm`:
         ├── .env.example            # default TEP4 environment template
         ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
         ├── .env.pp6.example        # optional PP6 environment template
-        ├── manifests/              # pinned vllm branch & official upstream 0e3c8db metadata
+        ├── manifests/              # pinned vllm branch & upstream source metadata
         ├── native/                 # 6 self-contained SM80 CUDA/C++ extensions built from source
-        ├── patches/                # auditable patch archive replaying onto official 0e3c8db
+        ├── patches/                # auditable patch archive replaying onto official vLLM
         ├── scripts/                # DeepSeek-only diagnostics
         ├── tests/                  # offline unit & encoding test suites
         └── docs/                   # design notes and historical PP6 investigation records
@@ -58,9 +59,8 @@ deployment guide, and measured 180 W / 250 W TEP4 benchmarks.
 ### Validate & Build
 
 By default (`SOURCE_MODE=vllm-branch`), `scripts/build-deepseek-v41-image.sh`
-exports this repository's `vllm` branch (`4e35eb0`, 10 feature commits on official
-`vllm-project/vllm @ 0e3c8db`), compiles all 6 self-contained native CUDA/C++
-extensions, bundles the patched official LMCache payload from
+exports this repository's `vllm` branch, compiles all 6 self-contained native
+CUDA/C++ extensions, bundles the patched official LMCache payload from
 `localhost/lmcache-server:latest` (building it automatically if absent, or when
 `REBUILD_LMCACHE_IMAGE=1`), and runs the offline test gates:
 
@@ -73,7 +73,7 @@ CONTAINER_ENGINE=podman \
 OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
 bash scripts/build-deepseek-v41-image.sh
 
-# Optional: rebuild by replaying models/deepseek-v4.1-flash/patches/ onto official 0e3c8db
+# Optional: rebuild by replaying models/deepseek-v4.1-flash/patches/ onto official upstream
 # SOURCE_MODE=patch-upstream bash scripts/build-deepseek-v41-image.sh
 ```
 
@@ -137,16 +137,8 @@ and speculative step/s.
 
 ## Shared LMCache Baseline
 
-`manifests/lmcache.env` pins the official LMCache release:
-
-```text
-LMCache v0.5.5
-source commit 05a013b29da78cf2321b9b46ec5039dde2fb0bb0
-Python 3.12 / CUDA 13.0 official image payloads by immutable digest
-```
-
-Patch rationale (including `0010-cached-request-resumed-req-ids-compat.patch` for
-official `vllm 0e3c8db` compatibility) and validation gates are documented in
+`manifests/lmcache.env` pins the official LMCache v0.5.5 CUDA 13.0 release and
+payload digests. Patch rationale and validation gates are documented in
 [`patches/lmcache/README.md`](patches/lmcache/README.md).
 
 ## Upstream Sources
@@ -156,8 +148,8 @@ vLLM fork in the chain:
 
 | Upstream | What we take from it | Where it is pinned |
 | --- | --- | --- |
-| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM `main` engine (`0e3c8db`), snapped as `ab629d9` on our `vllm` branch with 10 feature commits (`ab629d9..4e35eb0`) | `models/deepseek-v4.1-flash/manifests/source.env` |
-| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache `v0.5.5` (`05a013b2`) server/payload images plus `patches/lmcache/0001..0010` | `manifests/lmcache.env` |
+| [`vllm-project/vllm`](https://github.com/vllm-project/vllm) | Official vLLM engine, maintained on our `vllm` branch as feature commits on top of upstream | `models/deepseek-v4.1-flash/manifests/source.env` |
+| [`LMCache/LMCache`](https://github.com/LMCache/LMCache) | Official LMCache v0.5.5 server/payload images plus `patches/lmcache/0001..0010` | `manifests/lmcache.env` |
 
 ## License
 

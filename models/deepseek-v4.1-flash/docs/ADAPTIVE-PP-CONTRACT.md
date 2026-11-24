@@ -2,9 +2,9 @@
 
 > [!NOTE]
 > **Historical pre-rebase design record.** This proposal predates the direct
-> rebase onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
-> and the current `vllm` branch (`4e35eb0`). See `models/deepseek-v4.1-flash/README.md`
-> and `patches/adaptive/README.md` for the current implementation.
+> rebase onto official `vllm-project/vllm` and the current `vllm` branch. See
+> `models/deepseek-v4.1-flash/README.md` and `patches/adaptive/README.md` for
+> the current implementation.
 
 ## Keep from existing vLLM
 

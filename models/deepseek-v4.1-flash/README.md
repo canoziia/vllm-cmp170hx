@@ -1,8 +1,8 @@
-# DeepSeek V4.1 Flash on SM80 GPUs (Upstream `vllm` `0e3c8db`: TEP4 80G & PP6 CMP 170HX)
+# DeepSeek V4.1 Flash on SM80 GPUs (TEP4 80G & PP6 CMP 170HX)
 
 Reproducible patch series, self-contained native CUDA/C++ extensions, and Podman Compose
-deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` rebased onto official
-`vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) for SM80 GPUs:
+deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` built directly on official
+`vllm-project/vllm` for SM80 GPUs:
 
 - **Default — 4x 80G SM80 TEP4 (`compose.yml` / `.env.example`)**: `TP=4 + EP=4, DCP=1, PP=1`
   (`nvfp4_ds_mla` KV cache, `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` +
@@ -12,16 +12,18 @@ deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` rebased onto official
 
 ## Repository Branch Layout & Source
 
-This repository uses a two-branch layout:
+This repository uses a two-branch layout (exact commits and image tags are pinned in
+`manifests/source.env` and `../../manifests/lmcache.env`):
 
-- **`vllm` branch (`4e35eb0`)**: Complete patched vLLM source tree (`ab629d9` = clean upstream `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`, followed by 10 feature-scoped commits `ab629d9..4e35eb0` matching `patches/` 1:1). Run `git log --oneline ab629d9..vllm` or `git diff ab629d9..vllm` to inspect every change over upstream.
-- **`main` branch**: Deployment compose files (default TEP4 `compose.yml`, optional PP6 `compose.pp6.yml`), self-contained native CUDA/C++ extensions (`native/`), build scripts (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline test suites, and auditable patch archive (`patches/`).
-
-- Upstream reference: `https://github.com/vllm-project/vllm.git @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`
-- Patched vLLM branch (`manifests/source.env`): `vllm @ 4e35eb0022a518f1289029bc056612797fd50670`
-- Shared LMCache baseline (`../../manifests/lmcache.env`): official `LMCache v0.5.5` (`05a013b2`) + `../../patches/lmcache/0001..0010` (including `0010-cached-request-resumed-req-ids-compat.patch` for official `vllm 0e3c8db`)
-- SM80 base image (`manifests/source.env`): `localhost/vllm-main-sm80:base-2054de0`
-- Default TEP4 output image: `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`
+- **`vllm` branch**: Complete patched vLLM source tree (official upstream snapshot followed
+  by feature-scoped commits matching `patches/` 1:1).
+- **`main` branch**: Deployment compose files (default TEP4 `compose.yml`, optional PP6
+  `compose.pp6.yml`), self-contained native CUDA/C++ extensions (`native/`), build scripts
+  (`scripts/build-deepseek-v41-image.sh`, consuming our `vllm` branch by default), offline
+  test suites, and auditable patch archive (`patches/`).
+- **Shared LMCache layer**: official LMCache v0.5.5 + `../../patches/lmcache/0001..0010`
+  (including `0010-cached-request-resumed-req-ids-compat.patch` for upstream vLLM compatibility).
+- **Default TEP4 output image**: `localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4`
 
 ### Self-Contained Native Extensions (`models/deepseek-v4.1-flash/native/`)
 
@@ -73,7 +75,7 @@ VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
 CONTAINER_ENGINE=podman \
 OUTPUT_IMAGE=localhost/vllm-main-sm80:deepseek-v4.1-flash-tep4 \
 bash scripts/build-deepseek-v41-image.sh
-# (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream 0e3c8db + patches/)
+# (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream + patches/)
 
 # 3. Deploy default 4x 80G SM80 TEP4 with Podman Compose:
 cd models/deepseek-v4.1-flash

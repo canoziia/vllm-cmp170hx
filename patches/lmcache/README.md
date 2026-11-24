@@ -1,13 +1,9 @@
 # Official LMCache Patch Series
 
 This directory patches the **official LMCache v0.5.5 CUDA 13.0 release** for use
-with our official `vllm-project/vllm` (`0e3c8db`) SM80 deployments.
+with our official `vllm-project/vllm` SM80 deployments.
 
-Pinned inputs are in `manifests/lmcache.env`:
-
-- source commit `05a013b29da78cf2321b9b46ec5039dde2fb0bb0` (`v0.5.5`);
-- official server image digest `sha256:59b350...`;
-- official payload image digest `sha256:0dd644...`.
+Pinned source commit and immutable image digests are defined in `manifests/lmcache.env`.
 
 Two scripts carry this package, so server and client always run the same tree:
 
@@ -101,7 +97,7 @@ rather than mixes with any base image package. Verify at runtime that
 10. `0010-cached-request-resumed-req-ids-compat.patch`
     - guards `getattr(cached_reqs, "resumed_req_ids", ())` in
       `lmcache/integration/vllm/lmcache_mp_connector.py` so official LMCache
-      v0.5.5 runs cleanly against official `vllm-project/vllm @ 0e3c8db` (where
+      v0.5.5 runs cleanly against official upstream `vllm` (where
       `CachedRequestData.resumed_req_ids` was removed upstream) without adding
       compatibility shims to vLLM's core scheduler output.
 

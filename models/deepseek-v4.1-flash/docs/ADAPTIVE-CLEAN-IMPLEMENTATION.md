@@ -3,9 +3,8 @@
 > [!NOTE]
 > **Historical pre-rebase design record (PP6 era).** The branch and image hashes
 > below predate rebasing this repository directly onto official
-> `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`). The
-> resulting SM80 adaptive verification and sub-width CUDA graph implementation
-> now lives on the `vllm` branch (`4e35eb0`) and in
+> `vllm-project/vllm`. The resulting SM80 adaptive verification and sub-width
+> CUDA graph implementation now lives on the `vllm` branch and in
 > `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
 > See `models/deepseek-v4.1-flash/README.md` for current builds and benchmarks.
 

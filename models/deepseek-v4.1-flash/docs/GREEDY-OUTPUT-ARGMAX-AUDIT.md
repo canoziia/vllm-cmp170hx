@@ -2,9 +2,8 @@
 
 > [!NOTE]
 > **Historical pre-rebase PP6 audit (2026-09-26).** Recorded prior to rebasing
-> directly onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
-> via the `vllm` branch (`4e35eb0`). Preserved for the per-position argmax
-> audit methodology (`tests/argmax-audit.py`).
+> directly onto official `vllm-project/vllm` via the `vllm` branch. Preserved
+> for the per-position argmax audit methodology (`tests/argmax-audit.py`).
 
 2026-09-26, six-GPU SM80 DeepSeek-V4.1-Flash deployment (PP6, DSpark K=5,
 max_num_seqs=32, async scheduling, `VLLM_USE_BREAKABLE_CUDAGRAPH=1`).

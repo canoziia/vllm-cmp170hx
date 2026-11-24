@@ -6,11 +6,11 @@ keep the GPU confidence allocator; manual `vllm_xargs.spec_k` takes priority.
 Disabling the public switch retains the fixed full-width path. The verification
 execution profile does not select the algorithm.
 
-## Production build (official `vllm @ 0e3c8db` baseline)
+## Production build
 
-This policy is integrated directly into the `vllm` branch (`4e35eb0`, rebased on
-official `vllm-project/vllm @ 0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) and
-archived in `patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
+This policy is integrated directly into the `vllm` branch (rebased on official
+`vllm-project/vllm`) and archived in
+`patches/adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch`.
 The scheduler constructs `FixedHistoryPolicy`. There is no external Python
 loader, capability admission, file polling or per-step trace IO. Selected widths
 are retained even when a request is ineligible for a fresh decision.
@@ -36,7 +36,7 @@ request. Finishing/aborting removes its state.
 > [!NOTE]
 > The legacy `ENABLE_PERF_DEBUG=1` / `optional/0002-hot-perf-debug.patch` /
 > `optional/0003-hot-cpu-policy-debug.patch` hot-loader mechanism described
-> below predates the rebase onto official `vllm-project/vllm @ 0e3c8db` and is
+> below predates the rebase onto official `vllm-project/vllm` and is
 > **not shipped** in the current `vllm` branch or `patches/` series. It is
 > preserved here solely as historical design documentation.
 

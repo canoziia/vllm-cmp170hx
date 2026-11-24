@@ -1,13 +1,11 @@
-# DeepSeek V4.1 Flash SM80 Patch Series (Upstream `vllm` `0e3c8db`)
+# DeepSeek V4.1 Flash SM80 Patch Series
 
-Base source: official `https://github.com/vllm-project/vllm.git` at
-`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`.
+Base source: official `vllm-project/vllm` (pinned in `manifests/source.env`).
 
 > [!NOTE]
 > The default image build (`SOURCE_MODE=vllm-branch` in
 > `scripts/build-deepseek-v41-image.sh`) exports this repository's `vllm` branch
-> (`4e35eb0`, rebased directly onto official `vllm-project/vllm @ 0e3c8db`).
-> This directory preserves the auditable patch series used by
+> directly. This directory preserves the auditable patch series used by
 > `SOURCE_MODE=patch-upstream` and `scripts/apply-deepseek-v41-patches.sh`.
 
 ## Base Series (`patches/series`)
@@ -16,7 +14,7 @@ Applied in order by `scripts/apply-deepseek-v41-patches.sh`:
 
 1. `0001-upstream-0e3c8db-compat-and-entrypoints.patch`
    - Preserves SM80 / DeepSeek-V4.1 entrypoints, `vllm.env_override` profile bootstrap,
-     and `--sse-keep-alive-interval` CLI compatibility on upstream `vllm` `0e3c8db`.
+     and `--sse-keep-alive-interval` CLI compatibility on upstream `vllm`.
 2. `0002-common-async-pp-mamba-and-structured-spec-fixes.patch`
    - Ports all 4 shared runtime invariants verified by `scripts/test-vllm-common-patches.py`:
      async-PP Mamba state reclamation, resumed hybrid cache geometry restoration,

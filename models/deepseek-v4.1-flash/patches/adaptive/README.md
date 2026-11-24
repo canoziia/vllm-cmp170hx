@@ -1,7 +1,7 @@
 # Adaptive Verification & Topology-Aware Fusion Series
 
-Base source: official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`),
-already integrated into this repository's `vllm` branch (`4e35eb0`) for default
+Base source: official `vllm-project/vllm` (pinned in `manifests/source.env`),
+already integrated into this repository's `vllm` branch for default
 `SOURCE_MODE=vllm-branch` builds.
 
 When rebuilding from upstream via `SOURCE_MODE=patch-upstream`,

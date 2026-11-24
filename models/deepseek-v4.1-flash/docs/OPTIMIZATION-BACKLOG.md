@@ -2,11 +2,11 @@
 
 > [!NOTE]
 > **Historical pre-rebase backlog (PP6 era).** This document was written prior
-> to rebasing directly onto official `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`)
-> and implementing the TEP4 SM80 fusion stack (`tep4_fused`, `native/dsv41_r2`,
-> topology-aware NVLink/PCIe Lamport collectives, fused gate/top-k/align,
-> `w2_splitk_ep` + fused shared add, C++ `wo_a`, TP-local greedy verification,
-> and zero-HBM `dequant_marlin_mxfp8` cuBLAS prefill). See
+> to rebasing directly onto official `vllm-project/vllm` and implementing the
+> TEP4 SM80 fusion stack (`tep4_fused`, `native/dsv41_r2`, topology-aware
+> NVLink/PCIe Lamport collectives, fused gate/top-k/align, `w2_splitk_ep` +
+> fused shared add, C++ `wo_a`, TP-local greedy verification, and zero-HBM
+> `dequant_marlin_mxfp8` cuBLAS prefill). See
 > `models/deepseek-v4.1-flash/README.md` for the current architecture and
 > measured TEP4 benchmarks.
 
