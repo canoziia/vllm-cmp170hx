@@ -1197,9 +1197,29 @@ def _resolve_lmcache_mp_connector() -> type[KVConnectorBase_V1]:
         return LMCacheMPConnectorUpstream
 
     try:
+        import lmcache.integration.vllm.kv_cache_groups as _lmc_kv_groups
+        import lmcache.integration.vllm.lmcache_mp_connector as _lmc_mp_mod
         from lmcache.integration.vllm.lmcache_mp_connector import (
             LMCacheMPConnector as _ExternalLMCacheMPConnector,
         )
+
+        _orig_gtpb = getattr(_lmc_kv_groups, "get_tokens_per_block", None)
+        _is_sw = getattr(_lmc_kv_groups, "_is_sliding_window_spec", None)
+        if (
+            callable(_orig_gtpb)
+            and callable(_is_sw)
+            and not getattr(_orig_gtpb, "_dsv41_sw_dcp_safe", False)
+        ):
+
+            def _sw_dcp_safe_tokens_per_block(kv_cache_spec: Any, dcp_size: int) -> int:
+                if dcp_size > 1 and _is_sw(kv_cache_spec):
+                    return int(kv_cache_spec.block_size)
+                return int(_orig_gtpb(kv_cache_spec, dcp_size))
+
+            _sw_dcp_safe_tokens_per_block._dsv41_sw_dcp_safe = True  # type: ignore[attr-defined]
+            _lmc_kv_groups.get_tokens_per_block = _sw_dcp_safe_tokens_per_block
+            if hasattr(_lmc_mp_mod, "get_tokens_per_block"):
+                _lmc_mp_mod.get_tokens_per_block = _sw_dcp_safe_tokens_per_block
 
         logger.info(
             "Using external LMCacheMPConnector from "

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
@@ -361,6 +362,83 @@ class CudaGraphManager:
                 if ubatch_desc is not None:
                     decode_descs.append(ubatch_desc)
 
+        if (
+            capture_decode
+            and type(self).__name__ == "ModelCudaGraphManager"
+            and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
+            and any(
+                arch in self.vllm_config.model_config.architectures
+                for arch in (
+                    "DeepseekV41ForCausalLM",
+                    "DeepseekV41VLForConditionalGeneration",
+                )
+            )
+        ):
+            decode_max_tokens = decode_cudagraph_capture_max_tokens(compilation_config)
+            raw_spec = os.environ.get(
+                "VLLM_DSV41_SUBWIDTH_GRAPHS", "1:1-5;2:2-5;4,8,16,32:2-6"
+            ).strip()
+            sub_specs: list[tuple[int, int]] = []
+            if raw_spec and raw_spec.lower() not in ("0", "off", "none"):
+                for clause in raw_spec.split(";"):
+                    clause = clause.strip()
+                    if not clause:
+                        continue
+                    r_part, w_part = clause.split(":", 1)
+                    r_list = [int(x) for x in r_part.split(",") if x.strip()]
+                    w_list: list[int] = []
+                    for tok in w_part.split(","):
+                        tok = tok.strip()
+                        if "-" in tok:
+                            lo_s, hi_s = tok.split("-", 1)
+                            w_list.extend(range(int(lo_s), int(hi_s) + 1))
+                        elif tok:
+                            w_list.append(int(tok))
+                    for reqs in r_list:
+                        if reqs <= self.max_num_reqs:
+                            for width in w_list:
+                                if 1 <= width <= self.decode_query_len:
+                                    sub_specs.append((reqs, width))
+            for (reqs, width), loras in product(sub_specs, self.lora_capture_cases):
+                rows = reqs * width
+                if rows > decode_max_tokens:
+                    continue
+                sdesc = BatchExecutionDescriptor(
+                    cg_mode=decode_mode,
+                    num_tokens=rows,
+                    num_reqs=reqs,
+                    uniform_token_count=width,
+                    num_active_loras=loras,
+                )
+                if sdesc not in decode_descs:
+                    decode_descs.append(sdesc)
+            if (
+                not self.varlen_decode
+                and os.environ.get("VLLM_DSV41_MIXED_SPEC_FULL_GRAPH", "1") == "1"
+                and not self.vllm_config.parallel_config.use_ubatching
+            ):
+                raw_mixed = os.environ.get(
+                    "VLLM_DSV41_MIXED_SPEC_TOKENS",
+                    "16,24,32,40,48,64,80,96,128,160,192",
+                ).strip()
+                mixed_rows = (
+                    tuple(int(x) for x in raw_mixed.split(",") if x.strip())
+                    if raw_mixed and raw_mixed.lower() not in ("0", "off", "none")
+                    else ()
+                )
+                for rows, loras in product(mixed_rows, self.lora_capture_cases):
+                    if rows > decode_max_tokens:
+                        continue
+                    rdesc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=rows,
+                        num_reqs=min(rows, self.max_num_reqs),
+                        max_query_len=self.decode_query_len,
+                        num_active_loras=loras,
+                    )
+                    if rdesc not in token_keyed_descs:
+                        token_keyed_descs.append(rdesc)
+
         for num_tokens, num_active_loras in product(
             prefill_sizes, self.lora_capture_cases
         ):
@@ -391,7 +469,10 @@ class CudaGraphManager:
         for desc in decode_descs + token_keyed_descs:
             descs_by_mode[desc.cg_mode].append(desc)
         for mode, descs in descs_by_mode.items():
-            descs.sort(key=lambda d: d.num_tokens, reverse=True)
+            descs.sort(
+                key=lambda d: (d.num_tokens, d.num_reqs or 0),
+                reverse=True,
+            )
             self._capture_descs[mode] = descs
 
         # A uniform decode batch looks up its request count among the graphs of
@@ -414,7 +495,10 @@ class CudaGraphManager:
         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
             mode_descs = sorted(
                 (d for d in token_keyed_descs if d.cg_mode == mode),
-                key=lambda d: d.num_tokens,
+                key=lambda d: (
+                    d.num_tokens,
+                    d.num_reqs if d.num_reqs is not None else self.max_num_reqs,
+                ),
             )
             for num_active_loras in self.lora_capture_cases:
                 lora_descs = [

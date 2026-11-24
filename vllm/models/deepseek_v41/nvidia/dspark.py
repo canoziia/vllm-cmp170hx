@@ -127,11 +127,7 @@ class DSparkDeepseekV4Model(nn.Module):
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
-            dtype=torch.int32,
-        )
+        self.topk_indices_buffer = None
 
         current_vllm_config = get_current_vllm_config()
         # The target model already holds the GEMM-RS workspace (same hidden
@@ -321,8 +317,10 @@ def _insert_context_kv(
     # swa_bytes_per_token once the sliding-window and compressed records can
     # differ). block_size stays the layer's, so the op's size(1) check still
     # cross-checks the two rather than restating the tensor.
+    from vllm.models.deepseek_v41.attention import _dsv41_swa_ops
+
     cache = attn.swa_cache_layer.kv_cache
-    torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+    _dsv41_swa_ops().fused_deepseek_v4_kv_rope_insert(
         kv,
         cache,
         slot_mapping,
@@ -397,7 +395,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
                 or extra.get("dspark_fused_markov", is_ampere() or is_hopper())
             )
             and spec_config.draft_sample_method == "probabilistic"
-            and not spec_config.enable_adaptive_verification
+            and not spec_config.uses_gpu_adaptive_verification()
             and not vllm_config.model_config.use_fp64_gumbel
             and getattr(vllm_config, "watermark_config", None) is None
             and not vllm_config.parallel_config.enable_batch_sharded_sampling
@@ -414,6 +412,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
             self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
             self.num_speculative_steps = spec_config.num_speculative_tokens
 
+        self._fp8_draft_head = None
         self.set_moe_parameters()
 
     def set_moe_parameters(self) -> None:
@@ -477,19 +476,55 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         step = None if decode is None else decode.plan(positions)
         return self.model(input_ids, positions, inputs_embeds, decode_step=step)
 
+    def build_fp8_draft_head(self) -> None:
+        from .dspark_fp8_head import Fp8DraftHead
+
+        if self._fp8_draft_head is None and self.lm_head.weight.is_cuda:
+            self._fp8_draft_head = Fp8DraftHead(self.lm_head.weight.data)
+
+    def maybe_build_fp8_draft_head(self) -> None:
+        from .dspark_fp8_head import draft_head_fp8_enabled
+
+        if draft_head_fp8_enabled():
+            self.build_fp8_draft_head()
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Full-vocab draft: base logits, no d2t scatter.
+        if self._fp8_draft_head is not None:
+            local = self._fp8_draft_head(self.model.norm(hidden_states))
+            return self.logits_processor._gather_logits(local)
         return self.compute_logits(hidden_states)
 
     def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This TP rank's vocab shard of compute_draft_logits, not gathered."""
+        if self._fp8_draft_head is not None:
+            return self._fp8_draft_head(self.model.norm(hidden_states))
         return self.logits_processor(
             self.lm_head, self.model.norm(hidden_states), skip_gather=True
         )
+
+    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Same logits, this rank's vocab columns only (masked, no gather)."""
+        if self._fp8_draft_head is not None:
+            logits = self._fp8_draft_head(self.model.norm(hidden_states))
+            self.logits_processor._mask_outside_vocab(logits, self.lm_head)
+            return logits
+        return self.logits_processor.get_shard_logits(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def select_draft_token_shard(
+        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.markov_head.select_top_tokens(
+            markov_embed, base_shard_logits, self.logits_processor
+        )
+
+    def markov_fusion_operands(self):
+        return self.model.markov_head.fusion_operands(self.logits_processor)
 
     def draft_logits_shard(self) -> tuple[int, int] | None:
         """`(first column, width)` of `compute_draft_logits_local` within

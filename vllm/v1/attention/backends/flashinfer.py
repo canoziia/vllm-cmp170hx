@@ -10,14 +10,24 @@ from typing import ClassVar
 
 import numpy as np
 import torch
+import flashinfer as _flashinfer_mod
 from flashinfer import (
     BatchAttentionWithAttentionSinkWrapper,
     BatchDecodeWithPagedKVCacheWrapper,
-    BatchPrefillWithCausalBidirectionalRangesWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     get_seq_lens,
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+
+class _MissingBidirectionalRangesWrapper:
+    pass
+
+
+BatchPrefillWithCausalBidirectionalRangesWrapper = getattr(
+    _flashinfer_mod,
+    "BatchPrefillWithCausalBidirectionalRangesWrapper",
+    _MissingBidirectionalRangesWrapper,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
@@ -118,7 +128,9 @@ logger = init_logger(__name__)
 _MM_PREFIX_KV_DTYPES = (None, "auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "nvfp4")
 # An SM100 NVFP4 cache keeps its V scales in the trtllm-gen swizzle.
 _MM_PREFIX_READS_SWIZZLED_V_SF = (
-    "v_sf_swizzled"
+    BatchPrefillWithCausalBidirectionalRangesWrapper
+    is not _MissingBidirectionalRangesWrapper
+    and "v_sf_swizzled"
     in inspect.signature(BatchPrefillWithCausalBidirectionalRangesWrapper).parameters
 )
 
@@ -128,7 +140,12 @@ def _native_mm_prefix(vllm_config: VllmConfig | None) -> bool:
     only when FLASHINFER is selected explicitly."""
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    if vllm_config is None or vllm_config.model_config is None:
+    if (
+        BatchPrefillWithCausalBidirectionalRangesWrapper
+        is _MissingBidirectionalRangesWrapper
+        or vllm_config is None
+        or vllm_config.model_config is None
+    ):
         return False
     model_config = vllm_config.model_config
     return (
@@ -1419,7 +1436,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         speculative_config = vllm_config.speculative_config
         return (
             speculative_config is not None
-            and speculative_config.enable_adaptive_verification
+            and speculative_config.uses_gpu_adaptive_verification()
             and decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
             and not use_dcp
         )

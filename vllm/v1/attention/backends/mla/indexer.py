@@ -418,7 +418,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
-    token_to_seq: torch.Tensor
+    token_to_seq: torch.Tensor | None
     total_seq_lens: int
     # Host upper bound on cu_seqlen_ke - cu_seqlen_ks, sizing the compressed
     # DeepGEMM prefill logits.
@@ -528,11 +528,12 @@ class BuildPrefillChunkMetadataKernel(
                 mask=mask,
             )
 
-        # Compute token_to_seq
-        for i in range(0, compressed_seq_len, BLOCK_SIZE):
-            offset = i + tl.arange(0, BLOCK_SIZE)
-            mask = offset < compressed_seq_len
-            tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)
+        # Compute token_to_seq (only needed by ROCm KV gather, never on CUDA)
+        if token_to_seq_ptr is not None:
+            for i in range(0, compressed_seq_len, BLOCK_SIZE):
+                offset = i + tl.arange(0, BLOCK_SIZE)
+                mask = offset < compressed_seq_len
+                tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)
 
     def dispatch(
         self,
@@ -642,7 +643,7 @@ class BuildPrefillChunkMetadataKernel(
                 "cu_compressed_seq_lens", torch.int32
             ),
             row_start_cu_compressed_seq_lens=int32_ptr,
-            token_to_seq=int32_ptr,
+            token_to_seq=int32_ptr if current_platform.is_rocm() else None,
             cu_compressed_seq_len_ks=int32_ptr,
             cu_compressed_seq_len_ke=int32_ptr,
             query_slice_start=compile_key.query_slice_start,
@@ -662,7 +663,7 @@ class BuildPrefillChunkMetadataKernel(
         uncompressed_seq_lens: torch.Tensor,
         cu_compressed_seq_lens: torch.Tensor,
         row_start_cu_compressed_seq_lens: torch.Tensor,
-        token_to_seq: torch.Tensor,
+        token_to_seq: torch.Tensor | None,
         cu_compressed_seq_len_ks: torch.Tensor,
         cu_compressed_seq_len_ke: torch.Tensor,
         query_slice_start: int,
@@ -902,7 +903,9 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     # size while still fitting within the flashmla_sparse workspace.
     # For DeepSeek-V3.2, the max_model_len is 163840.
     #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * (576 * 2 // 132) * factor
+    # Cap at 128K tokens' worth so 1M max_model_len does not reserve >1 GiB of
+    # gather workspace; longer prefills split cleanly across gather chunks.
+    return min(max_model_len, 131072) * (576 * 2 // 132) * factor
 
 
 def dense_logits_rows(max_seqlen_k: int, max_logits_bytes: int | None = None) -> int:
@@ -965,7 +968,7 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
     next_n = 1 + vllm_config.num_speculative_tokens
     return not _supports_native_decode(next_n) or (
         speculative_config is not None
-        and speculative_config.enable_adaptive_verification
+        and speculative_config.uses_gpu_adaptive_verification()
         and (
             _supports_flattened_device_query_lens()
             or _supports_deepseek_v4_flattened_device_query_lens(vllm_config)
@@ -1031,7 +1034,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         )
         self.use_adaptive_verification = bool(
             self.vllm_config.speculative_config
-            and self.vllm_config.speculative_config.enable_adaptive_verification
+            and self.vllm_config.speculative_config.uses_gpu_adaptive_verification()
         )
         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
         # Plan prefill chunks for the fused MQA+top-k kernel (not bounded by
@@ -1212,7 +1215,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
         """Prepare native or per-token flattened decode tensors."""
         spec_config = self.vllm_config.speculative_config
-        adaptive = bool(spec_config and spec_config.enable_adaptive_verification)
+        adaptive = bool(spec_config and spec_config.uses_gpu_adaptive_verification())
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native:
             assert self.decode_seq_lens_buffer.dim() == 1
@@ -1712,7 +1715,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             min_decode_len = int(decode_lens_cpu.min().item())
             write_is_uniform = min_decode_len == max_decode_len
             next_n = 1 + self.num_speculative_tokens
-            if self.use_adaptive_verification:
+            if (
+                self.use_adaptive_verification
+                or common_attn_metadata.max_query_len > max_decode_len
+            ):
                 # Varlen FULL graphs are captured by distributing the graph's
                 # token bucket over as many one-token dummy requests as
                 # possible. Runtime adaptive budgets can put up to next_n
@@ -1720,7 +1726,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # branch must describe that upper bound rather than the dummy
                 # partition. Device per-request lengths still select the live
                 # rows at replay.
-                max_decode_len = next_n
+                max_decode_len = max(common_attn_metadata.max_query_len, next_n)
                 write_is_uniform = False
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
@@ -1957,7 +1963,11 @@ def build_prefill_chunk_metadata(
 
     num_reqs = end_idx - start_idx
     device = block_table.device
-    token_to_seq = torch.empty(total_seq_lens, dtype=torch.int32, device=device)
+    token_to_seq = (
+        torch.empty(total_seq_lens, dtype=torch.int32, device=device)
+        if current_platform.is_rocm()
+        else None
+    )
 
     if pcp_plan is not None:
         cu_seq_lens = pcp_plan.global_cu

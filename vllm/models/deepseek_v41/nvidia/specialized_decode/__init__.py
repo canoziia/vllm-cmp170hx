@@ -101,7 +101,7 @@ def unsupported(vllm_config: VllmConfig) -> list[str]:
         "DSpark speculative decoding without adaptive verification": (
             spec is not None
             and spec.method == "dspark"
-            and not spec.enable_adaptive_verification
+            and not spec.uses_gpu_adaptive_verification()
         ),
         "the FLASHINFER_MLA_SPARSE_DSV41 attention backend, an fp8 KV cache "
         "and the MXFP4 indexer with sparse logits": (

@@ -680,6 +680,9 @@ class SpeculativeConfig:
     """Whether to adaptively size the draft-verification budget from per-request
     confidence. Currently only supported for method="dspark"."""
 
+    adaptive_verification_decay: float = 0.95
+    """Exponential moving-average decay for CPU history verification policy."""
+
     prefill_context_kv_only: bool = False
     """Set on a P/D prefill instance (Model Runner V2, DFlash-based speculators)
     to only store the drafter's context K/V, which the decode instance reads:
@@ -1548,7 +1551,7 @@ class SpeculativeConfig:
 
         if (
             config_cls.adaptive_verification_uses_draft_logits
-            and self.enable_adaptive_verification
+            and self.uses_gpu_adaptive_verification()
             and self.use_local_argmax_reduction
         ):
             raise ValueError(
@@ -2152,6 +2155,23 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def uses_history_verification(self) -> bool:
+        """The public adaptive switch selects DeepSeek's CPU-known prefixes."""
+        target = self.target_model_config
+        return bool(
+            self.enable_adaptive_verification
+            and self.use_dspark()
+            and target is not None
+            and "DeepseekV41ForCausalLM" in target.architectures
+        )
+
+    def uses_gpu_adaptive_verification(self) -> bool:
+        """Internal device-layout capability, not a second user switch."""
+        return (
+            self.enable_adaptive_verification
+            and not self.uses_history_verification()
+        )
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

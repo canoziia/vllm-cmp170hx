@@ -404,6 +404,14 @@ class Scheduler(SchedulerInterface):
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+        self.dsv41_history_policy = None
+        spec = vllm_config.speculative_config
+        if spec is not None and spec.uses_history_verification():
+            from .dsv41_fixed_policy import FixedHistoryPolicy
+
+            self.dsv41_history_policy = FixedHistoryPolicy(
+                logger, decay=spec.adaptive_verification_decay
+            )
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
         # Scheduler iteration counter. Drives the PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
@@ -490,6 +498,17 @@ class Scheduler(SchedulerInterface):
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self.dsv41_prefill_helper = None
+        if any(
+            a in self.vllm_config.model_config.architectures
+            for a in (
+                "DeepseekV41ForCausalLM",
+                "DeepseekV41VLForConditionalGeneration",
+            )
+        ):
+            from .dsv41_prefill_sched import Dsv41PrefillHelper
+
+            self.dsv41_prefill_helper = Dsv41PrefillHelper(self.block_size)
 
         # Remaining-block reservations of in-flight prefills gate async loads.
         # Parked async KV loads can number thousands, so theirs are cached until
@@ -772,6 +791,37 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        history_limits = {}
+        if self.dsv41_history_policy is not None:
+            history_limits.update(
+                self.dsv41_history_policy.retained_limits(self.running)
+            )
+            eligible = [
+                r
+                for r in self.running
+                if not r.is_prefill_chunk
+                and self.current_step >= r.next_decode_eligible_step
+                and r.num_stale_output_tokens == 0
+                and not r.use_structured_output
+                and (r.spec_token_ids or r.num_output_placeholders > 0)
+            ]
+            if eligible:
+                eligible = eligible[
+                    : getattr(
+                        self,
+                        "_get_max_num_scheduled_decodes",
+                        lambda: self.max_num_running_reqs,
+                    )()
+                ]
+                num_running, num_waiting = self.get_request_counts()
+                history_limits.update(
+                    self.dsv41_history_policy.choose(
+                        eligible,
+                        min(self.max_num_running_reqs, num_running + num_waiting),
+                        self.running,
+                    )
+                )
+
         # `long_prefill_token_threshold` exists to stop a long prefill from
         # starving other requests of the token budget. When it is the only
         # request there is nobody to starve, so let it use the whole budget.
@@ -835,6 +885,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            limit = getattr(request, "verification_draft_limit", None)
+            if limit is None:
+                limit = history_limits.get(request.request_id)
+            if limit is not None and len(request.spec_token_ids) > limit:
+                request.spec_token_ids = request.spec_token_ids[:limit]
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -842,6 +897,15 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if (
+                self.dsv41_prefill_helper is not None
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                num_new_tokens = self.dsv41_prefill_helper.maybe_cap_prefill_chunk(
+                    request.num_computed_tokens,
+                    num_new_tokens,
+                    min(token_budget, input_budget - draft_slots),
+                )
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -1036,6 +1100,11 @@ class Scheduler(SchedulerInterface):
                     - request.num_tokens
                     - request.num_output_placeholders
                 )
+                limit = getattr(request, "verification_draft_limit", None)
+                if limit is None:
+                    limit = history_limits.get(request.request_id)
+                if limit is not None:
+                    num_scheduled_spec_tokens = min(num_scheduled_spec_tokens, limit)
                 if num_scheduled_spec_tokens > 0:
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
@@ -1385,6 +1454,8 @@ class Scheduler(SchedulerInterface):
                     # Not for diffusion where draft tokens can't be padded.
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        and getattr(request, "verification_draft_limit", None) is None
+                        and self.dsv41_history_policy is None
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
@@ -1406,6 +1477,18 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if (
+                        self.dsv41_prefill_helper is not None
+                        and not pad_spec_decode
+                        and num_computed_tokens < request.num_prompt_tokens
+                    ):
+                        num_new_tokens = (
+                            self.dsv41_prefill_helper.maybe_cap_prefill_chunk(
+                                num_computed_tokens,
+                                num_new_tokens,
+                                request_token_budget,
+                            )
+                        )
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1861,6 +1944,13 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self.dsv41_history_policy is not None:
+            num_running, num_waiting = self.get_request_counts()
+            self.dsv41_history_policy.scheduled(
+                scheduler_output,
+                self.running,
+                min(self.max_num_running_reqs, num_running + num_waiting),
+            )
         return scheduler_output
 
     def _get_max_num_scheduled_decodes(self) -> int:
@@ -2354,6 +2444,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self.dsv41_history_policy is not None:
+            self.dsv41_history_policy.begin_feedback()
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2464,7 +2556,34 @@ class Scheduler(SchedulerInterface):
                     num_draft_tokens = num_verified = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
-                num_rejected = len(scheduled_spec_token_ids) - num_accepted
+                scheduled_draft_count = len(scheduled_spec_token_ids)
+                num_rejected = scheduled_draft_count - num_accepted
+                if self.dsv41_history_policy is not None:
+                    has_invalid_drafts = num_verified != scheduled_draft_count
+                    self.dsv41_history_policy.feedback(
+                        scheduler_output,
+                        request,
+                        scheduled_draft_count,
+                        num_accepted,
+                        len(generated_token_ids),
+                        valid=(
+                            not output_is_stale
+                            and 0 <= num_accepted <= scheduled_draft_count
+                            and not has_invalid_drafts
+                            and not request.use_structured_output
+                            and request.num_output_tokens + len(generated_token_ids)
+                            < request.max_tokens
+                        ),
+                    )
+                    if (
+                        not output_is_stale
+                        and not has_invalid_drafts
+                        and not request.use_structured_output
+                        and getattr(request, "verification_draft_limit", None) is None
+                    ):
+                        self.dsv41_history_policy.observe(
+                            req_id, scheduled_draft_count, num_accepted
+                        )
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
                 # tokens). A stale rejection count predates the preemption
@@ -3075,8 +3194,12 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.trim_spec_tokens(
+            spec_token_ids = self.structured_output_manager.trim_spec_tokens(
                 request, spec_token_ids
+            )
+            limit = getattr(request, "verification_draft_limit", None)
+            request.spec_token_ids = (
+                spec_token_ids if limit is None else spec_token_ids[:limit]
             )
 
     def update_draft_token_ids_in_output(
@@ -3122,6 +3245,20 @@ class Scheduler(SchedulerInterface):
         return request_id in self.requests
 
     def add_request(self, request: Request) -> None:
+        if "DeepseekV41ForCausalLM" in self.vllm_config.model_config.architectures:
+            from vllm.v1.core.sched.dsv41_spec_k import draft_limit
+
+            limit = draft_limit(
+                request,
+                self.vllm_config.speculative_config,
+                self.num_spec_tokens,
+                True,
+            )
+            if limit is not None:
+                request.verification_draft_limit = limit
+        if self.dsv41_history_policy is not None:
+            self.dsv41_history_policy.forget(request.request_id)
+            self.dsv41_history_policy.admit(request)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -3266,6 +3403,8 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self._free_request_blocks(request)
+        if self.dsv41_history_policy is not None:
+            self.dsv41_history_policy.forget(request.request_id)
         del self.requests[request.request_id]
 
     @property

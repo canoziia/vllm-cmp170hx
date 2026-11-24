@@ -1304,7 +1304,7 @@ class VllmConfig:
             raise ValueError("AuxOutput Connector requires prefix caching.")
         if (
             self.speculative_config is not None
-            and self.speculative_config.enable_adaptive_verification
+            and self.speculative_config.uses_gpu_adaptive_verification()
         ):
             raise ValueError(
                 "--enable-return-routed-experts is incompatible with "
@@ -1424,7 +1424,7 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if (
             speculative_config is not None
-            and speculative_config.enable_adaptive_verification
+            and speculative_config.uses_gpu_adaptive_verification()
         ):
             raise ValueError(
                 "sampling distribution replay with speculative decoding "
@@ -2825,6 +2825,12 @@ class VllmConfig:
         else:
             prefill_sizes = list(shared_sizes)
 
+        if decode_sizes is None:
+            _env_req_sizes = os.environ.get("VLLM_DSV41_DECODE_REQ_SIZES", "").strip()
+            if _env_req_sizes and _env_req_sizes.lower() not in ("0", "off", "none"):
+                decode_sizes = [
+                    int(x) for x in _env_req_sizes.split(",") if x.strip()
+                ]
         if decode_sizes is not None:
             decode_sizes = explicit(
                 decode_sizes,
@@ -2886,6 +2892,11 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is not None and (
             speculative_config.enable_adaptive_verification
+            or (
+                os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
+                and self.model_config is not None
+                and "DeepseekV41ForCausalLM" in self.model_config.architectures
+            )
         ):
             token_sizes.update(
                 self.get_varlen_decode_cudagraph_token_sizes(
@@ -3476,6 +3487,35 @@ class VllmConfig:
     def _validate_adaptive_verification(self) -> None:
         spec_config = self.speculative_config
         if not spec_config or not spec_config.enable_adaptive_verification:
+            return
+
+        if spec_config.uses_history_verification():
+            parallel = self.parallel_config
+            valid_pp_tp_dcp = (
+                parallel.pipeline_parallel_size == 6
+                and parallel.tensor_parallel_size == 1
+                and parallel.decode_context_parallel_size == 1
+            ) or (
+                parallel.pipeline_parallel_size == 1
+                and parallel.decode_context_parallel_size
+                in (1, parallel.tensor_parallel_size)
+            )
+            if (
+                not current_platform.is_device_capability_family(80)
+                or spec_config.num_speculative_tokens != 5
+                or spec_config.draft_sample_method != "greedy"
+                or not valid_pp_tp_dcp
+                or parallel.data_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or parallel.use_ubatching
+                or self.lora_config is not None
+                or self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+            ):
+                raise ValueError(
+                    "Adaptive DeepSeek history verification currently requires "
+                    "SM80, five greedy drafts, PP6/TP1/DCP1 or PP1/TEP+DCP, "
+                    "CUDA graphs and no LoRA/DBO"
+                )
             return
 
         if self.lora_config is not None:

@@ -153,6 +153,11 @@ class InputProcessor:
                 self.structured_outputs_config,
                 self.tokenizer,
             )
+            if "DeepseekV41ForCausalLM" in self.model_config.architectures:
+                # DeepSeek V4.1 request-local verification width (vllm_xargs.spec_k).
+                from vllm.v1.core.sched.dsv41_spec_k import validate_request
+
+                validate_request(params.extra_args, self.speculative_config)
             if (
                 params.prompt_logprob_token_ids is not None
                 and self.vllm_config.cache_config.kv_sharing_fast_prefill

@@ -163,7 +163,7 @@ class RejectionSampler:
         if watermark_key is not None:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
-        self.enable_adaptive_verification = spec_config.enable_adaptive_verification
+        self.enable_adaptive_verification = spec_config.uses_gpu_adaptive_verification()
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
         self.fly_window_size = 0

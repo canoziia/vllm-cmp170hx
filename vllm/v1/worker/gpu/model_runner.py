@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -487,7 +488,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                     adaptive_verification_enabled=(
                         self.speculative_config is not None
-                        and self.speculative_config.enable_adaptive_verification
+                        and self.speculative_config.uses_gpu_adaptive_verification()
                     ),
                     draft_logits=draft_logits,
                 )
@@ -1096,11 +1097,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self, randomize_inputs: bool = False) -> None:
+        import os
+
         if self.vllm_config.aux_output_config.enabled:
             self.aux_output_connector = get_aux_output_connector(
                 self.model, self.vllm_config
             )
-        if self.supports_mm_inputs and self.is_first_pp_rank:
+        skip_offloaded_mm_profile = (
+            self.cache_config.kv_cache_memory_bytes is not None
+            and os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1"
+        )
+        if (
+            self.supports_mm_inputs
+            and self.is_first_pp_rank
+            and not skip_offloaded_mm_profile
+        ):
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
                 mm_budget = MultiModalBudget(
@@ -1130,6 +1141,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -1219,6 +1232,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.cudagraph_manager.capture_stream,
                     )
                     if self.speculator is not None:
+                        self.speculator._shared_capture_stream = (
+                            self.cudagraph_manager.capture_stream
+                        )
                         with self.draft_context():
                             self.speculator.capture()
                     if self.adaptive_verification is not None and not profile_only:
@@ -1485,6 +1501,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_graph_eligible=decode_graph_eligible,
             max_seq_len_np=max_seq_len_np,
         )
+        if (
+            num_reqs == 1
+            and decode_graph_eligible
+            and os.environ.get("VLLM_DSV41_VERIFICATION", "0") == "1"
+        ):
+            max_query_len = num_toks
         return batch_state, get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, decode_graph_eligible
         )

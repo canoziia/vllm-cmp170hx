@@ -176,7 +176,10 @@ def _skip_tail_min_remaining(vllm_config: VllmConfig, window: int) -> int | None
     priority preemption can return its step's budget. The second window covers the
     few tokens MTP lookahead or max_model_len shave off a chunk."""
     if (
-        vllm_config.model_config.supports_multimodal_inputs
+        (
+            vllm_config.model_config.supports_multimodal_inputs
+            and vllm_config.compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+        )
         or vllm_config.scheduler_config.policy == "priority"
     ):
         return None
@@ -189,7 +192,7 @@ def _skip_tail_min_remaining(vllm_config: VllmConfig, window: int) -> int | None
     draft_slots = dropped_drafts = 0
     if spec is not None:
         draft_slots = spec.max_num_new_slots_for_drafting
-        if spec.enable_adaptive_verification:
+        if spec.uses_gpu_adaptive_verification():
             dropped_drafts = spec.num_speculative_tokens
     # Each scheduled request takes draft_slots off the input budget, and
     # adaptive verification may drop every draft before graph dispatch.

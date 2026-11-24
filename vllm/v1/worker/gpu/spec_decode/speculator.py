@@ -251,7 +251,7 @@ class DraftModelSpeculator(BaseSpeculator):
             self.draft_tokens, dtype=torch.float32
         )
         self.enable_adaptive_verification = (
-            self.speculative_config.enable_adaptive_verification
+            self.speculative_config.uses_gpu_adaptive_verification()
         )
         self.use_acceptance_estimator = self.enable_adaptive_verification
         self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
