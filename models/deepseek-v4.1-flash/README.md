@@ -76,7 +76,7 @@ bash scripts/build-deepseek-v41-image.sh
 cd models/deepseek-v4.1-flash
 cp .env.tep4.example .env
 # Edit VLLM_API_KEY, MODEL_ROOT, and DSV41_GPU_0..3 in .env
-podman compose -f compose.tep4.yml up -d
+podman compose -f compose.tep4.yml --podman-run-args=--ipc=host up -d
 podman logs -f deepseek-v4.1-flash-tep4
 ```
 

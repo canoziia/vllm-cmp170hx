@@ -14,8 +14,11 @@ services:
     container_name: deepseek-v4.1-flash-tep4
     restart: "no"
     network_mode: host
+    # podman-compose can ignore ipc: host on the pod path; start with
+    # --podman-run-args=--ipc=host as well so /dev/shm uses host shared memory.
     ipc: host
     pid: host
+    privileged: true
 
     devices:
       - nvidia.com/gpu=${DSV41_GPU_0:-0}
