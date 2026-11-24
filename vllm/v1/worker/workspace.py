@@ -129,6 +129,20 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def fits(self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]) -> bool:
+        """True if ``get_simultaneous(*shapes_and_dtypes)`` would be served by
+        the current slot's buffer without a resize (safe during graph capture)."""
+        total_bytes = sum(
+            round_up(_compute_bytes(s, d), 256) for s, d in shapes_and_dtypes
+        )
+        workspace_id = dbo_current_ubatch_id() * self._num_lanes + _workspace_lane.get()
+        if workspace_id >= len(self._current_workspaces):
+            return False
+        return (
+            self._workspace_size_bytes(self._current_workspaces[workspace_id])
+            >= total_bytes
+        )
+
     def _get_workspace_id(self) -> int:
         lane = _workspace_lane.get()
         if lane >= self._num_lanes:

@@ -253,6 +253,8 @@ class DeepseekV41ForCausalLM(
                 )
             )
             span_offset += span_len
+        if getattr(self.vision, "_cpu_offloaded", False):
+            torch.cuda.empty_cache()
         return tuple(embeds)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
@@ -330,9 +332,35 @@ class DeepseekV41ForCausalLM(
         """Pre-hc_head residual stream buffer for the MTP/DSpark draft model."""
         return self.language_model.get_mtp_target_hidden_states()
 
+    def set_moe_parameters(self) -> None:
+        if hasattr(self.language_model, "set_moe_parameters"):
+            self.language_model.set_moe_parameters()
+
+    def build_specialized_decode(self, *args, **kwargs):
+        return self.language_model.build_specialized_decode(*args, **kwargs)
+
+    def _maybe_offload_vision_tower(self) -> None:
+        import os
+
+        if os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED", "0") == "1":
+            self.vision.offload_to_cpu()
+            self.aligner.offload_to_cpu()
+            torch.cuda.empty_cache()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
+        loaded_params = loader.load_weights(mapped)
+        self._maybe_offload_vision_tower()
+        self._weights_finalized = True
+        return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        if getattr(self, "_weights_finalized", False):
+            return
+        if hasattr(self.language_model, "process_weights_after_loading"):
+            self.language_model.process_weights_after_loading()
+        self._maybe_offload_vision_tower()
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Get the module prefixes in the multimodal model."""

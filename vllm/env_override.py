@@ -4,6 +4,11 @@
 import importlib.util
 import os
 
+# DeepSeek V4.1 Flash SM80: one switch for the per-patch switches (patch 0014).
+from vllm.dsv41_opt_profile import apply as _dsv41_apply_opt_profile
+
+_dsv41_apply_opt_profile()
+
 
 def _get_torch_root():
     """Locate the installed torch package without importing it."""

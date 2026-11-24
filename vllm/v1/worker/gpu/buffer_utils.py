@@ -36,6 +36,23 @@ def set_default_max_concurrency(n: int) -> None:
     _DEFAULT_MAX_CONCURRENCY = max(2, n)
 
 
+def async_copy_to_gpu(
+    x: torch.Tensor | np.ndarray,
+    out: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x)
+    assert x.is_cpu
+
+    if out is None:
+        assert device is not None
+        out = torch.empty_like(x, device=device)
+
+    pinned = x.pin_memory() if not out.is_cpu and is_pin_memory_available() else x
+    return out.copy_(pinned, non_blocking=True)
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():

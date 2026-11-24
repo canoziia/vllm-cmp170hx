@@ -220,6 +220,11 @@ class DeepseekV4ViT(nn.Module):
             ]
         )
         self.norm = DeepseekV4RMSNorm(config.vision_dim)
+        self._cpu_offloaded: bool = False
+
+    def offload_to_cpu(self) -> None:
+        self.to("cpu")
+        self._cpu_offloaded = True
 
     def enable_mm_device_normalize(self) -> None:
         self.patch_embed.input_norm = FusedMMInputNorm(
@@ -231,13 +236,32 @@ class DeepseekV4ViT(nn.Module):
     def forward(
         self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int
     ) -> torch.Tensor:
+        if not self._cpu_offloaded:
+            x = self.patch_embed(patches)
+            cos, sin = get_vision_cos_sin(
+                n_vit_h, n_vit_w, self.rope_dim, self.rope_theta
+            )
+            cos = async_tensor_h2d(cos, x.device)
+            sin = async_tensor_h2d(sin, x.device)
+            for block in self.blocks:
+                x = block(x, cos, sin)
+            return self.norm(x)
+
+        dev = patches.device
+        self.patch_embed.to(dev)
         x = self.patch_embed(patches)
+        self.patch_embed.to("cpu")
         cos, sin = get_vision_cos_sin(n_vit_h, n_vit_w, self.rope_dim, self.rope_theta)
-        cos = async_tensor_h2d(cos, x.device)
-        sin = async_tensor_h2d(sin, x.device)
+        cos = async_tensor_h2d(cos, dev)
+        sin = async_tensor_h2d(sin, dev)
         for block in self.blocks:
+            block.to(dev)
             x = block(x, cos, sin)
-        return self.norm(x)
+            block.to("cpu")
+        self.norm.to(dev)
+        x = self.norm(x)
+        self.norm.to("cpu")
+        return x
 
     def forward_packed(
         self,
@@ -250,10 +274,24 @@ class DeepseekV4ViT(nn.Module):
         """Varlen path for encoder CUDA graphs: multiple images packed along
         rows, per-image attention via `cu_seqlens`, RoPE tables precomputed
         on device. Pure-tensor (no host reads, no H2D), safe to capture."""
+        if not self._cpu_offloaded:
+            x = self.patch_embed(patches)
+            for block in self.blocks:
+                x = block(x, cos, sin, cu_seqlens, max_seqlen)
+            return self.norm(x)
+
+        dev = patches.device
+        self.patch_embed.to(dev)
         x = self.patch_embed(patches)
+        self.patch_embed.to("cpu")
         for block in self.blocks:
+            block.to(dev)
             x = block(x, cos, sin, cu_seqlens, max_seqlen)
-        return self.norm(x)
+            block.to("cpu")
+        self.norm.to(dev)
+        x = self.norm(x)
+        self.norm.to("cpu")
+        return x
 
 
 def build_packed_vit_metadata(
@@ -374,14 +412,28 @@ class DeepseekV4Aligner(nn.Module):
             quant_config=None,
             disable_tp=use_data_parallel,
         )
+        self._cpu_offloaded: bool = False
+
+    def offload_to_cpu(self) -> None:
+        self.to("cpu")
+        self._cpu_offloaded = True
 
     def forward(self, x: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
         r = self.downsample_ratio
         x = x.view(n_vit_h, n_vit_w, -1).permute(2, 0, 1)
         x = F.pad(x, (0, -n_vit_w % r, 0, -n_vit_h % r))
         x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+        if not self._cpu_offloaded:
+            hidden, _ = self.w1(x)
+            out, _ = self.w2(F.gelu(hidden))
+            return out
+        dev = x.device
+        self.w1.to(dev)
         hidden, _ = self.w1(x)
+        self.w1.to("cpu")
+        self.w2.to(dev)
         out, _ = self.w2(F.gelu(hidden))
+        self.w2.to("cpu")
         return out
 
     def forward_packed(
@@ -398,8 +450,17 @@ class DeepseekV4Aligner(nn.Module):
         are transposed before flattening).
         """
         gathered = vision_spatial_merge(x, merge_idx, merge_mask)
+        if not self._cpu_offloaded:
+            hidden, _ = self.w1(gathered)
+            out, _ = self.w2(F.gelu(hidden))
+            return out
+        dev = gathered.device
+        self.w1.to(dev)
         hidden, _ = self.w1(gathered)
+        self.w1.to("cpu")
+        self.w2.to(dev)
         out, _ = self.w2(F.gelu(hidden))
+        self.w2.to("cpu")
         return out
 
 
@@ -426,7 +487,11 @@ def encode_images(
     """
     sizes = [h * w for h, w in vit_grid]
     attn_backend = vision_model.blocks[0].attn.attn.attn_backend
-    if len(vit_grid) == 1 or attn_backend != AttentionBackendEnum.FLASH_ATTN:
+    if (
+        vision_model._cpu_offloaded
+        or len(vit_grid) == 1
+        or attn_backend != AttentionBackendEnum.FLASH_ATTN
+    ):
         return [
             aligner(vision_model(item, h, w), h, w)
             for item, (h, w) in zip(patches.split(sizes), vit_grid, strict=True)
