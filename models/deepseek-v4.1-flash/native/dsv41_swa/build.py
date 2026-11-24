@@ -29,7 +29,13 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     build_dir = Path(a.build_dir or out / "build_swa")
     build_dir.mkdir(parents=True, exist_ok=True)
-    flags = ["-O3", "-std=c++20", f"-I{HERE}"]
+    flags = [
+        "-O3",
+        "-std=c++20",
+        "-DUSE_CUDA",
+        "-DTORCH_TARGET_VERSION=0x020B000000000000ULL",
+        f"-I{HERE}",
+    ]
     cuda_flags = [
         *flags,
         "--expt-relaxed-constexpr",
