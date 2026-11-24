@@ -3,11 +3,15 @@
 
 import asyncio
 import functools
+import json
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
 
-import orjson
+try:
+    import orjson
+except ImportError:
+    orjson = None  # type: ignore[assignment]
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -21,6 +25,14 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def _json_default(obj: Any) -> Any:
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if hasattr(obj, "item"):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def create_json_response(
@@ -38,6 +50,16 @@ def create_json_response(
         content = result
     else:
         content = [item.model_dump() for item in result]
+    if orjson is None:
+        try:
+            body = json.dumps(
+                content, default=_json_default, separators=(",", ":")
+            ).encode("utf-8")
+        except TypeError:
+            return JSONResponse(content=content, status_code=status_code)
+        return Response(
+            content=body, status_code=status_code, media_type="application/json"
+        )
     try:
         body = orjson.dumps(
             content, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY

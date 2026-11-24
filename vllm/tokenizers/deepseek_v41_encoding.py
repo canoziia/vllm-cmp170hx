@@ -7,7 +7,6 @@
 Differences from the reference:
 - `developer` messages are supported and render as user turns.
 - Images arrive as placeholders; deepseek_v41.py flattens content first.
-- Tool namespaces (`ns::name`) are not supported.
 - A system message's `updated_tools` renders as deepseek-recipe's
   "### Updated Tool Schemas" (tool search results).
 
@@ -16,7 +15,7 @@ Message normalization and serving controls live in deepseek_v41.py.
 
 import copy
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 bos_token: str = "<｜begin▁of▁sentence｜>"
 eos_token: str = "<｜end▁of▁sentence｜>"
@@ -62,19 +61,61 @@ def to_json(value: Any) -> str:
 
 
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Extract function definitions with namespace-qualified names."""
+    functions = []
+    for tool in tools:
+        function = dict(tool["function"])
+        if tool.get("namespace") is not None:
+            function["namespace"] = tool["namespace"]
+        function["name"] = _tool_name_for_encoding(function)
+        namespace = function.pop("namespace", None)
+        if isinstance(namespace, dict) and namespace.get("description"):
+            function["description"] = (
+                namespace["description"] + "\n" + (function.get("description") or "")
+            )
+        functions.append(function)
+    return functions
+
+
+def _split_tool_name(
+    name: str, namespace: Optional[str] = None
+) -> Tuple[Optional[str], str]:
+    """Split a qualified name and validate any explicit namespace."""
+    prefix, separator, bare_name = name.partition("::")
+    if separator:
+        assert namespace in (None, prefix), (
+            f"Conflicting tool namespaces: {namespace} != {prefix}"
+        )
+        namespace, name = prefix, bare_name
+    assert "::" not in name, f"Tool name must not contain '::': {name}"
+    assert namespace is None or "::" not in namespace, (
+        f"Tool namespace must not contain '::': {namespace}"
+    )
+    return namespace, name
+
+
+def _tool_name_for_encoding(tool: Dict[str, Any]) -> str:
+    namespace = tool.get("namespace")
+    if isinstance(namespace, dict):
+        namespace = namespace["name"]
+    namespace, name = _split_tool_name(tool["name"], namespace)
+    return name if namespace is None else f"{namespace}::{name}"
 
 
 def tool_calls_from_openai_format(tool_calls):
     """Convert OpenAI-format tool calls to internal format."""
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
+    calls = []
+    for tool_call in tool_calls:
+        function = tool_call["function"]
+        namespace, name = _split_tool_name(
+            function["name"],
+            tool_call.get("namespace") or function.get("namespace"),
+        )
+        call = {"name": name, "arguments": function["arguments"]}
+        if namespace is not None:
+            call["namespace"] = namespace
+        calls.append(call)
+    return calls
 
 
 def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -92,10 +133,13 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         if role == "tool":
             # Convert tool message to a user message with tool_result block
+            content = msg.get("content", "")
+            if msg.get("content_blocks") and not isinstance(msg.get("content"), str):
+                content = msg["content_blocks"]
             tool_block = {
                 "type": "tool_result",
                 "tool_use_id": msg.get("tool_call_id", ""),
-                "content": msg.get("content", ""),
+                "content": content,
                 "_image_indices": msg.get("_image_indices", []),
             }
             # Merge into previous message if it's already a user (merged tool)
@@ -115,13 +159,17 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         elif role == "user":
             content_blocks = msg.get("content_blocks")
             if content_blocks is None:
-                content_blocks = [
-                    {
-                        "type": "text",
-                        "text": msg.get("content", ""),
-                        "_image_indices": msg.get("_image_indices", []),
-                    }
-                ]
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content_blocks = content
+                else:
+                    content_blocks = [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "_image_indices": msg.get("_image_indices", []),
+                        }
+                    ]
             if (
                 merged
                 and merged[-1].get("role") == "user"
@@ -197,7 +245,6 @@ REASONING_EFFORT_TEMPLATE = (
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
     "low": 50,
     "high": 75,
-    "xhigh": 75,
     "max": 100,
 }
 
@@ -463,7 +510,7 @@ def render_message(
                 tool_call_template.format(
                     dsml_token=dsml_token,
                     tool_call_tag_name=tool_call_tag_name,
-                    name=tc.get("name"),
+                    name=_tool_name_for_encoding(tc),
                     arguments=encode_arguments_to_dsml(tc),
                 )
                 for tc in tool_calls
@@ -546,8 +593,6 @@ def render_message(
     elif (
         messages[index].get("role") in ["user", "developer"]
         or (messages[index].get("role") == "system" and index > 0)
-        # A final assistant message left open by wo_eos is not followed by a turn.
-        or (is_last and role == "assistant" and not wo_eos)
     ):
         # Normal generation: append Assistant + thinking token
         # (mid-conversation system messages also trigger the assistant header)

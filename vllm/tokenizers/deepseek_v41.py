@@ -12,6 +12,7 @@ from vllm.renderers.chat_utils import ChatCompletionMessageParam
 from .deepseek_v41_encoding import (
     IMAGE_PLACEHOLDER,
     REASONING_EFFORT_MAPPINGS,
+    _tool_name_for_encoding,
     encode_messages,
 )
 from .hf import HfTokenizer, get_cached_tokenizer
@@ -96,7 +97,10 @@ def _tool_schema(tool: dict[str, Any]) -> dict[str, Any]:
         for k, v in tool["function"].items()
         if k != "defer_loading" and v is not None
     }
-    return {"type": "function", "function": function}
+    res: dict[str, Any] = {"type": "function", "function": function}
+    if tool.get("namespace") is not None:
+        res["namespace"] = tool["namespace"]
+    return res
 
 
 def _add_updated_tool_schemas(
@@ -104,7 +108,13 @@ def _add_updated_tool_schemas(
 ) -> list[dict[str, Any]]:
     """Like deepseek-recipe, follow each user turn whose tool results reference
     tools with a system turn listing those tools' schemas, in reference order."""
-    tools_by_name = {tool["function"]["name"]: tool for tool in tools or []}
+    tools_by_name: dict[str, dict[str, Any]] = {}
+    for tool in tools or []:
+        tools_by_name[tool["function"]["name"]] = tool
+        fn = dict(tool["function"])
+        if tool.get("namespace") is not None:
+            fn["namespace"] = tool["namespace"]
+        tools_by_name[_tool_name_for_encoding(fn)] = tool
     result: list[dict[str, Any]] = []
     referenced: list[dict[str, Any]] = []
     for message, next_message in zip(conversation, [*conversation[1:], {}]):
@@ -170,12 +180,17 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 effort = None
             if effort is None:
                 effort = "high"
+            # The 1017 checkpoint dropped "xhigh" (low/high/max = 50/75/100).
+            # Keep accepting it from existing clients as the next level above
+            # the default instead of rejecting the request.
+            if effort == "xhigh":
+                effort = "max"
             if not (
                 (type(effort) is int and 1 <= effort <= 100)
                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
             ):
                 raise ValueError(
-                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "
+                    "DeepSeek V4.1 reasoning_effort must be low, high, max, "
                     "or an integer within [1, 100] in chat_template_kwargs"
                 )
 

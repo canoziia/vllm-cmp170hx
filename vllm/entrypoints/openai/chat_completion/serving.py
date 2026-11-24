@@ -42,6 +42,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionStreamResponse,
     ChatMessage,
 )
+from vllm.entrypoints.openai.chat_completion.deepseek_thinking import (
+    apply_deepseek_thinking,
+)
 from vllm.entrypoints.openai.chat_completion.stream_processor import (
     ChatStreamProcessor,
 )
@@ -321,6 +324,17 @@ class OpenAIServingChat(GenerateBaseServing):
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
+        # DeepSeek V4 / V4.1: top-level thinking {type} -> chat_template_kwargs,
+        # before the parser and the renderer read them
+        thinking_error = apply_deepseek_thinking(
+            request,
+            [
+                *(getattr(self.model_config, "architectures", None) or ()),
+                *(getattr(self.model_config.hf_config, "architectures", None) or ()),
+            ],
+        )
+        if thinking_error is not None:
+            return self.create_error_response(thinking_error, param="thinking")
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
         parser: Parser | None = None
         if self.parser_cls is not None:
