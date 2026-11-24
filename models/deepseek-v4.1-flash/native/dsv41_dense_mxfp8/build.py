@@ -17,7 +17,7 @@ os.environ["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), "/usr/lo
 from torch.utils import cpp_extension
 out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 bd = out / ("build_" + a.name); bd.mkdir(parents=True, exist_ok=True)
-flags = ["-O3", "-std=c++17"]
+flags = ["-O3", "-std=c++20"]
 cuda_flags = [*flags, "--expt-relaxed-constexpr", "-lineinfo", "-Xptxas=-v", "--keep", "--keep-dir", str(bd),
               "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
               "-U__CUDA_NO_BFLOAT16_CONVERSIONS__", "-U__CUDA_NO_HALF2_OPERATORS__"]
