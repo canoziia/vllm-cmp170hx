@@ -1,3 +1,4 @@
 adaptive/0001-dsv41-adaptive-history-verification-and-subwidth-cudagraphs.patch
 adaptive/0002-dsv41-topology-fusions-and-tep4-fused-profile.patch
 adaptive/0003-dsv41-auto-profile-by-model-and-parallelism.patch
+adaptive/0004-dsv41-tp-local-greedy-masked-token-ids-compat.patch

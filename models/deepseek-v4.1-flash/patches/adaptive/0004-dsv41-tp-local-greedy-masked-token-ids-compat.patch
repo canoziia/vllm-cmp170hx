@@ -1,0 +1,26 @@
+From 840c292b1a3f5acb2c2558565aa0ac5aa9aa83d8 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Wed, 25 Nov 2026 03:08:13 +0800
+Subject: [PATCH] fix(deepseek-v4.1): guard optional masked_token_ids in
+ _try_tp_local_greedy_sample
+
+---
+ vllm/v1/worker/gpu/model_runner.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 8c29764..fd67d50 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1773,7 +1773,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             or input_batch.num_reqs == 0
+             or input_batch.logits_indices.shape[0] == 0
+             or grammar_output is not None
+-            or self.masked_token_ids is not None
++            or getattr(self, "masked_token_ids", None) is not None
+             or self.sampler is None
+             or self.sampler.compute_nans
+             or self.sampler.return_sampling_mask
+-- 
+2.56.0
+
