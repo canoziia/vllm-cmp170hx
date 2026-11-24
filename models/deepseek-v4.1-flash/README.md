@@ -5,7 +5,8 @@ deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` rebased onto official
 `vllm-project/vllm` `main` (`0e3c8dbdae9d55149b0fba4e6c1014b4b08c9c73`) for SM80 GPUs:
 
 - **4x 80G SM80 (`compose.tep4.yml`)**: `TP=4 + EP=4, DCP=1, PP=1` (`nvfp4_ds_mla` KV cache,
-  `2,518,128` KV tokens = `2.40x 1M` at `2.75 GB/rank`, topology-aware NVLink / PCIe P2P collectives).
+  `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` + LMCache 8 GiB L1 / 500 GiB L2,
+  topology-aware NVLink / PCIe P2P collectives).
 - **6x CMP 170HX (`compose.yml`)**: `TP=1 x PP=6` (`7,7,7,7,7,5`, LMCache KV tier, CPU Engram offload).
 
 ## Repository Branch Layout & Source
@@ -41,7 +42,7 @@ DSpark K=5, TP-local greedy verification + adaptive verification
 max_model_len=1,048,576
 max_num_batched_tokens=3072
 max_num_seqs=32
-KV=nvfp4_ds_mla (2,518,128 tokens at 2.75 GB/rank = 2.40x 1M context)
+KV=nvfp4_ds_mla (2,014,502 GPU KV tokens at 2.20 GB/rank = 1.92x 1M + LMCache 8 GiB L1 / 500 GiB L2)
 CPU Engram offload (2x 94.4 GiB packed 264B rows), CPU Vision offload
 VLLM_DSV41_OPT_PROFILE=tep4_fused
 ```
@@ -108,3 +109,45 @@ always take precedence:
   overrides verification depth cleanly.
 - **SSE Keep-Alive & Detailed Spec Metrics**: `--sse-keep-alive-interval` and
   `--per-request-spec-decode-metrics=detailed` supported out of the box.
+
+## Measured TEP4 Benchmarks (`4x 80G SM80 PCIe Gen4`, `compose.tep4.yml` + LMCache)
+
+Measured on the live `compose.tep4.yml` stack (`TP=4 + EP=4`, `nvfp4_ds_mla`,
+`VLLM_KV_CACHE_MEMORY=2200000000` -> `2,014,502` GPU KV tokens = `1.92x 1M`,
+LMCache `8 GiB` L1 RAM + `500 GiB` NVMe L2, `max_num_batched_tokens=3072`,
+`VLLM_DSV41_OPT_PROFILE=tep4_fused`, `enable_adaptive_verification=true`, `0` OOM across
+full 1M prefill + 32-concurrency stress).
+
+### Cold Prefill (`tok/s`, `c=1`, `cached_tokens=0`, async streaming to LMCache L1 + L2)
+
+| Target Length | 180W Power Cap | 250W Power Limit | 250W vs 180W |
+|---:|---:|---:|---:|
+| **64K** | 9,539.5 | **9,928.7** | +4.1% |
+| **128K** | 9,606.0 | **10,027.5** | +4.4% |
+| **256K** | 9,282.8 | **9,789.3** | +5.5% |
+| **512K** | 8,479.1 | **9,242.6** | +9.0% |
+| **1M** | 7,546.5 | **7,992.4** | +5.9% |
+
+### Decode Throughput & Step Latency (`full_batch_tok_s` / `step_ms`, `max_tokens=500`)
+
+#### 180W Power Cap (`159 / 75 / 75 / 345 MiB` free HBM post-stress)
+
+| Concurrency `c` | `prose` | `code` | `counting` |
+|---:|---:|---:|---:|
+| **1** | 203.4 (`10.22 ms`, acc 2.07) | 463.6 (`11.85 ms`, acc 5.43) | 538.4 (`11.03 ms`, acc 5.88) |
+| **2** | 333.2 (`12.58 ms`, acc 2.07) | 731.1 (`15.81 ms`, acc 5.51) | 883.4 (`13.90 ms`, acc 5.88) |
+| **4** | 545.1 (`14.36 ms`, acc 1.95) | 1,080.0 (`20.94 ms`, acc 5.41) | 1,386.1 (`17.71 ms`, acc 5.88) |
+| **8** | 762.1 (`20.25 ms`, acc 1.92) | 1,543.0 (`29.49 ms`, acc 5.41) | 1,953.0 (`25.20 ms`, acc 5.88) |
+| **16** | 1,055.7 (`24.88 ms`, acc 1.65) | 2,125.4 (`41.08 ms`, acc 5.43) | 2,478.5 (`38.49 ms`, acc 5.88) |
+| **32** | 1,327.9 (`46.58 ms`, acc 1.95) | 2,643.2 (`64.70 ms`, acc 5.43) | 3,056.0 (`62.73 ms`, acc 5.88) |
+
+#### 250W Power Limit (`155 / 69 / 69 / 341 MiB` free HBM post-stress, `61–65 °C`)
+
+| Concurrency `c` | `prose` | `code` | `counting` |
+|---:|---:|---:|---:|
+| **1** | **212.0 (`9.81 ms`, acc 2.07)** | **491.6 (`11.17 ms`, acc 5.43)** | **567.6 (`10.47 ms`, acc 5.88)** |
+| **2** | **353.2 (`11.88 ms`, acc 2.07)** | **779.6 (`14.83 ms`, acc 5.51)** | **935.3 (`13.15 ms`, acc 5.88)** |
+| **4** | **578.2 (`13.57 ms`, acc 1.95)** | **1,173.3 (`19.35 ms`, acc 5.41)** | **1,480.3 (`16.66 ms`, acc 5.88)** |
+| **8** | **813.3 (`18.86 ms`, acc 1.91)** | **1,710.7 (`26.25 ms`, acc 5.45)** | **2,095.1 (`23.54 ms`, acc 5.88)** |
+| **16** | **1,122.6 (`27.42 ms`, acc 1.93)** | **2,343.9 (`37.18 ms`, acc 5.46)** | **2,651.0 (`36.63 ms`, acc 5.88)** |
+| **32** | **1,436.1 (`36.51 ms`, acc 1.64)** | **2,894.7 (`59.31 ms`, acc 5.42)** | **3,304.5 (`57.58 ms`, acc 5.88)** |
