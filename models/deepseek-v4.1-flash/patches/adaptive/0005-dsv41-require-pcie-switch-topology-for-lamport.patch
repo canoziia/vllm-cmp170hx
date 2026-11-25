@@ -1,0 +1,254 @@
+From 1a789623b43bc72737313174f5694e746e9cebf4 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Wed, 25 Nov 2026 11:44:43 +0800
+Subject: [PATCH] fix(deepseek-v4.1): require PCIe switch topology (PIX/PXB)
+ for CuTe Lamport P2P
+
+---
+ .../device_communicators/cuda_communicator.py |  37 +++---
+ vllm/dsv41_opt_profile.py                     | 106 +++++++++++++++++-
+ .../specialized_decode/ampere/all_reduce.py   |  35 +++++-
+ 3 files changed, 149 insertions(+), 29 deletions(-)
+
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index fac5cba..5251216 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -107,33 +107,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         if self.world_size > 1:
+             import os
+ 
++            _pcie_opt = (
++                os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0")
++                .strip()
++                .lower()
++            )
+             if (
+-                os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
++                _pcie_opt in ("1", "force")
+                 and "NCCL_PROTO" not in os.environ
+                 and current_platform.is_cuda()
+             ):
+                 try:
+-                    from vllm.utils.import_utils import import_pynvml
+-
+-                    _nvml = import_pynvml()
+-                    _nvml.nvmlInit()
+-                    try:
+-                        _phys = current_platform.visible_device_id_to_physical_device_id(
+-                            self.device.index or 0
+-                        )
+-                        _hdl = _nvml.nvmlDeviceGetHandleByIndex(_phys)
+-                        _has_nvl = False
+-                        for _lnk in range(18):
+-                            try:
+-                                if _nvml.nvmlDeviceGetNvLinkState(_hdl, _lnk):
+-                                    _has_nvl = True
+-                                    break
+-                            except Exception:
+-                                break
+-                        if not _has_nvl:
+-                            os.environ["NCCL_PROTO"] = "Simple"
+-                    finally:
+-                        _nvml.nvmlShutdown()
++                    from vllm.dsv41_opt_profile import (
++                        _has_active_nvlink_nvml,
++                        pcie_switch_connected_nvml,
++                    )
++
++                    if not _has_active_nvlink_nvml() and (
++                        _pcie_opt == "force" or pcie_switch_connected_nvml()[0]
++                    ):
++                        os.environ["NCCL_PROTO"] = "Simple"
+                 except Exception:
+                     pass
+             self.pynccl_comm = PyNcclCommunicator(
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 7494d84..0f5d22d 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -362,6 +362,99 @@ def _has_active_nvlink_nvml() -> bool:
+         return False
+ 
+ 
++# NVML nvmlGpuTopologyLevel_t enum values (from nvml.h):
++#   0=INTERNAL, 10=SINGLE (PIX), 20=MULTIPLE (PXB),
++#   30=HOSTBRIDGE (PHB), 40=NODE, 50=SYSTEM (SYS).
++# Fine-grained 16-byte GPU SM P2P BAR1 writes (CuTe Lamport) require a shared
++# PCIe switch (<= 20, PIX/PXB); across CPU root complexes (>= 30, PHB/NODE/SYS)
++# posted-write credit exhaustion degrades low-M decode by 2-3x vs PyNCCL DMA.
++NVML_TOPO_SWITCH_MAX = 20
++NVML_TOPO_NAMES: dict[int, str] = {
++    0: "INTERNAL",
++    10: "PIX",
++    20: "PXB",
++    30: "PHB",
++    40: "NODE",
++    50: "SYS",
++}
++
++
++def pcie_switch_connected_nvml(
++    device_ids: list[int | str] | None = None,
++) -> tuple[bool, int | None]:
++    """Return ``(all_switch_connected, worst_nvml_topo_level)`` without CUDA init.
++
++    Checks ``nvmlDeviceGetTopologyCommonAncestor`` across every pair of
++    devices. Returns ``(True, worst)`` iff all pairs share a PCIe switch
++    (``INTERNAL`` / ``PIX`` / ``PXB``, level <= 20). Returns ``(False, None)``
++    if NVML is unavailable or fewer than 2 devices are visible.
++    """
++    import ctypes
++
++    try:
++        nvml = ctypes.CDLL("libnvidia-ml.so.1")
++        if nvml.nvmlInit_v2() != 0:
++            return (False, None)
++        try:
++            targets: list[int | str]
++            if device_ids is not None:
++                targets = list(device_ids)
++            else:
++                raw_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
++                if raw_vis:
++                    targets = []
++                    for tok in raw_vis.split(","):
++                        tok = tok.strip()
++                        if not tok:
++                            continue
++                        targets.append(int(tok) if tok.isdigit() else tok)
++                else:
++                    count = ctypes.c_uint(0)
++                    if nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
++                        return (False, None)
++                    targets = list(range(int(count.value)))
++            if len(targets) < 2:
++                return (False, None)
++
++            handles: list[ctypes.c_void_p] = []
++            for dev in targets:
++                handle = ctypes.c_void_p()
++                if isinstance(dev, int):
++                    rc = nvml.nvmlDeviceGetHandleByIndex_v2(
++                        ctypes.c_uint(dev), ctypes.byref(handle)
++                    )
++                else:
++                    rc = nvml.nvmlDeviceGetHandleByUUID(
++                        dev.encode("utf-8"), ctypes.byref(handle)
++                    )
++                    if rc != 0 and not dev.startswith("GPU-"):
++                        rc = nvml.nvmlDeviceGetHandleByUUID(
++                            f"GPU-{dev}".encode("utf-8"), ctypes.byref(handle)
++                        )
++                if rc != 0:
++                    return (False, None)
++                handles.append(handle)
++
++            worst: int | None = None
++            for i in range(len(handles)):
++                for j in range(i + 1, len(handles)):
++                    lvl = ctypes.c_int(-1)
++                    rc = nvml.nvmlDeviceGetTopologyCommonAncestor(
++                        handles[i], handles[j], ctypes.byref(lvl)
++                    )
++                    if rc != 0:
++                        return (False, None)
++                    val = int(lvl.value)
++                    worst = val if worst is None else max(worst, val)
++            if worst is None:
++                return (False, None)
++            return (worst <= NVML_TOPO_SWITCH_MAX, worst)
++        finally:
++            nvml.nvmlShutdown()
++    except Exception:
++        return (False, None)
++
++
+ def apply() -> None:
+     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
+     if name == "auto":
+@@ -382,13 +475,18 @@ def apply() -> None:
+         for key, value in PROFILES[name].items():
+             os.environ.setdefault(key, value)
+ 
+-    # Set NCCL_PROTO=Simple BEFORE torch/libnccl is imported when running on
+-    # PCIe-only GPUs (zero active NVLinks), avoiding 50% LL flag overhead on
+-    # multi-MB prefill Ring collectives while leaving NVLink untouched.
++    # Set NCCL_PROTO=Simple BEFORE torch/libnccl is imported ONLY when running
++    # on switch-connected PCIe GPUs (PIX/PXB, zero active NVLinks) where CuTe
++    # Lamport handles small decode messages (M<=60) and NCCL only handles
++    # larger Ring/prefill transfers. On cross-RC topologies (PHB/NODE/SYS),
++    # Lamport is disabled so PyNCCL handles small decode too and benefits from
++    # NCCL's automatic LL protocol selection.
++    pcie_opt = os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
+     if (
+-        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
++        pcie_opt in ("1", "force")
+         and "NCCL_PROTO" not in os.environ
+         and not _has_active_nvlink_nvml()
++        and (pcie_opt == "force" or pcie_switch_connected_nvml()[0])
+     ):
+         os.environ["NCCL_PROTO"] = "Simple"
+ 
+diff --git a/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py b/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
+index b56b75a..0b1ebe1 100644
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
+@@ -1147,15 +1147,21 @@ def _w2_splitk_kernel(
+ def ampere_peer_topology() -> str | None:
+     """Return `'nvlink'` when vLLM's custom all-reduce reports full NVLink
+     connectivity, `'pcie'` when PCIe P2P collectives are opted in and every TP
+-    peer pair on the node has direct CUDA P2P access, or `None` otherwise.
+-    Collective over the TP group so all ranks agree."""
++    peer pair on the node has direct CUDA P2P access behind a shared PCIe
++    switch (`PIX`/`PXB`, or overridden via `VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force`),
++    or `None` otherwise. Collective over the TP group so all ranks agree."""
+     from vllm.distributed import get_tp_group
++    from vllm.dsv41_opt_profile import NVML_TOPO_NAMES, pcie_switch_connected_nvml
++    from vllm.logger import init_logger
+ 
+     tp_group = get_tp_group()
+     comm = getattr(tp_group.device_communicator, "ca_comm", None)
+     if comm is not None and not comm.disabled and comm.fully_connected:
+         return "nvlink"
+-    if os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") != "1":
++    pcie_opt = (
++        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
++    )
++    if pcie_opt not in ("1", "force"):
+         return None
+     world_size = tp_group.world_size
+     if world_size < 2 or world_size > torch.cuda.device_count():
+@@ -1171,6 +1177,29 @@ def ampere_peer_topology() -> str | None:
+             if d != local_dev and not torch.cuda.can_device_access_peer(local_dev, d):
+                 ok = 0
+                 break
++    if ok and pcie_opt != "force":
++        phys_ids: list[int | str] = []
++        for d in peer_devs:
++            try:
++                u = getattr(torch.cuda.get_device_properties(d), "uuid", None)
++                if u is not None:
++                    phys_ids.append(f"GPU-{u}")
++                    continue
++            except Exception:
++                pass
++            phys_ids.append(current_platform.visible_device_id_to_physical_device_id(d))
++        switch_ok, worst_lvl = pcie_switch_connected_nvml(phys_ids)
++        if worst_lvl is not None and not switch_ok:
++            ok = 0
++            topo_name = NVML_TOPO_NAMES.get(worst_lvl, f"level={worst_lvl}")
++            init_logger(__name__).info_once(
++                "DSV41: PCIe peers traverse CPU root complex (NVML topology=%s); "
++                "disabling CuTe Lamport P2P collectives and falling back to PyNCCL "
++                "(fine-grained 16B P2P writes congest cross-RC interconnects; "
++                "set VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force to override, and "
++                "consider NCCL_P2P_LEVEL=SYS if PyNCCL disables P2P).",
++                topo_name,
++            )
+     flag = torch.tensor([ok], dtype=torch.int32, device=tp_group.device)
+     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.device_group)
+     return "pcie" if int(flag.item()) == 1 else None
+-- 
+2.56.0
+

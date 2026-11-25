@@ -108,6 +108,32 @@ try:
             m.resolve_auto_profile(["vllm", "serve", "deepseek-ai/DeepSeek-V4.1-Flash", "-tp", "8"])
             == "tp_auto"
         )
+
+        # NCCL_PROTO=Simple only set on switch-connected PCIe (PIX/PXB), not cross-RC (PHB/NODE/SYS)
+        orig_nvl = m._has_active_nvlink_nvml
+        orig_sw = m.pcie_switch_connected_nvml
+        try:
+            m._has_active_nvlink_nvml = lambda: False
+            m.pcie_switch_connected_nvml = lambda device_ids=None: (True, 10)  # PIX
+            os.environ.clear()
+            os.environ["VLLM_DSV41_OPT_PROFILE"] = "tep4_fused"
+            m.apply()
+            assert os.environ.get("NCCL_PROTO") == "Simple"
+
+            m.pcie_switch_connected_nvml = lambda device_ids=None: (False, 40)  # NODE
+            os.environ.clear()
+            os.environ["VLLM_DSV41_OPT_PROFILE"] = "tep4_fused"
+            m.apply()
+            assert "NCCL_PROTO" not in os.environ
+
+            os.environ.clear()
+            os.environ["VLLM_DSV41_OPT_PROFILE"] = "tep4_fused"
+            os.environ["VLLM_DSV41_AMPERE_PCIE_COLLECTIVES"] = "force"
+            m.apply()
+            assert os.environ.get("NCCL_PROTO") == "Simple"
+        finally:
+            m._has_active_nvlink_nvml = orig_nvl
+            m.pcie_switch_connected_nvml = orig_sw
 finally:
     os.environ.clear()
     os.environ.update(original_env)
