@@ -47,3 +47,26 @@ explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.
      - `VLLM_DSV41_IN_GRAPH_TEXT_EMBED=1`: keeps pure-text `embed_input_ids` inside
        `FULL_DECODE_ONLY` CUDA graphs on multimodal `DeepseekV41ForCausalLM` while
        preserving CPU-offloaded vision execution when multimodal embeddings are present.
+
+3. `0003-dsv41-auto-profile-by-model-and-parallelism.patch`
+   - Adds `VLLM_DSV41_OPT_PROFILE=auto` (auto-routes DeepSeek-V4.1 by parallelism
+     while leaving non-DeepSeek models untouched).
+
+4. `0004-dsv41-tp-local-greedy-masked-token-ids-compat.patch`
+   - Guards `masked_token_ids` access in `_try_tp_local_greedy_sample` across upstream builds.
+
+5. `0005-dsv41-require-pcie-switch-topology-for-lamport.patch`
+   - Requires NVML switch-connected PCIe (`PIX`/`PXB`) before auto-enabling CuTe Lamport
+     P2P and `NCCL_PROTO=Simple`, avoiding cross-Root-Complex BAR1 congestion.
+
+6. `0006-dsv41-pcie-dma-ring-and-row-shard-prefill.patch`
+   - **Native Copy-Engine Ring DMA (`dsv41_pcie_dma` / `pcie_dma_ring.py`)**:
+     Dedicated 0-offset `cudaMalloc` IPC ring (`ce_reduce_scatter`, `ce_all_gather`,
+     in-place `ce_all_reduce_inplace`) running lossless BF16 transfers on Copy Engines
+     (zero SM contention, +20–32% vs PyNCCL on PCIe Gen4 x16, true overlap with GEMM/MoE).
+   - **Lossless BF16 Row-Sharded Prefill (`_run_layers_prefill_row_shard`)**:
+     Keeps mHC residual streams `[S, 4, H]`, mixes, and Engram post-updates sharded across
+     TP ranks (`1/W` memory & compute) with zero `torch.cat` scratch spikes; eliminates
+     long-context prefill OOM on 4×80G and conditionally enables 2-microbatch MoE when
+     `M >= 4096` or `EP >= 6`.
+   - Tightens `try_gate_gemv` upper bound from `M <= 8` to `M <= 6` (cuBLAS wins at `M >= 8`).

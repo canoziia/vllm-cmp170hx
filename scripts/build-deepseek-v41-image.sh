@@ -235,7 +235,7 @@ fi
 # compiled *.so extensions, vllm_flash_attn, and vllm-rs inside $BASE_IMAGE).
 cp -a "$WORKDIR/source/vllm" "$WORKDIR/context/vllm"
 rm -f "$WORKDIR/context/vllm/_version.py"
-for nat in dsv4_moe dsv41_indexer dsv41_dense_mxfp8 dsv41_engram_cpu dsv41_swa dsv41_r2; do
+for nat in dsv4_moe dsv41_indexer dsv41_dense_mxfp8 dsv41_engram_cpu dsv41_swa dsv41_r2 dsv41_pcie_dma; do
   cp -a "$MODEL_DIR/native/$nat" "$WORKDIR/context/$nat"
 done
 INTEGRATION_REVISION=$(git -C "$REPO_ROOT" rev-parse HEAD)
@@ -248,6 +248,7 @@ COPY dsv41_indexer/ /tmp/dsv41_indexer/
 COPY dsv41_dense_mxfp8/ /tmp/dsv41_dense_mxfp8/
 COPY dsv41_swa/ /tmp/dsv41_swa/
 COPY dsv41_r2/ /tmp/dsv41_r2/
+COPY dsv41_pcie_dma/ /tmp/dsv41_pcie_dma/
 RUN (command -v g++ >/dev/null || (apt-get update -y && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*)) \\
     && bash /tmp/dsv4_moe/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build /tmp/dsv4_moe /root/.cache/torch_extensions \\
@@ -264,7 +265,10 @@ RUN (command -v g++ >/dev/null || (apt-get update -y && apt-get install -y --no-
     && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_swa_C.abi3.so \\
     && bash /tmp/dsv41_r2/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
     && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build_r2 /tmp/dsv41_r2 /root/.cache/torch_extensions \\
-    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_r2_C.abi3.so
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_r2_C.abi3.so \\
+    && bash /tmp/dsv41_pcie_dma/build.sh /usr/local/lib/python3.12/dist-packages/vllm \\
+    && rm -rf /usr/local/lib/python3.12/dist-packages/vllm/build_pcie_dma /tmp/dsv41_pcie_dma /root/.cache/torch_extensions \\
+    && test -f /usr/local/lib/python3.12/dist-packages/vllm/_dsv41_pcie_dma_C.so
 CONTAINERFILE
 
 if [[ $WITH_LMCACHE == 1 ]]; then

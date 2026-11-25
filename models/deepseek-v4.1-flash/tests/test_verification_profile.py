@@ -119,6 +119,9 @@ try:
             os.environ["VLLM_DSV41_OPT_PROFILE"] = "tep4_fused"
             m.apply()
             assert os.environ.get("NCCL_PROTO") == "Simple"
+            assert os.environ.get("VLLM_DSV41_PREFILL_DMA_RING") == "auto"
+            assert os.environ.get("VLLM_DSV41_PREFILL_ROW_SHARD") == "auto"
+            assert os.environ.get("VLLM_DSV41_PREFILL_2MB_MOE") == "auto"
 
             m.pcie_switch_connected_nvml = lambda device_ids=None: (False, 40)  # NODE
             os.environ.clear()
