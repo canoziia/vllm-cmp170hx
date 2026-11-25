@@ -401,6 +401,7 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
         ampere_peer_topology,
         default_ampere_ar_capacity,
         default_ampere_ar_oneshot_max_rows,
+        default_ampere_ar_ring_min_rows,
     )
 
     group = get_tp_group()
@@ -409,6 +410,7 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
     topo = ampere_peer_topology() or "pcie"
     capacity = default_ampere_ar_capacity(topo)
     oneshot_capacity = default_ampere_ar_oneshot_max_rows(topo)
+    ring_min_rows = default_ampere_ar_ring_min_rows(topo)
     top_k = None if parallel.enable_expert_parallel else config.num_experts_per_tok
     _ampere_all_reduce = AmpereAllReduce(
         group.device_group,
@@ -417,13 +419,15 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
         capacity=capacity,
         top_k=top_k,
         oneshot_capacity=oneshot_capacity,
+        ring_min_rows=ring_min_rows,
     )
     logger.info_once(
         "DSV4.1 mHC: CuTe DSL Lamport all-reduce (%s) for up to %d tokens "
-        "(oneshot <= %d).",
+        "(oneshot <= %d, ring >= %d).",
         topo,
         _ampere_all_reduce.capacity,
         _ampere_all_reduce.oneshot_capacity,
+        _ampere_all_reduce.ring_min_rows,
     )
 
 

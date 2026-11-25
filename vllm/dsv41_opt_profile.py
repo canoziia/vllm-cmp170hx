@@ -200,7 +200,8 @@ PROFILES["tep4_fused"] = {
 PROFILES["tp4_fused"] = {
     **PROFILES["tep4_fused"],
     "VLLM_DSV41_COST_MS_FUSED": "tp4",
-    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "3",
+    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "1",
+    "VLLM_DSV41_FUSED_W2_AR": "0",
 }
 
 # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).

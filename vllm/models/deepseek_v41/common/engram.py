@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 
 import vllm.envs as envs
@@ -48,6 +49,7 @@ from vllm.distributed import (
     get_engram_dp_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.distributed.device_communicators.shm_broadcast import (
@@ -2452,6 +2454,147 @@ def _fused_engram_post_wkv_kernel(
     )
 
 
+@triton.jit(do_not_specialize=["num_kv_tokens"])
+def _engram_partial_dot_kernel(
+    hidden_states,
+    kv_shard,
+    q_weight,
+    k_weight,
+    stats,
+    num_kv_tokens,
+    hidden_stride_t,
+    hidden_stride_h,
+    hidden_stride_d,
+    kv_stride_t,
+    kv_stride_d,
+    q_stride_h,
+    q_stride_d,
+    k_stride_h,
+    k_stride_d,
+    TP_RANK: tl.constexpr,
+    C_PART: tl.constexpr,
+    DIM: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    program_idx = tl.program_id(0)
+    token_idx = (program_idx // HC_MULT).to(tl.int64)
+    hc_idx = program_idx % HC_MULT
+    g_lo = TP_RANK * C_PART
+    g_hi = g_lo + C_PART
+    k_lo = hc_idx * DIM
+    k_hi = k_lo + DIM
+    ov_lo = tl.maximum(g_lo, k_lo)
+    ov_hi = tl.minimum(g_hi, k_hi)
+    ov_len = tl.maximum(ov_hi - ov_lo, 0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    valid = (offs < ov_len) & (token_idx < num_kv_tokens)
+    d_idx = (ov_lo - k_lo) + offs
+    kv_idx = (ov_lo - g_lo) + offs
+
+    hidden = tl.load(
+        hidden_states
+        + token_idx * hidden_stride_t
+        + hc_idx * hidden_stride_h
+        + d_idx * hidden_stride_d,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    key = tl.load(
+        kv_shard + token_idx * kv_stride_t + kv_idx * kv_stride_d,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    q = tl.load(
+        q_weight + hc_idx * q_stride_h + d_idx * q_stride_d,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    k = tl.load(
+        k_weight + hc_idx * k_stride_h + d_idx * k_stride_d,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+
+    ksq = tl.sum(key * key, axis=0)
+    dot = tl.sum(hidden * q * k * key, axis=0)
+    base = (token_idx * HC_MULT + hc_idx) * 2
+    tl.store(stats + base, ksq)
+    tl.store(stats + base + 1, dot)
+
+
+@triton.jit(do_not_specialize=["num_kv_tokens"])
+def _engram_apply_gate_v_kernel(
+    hidden_states,
+    v_buf,
+    stats,
+    token_mask,
+    output,
+    num_kv_tokens,
+    hidden_stride_t,
+    hidden_stride_h,
+    hidden_stride_d,
+    v_stride_t,
+    v_stride_d,
+    mask_stride,
+    output_stride_t,
+    output_stride_h,
+    output_stride_d,
+    eps,
+    clamp_value,
+    DIM: tl.constexpr,
+    HC_MULT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    program_idx = tl.program_id(0)
+    token_idx = (program_idx // HC_MULT).to(tl.int64)
+    hc_idx = program_idx % HC_MULT
+    source_valid = token_idx < num_kv_tokens
+
+    dim_offsets = tl.arange(0, BLOCK_SIZE)
+    dim_valid = dim_offsets < DIM
+    hidden = tl.load(
+        hidden_states
+        + token_idx * hidden_stride_t
+        + hc_idx * hidden_stride_h
+        + dim_offsets * hidden_stride_d,
+        mask=dim_valid,
+        other=0.0,
+    ).to(tl.float32)
+    base = (token_idx * HC_MULT + hc_idx) * 2
+    ksq = tl.load(stats + base)
+    dot = tl.load(stats + base + 1)
+
+    hidden_rms = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / DIM + eps)
+    key_rms = tl.rsqrt(ksq / DIM + eps)
+    dot *= hidden_rms * key_rms * tl.rsqrt(DIM * 1.0)
+    gate_input = tl.sqrt(tl.maximum(tl.abs(dot), clamp_value))
+    gate_input = tl.where(dot < 0.0, -gate_input, gate_input)
+    gate = tl.sigmoid(gate_input)
+    if HAS_MASK:
+        active = tl.load(
+            token_mask + token_idx * mask_stride,
+            mask=source_valid,
+            other=0,
+        )
+        gate = tl.where(active, gate, 0.0)
+
+    value = tl.load(
+        v_buf + token_idx * v_stride_t + dim_offsets * v_stride_d,
+        mask=source_valid & dim_valid,
+        other=0.0,
+    ).to(tl.float32)
+    tl.store(
+        output
+        + token_idx * output_stride_t
+        + hc_idx * output_stride_h
+        + dim_offsets * output_stride_d,
+        hidden + gate * value,
+        mask=dim_valid,
+    )
+
+
 @triton.jit(do_not_specialize=["num_tokens", "token_start", "num_elements"])
 def _engram_select_rows_kernel(
     gathered,
@@ -2917,10 +3060,26 @@ class Engram(nn.Module):
             kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
         else:
             kv = self.wkv(self.embed(hash_ids).flatten(-2))
-        if self._gather_columns is not None:
-            kv = self._gather_columns(kv)
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
+        if (
+            self._gather_columns is not None
+            and not self.use_sequence_parallel
+            and num_kv_tokens >= 160
+            and os.environ.get("VLLM_DSV41_ENGRAM_LOCAL_DOT", "1") == "1"
+        ):
+            tp_size = get_tensor_model_parallel_world_size()
+            c_part = kv.shape[1]
+            if (
+                tp_size > 1
+                and c_part * tp_size == (self.hc_mult + 1) * self.dim
+                and c_part >= self.dim
+            ):
+                return self._post_wkv_sharded(
+                    hidden_states, kv, token_mask, num_kv_tokens
+                )
+        if self._gather_columns is not None:
+            kv = self._gather_columns(kv)
         if self.use_sequence_parallel:
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
@@ -2932,6 +3091,95 @@ class Engram(nn.Module):
                 token_mask = token_mask[start : start + num_kv_tokens]
 
         return self._post_wkv(hidden_states, kv, token_mask, num_kv_tokens)
+
+    def _post_wkv_sharded(
+        self,
+        hidden_states: torch.Tensor,
+        kv_shard: torch.Tensor,
+        token_mask: torch.Tensor | None,
+        num_kv_tokens: int,
+    ) -> torch.Tensor:
+        """Lossless 5x-bandwidth-reduced Engram update from TP-column-sharded
+        `kv_shard` (`[M, c_part]`): computes local FP32 partial `(key^2, dot)`
+        scalars per stream, all-reduces only `[M, 2*hc_mult]` FP32 scalars and
+        broadcasts only `V` (`[M, dim]`, 1/5 of `kv`) from the last TP rank."""
+        num_tokens, hc_mult, dim = hidden_states.shape
+        assert hc_mult == self.hc_mult and dim == self.dim
+        output = torch.empty_like(hidden_states)
+        if num_tokens == 0:
+            return output
+
+        tp_group = get_tp_group()
+        tp_size = tp_group.world_size
+        tp_rank = tp_group.rank_in_group
+        c_part = kv_shard.shape[1]
+        block_size = triton.next_power_of_2(dim)
+        num_warps = 8 if block_size >= 2048 else 4
+
+        stats = torch.empty(
+            (num_tokens, hc_mult * 2), dtype=torch.float32, device=hidden_states.device
+        )
+        _engram_partial_dot_kernel[(num_tokens * hc_mult,)](
+            hidden_states,
+            kv_shard,
+            self.q_weight,
+            self.k_weight,
+            stats,
+            num_kv_tokens,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            hidden_states.stride(2),
+            kv_shard.stride(0),
+            kv_shard.stride(1),
+            self.q_weight.stride(0),
+            self.q_weight.stride(1),
+            self.k_weight.stride(0),
+            self.k_weight.stride(1),
+            TP_RANK=tp_rank,
+            C_PART=c_part,
+            DIM=dim,
+            HC_MULT=hc_mult,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+        )
+        dist.all_reduce(stats, group=tp_group.device_group)
+
+        if tp_rank == tp_size - 1:
+            v_buf = kv_shard[:, c_part - dim : c_part].contiguous()
+        else:
+            v_buf = torch.empty(
+                (num_kv_tokens, dim), dtype=kv_shard.dtype, device=kv_shard.device
+            )
+        dist.broadcast(
+            v_buf, src=tp_group.ranks[tp_size - 1], group=tp_group.device_group
+        )
+
+        mask = token_mask if token_mask is not None else hidden_states
+        _engram_apply_gate_v_kernel[(num_tokens * hc_mult,)](
+            hidden_states,
+            v_buf,
+            stats,
+            mask,
+            output,
+            num_kv_tokens,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            hidden_states.stride(2),
+            v_buf.stride(0),
+            v_buf.stride(1),
+            token_mask.stride(0) if token_mask is not None else 0,
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            self.eps,
+            self.clamp_value,
+            DIM=dim,
+            HC_MULT=hc_mult,
+            BLOCK_SIZE=block_size,
+            HAS_MASK=token_mask is not None,
+            num_warps=num_warps,
+        )
+        return output
 
     def _post_wkv(
         self,

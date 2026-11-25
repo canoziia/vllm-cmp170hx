@@ -104,6 +104,50 @@ def _w2_splitk_max_tokens() -> int:
     return int(os.environ.get("VLLM_DSV4_MXFP4_W2_SPLITK_MAX_TOKENS", "64"))
 
 
+def _tp4_w13_cfg(M: int, dq: int, fused_act: bool) -> tuple[int, int]:
+    """Dispatch (cfg, part_ks) for Pure TP4 NI=576 W13 on SM80.
+
+    - M == 1: c4 (KS=4, CR=16, TW=1) for minimum tiny-batch latency.
+    - M = 2..48: c2 (KS=4, CR=8, TW=1) — avoids KS=2 SM starvation on real
+      correlated speculative batches where active blocks nblk << M*topk.
+    - M >= 49 (c=16/32): c10 (GPU-side dynamic nblk-aware Split-K, CR=4 occ=5)
+      branching inside the CUDA-Graph kernel between KS=4 (nblk < 130, avoiding
+      wave quantization on correlated batches) and KS=2 (nblk >= 130, halving
+      partial traffic and sync contention for +3% c=32 throughput).
+    """
+    env = os.environ.get("VLLM_DSV4_MXFP4_TP4_W13_CFG")
+    if env is not None:
+        c = int(env)
+        return c, (2 if c == 1 else 4)
+    if dq not in (0, 3):
+        return 4, 4
+    if M == 1:
+        return 4, 4
+    if 4 <= M <= 6:
+        # occ=5 (2520 warps on 126 SMs) fits M=6 (<=36*18*4 = 2592 items) in
+        # ~1 wave vs 2 waves on occ=4 c2 (-13.3us/layer = -0.53ms/step at c=1 k=5).
+        return 0, 4
+    if M <= 48:
+        return 2, 4
+    return (10, 4) if fused_act else (2, 4)
+
+
+def _tp4_w2_cfg(M: int) -> int:
+    """Cold-L2 + end-to-end tuned cfg for Pure TP4 NI=576 W2 (KS=1) on SM80.
+
+    c4=(12,1) at M=1, c5=(6,2) at M=2 (paired with OneShotFinalize), and
+    c2=(6,1) across M>=3 (eliminating the old c5 slowdown at M=7..192).
+    """
+    env = os.environ.get("VLLM_DSV4_MXFP4_TP4_W2_CFG")
+    if env is not None:
+        return int(env)
+    if M == 1:
+        return 4
+    if M == 2:
+        return 5
+    return 2
+
+
 def _w2_splitk_ks(M: int) -> int:
     return 4 if M < 20 else 3
 
@@ -361,7 +405,7 @@ def try_fused_gate_topk_align(
 
     dev = hidden_states.device
     sk_scr = 4 if E == 384 else 10
-    fgta_sent = _fgta_sent(dev) if M >= 3 else None
+    fgta_sent = _fgta_sent(dev) if (M >= 3 and E != 384) else None
     use_sentinel = fgta_sent is not None and fgta_sent.numel() >= sk_scr * 8 * E
     logits_scr = (
         fgta_sent
@@ -886,15 +930,11 @@ def _try_run_v2(
             s_order,
         )
     if ni == 576:
-        w13_cfg = 2 if dq in (0, 3) else 4
-        w2_cfg = int(
-            os.environ.get(
-                "VLLM_DSV4_MXFP4_TP4_W2_CFG",
-                "2" if M <= _v4_tile_max_tokens() else "5",
-            )
-        )
+        w13_cfg, w13_ks = _tp4_w13_cfg(M, dq, limit is not None)
+        w2_cfg = _tp4_w2_cfg(M)
     else:
         w13_cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
+        w13_ks = 4
         w2_cfg = w13_cfg
     r2_ops = _ops_r2()
     w2_ks = None
@@ -904,7 +944,11 @@ def _try_run_v2(
         and dq in (0, 2, 3)
         and topk <= 8
         and _plain_moe_sum(moe_sum)
-        and (topk <= 3 or M <= 2 or M <= _w2_splitk_max_tokens())
+        and (
+            (topk <= 3 or M <= 8)
+            if ni == 576
+            else (topk <= 3 or M <= 2 or M <= _w2_splitk_max_tokens())
+        )
         and (
             output is None
             or (
@@ -921,14 +965,14 @@ def _try_run_v2(
                 w2_ks = int(
                     os.environ.get(
                         "VLLM_DSV4_MXFP4_TP4_W2_KS_MED",
-                        "2" if (topk <= 3 or M <= 8) else "1",
+                        "2",
                     )
                 )
         else:
             w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
-    # W13 split-K partials [4, slots, 2*ni]; split-K W2 reuses the buffer as
+    # W13 split-K partials [w13_ks, slots, 2*ni]; split-K W2 reuses the buffer as
     # [w2_ks, slots, K] after the activation consumed the W13 partials.
-    part_numel = max(4 * slots * 2 * ni, (w2_ks or 0) * slots * _K)
+    part_numel = max(w13_ks * slots * 2 * ni, (w2_ks or 0) * slots * _K)
     part = torch.empty(part_numel, dtype=torch.float32, device=dev)
     h = intermediate_cache2.reshape(-1)[: slots * ni].view(slots, ni)
     tw = topk_weights.view(-1)
