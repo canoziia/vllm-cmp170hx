@@ -362,6 +362,99 @@ def _has_active_nvlink_nvml() -> bool:
         return False
 
 
+# NVML nvmlGpuTopologyLevel_t enum values (from nvml.h):
+#   0=INTERNAL, 10=SINGLE (PIX), 20=MULTIPLE (PXB),
+#   30=HOSTBRIDGE (PHB), 40=NODE, 50=SYSTEM (SYS).
+# Fine-grained 16-byte GPU SM P2P BAR1 writes (CuTe Lamport) require a shared
+# PCIe switch (<= 20, PIX/PXB); across CPU root complexes (>= 30, PHB/NODE/SYS)
+# posted-write credit exhaustion degrades low-M decode by 2-3x vs PyNCCL DMA.
+NVML_TOPO_SWITCH_MAX = 20
+NVML_TOPO_NAMES: dict[int, str] = {
+    0: "INTERNAL",
+    10: "PIX",
+    20: "PXB",
+    30: "PHB",
+    40: "NODE",
+    50: "SYS",
+}
+
+
+def pcie_switch_connected_nvml(
+    device_ids: list[int | str] | None = None,
+) -> tuple[bool, int | None]:
+    """Return ``(all_switch_connected, worst_nvml_topo_level)`` without CUDA init.
+
+    Checks ``nvmlDeviceGetTopologyCommonAncestor`` across every pair of
+    devices. Returns ``(True, worst)`` iff all pairs share a PCIe switch
+    (``INTERNAL`` / ``PIX`` / ``PXB``, level <= 20). Returns ``(False, None)``
+    if NVML is unavailable or fewer than 2 devices are visible.
+    """
+    import ctypes
+
+    try:
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+        if nvml.nvmlInit_v2() != 0:
+            return (False, None)
+        try:
+            targets: list[int | str]
+            if device_ids is not None:
+                targets = list(device_ids)
+            else:
+                raw_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+                if raw_vis:
+                    targets = []
+                    for tok in raw_vis.split(","):
+                        tok = tok.strip()
+                        if not tok:
+                            continue
+                        targets.append(int(tok) if tok.isdigit() else tok)
+                else:
+                    count = ctypes.c_uint(0)
+                    if nvml.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+                        return (False, None)
+                    targets = list(range(int(count.value)))
+            if len(targets) < 2:
+                return (False, None)
+
+            handles: list[ctypes.c_void_p] = []
+            for dev in targets:
+                handle = ctypes.c_void_p()
+                if isinstance(dev, int):
+                    rc = nvml.nvmlDeviceGetHandleByIndex_v2(
+                        ctypes.c_uint(dev), ctypes.byref(handle)
+                    )
+                else:
+                    rc = nvml.nvmlDeviceGetHandleByUUID(
+                        dev.encode("utf-8"), ctypes.byref(handle)
+                    )
+                    if rc != 0 and not dev.startswith("GPU-"):
+                        rc = nvml.nvmlDeviceGetHandleByUUID(
+                            f"GPU-{dev}".encode("utf-8"), ctypes.byref(handle)
+                        )
+                if rc != 0:
+                    return (False, None)
+                handles.append(handle)
+
+            worst: int | None = None
+            for i in range(len(handles)):
+                for j in range(i + 1, len(handles)):
+                    lvl = ctypes.c_int(-1)
+                    rc = nvml.nvmlDeviceGetTopologyCommonAncestor(
+                        handles[i], handles[j], ctypes.byref(lvl)
+                    )
+                    if rc != 0:
+                        return (False, None)
+                    val = int(lvl.value)
+                    worst = val if worst is None else max(worst, val)
+            if worst is None:
+                return (False, None)
+            return (worst <= NVML_TOPO_SWITCH_MAX, worst)
+        finally:
+            nvml.nvmlShutdown()
+    except Exception:
+        return (False, None)
+
+
 def apply() -> None:
     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
     if name == "auto":
@@ -382,13 +475,18 @@ def apply() -> None:
         for key, value in PROFILES[name].items():
             os.environ.setdefault(key, value)
 
-    # Set NCCL_PROTO=Simple BEFORE torch/libnccl is imported when running on
-    # PCIe-only GPUs (zero active NVLinks), avoiding 50% LL flag overhead on
-    # multi-MB prefill Ring collectives while leaving NVLink untouched.
+    # Set NCCL_PROTO=Simple BEFORE torch/libnccl is imported ONLY when running
+    # on switch-connected PCIe GPUs (PIX/PXB, zero active NVLinks) where CuTe
+    # Lamport handles small decode messages (M<=60) and NCCL only handles
+    # larger Ring/prefill transfers. On cross-RC topologies (PHB/NODE/SYS),
+    # Lamport is disabled so PyNCCL handles small decode too and benefits from
+    # NCCL's automatic LL protocol selection.
+    pcie_opt = os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
     if (
-        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
+        pcie_opt in ("1", "force")
         and "NCCL_PROTO" not in os.environ
         and not _has_active_nvlink_nvml()
+        and (pcie_opt == "force" or pcie_switch_connected_nvml()[0])
     ):
         os.environ["NCCL_PROTO"] = "Simple"
 

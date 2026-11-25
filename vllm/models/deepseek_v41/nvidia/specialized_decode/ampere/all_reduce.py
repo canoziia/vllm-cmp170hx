@@ -1147,15 +1147,21 @@ def _w2_splitk_kernel(
 def ampere_peer_topology() -> str | None:
     """Return `'nvlink'` when vLLM's custom all-reduce reports full NVLink
     connectivity, `'pcie'` when PCIe P2P collectives are opted in and every TP
-    peer pair on the node has direct CUDA P2P access, or `None` otherwise.
-    Collective over the TP group so all ranks agree."""
+    peer pair on the node has direct CUDA P2P access behind a shared PCIe
+    switch (`PIX`/`PXB`, or overridden via `VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force`),
+    or `None` otherwise. Collective over the TP group so all ranks agree."""
     from vllm.distributed import get_tp_group
+    from vllm.dsv41_opt_profile import NVML_TOPO_NAMES, pcie_switch_connected_nvml
+    from vllm.logger import init_logger
 
     tp_group = get_tp_group()
     comm = getattr(tp_group.device_communicator, "ca_comm", None)
     if comm is not None and not comm.disabled and comm.fully_connected:
         return "nvlink"
-    if os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") != "1":
+    pcie_opt = (
+        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
+    )
+    if pcie_opt not in ("1", "force"):
         return None
     world_size = tp_group.world_size
     if world_size < 2 or world_size > torch.cuda.device_count():
@@ -1171,6 +1177,29 @@ def ampere_peer_topology() -> str | None:
             if d != local_dev and not torch.cuda.can_device_access_peer(local_dev, d):
                 ok = 0
                 break
+    if ok and pcie_opt != "force":
+        phys_ids: list[int | str] = []
+        for d in peer_devs:
+            try:
+                u = getattr(torch.cuda.get_device_properties(d), "uuid", None)
+                if u is not None:
+                    phys_ids.append(f"GPU-{u}")
+                    continue
+            except Exception:
+                pass
+            phys_ids.append(current_platform.visible_device_id_to_physical_device_id(d))
+        switch_ok, worst_lvl = pcie_switch_connected_nvml(phys_ids)
+        if worst_lvl is not None and not switch_ok:
+            ok = 0
+            topo_name = NVML_TOPO_NAMES.get(worst_lvl, f"level={worst_lvl}")
+            init_logger(__name__).info_once(
+                "DSV41: PCIe peers traverse CPU root complex (NVML topology=%s); "
+                "disabling CuTe Lamport P2P collectives and falling back to PyNCCL "
+                "(fine-grained 16B P2P writes congest cross-RC interconnects; "
+                "set VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force to override, and "
+                "consider NCCL_P2P_LEVEL=SYS if PyNCCL disables P2P).",
+                topo_name,
+            )
     flag = torch.tensor([ok], dtype=torch.int32, device=tp_group.device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.device_group)
     return "pcie" if int(flag.item()) == 1 else None

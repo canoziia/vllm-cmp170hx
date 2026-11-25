@@ -107,33 +107,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size > 1:
             import os
 
+            _pcie_opt = (
+                os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0")
+                .strip()
+                .lower()
+            )
             if (
-                os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0") == "1"
+                _pcie_opt in ("1", "force")
                 and "NCCL_PROTO" not in os.environ
                 and current_platform.is_cuda()
             ):
                 try:
-                    from vllm.utils.import_utils import import_pynvml
+                    from vllm.dsv41_opt_profile import (
+                        _has_active_nvlink_nvml,
+                        pcie_switch_connected_nvml,
+                    )
 
-                    _nvml = import_pynvml()
-                    _nvml.nvmlInit()
-                    try:
-                        _phys = current_platform.visible_device_id_to_physical_device_id(
-                            self.device.index or 0
-                        )
-                        _hdl = _nvml.nvmlDeviceGetHandleByIndex(_phys)
-                        _has_nvl = False
-                        for _lnk in range(18):
-                            try:
-                                if _nvml.nvmlDeviceGetNvLinkState(_hdl, _lnk):
-                                    _has_nvl = True
-                                    break
-                            except Exception:
-                                break
-                        if not _has_nvl:
-                            os.environ["NCCL_PROTO"] = "Simple"
-                    finally:
-                        _nvml.nvmlShutdown()
+                    if not _has_active_nvlink_nvml() and (
+                        _pcie_opt == "force" or pcie_switch_connected_nvml()[0]
+                    ):
+                        os.environ["NCCL_PROTO"] = "Simple"
                 except Exception:
                     pass
             self.pynccl_comm = PyNcclCommunicator(
