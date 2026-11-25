@@ -10,7 +10,7 @@ import math
 import os
 import time
 from types import SimpleNamespace
-from .dsv41_measured_policy import Policy
+from .dsv41_measured_policy import OnlineCostModel, Policy
 
 
 class FixedHistoryPolicy:
@@ -23,8 +23,18 @@ class FixedHistoryPolicy:
         self.generation = 0
         self.feedback_time = None
         self.warned = False
+        self._step_seq = 0
+        self._last_batch_fb = None
+        self._next_cost_log = 100
+        online_enabled = (
+            os.environ.get("VLLM_DSV41_ONLINE_COST_MODEL", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+        )
+        self.cost_model = OnlineCostModel() if online_enabled else None
         self.logger.info(
-            "DSV41 fixed measured CPU policy enabled: decay=%s; no hot loader", decay
+            "DSV41 fixed measured CPU policy enabled: decay=%s; online_cost_model=%s; no hot loader",
+            decay,
+            online_enabled,
         )
 
     def make_entry(self, request):
@@ -99,6 +109,7 @@ class FixedHistoryPolicy:
                             current_k=entry.k,
                             concurrency=concurrency,
                             cohort_size=len(requests),
+                            cost_model=self.cost_model,
                         )
                     )
                     if type(k) is not int or not 1 <= k <= 5 or k > entry.k + 1:
@@ -140,11 +151,31 @@ class FixedHistoryPolicy:
         return result
 
     def scheduled(self, output, residents, concurrency):
+        now = time.perf_counter()
+        self._step_seq += 1
+        prefilling = any(r.is_prefill_chunk for r in residents)
+        if self.cost_model is not None:
+            num_sched = getattr(output, "num_scheduled_tokens", None)
+            if num_sched:
+                batch_b = len(num_sched)
+                batch_m = sum(num_sched.values())
+                is_pure_decode = (
+                    not prefilling
+                    and batch_b >= 1
+                    and batch_m >= 2
+                    and batch_m <= batch_b * 6
+                    and len(output.scheduled_spec_decode_tokens) == batch_b
+                )
+                output._dsv41_batch_stamp = (
+                    self._step_seq,
+                    now,
+                    is_pure_decode,
+                    batch_b,
+                    batch_m,
+                )
         if not self.active:
             return
-        now = time.perf_counter()
         key = tuple(sorted(r.request_id for r in residents))
-        prefilling = any(r.is_prefill_chunk for r in residents)
         stamps = {}
         for rid, drafts in output.scheduled_spec_decode_tokens.items():
             entry = self.active.get(rid)
@@ -164,7 +195,49 @@ class FixedHistoryPolicy:
     def begin_feedback(self):
         self.feedback_time = time.perf_counter()
 
+    def _observe_batch_cost(self, output):
+        if self.cost_model is None or getattr(output, "_dsv41_batch_cost_done", False):
+            return
+        output._dsv41_batch_cost_done = True
+        stamp = getattr(output, "_dsv41_batch_stamp", None)
+        if stamp is None:
+            return
+        step_seq, sent, is_pure_decode, batch_b, batch_m = stamp
+        now = (
+            self.feedback_time
+            if self.feedback_time is not None
+            else time.perf_counter()
+        )
+        prev = self._last_batch_fb
+        self._last_batch_fb = (step_seq, now, is_pure_decode)
+        if (
+            not is_pure_decode
+            or prev is None
+            or not prev[2]
+            or step_seq != prev[0] + 1
+            or sent - prev[1] > 0.02
+        ):
+            return
+        dt = now - prev[1]
+        if not 0.0005 < dt < 0.5:
+            return
+        try:
+            if self.cost_model.observe(batch_b, batch_m, dt):
+                if self.cost_model.obs_count >= self._next_cost_log:
+                    self.logger.info(
+                        "DSV41 online cost model updated: %s",
+                        self.cost_model.diagnostics(),
+                    )
+                    self._next_cost_log = (
+                        500
+                        if self._next_cost_log < 500
+                        else self._next_cost_log + 2000
+                    )
+        except Exception:
+            pass
+
     def feedback(self, output, request, drafted, accepted, output_tokens, valid):
+        self._observe_batch_cost(output)
         rid = request.request_id
         entry = self.active.get(rid)
         stamp = getattr(output, "_dsv41_policy_stamps", {}).get(rid)
