@@ -75,6 +75,12 @@ inspects the model `config.json` and launch parallelism at startup:
 Moving the same container image between TEP4 / PP6 or PCIe / NVLink SM80 hosts requires
 **zero `.py` changes**.
 
+- **Host PCIe Relaxed Ordering (`NVreg_EnablePCIERelaxedOrderingMode`)**: keep the default `0` on
+  single-switch `PIX` hosts (where P2P already saturates PCIe Gen4 x16; enabling `1` adds
+  `~0.07–0.89 ms/step` sync tail latency across 86 decode barriers). On `PHB` / `NODE` / `SYS`
+  topologies traversing the CPU Root Complex, `1` may improve P2P/DMA throughput and is worth
+  benchmarking locally.
+
 ### Quickstart (Prebuilt GHCR Images)
 
 ```bash
