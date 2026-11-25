@@ -131,19 +131,17 @@ struct Frags {
 };
 
 template <int DQ, int R, int CR, int TW, int K, int N, bool W13>
-__global__ void __launch_bounds__(
-    WARPS * 32,
-    (CR * TW <= 2) ? 7 : ((CR * TW <= 4) ? 5 : ((CR * TW <= 8) ? (DQ == 0 ? 5 : 4) : 2)))
-    mxfp4_dec2_gemm(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
-                    const int4* __restrict__ W, const uint8_t* __restrict__ S,
-                    const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
-                    const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
-                    int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
-                    float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
-                    float limit, int sum_order, int* __restrict__ sync,
-                    __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
-                    bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
-                    int local_E) {
+__device__ __forceinline__ void mxfp4_dec2_body(
+    const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+    const int4* __restrict__ W, const uint8_t* __restrict__ S,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
+    const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+    int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
+    float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
+    float limit, int sum_order, int* __restrict__ sync,
+    __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+    bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+    int local_E) {
   static_assert(CR % 2 == 0 && R % CR == 0, "chunks hold whole 32-k scale groups");
   static_assert(K % (16 * R) == 0 && N % (64 * TW) == 0, "shape");
   constexpr int CH = R / CR;
@@ -537,6 +535,95 @@ __global__ void __launch_bounds__(
   cp_async_wait0();
 }
 
+template <int DQ, int R, int CR, int TW, int K, int N, bool W13>
+__global__ void __launch_bounds__(
+    WARPS * 32,
+    (CR * TW <= 2) ? 7 : ((CR * TW <= 4) ? 5 : ((CR * TW <= 8) ? (DQ == 0 ? 5 : 4) : 2)))
+    mxfp4_dec2_gemm(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+                    const int4* __restrict__ W, const uint8_t* __restrict__ S,
+                    const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
+                    const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+                    int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
+                    float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
+                    float limit, int sum_order, int* __restrict__ sync,
+                    __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+                    bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+                    int local_E) {
+  mxfp4_dec2_body<DQ, R, CR, TW, K, N, W13>(
+      A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+      fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+}
+
+// GPU-side dynamic nblk-aware Split-K for Pure TP4 NI=576 W13 (100% CUDA-Graph safe):
+// selects KS=4 (R=80) when active expert blocks nblk < NBLK_THRESH to avoid wave-quantization
+// and SM starvation on correlated batches (e.g. counting), and KS=2 (R=160) when nblk >= NBLK_THRESH
+// to halve partial-sum memory traffic and sync contention on diverse high-batch workloads.
+template <int DQ, int CR, int TW, int K, int N, int NBLK_THRESH>
+__global__ void __launch_bounds__(WARPS * 32, (CR * TW <= 4) ? 5 : 4)
+    mxfp4_dec2_gemm_dynks(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+                          const int4* __restrict__ W, const uint8_t* __restrict__ S,
+                          const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
+                          const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+                          int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
+                          float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
+                          float limit, int sum_order, int* __restrict__ sync,
+                          __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+                          bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+                          int local_E) {
+  if ((ntpp[0] >> 3) < NBLK_THRESH) {
+    mxfp4_dec2_body<DQ, 80, CR, TW, K, N, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  } else {
+    mxfp4_dec2_body<DQ, 160, CR, TW, K, N, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  }
+}
+
+template <int DQ, int CR, int TW, int KK, int NN, int NBLK_THRESH>
+static int64_t launch_dynks(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
+                            at::Tensor const& sorted, at::Tensor const& eids,
+                            at::Tensor const& ntpp, at::Tensor const& topk_w, int64_t topk,
+                            int64_t n_slots, int cap, bool fuse, double limit, int64_t sum_order,
+                            at::Tensor& ctr, at::Tensor& sync, at::Tensor& out, at::Tensor& aux,
+                            const void* topk_ids_raw, bool topk_i64, const int32_t* expert_map_ptr,
+                            int64_t global_E) {
+  TORCH_CHECK(fuse, "dynks w13 requires fuse=true");
+  constexpr int T = WARPS * 32;
+  constexpr int SMEM = WARPS * 2 * CR * TW * 32 * (int)sizeof(int4);
+  constexpr int TG = NN / 64 / TW;
+  auto kern = mxfp4_dec2_gemm_dynks<DQ, CR, TW, KK, NN, NBLK_THRESH>;
+  static const int occ = [&] {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    int n = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, T, SMEM);
+    return n > 0 ? n : 1;
+  }();
+  const int64_t max_blk = std::min<int64_t>(sorted.numel() / 8, n_slots);
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= 4 * n_slots * NN,
+              "w13 dynks partial buffer");
+  TORCH_CHECK(aux.scalar_type() == at::kBFloat16 && aux.is_contiguous() &&
+                  aux.numel() >= n_slots * (NN / 2) &&
+                  sync.numel() >= SYNC_W13 + max_blk * (TG / 2),
+              "fused act: h [n_slots, N/2] bf16 and sync counters");
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t max_items = max_blk * 4 * TG;
+  const int64_t grid = std::min<int64_t>(
+      (max_items + WARPS - 1) / WARPS,
+      (int64_t)sms * (cap > 0 ? std::min(cap, occ) : occ));
+  if (grid > 0)
+    kern<<<grid, T, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+        (const __nv_bfloat16*)a.data_ptr(), a.stride(0), (const int4*)w.data_ptr(),
+        (const uint8_t*)s.data_ptr(), sorted.data_ptr<int32_t>(), eids.data_ptr<int32_t>(),
+        ntpp.data_ptr<int32_t>(), topk_w.numel() > 0 ? topk_w.data_ptr<float>() : nullptr,
+        (int)topk, (int)n_slots, ctr.data_ptr<int32_t>(), ctr.data_ptr<int32_t>() + 1,
+        out.data_ptr<float>(), nullptr, 1, (float)limit, (int)sum_order,
+        sync.data_ptr<int32_t>(), (__nv_bfloat16*)aux.data_ptr(), topk_ids_raw, topk_i64,
+        expert_map_ptr, (int)global_E, (int)w.size(0));
+  return 4;
+}
+
 template <int DQ, int R, int CR, int TW, int KK, int NN, bool W13>
 static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
                       at::Tensor const& sorted, at::Tensor const& eids, at::Tensor const& ntpp,
@@ -750,10 +837,24 @@ int64_t dsv4_mxfp4_gemm2_ep(at::Tensor const& a, at::Tensor const& w, at::Tensor
   DSV4_CASE2(false, 2304, 5120, 144, 4, 16, 1)
   DSV4_CASE2(false, 2304, 5120, 144, 5, 8, 2)
   // DeepSeek-V4.1-Flash pure TP=4 experts: hidden 5120, intermediate 576 (2304/4)
+  // W13: KS=4 (R=80: c0/c2/c3/c4) + KS=2 (R=160: c1 CR=4 occ=5) + dynks (c10: nblk<130?KS4:KS2)
   DSV4_CASE2(true, 5120, 1152, 80, 0, 4, 1)
+  DSV4_CASE2(true, 5120, 1152, 160, 1, 4, 1)
   DSV4_CASE2(true, 5120, 1152, 80, 2, 8, 1)
   DSV4_CASE2(true, 5120, 1152, 80, 3, 2, 1)
   DSV4_CASE2(true, 5120, 1152, 80, 4, 16, 1)
+  if (w13 == true && K == 5120 && N == 1152 && (cfg & 15) == 10) {
+    if (dq == 0)
+      return launch_dynks<0, 4, 1, 5120, 1152, 130>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                    n_slots, cap, fuse, limit, sum_order, ctr,
+                                                    sync, out, aux, topk_ids_raw, topk_i64,
+                                                    expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch_dynks<3, 4, 1, 5120, 1152, 130>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                    n_slots, cap, fuse, limit, sum_order, ctr,
+                                                    sync, out, aux, topk_ids_raw, topk_i64,
+                                                    expert_map_ptr, global_E);
+  }
   DSV4_CASE2(false, 576, 5120, 36, 0, 4, 1)
   DSV4_CASE2(false, 576, 5120, 36, 1, 4, 2)
   DSV4_CASE2(false, 576, 5120, 36, 2, 6, 1)

@@ -79,7 +79,8 @@ try:
         m.apply()
         assert os.environ["VLLM_DSV41_OPT_PROFILE"] == "tp4_fused"
         assert os.environ["VLLM_DSV41_COST_MS_FUSED"] == "tp4"
-        assert os.environ["VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS"] == "3"
+        assert os.environ["VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS"] == "1"
+        assert os.environ["VLLM_DSV41_FUSED_W2_AR"] == "0"
         assert os.environ["VLLM_DSV41_WOA_FP8"] == "0"
 
         # Spawned worker with different argv inherits resolved tp4_fused

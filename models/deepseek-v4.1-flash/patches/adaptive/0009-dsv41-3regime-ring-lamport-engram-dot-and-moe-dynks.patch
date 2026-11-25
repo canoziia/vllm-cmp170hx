@@ -1,0 +1,2286 @@
+From 52be4e4991fbb8cd924eacbf0828e86bc29ee4cf Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Thu, 26 Nov 2026 01:23:14 +0800
+Subject: [PATCH] perf(deepseek-v4.1): 3-regime Ring Lamport AR, Engram Local
+ Partial-Dot, and NI=576 MoE dynks
+
+---
+ vllm/dsv41_opt_profile.py                     |    3 +-
+ .../layers/fused_moe/dsv4_mxfp4_decode.py     |   68 +-
+ vllm/models/deepseek_v41/common/engram.py     |  252 ++-
+ vllm/models/deepseek_v41/nvidia/model.py      |   93 +-
+ vllm/models/deepseek_v41/nvidia/ops/mhc.py    |    6 +-
+ .../specialized_decode/ampere/all_reduce.py   | 1560 ++++++++++++++---
+ 6 files changed, 1667 insertions(+), 315 deletions(-)
+
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 401c6b6..1b619d7 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -200,7 +200,8 @@ PROFILES["tep4_fused"] = {
+ PROFILES["tp4_fused"] = {
+     **PROFILES["tep4_fused"],
+     "VLLM_DSV41_COST_MS_FUSED": "tp4",
+-    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "3",
++    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "1",
++    "VLLM_DSV41_FUSED_W2_AR": "0",
+ }
+ 
+ # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).
+diff --git a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+index 8efe13a..cf4a49d 100644
+--- a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
++++ b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+@@ -104,6 +104,50 @@ def _w2_splitk_max_tokens() -> int:
+     return int(os.environ.get("VLLM_DSV4_MXFP4_W2_SPLITK_MAX_TOKENS", "64"))
+ 
+ 
++def _tp4_w13_cfg(M: int, dq: int, fused_act: bool) -> tuple[int, int]:
++    """Dispatch (cfg, part_ks) for Pure TP4 NI=576 W13 on SM80.
++
++    - M == 1: c4 (KS=4, CR=16, TW=1) for minimum tiny-batch latency.
++    - M = 2..48: c2 (KS=4, CR=8, TW=1) — avoids KS=2 SM starvation on real
++      correlated speculative batches where active blocks nblk << M*topk.
++    - M >= 49 (c=16/32): c10 (GPU-side dynamic nblk-aware Split-K, CR=4 occ=5)
++      branching inside the CUDA-Graph kernel between KS=4 (nblk < 130, avoiding
++      wave quantization on correlated batches) and KS=2 (nblk >= 130, halving
++      partial traffic and sync contention for +3% c=32 throughput).
++    """
++    env = os.environ.get("VLLM_DSV4_MXFP4_TP4_W13_CFG")
++    if env is not None:
++        c = int(env)
++        return c, (2 if c == 1 else 4)
++    if dq not in (0, 3):
++        return 4, 4
++    if M == 1:
++        return 4, 4
++    if 4 <= M <= 6:
++        # occ=5 (2520 warps on 126 SMs) fits M=6 (<=36*18*4 = 2592 items) in
++        # ~1 wave vs 2 waves on occ=4 c2 (-13.3us/layer = -0.53ms/step at c=1 k=5).
++        return 0, 4
++    if M <= 48:
++        return 2, 4
++    return (10, 4) if fused_act else (2, 4)
++
++
++def _tp4_w2_cfg(M: int) -> int:
++    """Cold-L2 + end-to-end tuned cfg for Pure TP4 NI=576 W2 (KS=1) on SM80.
++
++    c4=(12,1) at M=1, c5=(6,2) at M=2 (paired with OneShotFinalize), and
++    c2=(6,1) across M>=3 (eliminating the old c5 slowdown at M=7..192).
++    """
++    env = os.environ.get("VLLM_DSV4_MXFP4_TP4_W2_CFG")
++    if env is not None:
++        return int(env)
++    if M == 1:
++        return 4
++    if M == 2:
++        return 5
++    return 2
++
++
+ def _w2_splitk_ks(M: int) -> int:
+     return 4 if M < 20 else 3
+ 
+@@ -361,7 +405,7 @@ def try_fused_gate_topk_align(
+ 
+     dev = hidden_states.device
+     sk_scr = 4 if E == 384 else 10
+-    fgta_sent = _fgta_sent(dev) if M >= 3 else None
++    fgta_sent = _fgta_sent(dev) if (M >= 3 and E != 384) else None
+     use_sentinel = fgta_sent is not None and fgta_sent.numel() >= sk_scr * 8 * E
+     logits_scr = (
+         fgta_sent
+@@ -886,15 +930,11 @@ def _try_run_v2(
+             s_order,
+         )
+     if ni == 576:
+-        w13_cfg = 2 if dq in (0, 3) else 4
+-        w2_cfg = int(
+-            os.environ.get(
+-                "VLLM_DSV4_MXFP4_TP4_W2_CFG",
+-                "2" if M <= _v4_tile_max_tokens() else "5",
+-            )
+-        )
++        w13_cfg, w13_ks = _tp4_w13_cfg(M, dq, limit is not None)
++        w2_cfg = _tp4_w2_cfg(M)
+     else:
+         w13_cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
++        w13_ks = 4
+         w2_cfg = w13_cfg
+     r2_ops = _ops_r2()
+     w2_ks = None
+@@ -904,7 +944,11 @@ def _try_run_v2(
+         and dq in (0, 2, 3)
+         and topk <= 8
+         and _plain_moe_sum(moe_sum)
+-        and (topk <= 3 or M <= 2 or M <= _w2_splitk_max_tokens())
++        and (
++            (topk <= 3 or M <= 8)
++            if ni == 576
++            else (topk <= 3 or M <= 2 or M <= _w2_splitk_max_tokens())
++        )
+         and (
+             output is None
+             or (
+@@ -921,14 +965,14 @@ def _try_run_v2(
+                 w2_ks = int(
+                     os.environ.get(
+                         "VLLM_DSV4_MXFP4_TP4_W2_KS_MED",
+-                        "2" if (topk <= 3 or M <= 8) else "1",
++                        "2",
+                     )
+                 )
+         else:
+             w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
+-    # W13 split-K partials [4, slots, 2*ni]; split-K W2 reuses the buffer as
++    # W13 split-K partials [w13_ks, slots, 2*ni]; split-K W2 reuses the buffer as
+     # [w2_ks, slots, K] after the activation consumed the W13 partials.
+-    part_numel = max(4 * slots * 2 * ni, (w2_ks or 0) * slots * _K)
++    part_numel = max(w13_ks * slots * 2 * ni, (w2_ks or 0) * slots * _K)
+     part = torch.empty(part_numel, dtype=torch.float32, device=dev)
+     h = intermediate_cache2.reshape(-1)[: slots * ni].view(slots, ni)
+     tw = topk_weights.view(-1)
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+index 112b95b..c851a79 100644
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -36,6 +36,7 @@ from pathlib import Path
+ 
+ import numpy as np
+ import torch
++import torch.distributed as dist
+ from torch import nn
+ 
+ import vllm.envs as envs
+@@ -48,6 +49,7 @@ from vllm.distributed import (
+     get_engram_dp_size,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    get_tp_group,
+     tensor_model_parallel_all_gather,
+ )
+ from vllm.distributed.device_communicators.shm_broadcast import (
+@@ -2452,6 +2454,147 @@ def _fused_engram_post_wkv_kernel(
+     )
+ 
+ 
++@triton.jit(do_not_specialize=["num_kv_tokens"])
++def _engram_partial_dot_kernel(
++    hidden_states,
++    kv_shard,
++    q_weight,
++    k_weight,
++    stats,
++    num_kv_tokens,
++    hidden_stride_t,
++    hidden_stride_h,
++    hidden_stride_d,
++    kv_stride_t,
++    kv_stride_d,
++    q_stride_h,
++    q_stride_d,
++    k_stride_h,
++    k_stride_d,
++    TP_RANK: tl.constexpr,
++    C_PART: tl.constexpr,
++    DIM: tl.constexpr,
++    HC_MULT: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    program_idx = tl.program_id(0)
++    token_idx = (program_idx // HC_MULT).to(tl.int64)
++    hc_idx = program_idx % HC_MULT
++    g_lo = TP_RANK * C_PART
++    g_hi = g_lo + C_PART
++    k_lo = hc_idx * DIM
++    k_hi = k_lo + DIM
++    ov_lo = tl.maximum(g_lo, k_lo)
++    ov_hi = tl.minimum(g_hi, k_hi)
++    ov_len = tl.maximum(ov_hi - ov_lo, 0)
++    offs = tl.arange(0, BLOCK_SIZE)
++    valid = (offs < ov_len) & (token_idx < num_kv_tokens)
++    d_idx = (ov_lo - k_lo) + offs
++    kv_idx = (ov_lo - g_lo) + offs
++
++    hidden = tl.load(
++        hidden_states
++        + token_idx * hidden_stride_t
++        + hc_idx * hidden_stride_h
++        + d_idx * hidden_stride_d,
++        mask=valid,
++        other=0.0,
++    ).to(tl.float32)
++    key = tl.load(
++        kv_shard + token_idx * kv_stride_t + kv_idx * kv_stride_d,
++        mask=valid,
++        other=0.0,
++    ).to(tl.float32)
++    q = tl.load(
++        q_weight + hc_idx * q_stride_h + d_idx * q_stride_d,
++        mask=valid,
++        other=0.0,
++    ).to(tl.float32)
++    k = tl.load(
++        k_weight + hc_idx * k_stride_h + d_idx * k_stride_d,
++        mask=valid,
++        other=0.0,
++    ).to(tl.float32)
++
++    ksq = tl.sum(key * key, axis=0)
++    dot = tl.sum(hidden * q * k * key, axis=0)
++    base = (token_idx * HC_MULT + hc_idx) * 2
++    tl.store(stats + base, ksq)
++    tl.store(stats + base + 1, dot)
++
++
++@triton.jit(do_not_specialize=["num_kv_tokens"])
++def _engram_apply_gate_v_kernel(
++    hidden_states,
++    v_buf,
++    stats,
++    token_mask,
++    output,
++    num_kv_tokens,
++    hidden_stride_t,
++    hidden_stride_h,
++    hidden_stride_d,
++    v_stride_t,
++    v_stride_d,
++    mask_stride,
++    output_stride_t,
++    output_stride_h,
++    output_stride_d,
++    eps,
++    clamp_value,
++    DIM: tl.constexpr,
++    HC_MULT: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_MASK: tl.constexpr,
++):
++    program_idx = tl.program_id(0)
++    token_idx = (program_idx // HC_MULT).to(tl.int64)
++    hc_idx = program_idx % HC_MULT
++    source_valid = token_idx < num_kv_tokens
++
++    dim_offsets = tl.arange(0, BLOCK_SIZE)
++    dim_valid = dim_offsets < DIM
++    hidden = tl.load(
++        hidden_states
++        + token_idx * hidden_stride_t
++        + hc_idx * hidden_stride_h
++        + dim_offsets * hidden_stride_d,
++        mask=dim_valid,
++        other=0.0,
++    ).to(tl.float32)
++    base = (token_idx * HC_MULT + hc_idx) * 2
++    ksq = tl.load(stats + base)
++    dot = tl.load(stats + base + 1)
++
++    hidden_rms = tl.rsqrt(tl.sum(hidden * hidden, axis=0) / DIM + eps)
++    key_rms = tl.rsqrt(ksq / DIM + eps)
++    dot *= hidden_rms * key_rms * tl.rsqrt(DIM * 1.0)
++    gate_input = tl.sqrt(tl.maximum(tl.abs(dot), clamp_value))
++    gate_input = tl.where(dot < 0.0, -gate_input, gate_input)
++    gate = tl.sigmoid(gate_input)
++    if HAS_MASK:
++        active = tl.load(
++            token_mask + token_idx * mask_stride,
++            mask=source_valid,
++            other=0,
++        )
++        gate = tl.where(active, gate, 0.0)
++
++    value = tl.load(
++        v_buf + token_idx * v_stride_t + dim_offsets * v_stride_d,
++        mask=source_valid & dim_valid,
++        other=0.0,
++    ).to(tl.float32)
++    tl.store(
++        output
++        + token_idx * output_stride_t
++        + hc_idx * output_stride_h
++        + dim_offsets * output_stride_d,
++        hidden + gate * value,
++        mask=dim_valid,
++    )
++
++
+ @triton.jit(do_not_specialize=["num_tokens", "token_start", "num_elements"])
+ def _engram_select_rows_kernel(
+     gathered,
+@@ -2917,10 +3060,26 @@ class Engram(nn.Module):
+             kv = self.wkv(self._batch.wkv_input(self, hash_ids.shape[0]))
+         else:
+             kv = self.wkv(self.embed(hash_ids).flatten(-2))
+-        if self._gather_columns is not None:
+-            kv = self._gather_columns(kv)
+         num_kv_tokens = hash_ids.shape[0]
+         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
++        if (
++            self._gather_columns is not None
++            and not self.use_sequence_parallel
++            and num_kv_tokens >= 160
++            and os.environ.get("VLLM_DSV41_ENGRAM_LOCAL_DOT", "1") == "1"
++        ):
++            tp_size = get_tensor_model_parallel_world_size()
++            c_part = kv.shape[1]
++            if (
++                tp_size > 1
++                and c_part * tp_size == (self.hc_mult + 1) * self.dim
++                and c_part >= self.dim
++            ):
++                return self._post_wkv_sharded(
++                    hidden_states, kv, token_mask, num_kv_tokens
++                )
++        if self._gather_columns is not None:
++            kv = self._gather_columns(kv)
+         if self.use_sequence_parallel:
+             tp_size = get_tensor_model_parallel_world_size()
+             tp_rank = get_tensor_model_parallel_rank()
+@@ -2933,6 +3092,95 @@ class Engram(nn.Module):
+ 
+         return self._post_wkv(hidden_states, kv, token_mask, num_kv_tokens)
+ 
++    def _post_wkv_sharded(
++        self,
++        hidden_states: torch.Tensor,
++        kv_shard: torch.Tensor,
++        token_mask: torch.Tensor | None,
++        num_kv_tokens: int,
++    ) -> torch.Tensor:
++        """Lossless 5x-bandwidth-reduced Engram update from TP-column-sharded
++        `kv_shard` (`[M, c_part]`): computes local FP32 partial `(key^2, dot)`
++        scalars per stream, all-reduces only `[M, 2*hc_mult]` FP32 scalars and
++        broadcasts only `V` (`[M, dim]`, 1/5 of `kv`) from the last TP rank."""
++        num_tokens, hc_mult, dim = hidden_states.shape
++        assert hc_mult == self.hc_mult and dim == self.dim
++        output = torch.empty_like(hidden_states)
++        if num_tokens == 0:
++            return output
++
++        tp_group = get_tp_group()
++        tp_size = tp_group.world_size
++        tp_rank = tp_group.rank_in_group
++        c_part = kv_shard.shape[1]
++        block_size = triton.next_power_of_2(dim)
++        num_warps = 8 if block_size >= 2048 else 4
++
++        stats = torch.empty(
++            (num_tokens, hc_mult * 2), dtype=torch.float32, device=hidden_states.device
++        )
++        _engram_partial_dot_kernel[(num_tokens * hc_mult,)](
++            hidden_states,
++            kv_shard,
++            self.q_weight,
++            self.k_weight,
++            stats,
++            num_kv_tokens,
++            hidden_states.stride(0),
++            hidden_states.stride(1),
++            hidden_states.stride(2),
++            kv_shard.stride(0),
++            kv_shard.stride(1),
++            self.q_weight.stride(0),
++            self.q_weight.stride(1),
++            self.k_weight.stride(0),
++            self.k_weight.stride(1),
++            TP_RANK=tp_rank,
++            C_PART=c_part,
++            DIM=dim,
++            HC_MULT=hc_mult,
++            BLOCK_SIZE=block_size,
++            num_warps=num_warps,
++        )
++        dist.all_reduce(stats, group=tp_group.device_group)
++
++        if tp_rank == tp_size - 1:
++            v_buf = kv_shard[:, c_part - dim : c_part].contiguous()
++        else:
++            v_buf = torch.empty(
++                (num_kv_tokens, dim), dtype=kv_shard.dtype, device=kv_shard.device
++            )
++        dist.broadcast(
++            v_buf, src=tp_group.ranks[tp_size - 1], group=tp_group.device_group
++        )
++
++        mask = token_mask if token_mask is not None else hidden_states
++        _engram_apply_gate_v_kernel[(num_tokens * hc_mult,)](
++            hidden_states,
++            v_buf,
++            stats,
++            mask,
++            output,
++            num_kv_tokens,
++            hidden_states.stride(0),
++            hidden_states.stride(1),
++            hidden_states.stride(2),
++            v_buf.stride(0),
++            v_buf.stride(1),
++            token_mask.stride(0) if token_mask is not None else 0,
++            output.stride(0),
++            output.stride(1),
++            output.stride(2),
++            self.eps,
++            self.clamp_value,
++            DIM=dim,
++            HC_MULT=hc_mult,
++            BLOCK_SIZE=block_size,
++            HAS_MASK=token_mask is not None,
++            num_warps=num_warps,
++        )
++        return output
++
+     def _post_wkv(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 042ffed..231fefb 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -1742,11 +1742,59 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     engram_mod._batch.wkv_input(engram_mod, layer_hashes.shape[0])
+                 )
+             else:
+-                kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
++                if (
++                    engram_mod._gather_columns is not None
++                    and dma is not None
++                    and engram_mod.embed_tokens.tp_size == W
++                ):
++                    emb_rows = engram_mod._ready_rows(layer_hashes.shape[0])
++                    emb_flat = emb_rows.flatten(1).contiguous()
++                    if dma.supports_shard(emb_flat):
++                        emb_g = torch.empty(
++                            (W, emb_flat.shape[0], emb_flat.shape[1]),
++                            dtype=emb_flat.dtype,
++                            device=dev,
++                        )
++                        dma.all_gather(
++                            emb_flat,
++                            emb_g.view(W * emb_flat.shape[0], emb_flat.shape[1]),
++                            stream=def_stream,
++                        )
++                        emb_full = (
++                            emb_g.permute(1, 0, 2)
++                            .reshape(emb_flat.shape[0], -1, emb_rows.shape[-1])[
++                                :, : engram_mod.embed_tokens.n_hash_cols
++                            ]
++                            .flatten(-2)
++                            .contiguous()
++                        )
++                        del emb_g
++                        kv = engram_mod.wkv(emb_full)
++                        del emb_full
++                    else:
++                        kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
++                else:
++                    kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
+             if engram_mod._gather_columns is not None:
+-                kv = engram_mod._gather_columns(kv)
+-            kv_local = _slice_pad_local(kv)
+-            del kv
++                # Row-sharded prefill only needs local [S, W * C_part] rows:
++                # exchange [W, S, C_part] via AllToAll (1/W bytes vs AllGather
++                # + slice, 100% bitwise identical, -118 MB peak VRAM at M=3072).
++                c_part = kv.shape[1]
++                if M == M_pad and kv.is_contiguous():
++                    send = kv.view(W, S, c_part)
++                else:
++                    send = kv.new_zeros((M_pad, c_part))
++                    send[:M].copy_(kv)
++                    send = send.view(W, S, c_part)
++                del kv
++                recv = torch.empty_like(send)
++                dist.all_to_all_single(recv, send, group=tp_dev_group)
++                del send
++                kv_local = recv.permute(1, 0, 2).reshape(S, W * c_part).contiguous()
++                del recv
++            else:
++                kv_local = _slice_pad_local(kv)
++                del kv
+             mask_local: torch.Tensor | None = None
+             if tok_mask is not None:
+                 if valid == S:
+@@ -2155,6 +2203,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         full_num_tokens = positions.shape[0]
+         dev = hidden_states.device
+         def_stream = torch.cuda.current_stream(dev)
++        dma = self._pcie_dma_ring
++        split_moe_in_ar = (
++            os.environ.get("VLLM_DSV41_PREFILL_AR_SPLIT_MOE", "1") == "1"
++        )
++
++        def _ar_inplace(buf: torch.Tensor, stream: torch.cuda.Stream) -> None:
++            if dma is not None and dma.supports_full(buf):
++                dma.all_reduce_inplace(buf, stream=stream)
++            else:
++                pynccl.all_reduce(buf, buf, stream=stream)
++
+         comm_stream, evs, comm_buf = _get_prefill_ar_state(
+             dev,
+             full_num_tokens,
+@@ -2517,9 +2576,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         )
+                         ev_sync0.record(def_stream)
+                         comm_stream.wait_event(ev_sync0)
+-                        pynccl.all_reduce(
+-                            y_comm[:m0], y_comm[:m0], stream=comm_stream
+-                        )
++                        _ar_inplace(y_comm[:m0], comm_stream)
+                         ev_ar0.record(comm_stream)
+ 
+                         layer.attn._o_proj(
+@@ -2528,9 +2585,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                         del attn_out
+                         ev_sync1.record(def_stream)
+                         comm_stream.wait_event(ev_sync1)
+-                        pynccl.all_reduce(
+-                            y_comm[m0:], y_comm[m0:], stream=comm_stream
+-                        )
++                        _ar_inplace(y_comm[m0:], comm_stream)
+                         ev_ar1.record(comm_stream)
+                     finally:
+                         layer.attn.wo_b.reduce_results = orig_wob_reduce
+@@ -2584,7 +2639,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     )
+                     del ares0, apm0, arm0, aapre0
+ 
+-                    if can_defer_ffn_ar and mega_gate_metadata is None:
++                    if can_defer_ffn_ar and split_moe_in_ar and mega_gate_metadata is None:
+                         assert moe_cfg is not None
+                         ids_ok = (
+                             input_ids is not None
+@@ -2602,9 +2657,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                             del h0
+                             ev_fsync0.record(def_stream)
+                             comm_stream.wait_event(ev_fsync0)
+-                            pynccl.all_reduce(
+-                                y_comm[:m0], y_comm[:m0], stream=comm_stream
+-                            )
++                            _ar_inplace(y_comm[:m0], comm_stream)
+                             ef0.record(comm_stream)
+ 
+                             def_stream.wait_event(ev_ar1)
+@@ -2637,9 +2690,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                             del h1
+                             ev_fsync1.record(def_stream)
+                             comm_stream.wait_event(ev_fsync1)
+-                            pynccl.all_reduce(
+-                                y_comm[m0:], y_comm[m0:], stream=comm_stream
+-                            )
++                            _ar_inplace(y_comm[m0:], comm_stream)
+                             ef1.record(comm_stream)
+                         finally:
+                             moe_cfg.skip_final_all_reduce = orig_skip
+@@ -2766,13 +2817,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                             del h_raw
+                             ev_fsync0.record(def_stream)
+                             comm_stream.wait_event(ev_fsync0)
+-                            pynccl.all_reduce(
+-                                h_comm[:m0], h_comm[:m0], stream=comm_stream
+-                            )
++                            _ar_inplace(h_comm[:m0], comm_stream)
+                             ef0.record(comm_stream)
+-                            pynccl.all_reduce(
+-                                h_comm[m0:], h_comm[m0:], stream=comm_stream
+-                            )
++                            _ar_inplace(h_comm[m0:], comm_stream)
+                             ef1.record(comm_stream)
+                         finally:
+                             moe_cfg.skip_final_all_reduce = orig_skip
+diff --git a/vllm/models/deepseek_v41/nvidia/ops/mhc.py b/vllm/models/deepseek_v41/nvidia/ops/mhc.py
+index f601054..a084052 100644
+--- a/vllm/models/deepseek_v41/nvidia/ops/mhc.py
++++ b/vllm/models/deepseek_v41/nvidia/ops/mhc.py
+@@ -401,6 +401,7 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
+         ampere_peer_topology,
+         default_ampere_ar_capacity,
+         default_ampere_ar_oneshot_max_rows,
++        default_ampere_ar_ring_min_rows,
+     )
+ 
+     group = get_tp_group()
+@@ -409,6 +410,7 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
+     topo = ampere_peer_topology() or "pcie"
+     capacity = default_ampere_ar_capacity(topo)
+     oneshot_capacity = default_ampere_ar_oneshot_max_rows(topo)
++    ring_min_rows = default_ampere_ar_ring_min_rows(topo)
+     top_k = None if parallel.enable_expert_parallel else config.num_experts_per_tok
+     _ampere_all_reduce = AmpereAllReduce(
+         group.device_group,
+@@ -417,13 +419,15 @@ def init_ampere_all_reduce(vllm_config: VllmConfig) -> None:
+         capacity=capacity,
+         top_k=top_k,
+         oneshot_capacity=oneshot_capacity,
++        ring_min_rows=ring_min_rows,
+     )
+     logger.info_once(
+         "DSV4.1 mHC: CuTe DSL Lamport all-reduce (%s) for up to %d tokens "
+-        "(oneshot <= %d).",
++        "(oneshot <= %d, ring >= %d).",
+         topo,
+         _ampere_all_reduce.capacity,
+         _ampere_all_reduce.oneshot_capacity,
++        _ampere_all_reduce.ring_min_rows,
+     )
+ 
+ 
+diff --git a/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py b/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
+index 0b1ebe1..a46e160 100644
+--- a/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
++++ b/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py
+@@ -178,6 +178,45 @@ def store_fragment(address: Int64, words: list) -> None:
+     store_global_u32x4(Int64(address), [Uint32(word) for word in words], volatile=True)
+ 
+ 
++@dsl_user_op
++def _store_rel_sys_v4(
++    address: Int64,
++    w0: Uint32,
++    w1: Uint32,
++    w2: Uint32,
++    w3: Uint32,
++    *,
++    loc=None,
++    ip=None,
++) -> None:
++    _asm(
++        None,
++        [
++            Int64(address).ir_value(loc=loc, ip=ip),
++            Uint32(w0).ir_value(loc=loc, ip=ip),
++            Uint32(w1).ir_value(loc=loc, ip=ip),
++            Uint32(w2).ir_value(loc=loc, ip=ip),
++            Uint32(w3).ir_value(loc=loc, ip=ip),
++        ],
++        "st.relaxed.sys.global.v4.u32 [$0], {$1, $2, $3, $4};",
++        "l,r,r,r,r",
++        True,
++        loc,
++        ip,
++    )
++
++
++def store_fragment_ring(address: Int64, words: list) -> None:
++    """System-scope relaxed 16-byte P2P store for coalesced push-ring."""
++    _store_rel_sys_v4(
++        Int64(address),
++        Uint32(words[0]),
++        Uint32(words[1]),
++        Uint32(words[2]),
++        Uint32(words[3]),
++    )
++
++
+ @cute.jit
+ def poll(address: Int64, words: cute.Tensor):
+     """Wait until the slot at `address` holds no sentinel, read it into
+@@ -1024,264 +1063,1152 @@ class OneShotAllReducePostCollapse:
+             row += ctas
+ 
+ 
+-@cache
+-def _oneshot_collapse_kernel(
+-    device_index: int,
+-    hidden: int,
+-    world: int,
+-    capacity: int,
+-    write_aux: bool,
+-    slot_base: int,
+-):
+-    """`OneShotAllReducePostCollapse` compiled for a device and variant."""
+-    with torch.accelerator.device_index(device_index):
+-        return cute.compile(
+-            OneShotAllReducePostCollapse(
+-                hidden, world, capacity, write_aux, slot_base
+-            ),
+-            *(Int64(0),) * 3,
+-            Int32(0),
+-            *(Int64(0),) * 4,
+-            Int32(4),
+-            *(Int64(0),) * 4,
+-            Int32(1),
+-            Int32(1),
+-            Float32(1e-6),
+-            make_fake_stream(),
+-        )
+-
+-
+-@cache
+-def _kernel(device_index: int, hidden: int, world: int, capacity: int):
+-    """`TwoShotAllReduce` compiled for a device and shape."""
+-    with torch.accelerator.device_index(device_index):
+-        return cute.compile(
+-            TwoShotAllReduce(hidden, world, capacity),
+-            *(Int64(0),) * 4,
+-            Int32(0),
+-            Int32(1),
+-            Int32(1),
+-            make_fake_stream(),
+-        )
+-
+-
+-@cache
+-def _collapse_kernel(
+-    device_index: int, hidden: int, world: int, capacity: int, write_aux: bool
+-):
+-    """`TwoShotAllReducePostCollapse` compiled for a device and variant."""
+-    with torch.accelerator.device_index(device_index):
+-        return cute.compile(
+-            TwoShotAllReducePostCollapse(hidden, world, capacity, write_aux),
+-            *(Int64(0),) * 3,
+-            Int32(0),
+-            *(Int64(0),) * 4,
+-            Int32(4),
+-            *(Int64(0),) * 4,
+-            Int32(1),
+-            Int32(1),
+-            Float32(1e-6),
+-            make_fake_stream(),
+-        )
+-
+-
+-@cache
+-def _finalize_kernel(
+-    device_index: int,
+-    hidden: int,
+-    world: int,
+-    capacity: int,
+-    write_aux: bool,
+-    top_k: int,
+-):
+-    """`TwoShotAllReduceFinalizePostCollapse` compiled for a device and
+-    variant."""
+-    with torch.accelerator.device_index(device_index):
+-        return cute.compile(
+-            TwoShotAllReduceFinalizePostCollapse(
+-                hidden, world, capacity, write_aux, top_k
+-            ),
+-            *(Int64(0),) * 5,
+-            Int32(0),
+-            *(Int64(0),) * 4,
+-            Int32(4),
+-            *(Int64(0),) * 4,
+-            Int32(1),
+-            Int32(1),
+-            Float32(1e-6),
+-            make_fake_stream(),
+-        )
+-
+-
+-@cache
+-def _w2_splitk_kernel(
+-    device_index: int,
+-    hidden: int,
+-    world: int,
+-    capacity: int,
+-    write_aux: bool,
+-    top_k: int,
+-    ks: int,
+-):
+-    """`TwoShotAllReduceW2SplitKPostCollapse` compiled for a device and variant."""
+-    with torch.accelerator.device_index(device_index):
+-        return cute.compile(
+-            TwoShotAllReduceW2SplitKPostCollapse(
+-                hidden, world, capacity, write_aux, top_k, ks
+-            ),
+-            *(Int64(0),) * 5,
+-            Int32(384),
+-            Int64(0),
+-            *(Int64(0),) * 2,
+-            Int32(0),
+-            *(Int64(0),) * 4,
+-            Int32(4),
+-            *(Int64(0),) * 4,
+-            Int32(1),
+-            Int32(1),
+-            Float32(1e-6),
+-            make_fake_stream(),
+-        )
+-
+-
+-def ampere_peer_topology() -> str | None:
+-    """Return `'nvlink'` when vLLM's custom all-reduce reports full NVLink
+-    connectivity, `'pcie'` when PCIe P2P collectives are opted in and every TP
+-    peer pair on the node has direct CUDA P2P access behind a shared PCIe
+-    switch (`PIX`/`PXB`, or overridden via `VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force`),
+-    or `None` otherwise. Collective over the TP group so all ranks agree."""
+-    from vllm.distributed import get_tp_group
+-    from vllm.dsv41_opt_profile import NVML_TOPO_NAMES, pcie_switch_connected_nvml
+-    from vllm.logger import init_logger
+-
+-    tp_group = get_tp_group()
+-    comm = getattr(tp_group.device_communicator, "ca_comm", None)
+-    if comm is not None and not comm.disabled and comm.fully_connected:
+-        return "nvlink"
+-    pcie_opt = (
+-        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
+-    )
+-    if pcie_opt not in ("1", "force"):
+-        return None
+-    world_size = tp_group.world_size
+-    if world_size < 2 or world_size > torch.cuda.device_count():
+-        return None
+-    local_dev = torch.cuda.current_device()
+-    dev_tensor = torch.empty(world_size, dtype=torch.int32, device=tp_group.device)
+-    my_dev = torch.tensor([local_dev], dtype=torch.int32, device=tp_group.device)
+-    dist.all_gather_into_tensor(dev_tensor, my_dev, group=tp_group.device_group)
+-    peer_devs = [int(x) for x in dev_tensor.cpu().tolist()]
+-    ok = int(len(set(peer_devs)) == world_size)
+-    if ok:
+-        for d in peer_devs:
+-            if d != local_dev and not torch.cuda.can_device_access_peer(local_dev, d):
+-                ok = 0
+-                break
+-    if ok and pcie_opt != "force":
+-        phys_ids: list[int | str] = []
+-        for d in peer_devs:
+-            try:
+-                u = getattr(torch.cuda.get_device_properties(d), "uuid", None)
+-                if u is not None:
+-                    phys_ids.append(f"GPU-{u}")
+-                    continue
+-            except Exception:
+-                pass
+-            phys_ids.append(current_platform.visible_device_id_to_physical_device_id(d))
+-        switch_ok, worst_lvl = pcie_switch_connected_nvml(phys_ids)
+-        if worst_lvl is not None and not switch_ok:
+-            ok = 0
+-            topo_name = NVML_TOPO_NAMES.get(worst_lvl, f"level={worst_lvl}")
+-            init_logger(__name__).info_once(
+-                "DSV41: PCIe peers traverse CPU root complex (NVML topology=%s); "
+-                "disabling CuTe Lamport P2P collectives and falling back to PyNCCL "
+-                "(fine-grained 16B P2P writes congest cross-RC interconnects; "
+-                "set VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force to override, and "
+-                "consider NCCL_P2P_LEVEL=SYS if PyNCCL disables P2P).",
+-                topo_name,
+-            )
+-    flag = torch.tensor([ok], dtype=torch.int32, device=tp_group.device)
+-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.device_group)
+-    return "pcie" if int(flag.item()) == 1 else None
+-
+-
+-def default_ampere_ar_capacity(topology: str) -> int:
+-    """Default max rows for `AmpereAllReduce`: full `MAX_ROWS` (192) on NVLink,
+-    or 60 rows on PCIe Gen4 x16 (where push Lamport wins M<=60 and Ring NCCL
+-    wins M>=64). Overridable via `VLLM_DSV41_AMPERE_AR_MAX_ROWS`."""
+-    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_MAX_ROWS", "").strip()
+-    if raw:
+-        return max(1, min(MAX_ROWS, int(raw)))
+-    return MAX_ROWS if topology == "nvlink" else min(MAX_ROWS, 60)
+-
+-
+-def default_ampere_ag_capacity(
+-    topology: str, row_bytes: int, max_rows: int = MAX_ROWS
+-) -> int:
+-    """Default max rows for `AmpereAllGather`: full `max_rows` on NVLink (or
+-    tiny <=64B control/argmax rows on PCIe), else bounded by
+-    `VLLM_DSV41_AMPERE_AG_MAX_BYTES` (default 384 KiB/rank) on PCIe."""
+-    if topology == "nvlink" or row_bytes <= 64:
+-        return max_rows
+-    max_bytes = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_BYTES", "393216"))
+-    pcie_row_cap = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_ROWS", "64"))
+-    return max(1, min(max_rows, pcie_row_cap, max_bytes // max(1, row_bytes)))
+-
+-
+-def default_ampere_ar_oneshot_max_rows(topology: str) -> int:
+-    """Default max rows for 1-hop `OneShotAllReducePostCollapse`: 2 rows on
+-    PCIe Gen4 x16 (saving one full PCIe hop at M=1,2), 0 on NVLink."""
+-    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_ONESHOT_ROWS", "").strip()
+-    if raw:
+-        return max(0, min(MAX_ROWS, int(raw)))
+-    return 2 if topology == "pcie" else 0
+-
+-
+-class AmpereAllReduce:
+-    """The mailbox and per-row generations of `TwoShotAllReduce` for one TP
+-    group; construction is collective over the group.
+-
+-    Args:
+-        group: The TP group's device process group.
+-        hidden: Values per row.
+-        device: This rank's device.
+-        capacity: The most rows a call takes (`MAX_ROWS` by default).
+-        top_k: Routes a token of the MoE outputs `finalize_post_collapse`
+-            takes; None compiles no finalize kernels.
+-        oneshot_capacity: Optional tiny-row threshold (`<= capacity`) routed to
+-            1-hop `OneShotAllReducePostCollapse` inside `post_collapse`.
+-
+-    """
++class OneShotAllReduceFinalizePostCollapse(OneShotAllReducePostCollapse):
++    """One-shot push Lamport all-reduce fused with MoE top-k finalize, shared-expert
++    add, and `PostCollapse` for tiny row counts (`rows <= oneshot_capacity`, e.g.
++    `M=1,2`) on PCIe P2P. Saves one full peer-to-peer PCIe hop versus two-shot
++    finalize while avoiding separate W2 split-K sum and shared-add launches."""
+ 
+     def __init__(
+         self,
+-        group: dist.ProcessGroup,
+         hidden: int,
+-        device: torch.device,
+-        capacity: int = MAX_ROWS,
+-        top_k: int | None = None,
+-        oneshot_capacity: int = 0,
++        world: int,
++        capacity: int,
++        write_aux: bool,
++        top_k: int,
++        slot_base: int = 0,
+     ):
+-        self.world = dist.get_world_size(group)
+-        self.rank = dist.get_rank(group)
+-        self.hidden = hidden
+-        self.capacity = capacity
++        super().__init__(hidden, world, capacity, write_aux, slot_base)
+         self.top_k = top_k
+-        self.oneshot_capacity = (
+-            min(capacity, oneshot_capacity)
+-            if oneshot_capacity > 0 and self.world in (2, 4, 8)
+-            else 0
+-        )
+-        # The most CTAs a call launches, one per SM (see the module docstring).
+-        self.ctas = current_platform.num_compute_units(device.index)
+-        self.kernel = _kernel(device.index, hidden, self.world, capacity)
+-        self.collapse_kernels = [
+-            _collapse_kernel(device.index, hidden, self.world, capacity, write_aux)
+-            for write_aux in (False, True)
+-        ]
+-        two_shot_bytes = TwoShotAllReduce(hidden, self.world, capacity).mailbox_bytes()
+-        if self.oneshot_capacity > 0:
+-            self.oneshot_collapse_kernels = [
++
++    @cute.jit
++    def __call__(
++        self,
++        routes: Int64,
++        route_weights: Int64,
++        shared: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        ctas: Int32,
++        eps: Float32,
++        stream: cuda.CUstream,
++    ):
++        @cute.struct
++        class Storage:
++            sums: cute.struct.MemRange[Float32, self.collapse.warps]
++
++        self.kernel(
++            routes,
++            route_weights,
++            shared,
++            peers,
++            generations,
++            rank,
++            residual,
++            post,
++            comb,
++            pre,
++            pre_stride,
++            weight,
++            residual_out,
++            layer_input,
++            aux,
++            rows,
++            eps,
++            Storage,
++        ).launch(grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream)
++
++    @cute.kernel
++    def kernel(
++        self,
++        routes: Int64,
++        route_weights: Int64,
++        shared: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        eps: Float32,
++        Storage: cutlass.Constexpr,
++    ):
++        tid, _, _ = cute.arch.thread_idx()
++        row, _, _ = cute.arch.block_idx()
++        smem = cutlass.utils.SmemAllocator()
++        storage = smem.allocate(Storage)
++        sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
++        ctas, _, _ = cute.arch.grid_dim()
++        top_k = self.top_k
++        while row < rows:
++            generation_address = generations + Int64(row) * 4
++            generation = load_s32(generation_address)
++            route_words = [
++                load_fragment(
++                    routes
++                    + ((Int64(row) * top_k + k) * self.fragments + tid) * FRAGMENT_BYTES
++                )
++                for k in range(top_k)
++            ]
++            scales = [
++                f32_from_bits(load_u32(route_weights + (Int64(row) * top_k + k) * 4))
++                for k in range(top_k)
++            ]
++            shared_words = load_fragment(
++                shared + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
++            )
++            acc = unpack(route_words[0])
++            acc = [value * scales[0] for value in acc]
++            for k in cutlass.range_constexpr(1, top_k):
++                values = unpack(route_words[k])
++                acc = [fma(values[e], scales[k], acc[e]) for e in range(VEC)]
++            shared_values = unpack(shared_words)
++            partial = pack([acc[e] + shared_values[e] for e in range(VEC)])
++            sanitized = [sanitize_negative_zero_u32(word) for word in partial]
++            # Issue peer PCIe DMA stores first so they overlap local load_row.
++            for p_off in cutlass.range_constexpr(1, self.world):
++                dst = (rank + p_off) % self.world
++                store_fragment(
++                    load_u64(peers + Int64(dst) * 8)
++                    + self.slot(generation, rank, row, tid),
++                    sanitized,
++                )
++            loaded = self.collapse.load_row(
++                residual, post, comb, pre, pre_stride, weight, row, tid
++            )
++            local = load_u64(peers + Int64(rank) * 8)
++            words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++            s01 = [Float32(0.0)] * VEC
++            s23 = [Float32(0.0)] * VEC
++            s45 = [Float32(0.0)] * VEC
++            s67 = [Float32(0.0)] * VEC
++            for src in cutlass.range_constexpr(self.world):
++                vals = [Float32(0.0)] * VEC
++                if src == rank:
++                    vals = unpack(sanitized)
++                else:
++                    poll(local + self.slot(generation, src, row, tid), words)
++                    vals = unpack([words[i] for i in range(4)])
++                if cutlass.const_expr(src == 0):
++                    s01 = vals
++                elif cutlass.const_expr(src == 1):
++                    s01 = [s01[e] + vals[e] for e in range(VEC)]
++                elif cutlass.const_expr(src == 2):
++                    s23 = vals
++                elif cutlass.const_expr(src == 3):
++                    s23 = [s23[e] + vals[e] for e in range(VEC)]
++                elif cutlass.const_expr(src == 4):
++                    s45 = vals
++                elif cutlass.const_expr(src == 5):
++                    s45 = [s45[e] + vals[e] for e in range(VEC)]
++                elif cutlass.const_expr(src == 6):
++                    s67 = vals
++                elif cutlass.const_expr(src == 7):
++                    s67 = [s67[e] + vals[e] for e in range(VEC)]
++            sums = s01
++            if cutlass.const_expr(self.world >= 4):
++                sums = [sums[e] + s23[e] for e in range(VEC)]
++            if cutlass.const_expr(self.world == 8):
++                s47 = [s45[e] + s67[e] for e in range(VEC)]
++                sums = [sums[e] + s47[e] for e in range(VEC)]
++            reduced = [
++                sanitize_negative_zero_u32(
++                    pack_bf16x2(sums[2 * i], sums[2 * i + 1])
++                )
++                for i in range(4)
++            ]
++            xs = unpack(reduced)
++            self.collapse.finish_row(
++                xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
++            )
++            cute.arch.barrier()
++            if tid == 0:
++                store_u32(
++                    generation_address,
++                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
++                )
++            row += ctas
++
++
++class RingAllReduce:
++    """Single-kernel coalesced push-ring Lamport all-reduce for PCIe P2P at
++    medium/large decode batches (`rows >= ring_min_rows`, e.g. `16..192`).
++
++    Unlike TwoShot (which scatters all-to-all across PCIe switches and suffers
++    switch incast above ~12 rows), each rank pushes strictly to
++    `next = (rank + 1) % world` in contiguous 16B-vectorized warp strips along
++    a unidirectional ring for `W - 1` Reduce-Scatter hops followed by `W - 1`
++    All-Gather hops. Every rank gets bitwise-identical BF16 results, and 3
++    Lamport generations make the kernel CUDA-graph safe without barriers.
++    """
++
++    def __init__(
++        self,
++        hidden: int,
++        world: int,
++        capacity: int,
++        slot_base: int = 0,
++    ):
++        assert hidden % (VEC * world) == 0
++        assert world in (2, 4, 8)
++        self.hidden = hidden
++        self.world = world
++        self.capacity = capacity
++        self.slot_base = slot_base
++        self.fragments = hidden // VEC
++        self.slice_fragments = self.fragments // world
++        self.hops = 2 * (world - 1)
++
++    def mailbox_bytes(self) -> int:
++        return (
++            LAMPORT_GENERATIONS
++            * self.hops
++            * self.capacity
++            * self.slice_fragments
++            * FRAGMENT_BYTES
++        )
++
++    @cute.jit
++    def ring_slot(
++        self, generation: Int32, hop: Int32, row: Int32, fragment: Int32
++    ) -> Int64:
++        return self.slot_base + (
++            ((Int64(generation) * self.hops + hop) * self.capacity + row)
++            * self.slice_fragments
++            + fragment
++        ) * FRAGMENT_BYTES
++
++    @cute.jit
++    def __call__(
++        self,
++        x: Int64,
++        out: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        rows: Int32,
++        ctas: Int32,
++        stream: cuda.CUstream,
++    ):
++        @cute.struct
++        class Storage:
++            row_buf: cute.struct.MemRange[Uint32, self.fragments * 4]
++
++        self.kernel(x, out, peers, generations, rank, rows, Storage).launch(
++            grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        x: Int64,
++        out: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        rows: Int32,
++        Storage: cutlass.Constexpr,
++    ):
++        tid, _, _ = cute.arch.thread_idx()
++        row, _, _ = cute.arch.block_idx()
++        ctas, _, _ = cute.arch.grid_dim()
++        smem = cutlass.utils.SmemAllocator()
++        storage = smem.allocate(Storage)
++        sRow = storage.row_buf.get_tensor(cute.make_layout(self.fragments * 4))
++
++        local = load_u64(peers + Int64(rank) * 8)
++        next_rank = (rank + 1) % self.world
++        next_peer = load_u64(peers + Int64(next_rank) * 8)
++        sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
++        sf = self.slice_fragments
++        W = self.world
++
++        while row < rows:
++            generation_address = generations + Int64(row) * 4
++            generation = load_s32(generation_address)
++            partial = load_fragment(
++                x + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
++            )
++            sanitized = [sanitize_negative_zero_u32(word) for word in partial]
++            for i in cutlass.range_constexpr(4):
++                sRow[tid * 4 + i] = sanitized[i]
++            cute.arch.barrier()
++
++            if tid < sf:
++                words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++                cur = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++                c0 = (rank + W - 1) % W
++                base0 = (c0 * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    cur[i] = sRow[base0 + i]
++                for h in cutlass.range_constexpr(W - 1):
++                    store_fragment_ring(
++                        next_peer + self.ring_slot(generation, Int32(h), row, tid),
++                        [cur[i] for i in range(4)],
++                    )
++                    in_addr = local + self.ring_slot(generation, Int32(h), row, tid)
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 2 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    in_f = unpack([words[i] for i in range(4)])
++                    loc_f = unpack([sRow[rbase + i] for i in range(4)])
++                    summed = [in_f[i] + loc_f[i] for i in range(VEC)]
++                    for i in cutlass.range_constexpr(4):
++                        cur[i] = sanitize_negative_zero_u32(
++                            pack_bf16x2(summed[2 * i], summed[2 * i + 1])
++                        )
++
++                own_base = (rank * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    sRow[own_base + i] = cur[i]
++
++                for h in cutlass.range_constexpr(W - 1):
++                    hop_idx = (W - 1) + h
++                    store_fragment_ring(
++                        next_peer
++                        + self.ring_slot(generation, Int32(hop_idx), row, tid),
++                        [cur[i] for i in range(4)],
++                    )
++                    in_addr = local + self.ring_slot(
++                        generation, Int32(hop_idx), row, tid
++                    )
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 1 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    for i in cutlass.range_constexpr(4):
++                        val = words[i]
++                        sRow[rbase + i] = val
++                        cur[i] = val
++
++            cute.arch.barrier()
++            store_fragment(
++                out + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES,
++                [sRow[tid * 4 + i] for i in range(4)],
++            )
++            if tid < sf:
++                for h in cutlass.range_constexpr(2 * (W - 1)):
++                    store_fragment_ring(
++                        local + self.ring_slot(generation, Int32(h), row, tid),
++                        [sentinel] * 4,
++                    )
++            cute.arch.barrier()
++            if tid == 0:
++                store_u32(
++                    generation_address,
++                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
++                )
++            row += ctas
++
++
++class RingAllReducePostCollapse(RingAllReduce):
++    """`RingAllReduce` fused with `PostCollapse` (post-mix, collapse, RMSNorm)
++    in one CTA, overlapping Hop 0 PCIe flight with local residual loads."""
++
++    def __init__(
++        self,
++        hidden: int,
++        world: int,
++        capacity: int,
++        write_aux: bool,
++        slot_base: int = 0,
++    ):
++        super().__init__(hidden, world, capacity, slot_base)
++        self.collapse = PostCollapse(hidden, has_post=True, write_aux=write_aux)
++
++    @cute.jit
++    def __call__(
++        self,
++        x: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        ctas: Int32,
++        eps: Float32,
++        stream: cuda.CUstream,
++    ):
++        @cute.struct
++        class Storage:
++            sums: cute.struct.MemRange[Float32, self.collapse.warps]
++            row_buf: cute.struct.MemRange[Uint32, self.fragments * 4]
++
++        self.kernel(
++            x,
++            peers,
++            generations,
++            rank,
++            residual,
++            post,
++            comb,
++            pre,
++            pre_stride,
++            weight,
++            residual_out,
++            layer_input,
++            aux,
++            rows,
++            eps,
++            Storage,
++        ).launch(grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream)
++
++    @cute.kernel
++    def kernel(
++        self,
++        x: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        eps: Float32,
++        Storage: cutlass.Constexpr,
++    ):
++        tid, _, _ = cute.arch.thread_idx()
++        row, _, _ = cute.arch.block_idx()
++        ctas, _, _ = cute.arch.grid_dim()
++        smem = cutlass.utils.SmemAllocator()
++        storage = smem.allocate(Storage)
++        sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
++        sRow = storage.row_buf.get_tensor(cute.make_layout(self.fragments * 4))
++
++        local = load_u64(peers + Int64(rank) * 8)
++        next_rank = (rank + 1) % self.world
++        next_peer = load_u64(peers + Int64(next_rank) * 8)
++        sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
++        sf = self.slice_fragments
++        W = self.world
++
++        while row < rows:
++            generation_address = generations + Int64(row) * 4
++            generation = load_s32(generation_address)
++            partial = load_fragment(
++                x + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
++            )
++            sanitized = [sanitize_negative_zero_u32(word) for word in partial]
++            for i in cutlass.range_constexpr(4):
++                sRow[tid * 4 + i] = sanitized[i]
++            cute.arch.barrier()
++
++            words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++            cur = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++            if tid < sf:
++                c0 = (rank + W - 1) % W
++                base0 = (c0 * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    cur[i] = sRow[base0 + i]
++                store_fragment_ring(
++                    next_peer + self.ring_slot(generation, Int32(0), row, tid),
++                    [cur[i] for i in range(4)],
++                )
++
++            loaded = self.collapse.load_row(
++                residual, post, comb, pre, pre_stride, weight, row, tid
++            )
++
++            if tid < sf:
++                for h in cutlass.range_constexpr(W - 1):
++                    if cutlass.const_expr(h > 0):
++                        store_fragment_ring(
++                            next_peer
++                            + self.ring_slot(generation, Int32(h), row, tid),
++                            [cur[i] for i in range(4)],
++                        )
++                    in_addr = local + self.ring_slot(generation, Int32(h), row, tid)
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 2 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    in_f = unpack([words[i] for i in range(4)])
++                    loc_f = unpack([sRow[rbase + i] for i in range(4)])
++                    summed = [in_f[i] + loc_f[i] for i in range(VEC)]
++                    for i in cutlass.range_constexpr(4):
++                        cur[i] = sanitize_negative_zero_u32(
++                            pack_bf16x2(summed[2 * i], summed[2 * i + 1])
++                        )
++
++                own_base = (rank * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    sRow[own_base + i] = cur[i]
++
++                for h in cutlass.range_constexpr(W - 1):
++                    hop_idx = (W - 1) + h
++                    store_fragment_ring(
++                        next_peer
++                        + self.ring_slot(generation, Int32(hop_idx), row, tid),
++                        [cur[i] for i in range(4)],
++                    )
++                    in_addr = local + self.ring_slot(
++                        generation, Int32(hop_idx), row, tid
++                    )
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 1 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    for i in cutlass.range_constexpr(4):
++                        val = words[i]
++                        sRow[rbase + i] = val
++                        cur[i] = val
++
++            cute.arch.barrier()
++            xs = unpack([sRow[tid * 4 + i] for i in range(4)])
++            self.collapse.finish_row(
++                xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
++            )
++            if tid < sf:
++                for h in cutlass.range_constexpr(2 * (W - 1)):
++                    store_fragment_ring(
++                        local + self.ring_slot(generation, Int32(h), row, tid),
++                        [sentinel] * 4,
++                    )
++            cute.arch.barrier()
++            if tid == 0:
++                store_u32(
++                    generation_address,
++                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
++                )
++            row += ctas
++
++
++class RingAllReduceFinalizePostCollapse(RingAllReducePostCollapse):
++    """`RingAllReducePostCollapse` fused with MoE top-k weighting/sum and
++    shared-expert add in one CTA (`rows >= ring_min_rows`, e.g. `16..192`)."""
++
++    def __init__(
++        self,
++        hidden: int,
++        world: int,
++        capacity: int,
++        write_aux: bool,
++        top_k: int,
++        slot_base: int = 0,
++    ):
++        super().__init__(hidden, world, capacity, write_aux, slot_base)
++        self.top_k = top_k
++
++    @cute.jit
++    def __call__(
++        self,
++        routes: Int64,
++        route_weights: Int64,
++        shared: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        ctas: Int32,
++        eps: Float32,
++        stream: cuda.CUstream,
++    ):
++        @cute.struct
++        class Storage:
++            sums: cute.struct.MemRange[Float32, self.collapse.warps]
++            row_buf: cute.struct.MemRange[Uint32, self.fragments * 4]
++
++        self.kernel(
++            routes,
++            route_weights,
++            shared,
++            peers,
++            generations,
++            rank,
++            residual,
++            post,
++            comb,
++            pre,
++            pre_stride,
++            weight,
++            residual_out,
++            layer_input,
++            aux,
++            rows,
++            eps,
++            Storage,
++        ).launch(grid=(ctas, 1, 1), block=[self.fragments, 1, 1], stream=stream)
++
++    @cute.kernel
++    def kernel(
++        self,
++        routes: Int64,
++        route_weights: Int64,
++        shared: Int64,
++        peers: Int64,
++        generations: Int64,
++        rank: Int32,
++        residual: Int64,
++        post: Int64,
++        comb: Int64,
++        pre: Int64,
++        pre_stride: Int32,
++        weight: Int64,
++        residual_out: Int64,
++        layer_input: Int64,
++        aux: Int64,
++        rows: Int32,
++        eps: Float32,
++        Storage: cutlass.Constexpr,
++    ):
++        tid, _, _ = cute.arch.thread_idx()
++        row, _, _ = cute.arch.block_idx()
++        ctas, _, _ = cute.arch.grid_dim()
++        smem = cutlass.utils.SmemAllocator()
++        storage = smem.allocate(Storage)
++        sSums = storage.sums.get_tensor(cute.make_layout(self.collapse.warps))
++        sRow = storage.row_buf.get_tensor(cute.make_layout(self.fragments * 4))
++
++        local = load_u64(peers + Int64(rank) * 8)
++        next_rank = (rank + 1) % self.world
++        next_peer = load_u64(peers + Int64(next_rank) * 8)
++        sentinel = Uint32(NEGATIVE_ZERO_BF16_PAIR)
++        sf = self.slice_fragments
++        W = self.world
++        top_k = self.top_k
++
++        while row < rows:
++            generation_address = generations + Int64(row) * 4
++            generation = load_s32(generation_address)
++
++            route_words = [
++                load_fragment(
++                    routes
++                    + ((Int64(row) * top_k + k) * self.fragments + tid)
++                    * FRAGMENT_BYTES
++                )
++                for k in range(top_k)
++            ]
++            scales = [
++                f32_from_bits(
++                    load_u32(route_weights + (Int64(row) * top_k + k) * 4)
++                )
++                for k in range(top_k)
++            ]
++            shared_words = load_fragment(
++                shared + (Int64(row) * self.fragments + tid) * FRAGMENT_BYTES
++            )
++            acc = unpack(route_words[0])
++            acc = [value * scales[0] for value in acc]
++            for k in cutlass.range_constexpr(1, top_k):
++                values = unpack(route_words[k])
++                acc = [fma(values[e], scales[k], acc[e]) for e in range(VEC)]
++            shared_values = unpack(shared_words)
++            partial = pack([acc[e] + shared_values[e] for e in range(VEC)])
++            sanitized = [sanitize_negative_zero_u32(word) for word in partial]
++            for i in cutlass.range_constexpr(4):
++                sRow[tid * 4 + i] = sanitized[i]
++            cute.arch.barrier()
++
++            words = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++            cur = cute.make_rmem_tensor(cute.make_layout(4), Uint32)
++            if tid < sf:
++                c0 = (rank + W - 1) % W
++                base0 = (c0 * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    cur[i] = sRow[base0 + i]
++                store_fragment_ring(
++                    next_peer + self.ring_slot(generation, Int32(0), row, tid),
++                    [cur[i] for i in range(4)],
++                )
++
++            loaded = self.collapse.load_row(
++                residual, post, comb, pre, pre_stride, weight, row, tid
++            )
++
++            if tid < sf:
++                for h in cutlass.range_constexpr(W - 1):
++                    if cutlass.const_expr(h > 0):
++                        store_fragment_ring(
++                            next_peer
++                            + self.ring_slot(generation, Int32(h), row, tid),
++                            [cur[i] for i in range(4)],
++                        )
++                    in_addr = local + self.ring_slot(generation, Int32(h), row, tid)
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 2 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    in_f = unpack([words[i] for i in range(4)])
++                    loc_f = unpack([sRow[rbase + i] for i in range(4)])
++                    summed = [in_f[i] + loc_f[i] for i in range(VEC)]
++                    for i in cutlass.range_constexpr(4):
++                        cur[i] = sanitize_negative_zero_u32(
++                            pack_bf16x2(summed[2 * i], summed[2 * i + 1])
++                        )
++
++                own_base = (rank * sf + tid) * 4
++                for i in cutlass.range_constexpr(4):
++                    sRow[own_base + i] = cur[i]
++
++                for h in cutlass.range_constexpr(W - 1):
++                    hop_idx = (W - 1) + h
++                    store_fragment_ring(
++                        next_peer
++                        + self.ring_slot(generation, Int32(hop_idx), row, tid),
++                        [cur[i] for i in range(4)],
++                    )
++                    in_addr = local + self.ring_slot(
++                        generation, Int32(hop_idx), row, tid
++                    )
++                    poll_no_reset(in_addr, words)
++                    rc = (rank + 2 * W - 1 - h) % W
++                    rbase = (rc * sf + tid) * 4
++                    for i in cutlass.range_constexpr(4):
++                        val = words[i]
++                        sRow[rbase + i] = val
++                        cur[i] = val
++
++            cute.arch.barrier()
++            xs = unpack([sRow[tid * 4 + i] for i in range(4)])
++            self.collapse.finish_row(
++                xs, loaded, residual_out, layer_input, aux, eps, sSums, row, tid
++            )
++            if tid < sf:
++                for h in cutlass.range_constexpr(2 * (W - 1)):
++                    store_fragment_ring(
++                        local + self.ring_slot(generation, Int32(h), row, tid),
++                        [sentinel] * 4,
++                    )
++            cute.arch.barrier()
++            if tid == 0:
++                store_u32(
++                    generation_address,
++                    Uint32((generation + 1) % LAMPORT_GENERATIONS),
++                )
++            row += ctas
++
++
++@cache
++def _ring_kernel(
++    device_index: int, hidden: int, world: int, capacity: int, slot_base: int
++):
++    """`RingAllReduce` compiled for a device and shape."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            RingAllReduce(hidden, world, capacity, slot_base),
++            *(Int64(0),) * 4,
++            Int32(0),
++            Int32(1),
++            Int32(1),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _ring_collapse_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    slot_base: int,
++):
++    """`RingAllReducePostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            RingAllReducePostCollapse(hidden, world, capacity, write_aux, slot_base),
++            *(Int64(0),) * 3,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _ring_finalize_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    top_k: int,
++    slot_base: int,
++):
++    """`RingAllReduceFinalizePostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            RingAllReduceFinalizePostCollapse(
++                hidden, world, capacity, write_aux, top_k, slot_base
++            ),
++            *(Int64(0),) * 5,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _oneshot_finalize_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    top_k: int,
++    slot_base: int,
++):
++    """`OneShotAllReduceFinalizePostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            OneShotAllReduceFinalizePostCollapse(
++                hidden, world, capacity, write_aux, top_k, slot_base
++            ),
++            *(Int64(0),) * 5,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _oneshot_collapse_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    slot_base: int,
++):
++    """`OneShotAllReducePostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            OneShotAllReducePostCollapse(
++                hidden, world, capacity, write_aux, slot_base
++            ),
++            *(Int64(0),) * 3,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _kernel(device_index: int, hidden: int, world: int, capacity: int):
++    """`TwoShotAllReduce` compiled for a device and shape."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            TwoShotAllReduce(hidden, world, capacity),
++            *(Int64(0),) * 4,
++            Int32(0),
++            Int32(1),
++            Int32(1),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _collapse_kernel(
++    device_index: int, hidden: int, world: int, capacity: int, write_aux: bool
++):
++    """`TwoShotAllReducePostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            TwoShotAllReducePostCollapse(hidden, world, capacity, write_aux),
++            *(Int64(0),) * 3,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _finalize_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    top_k: int,
++):
++    """`TwoShotAllReduceFinalizePostCollapse` compiled for a device and
++    variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            TwoShotAllReduceFinalizePostCollapse(
++                hidden, world, capacity, write_aux, top_k
++            ),
++            *(Int64(0),) * 5,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++@cache
++def _w2_splitk_kernel(
++    device_index: int,
++    hidden: int,
++    world: int,
++    capacity: int,
++    write_aux: bool,
++    top_k: int,
++    ks: int,
++):
++    """`TwoShotAllReduceW2SplitKPostCollapse` compiled for a device and variant."""
++    with torch.accelerator.device_index(device_index):
++        return cute.compile(
++            TwoShotAllReduceW2SplitKPostCollapse(
++                hidden, world, capacity, write_aux, top_k, ks
++            ),
++            *(Int64(0),) * 5,
++            Int32(384),
++            Int64(0),
++            *(Int64(0),) * 2,
++            Int32(0),
++            *(Int64(0),) * 4,
++            Int32(4),
++            *(Int64(0),) * 4,
++            Int32(1),
++            Int32(1),
++            Float32(1e-6),
++            make_fake_stream(),
++        )
++
++
++def ampere_peer_topology() -> str | None:
++    """Return `'nvlink'` when vLLM's custom all-reduce reports full NVLink
++    connectivity, `'pcie'` when PCIe P2P collectives are opted in and every TP
++    peer pair on the node has direct CUDA P2P access behind a shared PCIe
++    switch (`PIX`/`PXB`, or overridden via `VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force`),
++    or `None` otherwise. Collective over the TP group so all ranks agree."""
++    from vllm.distributed import get_tp_group
++    from vllm.dsv41_opt_profile import NVML_TOPO_NAMES, pcie_switch_connected_nvml
++    from vllm.logger import init_logger
++
++    tp_group = get_tp_group()
++    comm = getattr(tp_group.device_communicator, "ca_comm", None)
++    if comm is not None and not comm.disabled and comm.fully_connected:
++        return "nvlink"
++    pcie_opt = (
++        os.environ.get("VLLM_DSV41_AMPERE_PCIE_COLLECTIVES", "0").strip().lower()
++    )
++    if pcie_opt not in ("1", "force"):
++        return None
++    world_size = tp_group.world_size
++    if world_size < 2 or world_size > torch.cuda.device_count():
++        return None
++    local_dev = torch.cuda.current_device()
++    dev_tensor = torch.empty(world_size, dtype=torch.int32, device=tp_group.device)
++    my_dev = torch.tensor([local_dev], dtype=torch.int32, device=tp_group.device)
++    dist.all_gather_into_tensor(dev_tensor, my_dev, group=tp_group.device_group)
++    peer_devs = [int(x) for x in dev_tensor.cpu().tolist()]
++    ok = int(len(set(peer_devs)) == world_size)
++    if ok:
++        for d in peer_devs:
++            if d != local_dev and not torch.cuda.can_device_access_peer(local_dev, d):
++                ok = 0
++                break
++    if ok and pcie_opt != "force":
++        phys_ids: list[int | str] = []
++        for d in peer_devs:
++            try:
++                u = getattr(torch.cuda.get_device_properties(d), "uuid", None)
++                if u is not None:
++                    phys_ids.append(f"GPU-{u}")
++                    continue
++            except Exception:
++                pass
++            phys_ids.append(current_platform.visible_device_id_to_physical_device_id(d))
++        switch_ok, worst_lvl = pcie_switch_connected_nvml(phys_ids)
++        if worst_lvl is not None and not switch_ok:
++            ok = 0
++            topo_name = NVML_TOPO_NAMES.get(worst_lvl, f"level={worst_lvl}")
++            init_logger(__name__).info_once(
++                "DSV41: PCIe peers traverse CPU root complex (NVML topology=%s); "
++                "disabling CuTe Lamport P2P collectives and falling back to PyNCCL "
++                "(fine-grained 16B P2P writes congest cross-RC interconnects; "
++                "set VLLM_DSV41_AMPERE_PCIE_COLLECTIVES=force to override, and "
++                "consider NCCL_P2P_LEVEL=SYS if PyNCCL disables P2P).",
++                topo_name,
++            )
++    flag = torch.tensor([ok], dtype=torch.int32, device=tp_group.device)
++    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tp_group.device_group)
++    return "pcie" if int(flag.item()) == 1 else None
++
++
++def default_ampere_ar_capacity(topology: str) -> int:
++    """Default max rows for `AmpereAllReduce`: full `MAX_ROWS` (192) on both
++    NVLink (TwoShot) and PCIe Gen4 x16 (3-regime OneShot -> TwoShot -> Ring).
++    Overridable via `VLLM_DSV41_AMPERE_AR_MAX_ROWS`."""
++    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_MAX_ROWS", "").strip()
++    if raw:
++        return max(1, min(MAX_ROWS, int(raw)))
++    return MAX_ROWS
++
++
++def default_ampere_ag_capacity(
++    topology: str, row_bytes: int, max_rows: int = MAX_ROWS
++) -> int:
++    """Default max rows for `AmpereAllGather`: full `max_rows` on NVLink (or
++    tiny <=64B control/argmax rows on PCIe), else bounded by
++    `VLLM_DSV41_AMPERE_AG_MAX_BYTES` (default 384 KiB/rank) on PCIe."""
++    if topology == "nvlink" or row_bytes <= 64:
++        return max_rows
++    max_bytes = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_BYTES", "393216"))
++    pcie_row_cap = int(os.environ.get("VLLM_DSV41_AMPERE_AG_MAX_ROWS", "64"))
++    return max(1, min(max_rows, pcie_row_cap, max_bytes // max(1, row_bytes)))
++
++
++def default_ampere_ar_oneshot_max_rows(topology: str) -> int:
++    """Default max rows for 1-hop `OneShotAllReducePostCollapse`: 2 rows on
++    PCIe Gen4 x16 (saving one full PCIe hop at M=1,2), 0 on NVLink."""
++    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_ONESHOT_ROWS", "").strip()
++    if raw:
++        return max(0, min(MAX_ROWS, int(raw)))
++    return 2 if topology == "pcie" else 0
++
++
++def default_ampere_ar_ring_min_rows(topology: str) -> int:
++    """Default min rows for single-kernel push-ring `RingAllReduce*`: 16 rows
++    on PCIe Gen4 x16 (where coalesced ring beats all-to-all TwoShot and PyNCCL
++    across M=16..192), 0 (disabled) on NVLink. Overridable via
++    `VLLM_DSV41_AMPERE_AR_RING_MIN_ROWS`."""
++    raw = os.environ.get("VLLM_DSV41_AMPERE_AR_RING_MIN_ROWS", "").strip()
++    if raw:
++        return max(0, min(MAX_ROWS, int(raw)))
++    return 16 if topology == "pcie" else 0
++
++
++class AmpereAllReduce:
++    """The mailbox and per-row generations of SM80 push-Lamport all-reduce for
++    one TP group; construction is collective over the group.
++
++    Supports three dispatch regimes on PCIe P2P:
++      - `rows <= oneshot_capacity`: 1-hop `OneShotAllReduce*`
++      - `oneshot_capacity < rows < ring_min_rows`: 2-hop `TwoShotAllReduce*`
++      - `rows >= ring_min_rows`: coalesced push-ring `RingAllReduce*`
++
++    Args:
++        group: The TP group's device process group.
++        hidden: Values per row.
++        device: This rank's device.
++        capacity: The most rows a call takes (`MAX_ROWS` by default).
++        top_k: Routes a token of the MoE outputs `finalize_post_collapse`
++            takes; None compiles no finalize kernels.
++        oneshot_capacity: Optional tiny-row threshold (`<= capacity`) routed to
++            1-hop `OneShotAllReduce*`.
++        ring_min_rows: Optional min-row threshold (`<= capacity`) routed to
++            coalesced push-ring `RingAllReduce*`; 0 disables ring.
++
++    """
++
++    def __init__(
++        self,
++        group: dist.ProcessGroup,
++        hidden: int,
++        device: torch.device,
++        capacity: int = MAX_ROWS,
++        top_k: int | None = None,
++        oneshot_capacity: int = 0,
++        ring_min_rows: int = 0,
++    ):
++        self.world = dist.get_world_size(group)
++        self.rank = dist.get_rank(group)
++        self.hidden = hidden
++        self.capacity = capacity
++        self.top_k = top_k
++        self.oneshot_capacity = (
++            min(capacity, oneshot_capacity)
++            if oneshot_capacity > 0 and self.world in (2, 4, 8)
++            else 0
++        )
++        if ring_min_rows > 0 and self.world in (2, 4, 8):
++            eff_ring_min = max(self.oneshot_capacity + 1, ring_min_rows)
++            self.ring_min_rows = eff_ring_min if eff_ring_min <= capacity else 0
++        else:
++            self.ring_min_rows = 0
++        # The most CTAs a call launches, one per SM (see the module docstring).
++        self.ctas = current_platform.num_compute_units(device.index)
++        use_w2_splitk = (
++            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
++            and hidden == 5120
++        )
++        two_shot_capacity = (
++            capacity
++            if (self.ring_min_rows == 0 or use_w2_splitk)
++            else max(1, self.ring_min_rows - 1)
++        )
++        self.two_shot_capacity = two_shot_capacity
++        self.kernel = _kernel(device.index, hidden, self.world, two_shot_capacity)
++        self.collapse_kernels = [
++            _collapse_kernel(
++                device.index, hidden, self.world, two_shot_capacity, write_aux
++            )
++            for write_aux in (False, True)
++        ]
++        two_shot_bytes = TwoShotAllReduce(
++            hidden, self.world, two_shot_capacity
++        ).mailbox_bytes()
++        if self.oneshot_capacity > 0:
++            self.oneshot_collapse_kernels = [
+                 _oneshot_collapse_kernel(
+                     device.index,
+                     hidden,
+@@ -1298,6 +2225,24 @@ class AmpereAllReduce:
+         else:
+             self.oneshot_collapse_kernels = []
+             oneshot_bytes = 0
++        ring_base = two_shot_bytes + oneshot_bytes
++        if self.ring_min_rows > 0:
++            self.ring_kernel = _ring_kernel(
++                device.index, hidden, self.world, capacity, ring_base
++            )
++            self.ring_collapse_kernels = [
++                _ring_collapse_kernel(
++                    device.index, hidden, self.world, capacity, write_aux, ring_base
++                )
++                for write_aux in (False, True)
++            ]
++            ring_bytes = RingAllReduce(
++                hidden, self.world, capacity, ring_base
++            ).mailbox_bytes()
++        else:
++            self.ring_kernel = None
++            self.ring_collapse_kernels = []
++            ring_bytes = 0
+         # Compiled here: the first finalize may come while a CUDA graph is
+         # being captured.
+         self.finalize_kernels = (
+@@ -1305,16 +2250,50 @@ class AmpereAllReduce:
+             if top_k is None
+             else [
+                 _finalize_kernel(
+-                    device.index, hidden, self.world, capacity, write_aux, top_k
++                    device.index,
++                    hidden,
++                    self.world,
++                    two_shot_capacity,
++                    write_aux,
++                    top_k,
++                )
++                for write_aux in (False, True)
++            ]
++        )
++        self.oneshot_finalize_kernels = (
++            []
++            if top_k is None or self.oneshot_capacity <= 0
++            else [
++                _oneshot_finalize_kernel(
++                    device.index,
++                    hidden,
++                    self.world,
++                    self.oneshot_capacity,
++                    write_aux,
++                    top_k,
++                    two_shot_bytes,
++                )
++                for write_aux in (False, True)
++            ]
++        )
++        self.ring_finalize_kernels = (
++            []
++            if top_k is None or self.ring_min_rows <= 0
++            else [
++                _ring_finalize_kernel(
++                    device.index,
++                    hidden,
++                    self.world,
++                    capacity,
++                    write_aux,
++                    top_k,
++                    ring_base,
+                 )
+                 for write_aux in (False, True)
+             ]
+         )
+         self.w2_splitk_kernels = {}
+-        if (
+-            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
+-            and hidden == 5120
+-        ):
++        if use_w2_splitk:
+             for write_aux in (False, True):
+                 for tk in (6, 3):
+                     for ks_val in (4, 3):
+@@ -1323,23 +2302,31 @@ class AmpereAllReduce:
+                                 device.index,
+                                 hidden,
+                                 self.world,
+-                                capacity,
++                                two_shot_capacity,
+                                 write_aux,
+                                 tk,
+                                 ks_val,
+                             )
+                         )
+-        nbytes = two_shot_bytes + oneshot_bytes
++        nbytes = two_shot_bytes + oneshot_bytes + ring_bytes
+         self.mailbox = symm_mem.empty(nbytes // 2, dtype=torch.bfloat16, device=device)
+         handle = symm_mem.rendezvous(self.mailbox, group)
+         self.peers = torch.tensor(handle.buffer_ptrs, dtype=torch.int64, device=device)
+         # Every slot starts as the sentinel, BF16 negative zero.
+         self.mailbox.view(torch.int16).fill_(-32768)
++        ring_gen_len = capacity if self.ring_min_rows > 0 else 0
+         self.generations_all = torch.zeros(
+-            capacity + self.oneshot_capacity, dtype=torch.int32, device=device
++            two_shot_capacity + self.oneshot_capacity + ring_gen_len,
++            dtype=torch.int32,
++            device=device,
+         )
+-        self.generations = self.generations_all[:capacity]
+-        self.oneshot_generations = self.generations_all[capacity:]
++        self.generations = self.generations_all[:two_shot_capacity]
++        self.oneshot_generations = self.generations_all[
++            two_shot_capacity : two_shot_capacity + self.oneshot_capacity
++        ]
++        self.ring_generations = self.generations_all[
++            two_shot_capacity + self.oneshot_capacity :
++        ]
+         torch.accelerator.synchronize()
+         dist.barrier(group=group)
+ 
+@@ -1359,11 +2346,14 @@ class AmpereAllReduce:
+         """The sum of `x` over the TP group, as a new tensor."""
+         assert self.supports(x)
+         out = torch.empty_like(x)
+-        self.kernel(
++        use_ring = self.ring_min_rows > 0 and x.shape[0] >= self.ring_min_rows
++        kern = self.ring_kernel if use_ring else self.kernel
++        gens = self.ring_generations if use_ring else self.generations
++        kern(
+             Int64(x.data_ptr()),
+             Int64(out.data_ptr()),
+             Int64(self.peers.data_ptr()),
+-            Int64(self.generations.data_ptr()),
++            Int64(gens.data_ptr()),
+             Int32(self.rank),
+             Int32(x.shape[0]),
+             Int32(min(x.shape[0], self.ctas)),
+@@ -1389,23 +2379,25 @@ class AmpereAllReduce:
+         `[rows, 4, 1]`, `comb_mix` `[rows, 4, 4]`; `pre_mix` None
+         selects stream zero."""
+         assert self.supports(x)
+-        use_oneshot = x.shape[0] <= self.oneshot_capacity
++        rows = x.shape[0]
++        if rows <= self.oneshot_capacity:
++            kern = self.oneshot_collapse_kernels[int(write_aux)]
++            gens = self.oneshot_generations
++        elif self.ring_min_rows > 0 and rows >= self.ring_min_rows:
++            kern = self.ring_collapse_kernels[int(write_aux)]
++            gens = self.ring_generations
++        else:
++            kern = self.collapse_kernels[int(write_aux)]
++            gens = self.generations
+         streams, layer_input, aux, args, _inputs = self._collapse_args(
+-            x.shape[0],
++            rows,
+             residual,
+             post_mix,
+             comb_mix,
+             pre_mix,
+             norm_weight,
+             write_aux,
+-            generations=(
+-                self.oneshot_generations if use_oneshot else self.generations
+-            ),
+-        )
+-        kern = (
+-            self.oneshot_collapse_kernels[int(write_aux)]
+-            if use_oneshot
+-            else self.collapse_kernels[int(write_aux)]
++            generations=gens,
+         )
+         kern(
+             Int64(x.data_ptr()),
+@@ -1442,10 +2434,26 @@ class AmpereAllReduce:
+         assert routes.dim() == 2 and routes.shape[0] >= rows * top_k
+         assert routes.shape[1] == self.hidden and routes.dtype == torch.bfloat16
+         assert routes.is_contiguous() and routes.data_ptr() % FRAGMENT_BYTES == 0
++        if rows <= self.oneshot_capacity and self.oneshot_finalize_kernels:
++            kern = self.oneshot_finalize_kernels[int(write_aux)]
++            gens = self.oneshot_generations
++        elif self.ring_min_rows > 0 and rows >= self.ring_min_rows:
++            kern = self.ring_finalize_kernels[int(write_aux)]
++            gens = self.ring_generations
++        else:
++            kern = self.finalize_kernels[int(write_aux)]
++            gens = self.generations
+         streams, layer_input, aux, args, _inputs = self._collapse_args(
+-            rows, residual, post_mix, comb_mix, pre_mix, norm_weight, write_aux
++            rows,
++            residual,
++            post_mix,
++            comb_mix,
++            pre_mix,
++            norm_weight,
++            write_aux,
++            generations=gens,
+         )
+-        self.finalize_kernels[int(write_aux)](
++        kern(
+             Int64(routes.data_ptr()),
+             Int64(route_weights.data_ptr()),
+             Int64(shared.data_ptr()),
+-- 
+2.56.0
+

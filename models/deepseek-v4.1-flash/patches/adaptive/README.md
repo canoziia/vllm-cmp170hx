@@ -90,3 +90,42 @@ explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.
    - Adds Pure-TP4 calibrated adaptive step-cost curve `COST_MS_TP4` (`VLLM_DSV41_COST_MS_FUSED=tp4`)
      in `dsv41_measured_policy.py` from full 30-cell 4×80G measurements while preserving strict
      `[5, 1, 5]` trim-and-recovery invariants across `c=1..32`.
+
+9. `0009-dsv41-3regime-ring-lamport-engram-dot-and-moe-dynks.patch`
+   - **3-Regime Push-Lamport AllReduce (`OneShot 1..2` → `TwoShot 3..15` → `Ring 16..192`)**:
+     Adds `OneShotAllReducePostCollapse` / `OneShotAllReduceFinalizePostCollapse` (`M=1..2`,
+     `VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS=1`, `VLLM_DSV41_FUSED_W2_AR=0`) and
+     `RingAllReduce` / `RingAllReducePostCollapse` / `RingAllReduceFinalizePostCollapse`
+     (`M=16..192`, deadlock-safe `ctas = min(rows, self.ctas)`, Hop-0 PCIe overlap with
+     `PostCollapse.load_row`, `st.relaxed.sys.global.v4.u32` + deferred sentinel reset,
+     `9.55 MiB/GPU` total mailbox). Raises PCIe `default_ampere_ar_capacity("pcie") = 192`
+     and `default_ampere_ar_ring_min_rows("pcie") = 16` (`0` on NVLink).
+   - **Engram Communication Overhaul (100% lossless)**:
+     Replaces `[M, 25600]` `AllGather + slice` in prefill `_engram_local` with
+     `dist.all_to_all_single` (`1/4` bytes, `-118 MiB` peak VRAM) + Copy-Engine `dma.all_gather`
+     for `embed`; adds 5×-bandwidth-reduced Engram Local Partial-Dot reduction (`engram.py`,
+     `M >= 160`, `VLLM_DSV41_ENGRAM_LOCAL_DOT=1`, all-reducing only `[M, 8]` FP32 scalars and
+     broadcasting only `V` `[M, 5120]`). Also retains Copy-Engine `dma.all_reduce_inplace` +
+     `VLLM_DSV41_PREFILL_AR_SPLIT_MOE` inside `_run_layers_prefill_ar_overlap` for future
+     `M >= 4096` / `TP >= 6,8` scaling.
+   - **Pure TP4 `NI=576` MoE + Router Tuning**:
+     Pairs with `mxfp4_dec2_gemm_dynks` (`c10`, GPU-side CUDA-Graph-safe dynamic `nblk` Split-K
+     switching `KS=4` when `nblk < 130` vs `KS=2` when `nblk >= 130` for `M >= 49`), routes
+     `M = 4..6` to occ=5 `c0`, fixes `W2` cfg (`c4/c5/c2` across `M=1/2/>=3`), bypasses
+     `w2_splitk_ep` for `NI=576 M > 8`, and disables `use_sentinel` on `E == 384`.
+
+10. `0010-dsv41-online-self-calibrating-cost-model.patch`
+    - **Online Self-Calibrating Step-Cost Model (`OnlineCostModel`)**:
+      Adds a two-level CPU-only (`~5 us/step`, `VLLM_DSV41_ONLINE_COST_MODEL=1`) self-calibrating
+      step-latency model in `dsv41_measured_policy.py` wired into `FixedHistoryPolicy`
+      (`dsv41_fixed_policy.py`) with zero changes to `scheduler.py`:
+      - Level 1: non-collinear 3-parameter physics-informed Bayesian WLS
+        `T(M_eff) = theta_0 + theta_1 * M_eff + theta_2 * sqrt(M_eff)` with CUDA-graph-aware
+        effective token count `M_eff = 0.75 * M + 0.25 * M_cg(M)`, bounded per-cell weights
+        (eliminating covariance windup), Huber outlier clipping, and gentle aging to track
+        live power-limit (`180W <-> 250W`), thermal, interconnect, and context-length shifts.
+      - Level 2: local Empirical-Bayes `(B, M)` cell refinement over contiguous pure-decode
+        steps (natively supporting mixed-`k` heterogeneous batches via `M = sum(1 + k_r)`),
+        clamped to provable monotonic `[5, 1, 5]` trim-and-recovery ratio bounds.
+    - Updates `COST_MS_TP4` prior table from full 30-cell 4×80G measurements under the new
+      3-regime Ring Lamport + dynks + Engram Local Partial-Dot stack.

@@ -64,15 +64,18 @@ inspects the model `config.json` and launch parallelism at startup:
 
 - **Non-DeepSeek models**: completely untouched (100% standard upstream vLLM).
 - **DeepSeek-V4.1 Pure `TP=4` (`PP=1`, default)**: automatically selects `tp4_fused`
-  (`NI=576` weight-streaming MXFP4 W13/W2, `DeferringMarlinExperts` +
-  `TwoShotAllReduceFinalizePostCollapse` for `M=3..60`, 1-hop OneShot + `w2_splitk_ep` `KS=3`
-  for `M=1..2`, `fused_gate_topk_align` for `local_e <= 384`, calibrated `COST_MS_TP4`), and
-  queries `ampere_peer_topology()` at worker startup via `cudaDevP2PAttrPerformanceRank` / NVML:
-  - **PCIe Gen4 P2P (`"pcie"`)**: bounds two-shot CuTe Lamport AllReduce to `<= 60` rows
-    (switching seamlessly to full-duplex Ring NCCL for `> 60` rows) and runs single-kernel
-    Lamport symmetric-memory exchange (`markov_symm.py`) across the 5 DSpark Markov steps.
+  (`NI=576` weight-streaming MXFP4 W13/W2 with GPU-side dynamic `nblk` Split-K `dynks`,
+  `DeferringMarlinExperts` + 3-regime push-Lamport finalize across all `M=1..192`,
+  5×-bandwidth-reduced Engram Local Partial-Dot for `M >= 160`, `fused_gate_topk_align` for
+  `local_e <= 384`, and online self-calibrating `OnlineCostModel` anchored to `COST_MS_TP4`),
+  and queries `ampere_peer_topology()` at worker startup via `cudaDevP2PAttrPerformanceRank` / NVML:
+  - **PCIe Gen4 P2P (`"pcie"`)**: runs 3-regime push-Lamport AllReduce (`OneShot` `M=1..2`,
+    `TwoShot` `M=3..15`, `Ring` `M=16..192` with Hop-0 PCIe overlap and deferred sentinel reset)
+    across all decode batch sizes (`c=1..32`), single-kernel Lamport symmetric-memory exchange
+    (`markov_symm.py`) across the 5 DSpark Markov steps, and Copy-Engine Ring DMA Row-Sharded
+    prefill (`24.5 GB/s` P2P ring).
   - **NVLink (`"nvlink"`)**: automatically unlocks full `MAX_ROWS = 192` two-shot CuTe
-    Lamport AllReduce and column AllGather across all decode batch sizes (`c=1..32`).
+    Lamport AllReduce (`ring_min_rows = 0`) and column AllGather across all decode batch sizes.
 - **DeepSeek-V4.1 Legacy `TP=4 + EP=4` (`--enable-expert-parallel`)**: automatically selects `tep4_fused`.
 - **DeepSeek-V4.1 `PP > 1` (e.g. 6x CMP 170HX PP6)**: automatically selects `default`
   (or `verification` when `enable_adaptive_verification: true`).
@@ -132,7 +135,7 @@ always take precedence:
 | profile | target topology | description |
 |---|---|---|
 | `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tp4_fused` for Pure TP4 (default), `tep4_fused` for legacy TEP4, `default`/`verification` for PP>1, `tp_auto` for other TP>1 |
-| `tp4_fused` (4×80G default) | 4x 80G Pure TP4 (PCIe or NVLink) | Pure TP4 deep-fusion profile (`EP=1, NI=576`): `DeferringMarlinExperts` + `TwoShotAllReduceFinalizePostCollapse` (`M=3..60`), 1-hop OneShot + `w2_splitk_ep` `KS=3` (`M=1..2`), `fused_gate_topk_align` (`local_e<=384`), `moe_prefill` split-list (`NI=576`), `COST_MS_TP4` |
+| `tp4_fused` (4×80G default) | 4x 80G Pure TP4 (PCIe or NVLink) | Pure TP4 deep-fusion profile (`EP=1, NI=576`): 3-regime push-Lamport finalize (`OneShot M=1..2`, `TwoShot M=3..15`, `Ring M=16..192`), GPU-side `dynks` W13 + occ=5 `M=4..6`, Engram Local Partial-Dot (`M>=160`), `fused_gate_topk_align` (`local_e<=384`), `moe_prefill` split-list (`NI=576`), online self-calibrating `OnlineCostModel` + `COST_MS_TP4` |
 | `default` | PP6 / general SM80 | Base 1x-HBM MXFP8/MXFP4 decode & long-context prefill kernels |
 | `verification` | PP6 + DSpark | Adds sub-width & mixed-`spec_k` FULL CUDA graphs, metadata replay, live-load PP cohorts |
 | `tp_auto` / `tp_auto_verification` | General DeepSeek TP>1 | TP-safe SM80 optimisations (Engram NUMA interleave, FP8 `wo_a`, vision offload, cuBLAS MXFP8 prefill, topology-aware collectives) |
@@ -168,11 +171,11 @@ full 1M prefill + 32-concurrency stress).
 
 | Target Length | 180W Power Cap | 250W Power Limit | 250W vs 180W |
 |---:|---:|---:|---:|
-| **64K** | 10,362.0 | **10,383.2** | +0.2% |
-| **128K** | 10,474.5 | **11,239.9** | +7.3% |
-| **256K** | 10,064.5 | **10,847.7** | +7.8% |
-| **512K** | 9,472.3 | **9,859.0** | +4.1% |
-| **1M** | 8,220.5 | **8,819.9** | +7.3% |
+| **64K** | 10,222.3 | **12,191.6** | +19.3% |
+| **128K** | 11,278.7 | **12,045.2** | +6.8% |
+| **256K** | 10,800.5 | **11,587.6** | +7.3% |
+| **512K** | 9,854.8 | **10,714.3** | +8.7% |
+| **1M** | 8,517.6 | **9,367.8** | +10.0% |
 
 ### Decode Throughput & Step Latency (`full_batch_tok_s` / `step_ms`, `max_tokens=500`)
 
@@ -180,20 +183,20 @@ full 1M prefill + 32-concurrency stress).
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | 222.0 (`9.29 ms`, acc 2.06) | 514.0 (`10.84 ms`, acc 5.51) | 585.3 (`10.15 ms`, acc 5.88) |
-| **2** | 376.8 (`11.33 ms`, acc 2.16) | 775.6 (`14.27 ms`, acc 5.43) | 957.3 (`12.47 ms`, acc 5.88) |
-| **4** | 579.5 (`12.94 ms`, acc 1.90) | 1,217.8 (`18.12 ms`, acc 5.40) | 1,524.2 (`15.71 ms`, acc 5.88) |
-| **8** | 839.4 (`18.34 ms`, acc 1.93) | 1,762.1 (`25.27 ms`, acc 5.44) | 2,169.0 (`22.10 ms`, acc 5.88) |
-| **16** | 1,152.0 (`26.80 ms`, acc 1.93) | 2,304.4 (`38.43 ms`, acc 5.38) | 2,649.4 (`36.21 ms`, acc 5.88) |
-| **32** | 1,425.5 (`43.57 ms`, acc 1.94) | 2,893.9 (`59.10 ms`, acc 5.38) | 3,419.7 (`56.12 ms`, acc 5.88) |
+| **1** | 224.3 (`9.59 ms`, acc 2.15) | 507.1 (`10.68 ms`, acc 5.36) | 582.3 (`10.20 ms`, acc 5.88) |
+| **2** | 365.2 (`11.13 ms`, acc 2.04) | 790.1 (`14.10 ms`, acc 5.47) | 976.1 (`12.23 ms`, acc 5.88) |
+| **4** | 585.9 (`12.95 ms`, acc 1.90) | 1,180.8 (`18.96 ms`, acc 5.49) | 1,604.6 (`15.11 ms`, acc 5.95) |
+| **8** | 968.4 (`16.54 ms`, acc 2.02) | 1,805.5 (`24.61 ms`, acc 5.43) | 2,349.0 (`20.41 ms`, acc 5.88) |
+| **16** | 1,208.7 (`25.56 ms`, acc 1.94) | 2,347.1 (`37.85 ms`, acc 5.41) | 2,968.1 (`32.32 ms`, acc 5.88) |
+| **32** | 1,551.4 (`40.14 ms`, acc 1.95) | 2,983.5 (`57.90 ms`, acc 5.43) | 3,660.7 (`52.44 ms`, acc 5.88) |
 
 #### 250W Power Limit (`RO=0`, `0` OOM)
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | **232.4 (`8.87 ms`, acc 2.06)** | **549.9 (`10.13 ms`, acc 5.51)** | **623.6 (`9.53 ms`, acc 5.88)** |
-| **2** | **401.0 (`10.65 ms`, acc 2.16)** | **838.3 (`13.20 ms`, acc 5.43)** | **1,027.7 (`11.62 ms`, acc 5.88)** |
-| **4** | **614.7 (`12.20 ms`, acc 1.90)** | **1,269.2 (`17.24 ms`, acc 5.37)** | **1,624.7 (`14.73 ms`, acc 5.88)** |
-| **8** | **892.3 (`14.73 ms`, acc 1.65)** | **1,907.9 (`23.34 ms`, acc 5.44)** | **2,358.7 (`20.33 ms`, acc 5.88)** |
-| **16** | **1,247.7 (`24.75 ms`, acc 1.93)** | **2,410.2 (`37.01 ms`, acc 5.43)** | **2,894.6 (`33.15 ms`, acc 5.88)** |
-| **32** | **1,556.6 (`39.67 ms`, acc 1.93)** | **3,131.5 (`54.47 ms`, acc 5.40)** | **3,709.8 (`51.73 ms`, acc 5.88)** |
+| **1** | **239.9 (`8.96 ms`, acc 2.15)** | **548.0 (`9.89 ms`, acc 5.36)** | **627.3 (`9.47 ms`, acc 5.88)** |
+| **2** | **396.7 (`9.98 ms`, acc 1.99)** | **853.3 (`13.05 ms`, acc 5.47)** | **1,038.2 (`11.50 ms`, acc 5.88)** |
+| **4** | **642.0 (`12.17 ms`, acc 1.96)** | **1,364.8 (`16.33 ms`, acc 5.46)** | **1,733.8 (`13.81 ms`, acc 5.88)** |
+| **8** | **1,024.2 (`15.26 ms`, acc 1.97)** | **2,012.1 (`22.08 ms`, acc 5.43)** | **2,559.8 (`18.73 ms`, acc 5.88)** |
+| **16** | **1,342.8 (`23.06 ms`, acc 1.93)** | **2,851.1 (`31.28 ms`, acc 5.41)** | **3,297.0 (`29.10 ms`, acc 5.88)** |
+| **32** | **1,741.8 (`35.50 ms`, acc 1.93)** | **3,333.6 (`51.49 ms`, acc 5.40)** | **3,938.5 (`48.73 ms`, acc 5.88)** |
