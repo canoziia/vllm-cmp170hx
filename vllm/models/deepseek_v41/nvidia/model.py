@@ -979,6 +979,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # The row-sharded indexers' gathers need the same peer access.
                 init_ampere_all_gather(vllm_config)
 
+        self._pcie_dma_ring = None
+        if (
+            get_tensor_model_parallel_world_size() > 1
+            and not self.use_sequence_parallel
+            and current_platform.is_cuda()
+            and current_platform.get_device_capability().to_int() == 80
+        ):
+            from .specialized_decode.ampere.pcie_dma_ring import (
+                get_or_init_pcie_dma_ring,
+            )
+
+            self._pcie_dma_ring = get_or_init_pcie_dma_ring(
+                get_tp_group(),
+                config.hidden_size,
+                vllm_config.scheduler_config.max_num_batched_tokens,
+            )
+
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
@@ -1508,30 +1525,52 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and not self.use_sequence_parallel
             and not self.use_native_mega_moe
             and not torch.cuda.is_current_stream_capturing()
-            and os.environ.get("VLLM_DSV41_PREFILL_AR_OVERLAP", "0") == "1"
             and get_tensor_model_parallel_world_size() > 1
         ):
-            dev_comm = getattr(get_tp_group(), "device_communicator", None)
-            cand = getattr(dev_comm, "pynccl_comm", None)
-            if cand is not None and not getattr(cand, "disabled", True):
-                m0 = ((full_num_tokens // 3) // 64) * 64
-                if m0 >= 256 and (full_num_tokens - m0) >= 256:
-                    return self._run_layers_prefill_ar_overlap(
-                        layer_ids=layer_ids,
-                        hidden_states=hidden_states,
-                        positions=positions,
-                        input_ids=input_ids,
-                        pre_mix=pre_mix,
-                        post_mix=post_mix,
-                        res_mix=res_mix,
-                        residual=residual,
-                        aux_hidden_by_layer=aux_hidden_by_layer,
-                        engram_hashes=engram_hashes,
-                        engram_mask=engram_mask,
-                        mega_gate_metadata=mega_gate_metadata,
-                        m0=m0,
-                        pynccl=cand,
-                    )
+            from .specialized_decode.ampere.pcie_dma_ring import (
+                prefill_row_shard_enabled,
+            )
+
+            if prefill_row_shard_enabled() and all(
+                getattr(self.layers[i].attn, "gemm_rs", None) is None
+                for i in layer_ids
+            ):
+                return self._run_layers_prefill_row_shard(
+                    layer_ids=layer_ids,
+                    hidden_states=hidden_states,
+                    positions=positions,
+                    input_ids=input_ids,
+                    pre_mix=pre_mix,
+                    post_mix=post_mix,
+                    res_mix=res_mix,
+                    residual=residual,
+                    aux_hidden_by_layer=aux_hidden_by_layer,
+                    engram_hashes=engram_hashes,
+                    engram_mask=engram_mask,
+                    mega_gate_metadata=mega_gate_metadata,
+                )
+            if os.environ.get("VLLM_DSV41_PREFILL_AR_OVERLAP", "0") == "1":
+                dev_comm = getattr(get_tp_group(), "device_communicator", None)
+                cand = getattr(dev_comm, "pynccl_comm", None)
+                if cand is not None and not getattr(cand, "disabled", True):
+                    m0 = ((full_num_tokens // 3) // 64) * 64
+                    if m0 >= 256 and (full_num_tokens - m0) >= 256:
+                        return self._run_layers_prefill_ar_overlap(
+                            layer_ids=layer_ids,
+                            hidden_states=hidden_states,
+                            positions=positions,
+                            input_ids=input_ids,
+                            pre_mix=pre_mix,
+                            post_mix=post_mix,
+                            res_mix=res_mix,
+                            residual=residual,
+                            aux_hidden_by_layer=aux_hidden_by_layer,
+                            engram_hashes=engram_hashes,
+                            engram_mask=engram_mask,
+                            mega_gate_metadata=mega_gate_metadata,
+                            m0=m0,
+                            pynccl=cand,
+                        )
         can_defer_w2 = (
             os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
             and not self.use_sequence_parallel
@@ -1580,6 +1619,517 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         assert residual is not None and post_mix is not None
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
+
+    def _run_layers_prefill_row_shard(
+        self,
+        *,
+        layer_ids: range,
+        hidden_states: torch.Tensor | MoEOutput,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+        residual: torch.Tensor | None,
+        aux_hidden_by_layer: dict[int, torch.Tensor],
+        engram_hashes: torch.Tensor | None,
+        engram_mask: torch.Tensor | None,
+        mega_gate_metadata: MegaGateRoutingMetadata | None,
+    ) -> tuple[
+        torch.Tensor | MoEOutput, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Lossless BF16 Row-Sharded Prefill with Copy-Engine Ring DMA.
+
+        Keeps mHC residual streams `[S, 4, H]` (`S = ceil(M / W)`), mixes,
+        and per-row mHC/Engram post-updates sharded across TP ranks (`1/W`
+        memory & compute), using Copy-Engine Ring `reduce_scatter` / `all_gather`
+        with zero `torch.cat` scratch spikes. Automatically enables 2-microbatch
+        MoE splitting only when `M >= 4096` or `EP >= 6` (whole MoE on 4-card
+        `M <= 3072` to avoid extra Marlin weight reads).
+        """
+        import torch.distributed as dist
+
+        from .specialized_decode.ampere.pcie_dma_ring import (
+            prefill_2mb_moe_enabled,
+        )
+
+        assert isinstance(hidden_states, torch.Tensor)
+        M = positions.shape[0]
+        H = self.config.hidden_size
+        dev = hidden_states.device
+        dtype = hidden_states.dtype
+
+        tp_group = get_tp_group()
+        W = tp_group.world_size
+        r = tp_group.rank_in_group
+        tp_dev_group = tp_group.device_group
+        dma = self._pcie_dma_ring
+
+        M_pad = ((M + W - 1) // W) * W
+        S = M_pad // W
+        r_lo = r * S
+        r_hi = r_lo + S
+        valid = max(0, min(r_hi, M) - r_lo)
+
+        def_stream = torch.cuda.current_stream(dev)
+        comm_stream, evs, comm_buf = _get_prefill_ar_state(dev, M_pad, H, dtype)
+        ev_h0_ready, ev_h0_done, ev_h1_ready, ev_h1_done = evs[:4]
+        full_buf = comm_buf[:M_pad]
+        shard_buf = torch.empty((S, H), dtype=dtype, device=dev)
+
+        ep_size = (
+            W if self.parallel_config.enable_expert_parallel else 1
+        )
+        use_2mb_moe = prefill_2mb_moe_enabled(M, ep_size)
+        m0_2mb = ((M // 2) // (W * 64)) * (W * 64) if use_2mb_moe else 0
+        if m0_2mb < 256 or (M - m0_2mb) < 256:
+            use_2mb_moe = False
+
+        def _slice_pad_local(t: torch.Tensor) -> torch.Tensor:
+            if valid == S:
+                return t[r_lo:r_hi].contiguous()
+            out = t.new_zeros((S, *t.shape[1:]))
+            if valid > 0:
+                out[:valid].copy_(t[r_lo : r_lo + valid])
+            return out
+
+        def _pad_full_bf16(t: torch.Tensor) -> torch.Tensor:
+            if M == M_pad and t.is_contiguous():
+                return t
+            full_buf[:M].copy_(t)
+            if M_pad > M:
+                full_buf[M:].zero_()
+            return full_buf
+
+        def _rs_bf16(full_t: torch.Tensor, out_shard: torch.Tensor) -> None:
+            inp = _pad_full_bf16(full_t)
+            if dma is not None and dma.supports_full(inp):
+                dma.reduce_scatter(inp, out_shard, stream=def_stream)
+            else:
+                dist.reduce_scatter_single(out_shard, inp, group=tp_dev_group)
+
+        def _ag_bf16(shard: torch.Tensor, out_full: torch.Tensor) -> None:
+            sc = shard.contiguous()
+            if dma is not None and dma.supports_shard(sc):
+                dma.all_gather(sc, out_full[:M_pad], stream=def_stream)
+            else:
+                dist.all_gather_single(out_full[:M_pad], sc, group=tp_dev_group)
+
+        def _ag_generic(shard: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (M_pad, *shard.shape[1:]), dtype=shard.dtype, device=shard.device
+            )
+            sc = shard.contiguous()
+            if (
+                sc.dtype == torch.bfloat16
+                and sc.ndim == 2
+                and dma is not None
+                and dma.supports_shard(sc)
+            ):
+                dma.all_gather(sc, out, stream=def_stream)
+            else:
+                dist.all_gather_single(out, sc, group=tp_dev_group)
+            return out[:M]
+
+        def _engram_local(
+            engram_mod: typing.Any,
+            prev_post_local: torch.Tensor,
+            layer_hashes: torch.Tensor,
+            tok_mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            if engram_mod._batch is not None:
+                kv = engram_mod.wkv(
+                    engram_mod._batch.wkv_input(engram_mod, layer_hashes.shape[0])
+                )
+            else:
+                kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
+            if engram_mod._gather_columns is not None:
+                kv = engram_mod._gather_columns(kv)
+            kv_local = _slice_pad_local(kv)
+            del kv
+            mask_local: torch.Tensor | None = None
+            if tok_mask is not None:
+                if valid == S:
+                    mask_local = tok_mask[r_lo:r_hi].contiguous()
+                else:
+                    mask_local = torch.zeros(S, dtype=tok_mask.dtype, device=dev)
+                    if valid > 0:
+                        mask_local[:valid].copy_(tok_mask[r_lo : r_lo + valid])
+            return engram_mod._post_wkv(prev_post_local, kv_local, mask_local, valid)
+
+        def _mhc_pre_fn(layer: DeepseekV4DecoderLayer):
+            return (
+                partial(mhc_pre_delayed_ampere, stream=None)
+                if layer.ampere_mhc
+                else mhc_pre_delayed_tilelang
+            )
+
+        # ---- Entry: prepare local [S, ...] mHC state & first layer's x_in ----
+        first_layer = self.layers[layer_ids.start]
+        assert isinstance(first_layer, DeepseekV4DecoderLayer)
+        if residual is None:
+            if hidden_states.dim() == 2:
+                assert first_layer.hc_attn_fn_broadcast is not None
+                h_loc = _slice_pad_local(hidden_states)
+                del hidden_states
+                res_loc = hc_expand(h_loc, first_layer.hc_mult)
+                pm_loc, rm_loc, x_loc, attn_pre_loc = _mhc_pre_fn(first_layer)(
+                    res_loc,
+                    first_layer.hc_attn_fn_broadcast,
+                    first_layer.hc_attn_scale,
+                    first_layer.hc_attn_base,
+                    first_layer.rms_norm_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_post_alpha,
+                    first_layer.hc_sinkhorn_iters,
+                    x=h_loc,
+                    norm_weight=first_layer.attn_norm.weight,
+                    norm_eps=first_layer.attn_norm.variance_epsilon,
+                )
+                del h_loc
+            else:
+                res_loc = _slice_pad_local(hidden_states)
+                del hidden_states
+                pre_loc_in = _slice_pad_local(pre_mix) if pre_mix is not None else None
+                del pre_mix
+                if first_layer.engram is not None and engram_hashes is not None:
+                    res_loc = _engram_local(
+                        first_layer.engram,
+                        res_loc,
+                        engram_hashes[:, first_layer.engram.layer_hash_index],
+                        engram_mask,
+                    )
+                pm_loc, rm_loc, x_loc, attn_pre_loc = _mhc_pre_fn(first_layer)(
+                    res_loc,
+                    first_layer.hc_attn_fn,
+                    first_layer.hc_attn_scale,
+                    first_layer.hc_attn_base,
+                    first_layer.rms_norm_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_post_alpha,
+                    first_layer.hc_sinkhorn_iters,
+                    pre_mix=pre_loc_in,
+                    norm_weight=first_layer.attn_norm.weight,
+                    norm_eps=first_layer.attn_norm.variance_epsilon,
+                )
+                del pre_loc_in
+        else:
+            assert (
+                post_mix is not None
+                and res_mix is not None
+                and pre_mix is not None
+            )
+            res_loc = _slice_pad_local(residual)
+            pm_loc = _slice_pad_local(post_mix)
+            rm_loc = _slice_pad_local(res_mix)
+            pre_loc_in = _slice_pad_local(pre_mix)
+            del residual, post_mix, res_mix, pre_mix
+            if first_layer.fuse_mhc_all_reduce:
+                _rs_bf16(hidden_states, shard_buf)
+                h_loc = shard_buf
+            else:
+                h_loc = _slice_pad_local(hidden_states)
+            del hidden_states
+            capture_first_aux = layer_ids.start in self.aux_hidden_state_layers
+            if first_layer.engram is not None and engram_hashes is not None:
+                prev_post_loc = mhc_post_tilelang(h_loc, res_loc, pm_loc, rm_loc)
+                if capture_first_aux:
+                    aux_hidden_by_layer[layer_ids.start] = _ag_generic(
+                        prev_post_loc.mean(dim=1)
+                    )
+                res_loc = _engram_local(
+                    first_layer.engram,
+                    prev_post_loc,
+                    engram_hashes[:, first_layer.engram.layer_hash_index],
+                    engram_mask,
+                )
+                del prev_post_loc
+                pm_loc, rm_loc, x_loc, attn_pre_loc = _mhc_pre_fn(first_layer)(
+                    res_loc,
+                    first_layer.hc_attn_fn,
+                    first_layer.hc_attn_scale,
+                    first_layer.hc_attn_base,
+                    first_layer.rms_norm_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_eps,
+                    first_layer.hc_post_alpha,
+                    first_layer.hc_sinkhorn_iters,
+                    pre_mix=pre_loc_in,
+                    norm_weight=first_layer.attn_norm.weight,
+                    norm_eps=first_layer.attn_norm.variance_epsilon,
+                )
+            else:
+                res_loc, pm_loc, rm_loc, x_loc, attn_pre_loc, aux_loc = (
+                    mhc_shifted_post_pre(
+                        h_loc,
+                        res_loc,
+                        pm_loc,
+                        rm_loc,
+                        first_layer.hc_attn_fn,
+                        first_layer.hc_attn_scale,
+                        first_layer.hc_attn_base,
+                        first_layer.rms_norm_eps,
+                        first_layer.hc_eps,
+                        first_layer.hc_eps,
+                        first_layer.hc_post_alpha,
+                        first_layer.hc_sinkhorn_iters,
+                        pre_mix=pre_loc_in,
+                        norm_weight=first_layer.attn_norm.weight,
+                        norm_eps=first_layer.attn_norm.variance_epsilon,
+                        capture_aux=capture_first_aux,
+                        stream=None,
+                        reduce_results=False,
+                        boundary_weight=first_layer.hc_attn_boundary_weight,
+                    )
+                )
+                if capture_first_aux and aux_loc is not None:
+                    aux_hidden_by_layer[layer_ids.start] = _ag_generic(aux_loc)
+            del pre_loc_in
+
+        _ag_bf16(x_loc, full_buf)
+        del x_loc
+        x_in = full_buf[:M]
+
+        final_hidden: torch.Tensor | MoEOutput | None = None
+        pre_loc: torch.Tensor | None = None
+
+        # ---- Main Row-Sharded Layer Loop ----
+        for idx in layer_ids:
+            layer = self.layers[idx]
+            assert isinstance(layer, DeepseekV4DecoderLayer)
+            is_last = (idx + 1) >= layer_ids.stop
+
+            # 1. Attention on full M rows
+            qr_kv, kv_score, indexer_weights = (
+                layer.attn._run_parallel_input_projections(x_in)
+            )
+            qr, qr_scale, kv = layer.attn._split_qkv_and_norm(qr_kv)
+            del qr_kv
+            attn_out = layer.attn._alloc_attn_out(M, x_in)
+            assert kv is not None
+            layer.attn._prepare_and_attn(
+                x_in,
+                qr,
+                kv,
+                qr_scale,
+                kv_score,
+                indexer_weights,
+                positions,
+                attn_out,
+            )
+            del x_in, qr, qr_scale, kv, kv_score, indexer_weights
+
+            orig_wob_reduce = layer.attn.wo_b.reduce_results
+            try:
+                layer.attn.wo_b.reduce_results = False
+                y_partial = layer.attn._o_proj(attn_out, positions)
+            finally:
+                layer.attn.wo_b.reduce_results = orig_wob_reduce
+            del attn_out
+
+            # Reduce-Scatter attention partial output into local S rows
+            _rs_bf16(y_partial, shard_buf)
+            del y_partial
+
+            # 2. FFN mHC + RMSNorm on ONLY S local rows (1/W memory & compute!)
+            res_loc, pm_loc, rm_loc, x_ffn_loc, pre_loc, _ = mhc_shifted_post_pre(
+                shard_buf,
+                res_loc,
+                pm_loc,
+                rm_loc,
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                layer.rms_norm_eps,
+                layer.hc_eps,
+                layer.hc_eps,
+                layer.hc_post_alpha,
+                layer.hc_sinkhorn_iters,
+                pre_mix=attn_pre_loc,
+                norm_weight=layer.ffn_norm.weight,
+                norm_eps=layer.ffn_norm.variance_epsilon,
+                stream=None,
+                reduce_results=False,
+                boundary_weight=layer.hc_ffn_boundary_weight,
+            )
+            del attn_pre_loc
+
+            _ag_bf16(x_ffn_loc, full_buf)
+            del x_ffn_loc
+            x_ffn_in = full_buf[:M]
+
+            # 3. FFN / MoE
+            moe_cfg = getattr(layer.ffn.experts, "moe_config", None)
+            if not is_last:
+                if (
+                    use_2mb_moe
+                    and moe_cfg is not None
+                    and mega_gate_metadata is None
+                    and dma is not None
+                ):
+                    # 6/8-card large-chunk path: 2-microbatch MoE overlapped
+                    # with Copy-Engine Ring AllReduce on comm_stream!
+                    orig_skip = moe_cfg.skip_final_all_reduce
+                    try:
+                        moe_cfg.skip_final_all_reduce = True
+                        ids0 = input_ids[:m0_2mb] if input_ids is not None else None
+                        ids1 = input_ids[m0_2mb:] if input_ids is not None else None
+                        h0 = layer.ffn(x_ffn_in[:m0_2mb], ids0, None)
+                        ev_h0_ready.record(def_stream)
+                        comm_stream.wait_event(ev_h0_ready)
+                        if dma.supports_full(h0):
+                            dma.all_reduce_inplace(h0, stream=comm_stream)
+                        else:
+                            with torch.cuda.stream(comm_stream):
+                                dist.all_reduce(h0, group=tp_dev_group)
+                        ev_h0_done.record(comm_stream)
+
+                        h1 = layer.ffn(x_ffn_in[m0_2mb:], ids1, None)
+                        del x_ffn_in
+                        m1 = M - m0_2mb
+                        m1_pad = ((m1 + W - 1) // W) * W
+                        h1_buf = full_buf[:m1_pad]
+                        h1_buf[:m1].copy_(h1)
+                        if m1_pad > m1:
+                            h1_buf[m1:].zero_()
+                        del h1
+                        ev_h1_ready.record(def_stream)
+                        comm_stream.wait_event(ev_h1_ready)
+                        if dma.supports_full(h1_buf):
+                            dma.all_reduce_inplace(h1_buf, stream=comm_stream)
+                        else:
+                            with torch.cuda.stream(comm_stream):
+                                dist.all_reduce(h1_buf, group=tp_dev_group)
+                        ev_h1_done.record(comm_stream)
+                    finally:
+                        moe_cfg.skip_final_all_reduce = orig_skip
+
+                    def_stream.wait_event(ev_h0_done)
+                    def_stream.wait_event(ev_h1_done)
+                    # Copy rank r's canonical [r_lo : r_lo + valid] into shard_buf
+                    if valid < S:
+                        shard_buf[valid:].zero_()
+                    if valid > 0:
+                        lo0 = min(r_lo, m0_2mb)
+                        hi0 = min(r_lo + valid, m0_2mb)
+                        n0 = max(0, hi0 - lo0)
+                        if n0 > 0:
+                            shard_buf[:n0].copy_(h0[lo0:hi0])
+                        lo1 = max(r_lo, m0_2mb) - m0_2mb
+                        hi1 = max(r_lo + valid, m0_2mb) - m0_2mb
+                        n1 = max(0, hi1 - lo1)
+                        if n1 > 0:
+                            shard_buf[n0 : n0 + n1].copy_(h1_buf[lo1:hi1])
+                    del h0
+                elif moe_cfg is not None:
+                    # 4-card M<=3072 optimal path: whole MoE (0 extra weight reads)
+                    # followed by Copy-Engine Ring Reduce-Scatter (1.31x vs NCCL RS).
+                    orig_skip = moe_cfg.skip_final_all_reduce
+                    try:
+                        moe_cfg.skip_final_all_reduce = True
+                        h_raw = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
+                    finally:
+                        moe_cfg.skip_final_all_reduce = orig_skip
+                    del x_ffn_in
+                    _rs_bf16(h_raw, shard_buf)
+                    del h_raw
+                else:
+                    h_full = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
+                    del x_ffn_in
+                    shard_buf.copy_(_slice_pad_local(h_full))
+                    del h_full
+
+                # 4. Next layer's Engram + Attn mHC on ONLY S local rows
+                nxt_idx = idx + 1
+                nxt = self.layers[nxt_idx]
+                assert isinstance(nxt, DeepseekV4DecoderLayer)
+                capture_nxt_aux = nxt_idx in self.aux_hidden_state_layers
+                if nxt.engram is not None and engram_hashes is not None:
+                    prev_post_loc = mhc_post_tilelang(
+                        shard_buf, res_loc, pm_loc, rm_loc
+                    )
+                    if capture_nxt_aux:
+                        aux_hidden_by_layer[nxt_idx] = _ag_generic(
+                            prev_post_loc.mean(dim=1)
+                        )
+                    res_loc = _engram_local(
+                        nxt.engram,
+                        prev_post_loc,
+                        engram_hashes[:, nxt.engram.layer_hash_index],
+                        engram_mask,
+                    )
+                    del prev_post_loc
+                    pm_loc, rm_loc, x_nxt_loc, attn_pre_loc = _mhc_pre_fn(nxt)(
+                        res_loc,
+                        nxt.hc_attn_fn,
+                        nxt.hc_attn_scale,
+                        nxt.hc_attn_base,
+                        nxt.rms_norm_eps,
+                        nxt.hc_eps,
+                        nxt.hc_eps,
+                        nxt.hc_post_alpha,
+                        nxt.hc_sinkhorn_iters,
+                        pre_mix=pre_loc,
+                        norm_weight=nxt.attn_norm.weight,
+                        norm_eps=nxt.attn_norm.variance_epsilon,
+                    )
+                else:
+                    res_loc, pm_loc, rm_loc, x_nxt_loc, attn_pre_loc, aux_loc = (
+                        mhc_shifted_post_pre(
+                            shard_buf,
+                            res_loc,
+                            pm_loc,
+                            rm_loc,
+                            nxt.hc_attn_fn,
+                            nxt.hc_attn_scale,
+                            nxt.hc_attn_base,
+                            nxt.rms_norm_eps,
+                            nxt.hc_eps,
+                            nxt.hc_eps,
+                            nxt.hc_post_alpha,
+                            nxt.hc_sinkhorn_iters,
+                            pre_mix=pre_loc,
+                            norm_weight=nxt.attn_norm.weight,
+                            norm_eps=nxt.attn_norm.variance_epsilon,
+                            capture_aux=capture_nxt_aux,
+                            stream=None,
+                            reduce_results=False,
+                            boundary_weight=nxt.hc_attn_boundary_weight,
+                        )
+                    )
+                    if capture_nxt_aux and aux_loc is not None:
+                        aux_hidden_by_layer[nxt_idx] = _ag_generic(aux_loc)
+                del pre_loc
+                _ag_bf16(x_nxt_loc, full_buf)
+                del x_nxt_loc
+                x_in = full_buf[:M]
+            else:
+                # Last layer: preserve native reduce_results contract for _collapse
+                # / decoder_replay_layers.
+                if layer.fuse_mhc_all_reduce and layer.ffn.defers_finalize(
+                    x_ffn_in.shape[0]
+                ):
+                    final_hidden = layer.ffn.forward_unfinalized(x_ffn_in, input_ids)
+                else:
+                    final_hidden = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
+                del x_ffn_in
+
+        # ---- Exit: gather local mHC state once to match _run_layers contract ----
+        assert final_hidden is not None and pre_loc is not None
+        hc_mult = res_loc.shape[1]
+        res_out = torch.empty((M, hc_mult, H), dtype=dtype, device=dev)
+        for c_idx in range(hc_mult):
+            _ag_bf16(res_loc[:, c_idx, :], full_buf)
+            res_out[:, c_idx, :].copy_(full_buf[:M])
+        del res_loc
+
+        post_out = _ag_generic(pm_loc)
+        res_mix_out = _ag_generic(rm_loc)
+        pre_out = _ag_generic(pre_loc)
+        del pm_loc, rm_loc, pre_loc, shard_buf
+        return final_hidden, res_out, post_out, res_mix_out, pre_out
 
     def _run_layers_prefill_ar_overlap(
         self,

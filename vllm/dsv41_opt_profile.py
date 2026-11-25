@@ -189,6 +189,9 @@ PROFILES["tep4_fused"] = {
     "VLLM_DSV4_MXFP4_DQ": "3",
     "VLLM_DSV41_FUSED_SHARED_ADD": "1",
     "VLLM_DSV41_FUSED_W2_AR": "1",
+    "VLLM_DSV41_PREFILL_DMA_RING": "auto",
+    "VLLM_DSV41_PREFILL_ROW_SHARD": "auto",
+    "VLLM_DSV41_PREFILL_2MB_MOE": "auto",
 }
 
 # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).
@@ -210,6 +213,9 @@ _TP_COMMON_EXTRAS: dict[str, str] = {
     "VLLM_DSV41_WOA_CPP": "1",
     "VLLM_DSV41_WOA_MARLIN": "1",
     "VLLM_DSV41_FUSED_SHARED_ADD": "1",
+    "VLLM_DSV41_PREFILL_DMA_RING": "auto",
+    "VLLM_DSV41_PREFILL_ROW_SHARD": "auto",
+    "VLLM_DSV41_PREFILL_2MB_MOE": "auto",
 }
 PROFILES["tp_auto"] = {**PROFILES["default"], **_TP_COMMON_EXTRAS}
 PROFILES["tp_auto_verification"] = {**PROFILES["verification"], **_TP_COMMON_EXTRAS}

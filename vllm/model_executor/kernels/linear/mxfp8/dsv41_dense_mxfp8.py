@@ -303,7 +303,7 @@ def fast_gate_topk_enabled() -> bool:
 
 
 def try_gate_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype | None):
-    """Bitwise-identical CUDA replacement for Triton bf16_gemv on M=1..8."""
+    """Bitwise-identical CUDA replacement for Triton bf16_gemv on M=1..6."""
     if not fast_gate_topk_enabled() or out_dtype != torch.float32:
         return None
     if x.ndim != 2 or weight.ndim != 2 or not x.is_cuda or not weight.is_cuda:
@@ -312,7 +312,7 @@ def try_gate_gemv(x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype 
     E, Kw = weight.shape
     if (
         M < 1
-        or M > 8
+        or M > 6
         or K < 8
         or K % 8 != 0
         or Kw != K
