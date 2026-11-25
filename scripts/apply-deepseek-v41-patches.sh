@@ -81,6 +81,7 @@ if [[ $ENABLE_ADAPTIVE_VERIFICATION == 1 ]]; then
   "$PYTHON" "$MODEL_DIR/tests/test_verification_profile.py" "$SOURCE_TREE"
   "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$SOURCE_TREE"
   VLLM_DSV41_COST_MS_FUSED=1 "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$SOURCE_TREE"
+  VLLM_DSV41_COST_MS_FUSED=tp4 "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$SOURCE_TREE"
   "$PYTHON" "$MODEL_DIR/tests/test_cohort_packing.py" "$SOURCE_TREE"
   "$PYTHON" "$MODEL_DIR/tests/test_verification_dispatch.py" "$SOURCE_TREE"
   compile_files+=(

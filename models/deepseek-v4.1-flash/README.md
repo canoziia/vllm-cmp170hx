@@ -1,12 +1,14 @@
-# DeepSeek V4.1 Flash on SM80 GPUs (TEP4 80G & PP6 CMP 170HX)
+# DeepSeek V4.1 Flash on SM80 GPUs (Pure TP4 80G, optional TEP4 & PP6 CMP 170HX)
 
 Reproducible patch series, self-contained native CUDA/C++ extensions, and Podman Compose
 deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` built directly on official
 `vllm-project/vllm` for SM80 GPUs:
 
-- **Default — 4x 80G SM80 TEP4 (`compose.yml` / `.env.example`)**: `TP=4 + EP=4, DCP=1, PP=1`
-  (`nvfp4_ds_mla` KV cache, `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` +
+- **Default — 4x 80G SM80 Pure TP4 (`compose.yml` / `.env.example`)**: `TP=4, EP=1, DCP=1, PP=1`
+  (`NI=576`, all `384` routed experts sharded 1/4 per rank for 100% load balance across decode and
+  prefill, `nvfp4_ds_mla` KV cache, `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` +
   LMCache 8 GiB L1 / 500 GiB L2, topology-aware NVLink / PCIe P2P collectives).
+  *(Legacy `TEP4` remains supported by adding `--enable-expert-parallel`, auto-selecting `tep4_fused`.)*
 - **Optional — 6x CMP 170HX PP6 (`compose.pp6.yml` / `.env.pp6.example`)**: `TP=1 x PP=6`
   (`7,7,7,7,7,5`, LMCache KV tier, CPU Engram offload).
 
@@ -42,17 +44,17 @@ All seven native extensions are built from source during `scripts/build-deepseek
 | `native/dsv41_pcie_dma` | `vllm/_dsv41_pcie_dma_C.so` | O(1) `K = 3` triple-buffered Copy-Engine Ring DMA (`ce_reduce_scatter`, `ce_all_gather`, `ce_all_reduce_inplace`) with 64-bit bidirectional PTX ACK |
 | `native/dsv41_engram_cpu` | `.../common/_dsv41_engram_cpu.so` | OpenMP + AVX2/FMA packed 264 B FP8+UE8M0 host Engram gather |
 
-## TEP4 Deployment (`4x 80G SM80`) & Automatic NVLink / PCIe Detection
+## Pure TP4 Deployment (`4x 80G SM80`, Default) & Automatic NVLink / PCIe Detection
 
 ```text
-TP4 + EP4, DCP1, PP1
-DSpark K=5, TP-local greedy verification + adaptive verification
+TP4 (EP=1, NI=576, E=384), DCP1, PP1
+DSpark K=5, TP-local greedy verification + adaptive verification (COST_MS_TP4)
 max_model_len=1,048,576
 max_num_batched_tokens=3072
 max_num_seqs=32
 KV=nvfp4_ds_mla (2,014,502 GPU KV tokens at 2.20 GB/rank = 1.92x 1M + LMCache 8 GiB L1 / 500 GiB L2)
 CPU Engram offload (2x 94.4 GiB packed 264B rows), CPU Vision offload
-VLLM_DSV41_OPT_PROFILE=auto   # auto-selects tep4_fused for TP=4+EP=4
+VLLM_DSV41_OPT_PROFILE=auto   # auto-selects tp4_fused for Pure TP=4 (or tep4_fused with --enable-expert-parallel)
 ```
 
 ### Zero-Edit Migration Between Parallelism Splits, PCIe P2P, and NVLink
@@ -61,19 +63,23 @@ VLLM_DSV41_OPT_PROFILE=auto   # auto-selects tep4_fused for TP=4+EP=4
 inspects the model `config.json` and launch parallelism at startup:
 
 - **Non-DeepSeek models**: completely untouched (100% standard upstream vLLM).
-- **DeepSeek-V4.1 `TP=4 + EP=4` (`PP=1`)**: automatically selects `tep4_fused`, which
+- **DeepSeek-V4.1 Pure `TP=4` (`PP=1`, default)**: automatically selects `tp4_fused`
+  (`NI=576` weight-streaming MXFP4 W13/W2, `DeferringMarlinExperts` +
+  `TwoShotAllReduceFinalizePostCollapse` for `M=3..60`, 1-hop OneShot + `w2_splitk_ep` `KS=3`
+  for `M=1..2`, `fused_gate_topk_align` for `local_e <= 384`, calibrated `COST_MS_TP4`), and
   queries `ampere_peer_topology()` at worker startup via `cudaDevP2PAttrPerformanceRank` / NVML:
   - **PCIe Gen4 P2P (`"pcie"`)**: bounds two-shot CuTe Lamport AllReduce to `<= 60` rows
     (switching seamlessly to full-duplex Ring NCCL for `> 60` rows) and runs single-kernel
     Lamport symmetric-memory exchange (`markov_symm.py`) across the 5 DSpark Markov steps.
   - **NVLink (`"nvlink"`)**: automatically unlocks full `MAX_ROWS = 192` two-shot CuTe
     Lamport AllReduce and column AllGather across all decode batch sizes (`c=1..32`).
+- **DeepSeek-V4.1 Legacy `TP=4 + EP=4` (`--enable-expert-parallel`)**: automatically selects `tep4_fused`.
 - **DeepSeek-V4.1 `PP > 1` (e.g. 6x CMP 170HX PP6)**: automatically selects `default`
   (or `verification` when `enable_adaptive_verification: true`).
 - **Other DeepSeek-V4.1 `TP > 1` splits (e.g. TP2 / TP8)**: automatically selects `tp_auto`
   (or `tp_auto_verification`).
 
-Moving the same container image between TEP4 / PP6 or PCIe / NVLink SM80 hosts requires
+Moving the same container image between Pure TP4 / TEP4 / PP6 or PCIe / NVLink SM80 hosts requires
 **zero `.py` changes**.
 
 - **Host PCIe Relaxed Ordering (`NVreg_EnablePCIERelaxedOrderingMode`)**: keep the default `0` on
@@ -85,14 +91,14 @@ Moving the same container image between TEP4 / PP6 or PCIe / NVLink SM80 hosts r
 ### Quickstart (Prebuilt GHCR Images)
 
 ```bash
-# Default: 4x 80G SM80 TEP4 (PCIe P2P or NVLink)
+# Default: 4x 80G SM80 Pure TP4 (PCIe P2P or NVLink)
 cd models/deepseek-v4.1-flash
 cp .env.example .env
 chmod 600 .env
 # Edit VLLM_API_KEY, MODEL_ROOT, cache/LMCache paths, and DSV41_GPU_0..3 in .env
 
 podman compose --podman-run-args=--ipc=host up -d
-podman logs -f deepseek-v4.1-flash-tep4
+podman logs -f deepseek-v4.1-flash-tp4
 
 # Optional: 6x CMP 170HX PP6 (7,7,7,7,7,5)
 # cp .env.pp6.example .env
@@ -125,12 +131,13 @@ always take precedence:
 
 | profile | target topology | description |
 |---|---|---|
-| `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tep4_fused` for TEP4, `default`/`verification` for PP>1, `tp_auto` for other TP>1 |
+| `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tp4_fused` for Pure TP4 (default), `tep4_fused` for legacy TEP4, `default`/`verification` for PP>1, `tp_auto` for other TP>1 |
+| `tp4_fused` (4×80G default) | 4x 80G Pure TP4 (PCIe or NVLink) | Pure TP4 deep-fusion profile (`EP=1, NI=576`): `DeferringMarlinExperts` + `TwoShotAllReduceFinalizePostCollapse` (`M=3..60`), 1-hop OneShot + `w2_splitk_ep` `KS=3` (`M=1..2`), `fused_gate_topk_align` (`local_e<=384`), `moe_prefill` split-list (`NI=576`), `COST_MS_TP4` |
 | `default` | PP6 / general SM80 | Base 1x-HBM MXFP8/MXFP4 decode & long-context prefill kernels |
 | `verification` | PP6 + DSpark | Adds sub-width & mixed-`spec_k` FULL CUDA graphs, metadata replay, live-load PP cohorts |
 | `tp_auto` / `tp_auto_verification` | General DeepSeek TP>1 | TP-safe SM80 optimisations (Engram NUMA interleave, FP8 `wo_a`, vision offload, cuBLAS MXFP8 prefill, topology-aware collectives) |
-| `tep4_verification` | 4x 80G TEP4 | Baseline SM80 adaptive-verification profile (`nvfp4_ds_mla`, CPU vision offload, `COST_MS_BASE`) |
-| `tep4_fused` | 4x 80G TEP4 (PCIe or NVLink) | Topology-aware deep-fusion profile: topology-aware Lamport collectives, `fused_gate_topk_align`, `w2_splitk_ep` + fused shared add, C++ `wo_a`, TP-local greedy verify, `dequant_marlin_mxfp8` cuBLAS prefill, `COST_MS_FUSED` |
+| `tep4_verification` | 4x 80G legacy TEP4 | Baseline SM80 adaptive-verification profile (`nvfp4_ds_mla`, CPU vision offload, `COST_MS_BASE`) |
+| `tep4_fused` | 4x 80G legacy TEP4 (PCIe or NVLink) | Legacy TEP4 (`TP=4 + EP=4`) deep-fusion profile (`w2_splitk_ep` + fused shared add, `COST_MS_FUSED`) |
 | `off` / `0` | Any | Disables all automatic profile overrides |
 
 ## Preserved API & Serving Contracts
@@ -149,23 +156,23 @@ always take precedence:
 - **SSE Keep-Alive & Detailed Spec Metrics**: `--sse-keep-alive-interval` and
   `--per-request-spec-decode-metrics=detailed` supported out of the box.
 
-## Measured TEP4 Benchmarks (`4x 80G SM80 PCIe Gen4`, `compose.yml` + LMCache)
+## Measured Pure TP4 Benchmarks (`4x 80G SM80 PCIe Gen4`, `compose.yml` + LMCache)
 
-Measured on the live `compose.yml` stack (`TP=4 + EP=4`, `nvfp4_ds_mla`,
+Measured on the live `compose.yml` stack (`TP=4, EP=1, NI=576`, `nvfp4_ds_mla`,
 `VLLM_KV_CACHE_MEMORY=2200000000` -> `2,014,502` GPU KV tokens = `1.92x 1M`,
 LMCache `8 GiB` L1 RAM + `500 GiB` NVMe L2, `max_num_batched_tokens=3072`,
-`VLLM_DSV41_OPT_PROFILE=tep4_fused`, `enable_adaptive_verification=true`, `0` OOM across
+`VLLM_DSV41_OPT_PROFILE=auto` (`tp4_fused`), `enable_adaptive_verification=true`, `0` OOM across
 full 1M prefill + 32-concurrency stress).
 
 ### Cold Prefill (`tok/s`, `c=1`, `cached_tokens=0`, async streaming to LMCache L1 + L2)
 
 | Target Length | 180W Power Cap | 250W Power Limit | 250W vs 180W |
 |---:|---:|---:|---:|
-| **64K** | 10,174.9 | **10,551.7** | +3.7% |
-| **128K** | 10,043.3 | **10,491.8** | +4.5% |
-| **256K** | 9,654.7 | **10,205.2** | +5.7% |
-| **512K** | 8,943.1 | **9,515.6** | +6.4% |
-| **1M** | 7,631.3 | **8,314.6** | +9.0% |
+| **64K** | 10,362.0 | **10,383.2** | +0.2% |
+| **128K** | 10,474.5 | **11,239.9** | +7.3% |
+| **256K** | 10,064.5 | **10,847.7** | +7.8% |
+| **512K** | 9,472.3 | **9,859.0** | +4.1% |
+| **1M** | 8,220.5 | **8,819.9** | +7.3% |
 
 ### Decode Throughput & Step Latency (`full_batch_tok_s` / `step_ms`, `max_tokens=500`)
 
@@ -173,20 +180,20 @@ full 1M prefill + 32-concurrency stress).
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | 202.3 (`10.41 ms`, acc 2.10) | 459.9 (`11.94 ms`, acc 5.43) | 535.0 (`11.10 ms`, acc 5.88) |
-| **2** | 350.2 (`12.43 ms`, acc 2.18) | 722.3 (`15.45 ms`, acc 5.46) | 879.1 (`13.58 ms`, acc 5.88) |
-| **4** | 521.6 (`14.91 ms`, acc 1.97) | 1,067.1 (`20.76 ms`, acc 5.39) | 1,384.5 (`17.29 ms`, acc 5.88) |
-| **8** | 750.7 (`20.33 ms`, acc 1.91) | 1,551.5 (`28.67 ms`, acc 5.42) | 1,950.5 (`24.58 ms`, acc 5.88) |
-| **16** | 1,051.4 (`25.23 ms`, acc 1.66) | 2,042.6 (`42.42 ms`, acc 5.44) | 2,381.3 (`40.29 ms`, acc 5.88) |
-| **32** | 1,277.9 (`48.24 ms`, acc 1.93) | 2,626.9 (`66.43 ms`, acc 5.41) | 2,989.5 (`64.20 ms`, acc 5.88) |
+| **1** | 222.0 (`9.29 ms`, acc 2.06) | 514.0 (`10.84 ms`, acc 5.51) | 585.3 (`10.15 ms`, acc 5.88) |
+| **2** | 376.8 (`11.33 ms`, acc 2.16) | 775.6 (`14.27 ms`, acc 5.43) | 957.3 (`12.47 ms`, acc 5.88) |
+| **4** | 579.5 (`12.94 ms`, acc 1.90) | 1,217.8 (`18.12 ms`, acc 5.40) | 1,524.2 (`15.71 ms`, acc 5.88) |
+| **8** | 839.4 (`18.34 ms`, acc 1.93) | 1,762.1 (`25.27 ms`, acc 5.44) | 2,169.0 (`22.10 ms`, acc 5.88) |
+| **16** | 1,152.0 (`26.80 ms`, acc 1.93) | 2,304.4 (`38.43 ms`, acc 5.38) | 2,649.4 (`36.21 ms`, acc 5.88) |
+| **32** | 1,425.5 (`43.57 ms`, acc 1.94) | 2,893.9 (`59.10 ms`, acc 5.38) | 3,419.7 (`56.12 ms`, acc 5.88) |
 
-#### 250W Power Limit (`RO=0`, `61–66 °C`, `0` OOM)
+#### 250W Power Limit (`RO=0`, `0` OOM)
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | **211.9 (`9.94 ms`, acc 2.10)** | **488.6 (`11.24 ms`, acc 5.43)** | **563.7 (`10.54 ms`, acc 5.88)** |
-| **2** | **370.9 (`11.74 ms`, acc 2.18)** | **777.1 (`14.36 ms`, acc 5.46)** | **932.2 (`12.81 ms`, acc 5.88)** |
-| **4** | **564.8 (`13.46 ms`, acc 1.90)** | **1,180.1 (`18.74 ms`, acc 5.45)** | **1,485.5 (`16.11 ms`, acc 5.88)** |
-| **8** | **818.2 (`18.81 ms`, acc 1.93)** | **1,770.8 (`24.88 ms`, acc 5.44)** | **2,115.5 (`22.66 ms`, acc 5.88)** |
-| **16** | **1,133.1 (`27.80 ms`, acc 1.96)** | **2,223.0 (`38.91 ms`, acc 5.45)** | **2,544.0 (`37.71 ms`, acc 5.88)** |
-| **32** | **1,398.2 (`44.25 ms`, acc 1.94)** | **2,851.3 (`61.20 ms`, acc 5.41)** | **3,192.3 (`60.13 ms`, acc 5.88)** |
+| **1** | **232.4 (`8.87 ms`, acc 2.06)** | **549.9 (`10.13 ms`, acc 5.51)** | **623.6 (`9.53 ms`, acc 5.88)** |
+| **2** | **401.0 (`10.65 ms`, acc 2.16)** | **838.3 (`13.20 ms`, acc 5.43)** | **1,027.7 (`11.62 ms`, acc 5.88)** |
+| **4** | **614.7 (`12.20 ms`, acc 1.90)** | **1,269.2 (`17.24 ms`, acc 5.37)** | **1,624.7 (`14.73 ms`, acc 5.88)** |
+| **8** | **892.3 (`14.73 ms`, acc 1.65)** | **1,907.9 (`23.34 ms`, acc 5.44)** | **2,358.7 (`20.33 ms`, acc 5.88)** |
+| **16** | **1,247.7 (`24.75 ms`, acc 1.93)** | **2,410.2 (`37.01 ms`, acc 5.43)** | **2,894.6 (`33.15 ms`, acc 5.88)** |
+| **32** | **1,556.6 (`39.67 ms`, acc 1.93)** | **3,131.5 (`54.47 ms`, acc 5.40)** | **3,709.8 (`51.73 ms`, acc 5.88)** |

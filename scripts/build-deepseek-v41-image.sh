@@ -71,6 +71,7 @@ validate_vllm_tree() {
   "$PYTHON" "$MODEL_DIR/tests/test_verification_profile.py" "$src"
   "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$src"
   VLLM_DSV41_COST_MS_FUSED=1 "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$src"
+  VLLM_DSV41_COST_MS_FUSED=tp4 "$PYTHON" "$MODEL_DIR/tests/test_measured_selection.py" "$src"
   "$PYTHON" "$MODEL_DIR/tests/test_cohort_packing.py" "$src"
   "$PYTHON" "$MODEL_DIR/tests/test_verification_dispatch.py" "$src"
   "$PYTHON" -m py_compile \

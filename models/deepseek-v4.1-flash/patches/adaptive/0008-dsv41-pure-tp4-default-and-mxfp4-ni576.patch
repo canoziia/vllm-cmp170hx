@@ -1,0 +1,472 @@
+From 53498d6d2f371f9f74d57831a9613d4bb83e87d5 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Wed, 25 Nov 2026 21:19:40 +0800
+Subject: [PATCH] perf(deepseek-v4.1): Pure TP4 default (NI=576 MXFP4,
+ tp4_fused, calibrated COST_MS_TP4)
+
+---
+ vllm/dsv41_opt_profile.py                     |  15 ++-
+ .../model_executor/layers/fused_moe/config.py |   4 +-
+ .../layers/fused_moe/dsv4_mxfp4_decode.py     | 108 ++++++++++++------
+ .../layers/fused_moe/experts/marlin_moe.py    |   4 +-
+ .../layers/fused_moe/moe_prefill.py           |  11 +-
+ vllm/v1/core/sched/dsv41_measured_policy.py   |  25 +++-
+ 6 files changed, 119 insertions(+), 48 deletions(-)
+
+diff --git a/vllm/dsv41_opt_profile.py b/vllm/dsv41_opt_profile.py
+index 6bb044a..401c6b6 100644
+--- a/vllm/dsv41_opt_profile.py
++++ b/vllm/dsv41_opt_profile.py
+@@ -1,15 +1,17 @@
+ # SPDX-License-Identifier: Apache-2.0
+ """One switch for the DeepSeek V4.1 Flash SM80 optimisation patches.
+ 
+-VLLM_DSV41_OPT_PROFILE=auto|default|verification|tp_auto|tp_auto_verification|tep4|tep4_verification|tep4_fused
++VLLM_DSV41_OPT_PROFILE=auto|default|verification|tp_auto|tp_auto_verification|tp4_fused|tep4|tep4_verification|tep4_fused
+ sets every per-patch switch to its deployed value *unless that variable is
+ already set*, so a single switch can still be overridden.
+ 
+ In ``auto`` mode, the launch command line and model ``config.json`` are
+ inspected before vLLM imports:
+   * non-DeepSeek-V4/V4.1 models are left completely untouched (official vLLM);
+-  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP enabled selects ``tep4_fused``
++  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP disabled (default) selects ``tp4_fused``
+     (which further auto-detects NVLink vs PCIe P2P via NVML/peer topology);
++  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP enabled selects ``tep4_fused``
++    (legacy TEP4 path, also auto-detecting NVLink vs PCIe P2P);
+   * DeepSeek-V4/V4.1 with PP > 1 selects ``verification`` when
+     ``enable_adaptive_verification`` is set in ``--speculative-config``, else
+     ``default``;
+@@ -194,6 +196,13 @@ PROFILES["tep4_fused"] = {
+     "VLLM_DSV41_PREFILL_2MB_MOE": "auto",
+ }
+ 
++# Topology-aware deep fusion profile for 4x SM80 pure TP4 (default: EP=1, NI=576).
++PROFILES["tp4_fused"] = {
++    **PROFILES["tep4_fused"],
++    "VLLM_DSV41_COST_MS_FUSED": "tp4",
++    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "3",
++}
++
+ # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).
+ _TP_COMMON_EXTRAS: dict[str, str] = {
+     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": "0",
+@@ -329,6 +338,8 @@ def resolve_auto_profile(argv: list[str] | None = None) -> str | None:
+         return None
+     if pp > 1:
+         return "verification" if adaptive else "default"
++    if tp == 4 and not ep:
++        return "tp4_fused"
+     if tp == 4 and ep:
+         return "tep4_fused"
+     if tp > 1:
+diff --git a/vllm/model_executor/layers/fused_moe/config.py b/vllm/model_executor/layers/fused_moe/config.py
+index e2aa126..80e4940 100644
+--- a/vllm/model_executor/layers/fused_moe/config.py
++++ b/vllm/model_executor/layers/fused_moe/config.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from dataclasses import dataclass, field
+ from enum import Enum, IntEnum
+ from typing import TYPE_CHECKING, Union
+@@ -1621,9 +1622,10 @@ class FusedMoEConfig:
+     def should_defer_moe_finalize(self, num_tokens: int) -> bool:
+         """Return whether this invocation may defer the top-k reduction."""
+         max_num_tokens = self.defer_moe_finalize_max_num_tokens
++        min_num_tokens = int(os.environ.get("VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS", "1"))
+         return (
+             self.use_deferred_moe_finalize
+-            and num_tokens > 0
++            and num_tokens >= min_num_tokens
+             and (max_num_tokens < 0 or num_tokens <= max_num_tokens)
+         )
+ 
+diff --git a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+index 2d32322..8efe13a 100644
+--- a/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
++++ b/vllm/model_executor/layers/fused_moe/dsv4_mxfp4_decode.py
+@@ -27,6 +27,7 @@ from vllm.logger import init_logger
+ logger = init_logger(__name__)
+ 
+ _K, _NI = 5120, 2304
++_NI_SUPPORTED = (2304, 576)
+ _OPS = None
+ _LOAD_ERROR: str | None = None
+ _SCALE_OK: dict[int | tuple[int, int], bool] = {}
+@@ -346,7 +347,7 @@ def try_fused_gate_topk_align(
+         cuda_align_enabled()
+         and type(routed_experts).__name__ == "RoutedExperts"
+         and getattr(routed_experts, "_lora_context", None) is None
+-        and 0 < local_e <= 128
++        and 0 < local_e <= 384
+         and (
+             emap is None
+             or (
+@@ -622,6 +623,7 @@ def try_run(
+     moe_sum=None,
+     output=None,
+     global_num_experts=-1,
++    mul_topk_weights_in_gemm2=True,
+ ):
+     """Return (tensor, summed) or None to keep the Marlin path.
+ 
+@@ -632,10 +634,11 @@ def try_run(
+ 
+     M, K = hidden_states.shape
+     topk = topk_ids.size(1)
++    ni = w2.size(1) * 16
+     if (
+         quant_type != scalar_types.float4_e2m1f
+         or K != _K
+-        or w2.size(1) * 16 != _NI
++        or ni not in _NI_SUPPORTED
+         or M > _max_tokens()
+         or block_size_m != 8
+         or hidden_states.dtype != torch.bfloat16
+@@ -688,7 +691,8 @@ def try_run(
+         else None
+     )
+     fsum = (
+-        _fused_sum()
++        mul_topk_weights_in_gemm2
++        and _fused_sum()
+         and M <= _sum_max_tokens()
+         and _plain_moe_sum(moe_sum)
+         and topk <= 8
+@@ -701,12 +705,21 @@ def try_run(
+             )
+         )
+     )
+-    if dq != 0 or limit is not None or fsum or expert_map is not None:
++    if (
++        dq != 0
++        or limit is not None
++        or fsum
++        or expert_map is not None
++        or ni != _NI
++        or not mul_topk_weights_in_gemm2
++    ):
+         return _try_run_v2(
+             ops,
+             dq,
+             limit,
+             fsum,
++            ni,
++            mul_topk_weights_in_gemm2,
+             hidden_states,
+             w1,
+             w2,
+@@ -814,6 +827,8 @@ def _try_run_v2(
+     dq,
+     limit,
+     fsum,
++    ni,
++    mul_topk_weights_in_gemm2,
+     hidden_states,
+     w1,
+     w2,
+@@ -848,13 +863,14 @@ def _try_run_v2(
+     if ctr is None or sync is None:
+         return None
+     if (
+-        intermediate_cache13.numel() < slots * max(2 * _NI, _K)
+-        or intermediate_cache2.numel() < slots * _NI
++        intermediate_cache13.numel() < slots * max(2 * ni, _K)
++        or intermediate_cache2.numel() < slots * ni
+         or not intermediate_cache13.is_contiguous()
+         or not intermediate_cache2.is_contiguous()
+     ):
+         return None
+-    if 128 + slots * 36 > _SYNC_SIZE:
++    hp = ni // 64
++    if 128 + slots * hp > _SYNC_SIZE:
+         return None
+     ops2 = _ops2()
+     s_order = _sum_order(moe_sum, expert_map)
+@@ -862,17 +878,29 @@ def _try_run_v2(
+     if not _LOGGED2:
+         _LOGGED2 = True
+         logger.info(
+-            "VLLM_DSV4_MXFP4_DECODE v2: dq=%d fused_act=%s fused_sum=%s (order %d)",
++            "VLLM_DSV4_MXFP4_DECODE v2: ni=%d dq=%d fused_act=%s fused_sum=%s (order %d)",
++            ni,
+             dq,
+             limit is not None,
+             fsum,
+             s_order,
+         )
+-    cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
++    if ni == 576:
++        w13_cfg = 2 if dq in (0, 3) else 4
++        w2_cfg = int(
++            os.environ.get(
++                "VLLM_DSV4_MXFP4_TP4_W2_CFG",
++                "2" if M <= _v4_tile_max_tokens() else "5",
++            )
++        )
++    else:
++        w13_cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
++        w2_cfg = w13_cfg
+     r2_ops = _ops_r2()
+     w2_ks = None
+     if (
+-        r2_ops is not None
++        mul_topk_weights_in_gemm2
++        and r2_ops is not None
+         and dq in (0, 2, 3)
+         and topk <= 8
+         and _plain_moe_sum(moe_sum)
+@@ -886,12 +914,23 @@ def _try_run_v2(
+             )
+         )
+     ):
+-        w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
+-    # W13 split-K partials [4, slots, 2*NI]; split-K W2 reuses the buffer as
++        if ni == 576:
++            if M <= 2:
++                w2_ks = int(os.environ.get("VLLM_DSV4_MXFP4_TP4_W2_KS_SMALL", "3"))
++            else:
++                w2_ks = int(
++                    os.environ.get(
++                        "VLLM_DSV4_MXFP4_TP4_W2_KS_MED",
++                        "2" if (topk <= 3 or M <= 8) else "1",
++                    )
++                )
++        else:
++            w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
++    # W13 split-K partials [4, slots, 2*ni]; split-K W2 reuses the buffer as
+     # [w2_ks, slots, K] after the activation consumed the W13 partials.
+-    part_numel = max(4 * slots * 2 * _NI, (w2_ks or 0) * slots * _K)
++    part_numel = max(4 * slots * 2 * ni, (w2_ks or 0) * slots * _K)
+     part = torch.empty(part_numel, dtype=torch.float32, device=dev)
+-    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
++    h = intermediate_cache2.reshape(-1)[: slots * ni].view(slots, ni)
+     tw = topk_weights.view(-1)
+     w1s = w1_scale.view(torch.uint8)
+     w2s = w2_scale.view(torch.uint8)
+@@ -908,9 +947,9 @@ def _try_run_v2(
+                 topk,
+                 slots,
+                 _K,
+-                2 * _NI,
++                2 * ni,
+                 True,
+-                cfg,
++                w13_cfg,
+                 dq,
+                 True,
+                 limit,
+@@ -932,9 +971,9 @@ def _try_run_v2(
+                 topk,
+                 slots,
+                 _K,
+-                2 * _NI,
++                2 * ni,
+                 True,
+-                cfg,
++                w13_cfg,
+                 dq,
+                 True,
+                 limit,
+@@ -961,9 +1000,9 @@ def _try_run_v2(
+                 topk,
+                 slots,
+                 _K,
+-                2 * _NI,
++                2 * ni,
+                 True,
+-                cfg,
++                w13_cfg,
+                 dq,
+                 False,
+                 0.0,
+@@ -985,9 +1024,9 @@ def _try_run_v2(
+                 topk,
+                 slots,
+                 _K,
+-                2 * _NI,
++                2 * ni,
+                 True,
+-                cfg,
++                w13_cfg,
+                 dq,
+                 False,
+                 0.0,
+@@ -1000,8 +1039,8 @@ def _try_run_v2(
+                 expert_map,
+                 global_e,
+             )
+-        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
+-        ops.sum(part, ks, slots, 2 * _NI, act_in)
++        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * ni].view(slots, 2 * ni)
++        ops.sum(part, ks, slots, 2 * ni, act_in)
+         if activation_func is None:
+             from vllm.model_executor.layers.fused_moe.activation import (
+                 ApplyMoEActivationConfig,
+@@ -1101,10 +1140,10 @@ def _try_run_v2(
+                 tw,
+                 topk,
+                 slots,
+-                _NI,
++                ni,
+                 _K,
+                 False,
+-                cfg,
++                w2_cfg,
+                 dq,
+                 True,
+                 0.0,
+@@ -1125,10 +1164,10 @@ def _try_run_v2(
+                 tw,
+                 topk,
+                 slots,
+-                _NI,
++                ni,
+                 _K,
+                 False,
+-                cfg,
++                w2_cfg,
+                 dq,
+                 True,
+                 0.0,
+@@ -1143,6 +1182,7 @@ def _try_run_v2(
+             )
+         return y, True
+     dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
++    tw_w2 = tw if mul_topk_weights_in_gemm2 else torch.empty(0, dtype=torch.float32, device=dev)
+     if expert_map is None:
+         ops2.gemm(
+             h,
+@@ -1151,13 +1191,13 @@ def _try_run_v2(
+             sorted_token_ids,
+             expert_ids,
+             num_tokens_post_padded,
+-            tw,
++            tw_w2,
+             topk,
+             slots,
+-            _NI,
++            ni,
+             _K,
+             False,
+-            cfg,
++            w2_cfg,
+             dq,
+             False,
+             0.0,
+@@ -1175,13 +1215,13 @@ def _try_run_v2(
+             sorted_token_ids,
+             expert_ids,
+             num_tokens_post_padded,
+-            tw,
++            tw_w2,
+             topk,
+             slots,
+-            _NI,
++            ni,
+             _K,
+             False,
+-            cfg,
++            w2_cfg,
+             dq,
+             False,
+             0.0,
+diff --git a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+index deb9058..fddf3fa 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py
+@@ -396,8 +396,7 @@ def fused_marlin_moe(
+     assert activation is not None
+     moe_output = None
+     if (
+-        mul_topk_weights_in_gemm2
+-        and prefill_block_lists is None
++        prefill_block_lists is None
+         and _dsv4_mxfp4_decode.enabled()
+     ):
+         # VLLM_DSV4_MXFP4_DECODE: weight-streaming MXFP4 decode kernels for
+@@ -443,6 +442,7 @@ def fused_marlin_moe(
+             moe_sum=moe_sum,
+             output=output,
+             global_num_experts=global_num_experts,
++            mul_topk_weights_in_gemm2=mul_topk_weights_in_gemm2,
+         )
+         if moe_output is not None:
+             moe_output, summed = moe_output
+diff --git a/vllm/model_executor/layers/fused_moe/moe_prefill.py b/vllm/model_executor/layers/fused_moe/moe_prefill.py
+index 7e7921e..8742145 100644
+--- a/vllm/model_executor/layers/fused_moe/moe_prefill.py
++++ b/vllm/model_executor/layers/fused_moe/moe_prefill.py
+@@ -48,11 +48,14 @@ def eligible(
+     min_m = _MIN_M.get(E)
+     if min_m is None:
+         return False
++    ni = w2.shape[1] * 16 if w2.ndim == 3 else -1
++    if ni not in (2304, 576):
++        return False
+     return (
+         min_m <= x.shape[0] <= 4096
+         and x.shape[1] == 5120
+-        and tuple(w1.shape) == (E, 320, 9216)
+-        and tuple(w2.shape) == (E, 144, 10240)
++        and tuple(w1.shape) == (E, 320, 4 * ni)
++        and tuple(w2.shape) == (E, ni // 16, 10240)
+         and ids.ndim == 2
+         and ids.shape[0] == x.shape[0]
+         and ids.shape[1] in _SUPPORTED_TOPK
+@@ -61,8 +64,8 @@ def eligible(
+         and qt == scalar_types.float4_e2m1f
+         and sc1.dtype == torch.float8_e8m0fnu
+         and sc2.dtype == torch.float8_e8m0fnu
+-        and tuple(sc1.shape) == (E, 160, 4608)
+-        and tuple(sc2.shape) == (E, 72, 5120)
++        and tuple(sc1.shape) == (E, 160, 2 * ni)
++        and tuple(sc2.shape) == (E, ni // 32, 5120)
+         and (
+             expert_map is None
+             or (
+diff --git a/vllm/v1/core/sched/dsv41_measured_policy.py b/vllm/v1/core/sched/dsv41_measured_policy.py
+index 208acd7..2daa597 100644
+--- a/vllm/v1/core/sched/dsv41_measured_policy.py
++++ b/vllm/v1/core/sched/dsv41_measured_policy.py
+@@ -38,15 +38,30 @@ COST_MS_FUSED = {
+     32: (33.1000, 39.9200, 43.3900, 46.2100, 48.5700),
+ }
+ 
++# Pure-TP4 (EP=1, NI=576) step curve, calibrated on 384-expert DeepSeek-V4.1-Flash
++# weights on 4x GA100 80G PCIe (4x 126 SM, 180W default power limit) with
++# DeferringMarlinExperts + TwoShotAllReduceFinalizePostCollapse (M=3..60),
++# 1-hop OneShot + w2_splitk_ep KS=3 (M=1..2), and fused_gate_topk_align (M<=8),
++# satisfying strict 6-concurrency [5, 1, 5] trim-and-recovery invariants across k=1..5.
++COST_MS_TP4 = {
++    1: (8.5600, 9.1100, 9.4900, 9.7700, 10.0600),
++    2: (9.7400, 10.3100, 10.5500, 11.4500, 11.8000),
++    4: (10.9300, 12.2500, 13.4700, 14.5500, 15.1000),
++    8: (13.4500, 15.7000, 17.3950, 18.9277, 20.2009),
++    16: (18.5000, 22.3110, 25.2018, 26.4637, 27.7114),
++    32: (29.9100, 36.0715, 40.4382, 43.6421, 46.5427),
++}
++
+ COST_MS = COST_MS_BASE
+ 
+ 
+ def _active_cost_ms():
+-    return (
+-        COST_MS_FUSED
+-        if os.environ.get("VLLM_DSV41_COST_MS_FUSED", "0") == "1"
+-        else COST_MS
+-    )
++    mode = os.environ.get("VLLM_DSV41_COST_MS_FUSED", "0").strip().lower()
++    if mode in ("tp4", "2"):
++        return COST_MS_TP4
++    if mode == "1":
++        return COST_MS_FUSED
++    return COST_MS
+ 
+ 
+ def costs(c):
+-- 
+2.56.0
+

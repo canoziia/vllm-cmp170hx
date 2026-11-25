@@ -399,23 +399,35 @@ __global__ void __launch_bounds__(
         if (arrive(sync + SYNC_W13 + b * HP + pair, 2 * KS)) act_pair(b, pair);
       }
     } else {
-      const float w0 = v0 ? __bfloat162float(__float2bfloat16(topk_w[s0])) : 0.f;
-      const float w1 = v1 ? __bfloat162float(__float2bfloat16(topk_w[s1])) : 0.f;
       __nv_bfloat16* o0 = out + (int64_t)s0 * N + t0 * 64 + g;
       __nv_bfloat16* o1 = out + (int64_t)s1 * N + t0 * 64 + g;
+      if (topk_w != nullptr) {
+        const float w0 = v0 ? __bfloat162float(__float2bfloat16(topk_w[s0])) : 0.f;
+        const float w1 = v1 ? __bfloat162float(__float2bfloat16(topk_w[s1])) : 0.f;
 #pragma unroll
-      for (int u = 0; u < TW; u++)
+        for (int u = 0; u < TW; u++)
 #pragma unroll
-        for (int j = 0; j < 4; j++)
+          for (int j = 0; j < 4; j++)
 #pragma unroll
-          for (int h = 0; h < 2; h++) {
-            if (v0)
-              o0[64 * u + 16 * j + 8 * h] = __float2bfloat16(
-                  __bfloat162float(__float2bfloat16(acc[u][j][2 * h])) * w0);
-            if (v1)
-              o1[64 * u + 16 * j + 8 * h] = __float2bfloat16(
-                  __bfloat162float(__float2bfloat16(acc[u][j][2 * h + 1])) * w1);
-          }
+            for (int h = 0; h < 2; h++) {
+              if (v0)
+                o0[64 * u + 16 * j + 8 * h] = __float2bfloat16(
+                    __bfloat162float(__float2bfloat16(acc[u][j][2 * h])) * w0);
+              if (v1)
+                o1[64 * u + 16 * j + 8 * h] = __float2bfloat16(
+                    __bfloat162float(__float2bfloat16(acc[u][j][2 * h + 1])) * w1);
+            }
+      } else {
+#pragma unroll
+        for (int u = 0; u < TW; u++)
+#pragma unroll
+          for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+              if (v0) o0[64 * u + 16 * j + 8 * h] = __float2bfloat16(acc[u][j][2 * h]);
+              if (v1) o1[64 * u + 16 * j + 8 * h] = __float2bfloat16(acc[u][j][2 * h + 1]);
+            }
+      }
       if (fuse) {
         const int tg = t0 / TW;
         if (arrive(sync + SYNC_W2 + tg, nblk * KS)) sum_tile(tg);
@@ -571,7 +583,8 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
     kern<<<grid, T, SMEM, at::cuda::getCurrentCUDAStream()>>>(
         (const __nv_bfloat16*)a.data_ptr(), a.stride(0), (const int4*)w.data_ptr(),
         (const uint8_t*)s.data_ptr(), sorted.data_ptr<int32_t>(), eids.data_ptr<int32_t>(),
-        ntpp.data_ptr<int32_t>(), topk_w.data_ptr<float>(), (int)topk, (int)n_slots,
+        ntpp.data_ptr<int32_t>(), topk_w.numel() > 0 ? topk_w.data_ptr<float>() : nullptr,
+        (int)topk, (int)n_slots,
         ctr.data_ptr<int32_t>() + (W13 ? 0 : 1), ctr.data_ptr<int32_t>() + (W13 ? 1 : 0),
         W13 ? out.data_ptr<float>() : nullptr,
         W13 ? nullptr : (__nv_bfloat16*)out.data_ptr(), fuse ? 1 : 0, (float)limit,
@@ -736,6 +749,17 @@ int64_t dsv4_mxfp4_gemm2_ep(at::Tensor const& a, at::Tensor const& w, at::Tensor
   DSV4_CASE2(false, 2304, 5120, 144, 3, 2, 1)
   DSV4_CASE2(false, 2304, 5120, 144, 4, 16, 1)
   DSV4_CASE2(false, 2304, 5120, 144, 5, 8, 2)
+  // DeepSeek-V4.1-Flash pure TP=4 experts: hidden 5120, intermediate 576 (2304/4)
+  DSV4_CASE2(true, 5120, 1152, 80, 0, 4, 1)
+  DSV4_CASE2(true, 5120, 1152, 80, 2, 8, 1)
+  DSV4_CASE2(true, 5120, 1152, 80, 3, 2, 1)
+  DSV4_CASE2(true, 5120, 1152, 80, 4, 16, 1)
+  DSV4_CASE2(false, 576, 5120, 36, 0, 4, 1)
+  DSV4_CASE2(false, 576, 5120, 36, 1, 4, 2)
+  DSV4_CASE2(false, 576, 5120, 36, 2, 6, 1)
+  DSV4_CASE2(false, 576, 5120, 36, 3, 2, 1)
+  DSV4_CASE2(false, 576, 5120, 36, 4, 12, 1)
+  DSV4_CASE2(false, 576, 5120, 36, 5, 6, 2)
   // DeepSeek-V4-Flash experts: hidden 4096, intermediate 2048 (R = 64 / 128)
   DSV4_CASE2(true, 4096, 4096, 64, 0, 4, 1)
   DSV4_CASE2(true, 4096, 4096, 64, 1, 4, 2)

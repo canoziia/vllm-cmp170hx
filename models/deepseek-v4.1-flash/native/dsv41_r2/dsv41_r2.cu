@@ -718,12 +718,41 @@ void w2_splitk_ep(
     at::Tensor& y,
     const c10::optional<at::Tensor>& bias_opt) {
   const at::cuda::OptionalCUDAGuard guard(h.device());
-  TORCH_CHECK(h.size(1) == 2304 && (y.numel() == 0 || y.size(1) == 5120), "w2_splitk_ep shape 2304x5120");
+  const int64_t K = h.size(1);
+  TORCH_CHECK((K == 2304 || K == 576) && (y.numel() == 0 || y.size(1) == 5120),
+              "w2_splitk_ep shape (2304|576)x5120");
   if (y.numel() > 0 && bias_opt.has_value() && bias_opt->defined()) {
     TORCH_CHECK(
         bias_opt->is_contiguous() && bias_opt->scalar_type() == at::kBFloat16 &&
             bias_opt->sizes() == y.sizes(),
         "w2_splitk_ep bias");
+  }
+  if (K == 576) {
+    if (ks_mode == 3) {
+      if (dq == 0)
+        launch_w2_splitk<0, 12, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else if (dq == 3)
+        launch_w2_splitk<3, 12, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else
+        launch_w2_splitk<2, 12, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+    } else if (ks_mode == 2) {
+      if (dq == 0)
+        launch_w2_splitk<0, 18, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else if (dq == 3)
+        launch_w2_splitk<3, 18, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else
+        launch_w2_splitk<2, 18, 6, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+    } else if (ks_mode == 1) {
+      if (dq == 0)
+        launch_w2_splitk<0, 36, 12, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else if (dq == 3)
+        launch_w2_splitk<3, 36, 12, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+      else
+        launch_w2_splitk<2, 36, 12, 1, 576, 5120>(h, w, s, sorted, eids, ntpp, topk_w, topk_ids_opt, emap_opt, topk, global_e, ctr, part2, y, bias_opt);
+    } else {
+      TORCH_CHECK(false, "unsupported ks_mode for K=576 (use 1, 2, or 3)");
+    }
+    return;
   }
   if (ks_mode == 4) {
     if (dq == 0)
@@ -2320,9 +2349,9 @@ __global__ void __launch_bounds__(32) dsv4_topk_v2_kernel(
 struct AlignBs8Smem {
   int32_t topk_ids[64];
   int16_t sid[64];
-  int32_t cnt[128];
-  int32_t sblk[128];
-  int32_t wsum[8];
+  int32_t cnt[384];
+  int16_t sblk[384];
+  int32_t wsum[16];
   int32_t s_sorted[512];
 };
 
@@ -2340,7 +2369,7 @@ __device__ __forceinline__ void epilogue_align_bs8(
     int nb,
     int32_t* __restrict__ ntpp) {
   static_assert(NT >= 128, "NT must be >= 128");
-  if (tid < 128) as->cnt[tid] = 0;
+  for (int e = tid; e < local_e; e += NT) as->cnt[e] = 0;
   __syncthreads();
 
   if (tid < S) {
@@ -2355,45 +2384,55 @@ __device__ __forceinline__ void epilogue_align_bs8(
   }
   __syncthreads();
 
-  int my_cnt = 0, myblk = 0, excl = 0;
   const int lane = tid & 31, wid = tid >> 5;
+  const int n_chunks = (local_e + 127) >> 7;  // 1..3 (local_e <= 384)
   if (tid < 128) {
-    my_cnt = (tid < local_e) ? as->cnt[tid] : 0;
-    myblk = (my_cnt + 7) >> 3;
-    int inc = myblk;
+    for (int c = 0; c < n_chunks; ++c) {
+      const int e = c * 128 + tid;
+      const int my_cnt = (e < local_e) ? as->cnt[e] : 0;
+      const int myblk = (my_cnt + 7) >> 3;
+      int inc = myblk;
 #pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-      const int t = __shfl_up_sync(0xffffffffu, inc, o);
-      if (lane >= o) inc += t;
+      for (int o = 1; o < 32; o <<= 1) {
+        const int t = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += t;
+      }
+      if (lane == 31) as->wsum[c * 4 + wid] = inc;
+      if (e < local_e) as->sblk[e] = static_cast<int16_t>(inc - myblk);
     }
-    if (lane == 31) as->wsum[wid] = inc;
-    excl = inc - myblk;
   }
   __syncthreads();
 
-  if (wid == 0 && lane < 4) {
-    int v = as->wsum[lane];
-    const int t1 = __shfl_up_sync(0x0fu, v, 1);
-    if (lane >= 1) v += t1;
-    const int t2 = __shfl_up_sync(0x0fu, v, 2);
-    if (lane >= 2) v += t2;
+  const int n_warps = n_chunks * 4;  // 4, 8, or 12 (<= 16)
+  if (wid == 0 && lane < 16) {
+    int v = (lane < n_warps) ? as->wsum[lane] : 0;
+#pragma unroll
+    for (int o = 1; o < 16; o <<= 1) {
+      const int t = __shfl_up_sync(0x0000ffffu, v, o);
+      if (lane >= o) v += t;
+    }
     as->wsum[lane] = v;
   }
   __syncthreads();
 
-  if (tid < 128) {
-    if (wid > 0) excl += as->wsum[wid - 1];
-    as->sblk[tid] = excl;
-  }
-  const int total_blk = as->wsum[3];
+  const int total_blk = as->wsum[n_warps - 1];
   const int total = total_blk * 8;
 
   for (int b = tid; b < nb; b += NT) {
     if (b >= total_blk) eids[b] = -1;
   }
-  if (tid < local_e) {
-    for (int k = 0; k < myblk; ++k) {
-      if (excl + k < nb) eids[excl + k] = tid;
+  if (tid < 128) {
+    for (int c = 0; c < n_chunks; ++c) {
+      const int e = c * 128 + tid;
+      if (e < local_e) {
+        const int widx = c * 4 + wid;
+        const int excl = static_cast<int>(as->sblk[e]) + (widx > 0 ? as->wsum[widx - 1] : 0);
+        as->sblk[e] = static_cast<int16_t>(excl);
+        const int myblk = (as->cnt[e] + 7) >> 3;
+        for (int k = 0; k < myblk; ++k) {
+          if (excl + k < nb) eids[excl + k] = e;
+        }
+      }
     }
   }
   if (tid == 0) *ntpp = total;
@@ -3046,7 +3085,7 @@ void fused_gate_topk_align(
   int32_t* ntpp_ptr = nullptr;
   int cap = 0, nb = 0;
   if (do_align) {
-    TORCH_CHECK(local_e > 0 && local_e <= 128, "local_e <= 128");
+    TORCH_CHECK(local_e > 0 && local_e <= 384, "local_e <= 384");
     TORCH_CHECK(sorted_opt.has_value() && eids_opt.has_value() && ntpp_opt.has_value(), "align tensors");
     if (emap_opt.has_value() && emap_opt->defined()) {
       emap_ptr = emap_opt->data_ptr<int32_t>();

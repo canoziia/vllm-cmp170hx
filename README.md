@@ -1,6 +1,6 @@
 # vllm-sm80
 
-**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 200–560 tok/s single-stream and up to 10.5K tok/s prefill (8.3K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
+**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 230–620 tok/s single-stream, up to 1.5–3.7K tok/s at c=32, and up to 11.2K tok/s prefill (8.8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
 
 ## Prebuilt Images (GHCR)
 
@@ -14,32 +14,33 @@ One unified SM80 vLLM image serves all DeepSeek parallelism splits (auto-selecti
 ### DeepSeek V4.1 Flash
 
 See [`models/deepseek-v4.1-flash/README.md`](models/deepseek-v4.1-flash/README.md)
-for build instructions, Compose deployments (4× 80G TEP4 & 6× CMP 170HX PP6),
+for build instructions, Compose deployments (default 4× 80G Pure TP4, optional TEP4 & 6× CMP 170HX PP6),
 optimization profiles, native CUDA/C++ extensions, and full 180 W & 250 W benchmarks.
 
-#### Measured TEP4 Benchmarks (`4× 80G SM80 PCIe Gen4`, 250 W, `compose.yml` + LMCache)
+#### Measured Pure TP4 Benchmarks (`4× 80G SM80 PCIe Gen4`, 250 W, `compose.yml` + LMCache)
 
-`TP=4 + EP=4`, unmodified official MXFP4/FP8 weights, `nvfp4_ds_mla` KV cache
+Pure `TP=4` (`EP=1`, `NI=576`, `E=384`, 100% load-balanced across all 384 experts with
+zero All-to-All), unmodified official MXFP4/FP8 weights, `nvfp4_ds_mla` KV cache
 (`2,014,502` GPU KV tokens = `1.92× 1M` + LMCache `8 GiB` L1 RAM / `500 GiB`
-NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tep4_fused`), `enable_adaptive_verification=true`,
+NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tp4_fused`), `enable_adaptive_verification=true`,
 `0` OOM across full 1M prefill and 32-concurrency stress.
 
 **Cold Prefill (`tok/s`, `c=1`, `cached_tokens=0`)**
 
 | Target Length | 64K | 128K | 256K | 512K | 1M |
 |---|---:|---:|---:|---:|---:|
-| **Prefill (`tok/s`)** | **10,551.7** | **10,491.8** | **10,205.2** | **9,515.6** | **8,314.6** |
+| **Prefill (`tok/s`)** | **10,383.2** | **11,239.9** | **10,847.7** | **9,859.0** | **8,819.9** |
 
 **Decode Throughput & Step Latency (`full_batch_tok_s` / `step_ms`, `max_tokens=500`)**
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | **211.9** (`9.94 ms`, acc 2.10) | **488.6** (`11.24 ms`, acc 5.43) | **563.7** (`10.54 ms`, acc 5.88) |
-| **2** | **370.9** (`11.74 ms`, acc 2.18) | **777.1** (`14.36 ms`, acc 5.46) | **932.2** (`12.81 ms`, acc 5.88) |
-| **4** | **564.8** (`13.46 ms`, acc 1.90) | **1,180.1** (`18.74 ms`, acc 5.45) | **1,485.5** (`16.11 ms`, acc 5.88) |
-| **8** | **818.2** (`18.81 ms`, acc 1.93) | **1,770.8** (`24.88 ms`, acc 5.44) | **2,115.5** (`22.66 ms`, acc 5.88) |
-| **16** | **1,133.1** (`27.80 ms`, acc 1.96) | **2,223.0** (`38.91 ms`, acc 5.45) | **2,544.0** (`37.71 ms`, acc 5.88) |
-| **32** | **1,398.2** (`44.25 ms`, acc 1.94) | **2,851.3** (`61.20 ms`, acc 5.41) | **3,192.3** (`60.13 ms`, acc 5.88) |
+| **1** | **232.4** (`8.87 ms`, acc 2.06) | **549.9** (`10.13 ms`, acc 5.51) | **623.6** (`9.53 ms`, acc 5.88) |
+| **2** | **401.0** (`10.65 ms`, acc 2.16) | **838.3** (`13.20 ms`, acc 5.43) | **1,027.7** (`11.62 ms`, acc 5.88) |
+| **4** | **614.7** (`12.20 ms`, acc 1.90) | **1,269.2** (`17.24 ms`, acc 5.37) | **1,624.7** (`14.73 ms`, acc 5.88) |
+| **8** | **892.3** (`14.73 ms`, acc 1.65) | **1,907.9** (`23.34 ms`, acc 5.44) | **2,358.7** (`20.33 ms`, acc 5.88) |
+| **16** | **1,247.7** (`24.75 ms`, acc 1.93) | **2,410.2** (`37.01 ms`, acc 5.43) | **2,894.6** (`33.15 ms`, acc 5.88) |
+| **32** | **1,556.6** (`39.67 ms`, acc 1.93) | **3,131.5** (`54.47 ms`, acc 5.40) | **3,709.8** (`51.73 ms`, acc 5.88) |
 
 ## Branch Architecture
 
@@ -80,8 +81,8 @@ Exact upstream commits and Docker base image digests are pinned in
 └── models/
     └── deepseek-v4.1-flash/
         ├── README.md               # DeepSeek V4.1 Flash build, deploy, and full benchmarks
-        ├── compose.yml             # default: 4x 80G SM80 TEP4 (TP=4 + EP=4 + LMCache)
-        ├── .env.example            # default TEP4 environment template
+        ├── compose.yml             # default: 4x 80G SM80 Pure TP4 (TP=4, EP=1 + LMCache)
+        ├── .env.example            # default Pure TP4 environment template
         ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
         ├── .env.pp6.example        # optional PP6 environment template
         ├── native/                 # 7 self-contained SM80 CUDA/C++ extensions built from source

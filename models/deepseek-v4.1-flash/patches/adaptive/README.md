@@ -76,3 +76,17 @@ explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.
      `100–140 MiB` on TP6/8) to a constant `K = 3` triple-buffered circular ring (`22.5 MiB/rank`
      on TP4, `30 MiB` on TP6/8) using 64-bit bidirectional ACK flow control (zero pipeline bubbles,
      reuses the open peer IPC handle on `world == 2`).
+
+8. `0008-dsv41-pure-tp4-default-and-mxfp4-ni576.patch`
+   - Makes **Pure TP4 (`TP=4, EP=1`, `NI=576`, `E=384`)** the default 4×80G profile (`tp4_fused`,
+     auto-selected by `VLLM_DSV41_OPT_PROFILE=auto` when `-tp 4` without `--enable-expert-parallel`;
+     legacy `TEP4` remains supported as `tep4_fused` when `--enable-expert-parallel` is passed).
+   - Extends `dsv4_mxfp4_decode.py`, `marlin_moe.py`, and `moe_prefill.py` for `NI=576` (paired with
+     `mxfp4_decode_v2.cu` `NI=576` W13/W2 + unweighted W2 for `DeferringMarlinExperts`, and
+     `dsv41_r2.cu` `w2_splitk_ep` `K=576` `KS=1/2/3` + `fused_gate_topk_align` `local_e <= 384`).
+   - Adds `VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS=3` (`config.py`) so `M=1..2` keeps 1-hop OneShot
+     PCIe AllReduce + `w2_splitk_ep` `KS=3`, while `M=3..60` fuses unweighted W2 into
+     `TwoShotAllReduceFinalizePostCollapse`.
+   - Adds Pure-TP4 calibrated adaptive step-cost curve `COST_MS_TP4` (`VLLM_DSV41_COST_MS_FUSED=tp4`)
+     in `dsv41_measured_policy.py` from full 30-cell 4×80G measurements while preserving strict
+     `[5, 1, 5]` trim-and-recovery invariants across `c=1..32`.

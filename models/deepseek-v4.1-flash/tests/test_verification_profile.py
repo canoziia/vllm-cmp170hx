@@ -66,7 +66,29 @@ try:
 
         assert m.resolve_auto_profile(["vllm", "serve", "Qwen/Qwen3-32B", "-tp", "4"]) is None
 
-        # DeepSeek-V4.1 TEP4 -> tep4_fused, propagated for spawned workers
+        # DeepSeek-V4.1 Pure TP4 (default) -> tp4_fused, propagated for spawned workers
+        os.environ.clear()
+        os.environ["VLLM_DSV41_OPT_PROFILE"] = "auto"
+        os.environ["VLLM_DSV41_WOA_FP8"] = "0"  # explicit user override must survive
+        sys.argv = [
+            "vllm",
+            "serve",
+            str(dsv41_dir),
+            "--tensor-parallel-size=4",
+        ]
+        m.apply()
+        assert os.environ["VLLM_DSV41_OPT_PROFILE"] == "tp4_fused"
+        assert os.environ["VLLM_DSV41_COST_MS_FUSED"] == "tp4"
+        assert os.environ["VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS"] == "3"
+        assert os.environ["VLLM_DSV41_WOA_FP8"] == "0"
+
+        # Spawned worker with different argv inherits resolved tp4_fused
+        sys.argv = ["python3", "-c", "from multiprocessing.spawn import spawn_main"]
+        m.apply()
+        assert os.environ["VLLM_DSV41_OPT_PROFILE"] == "tp4_fused"
+        assert os.environ["VLLM_DSV41_COST_MS_FUSED"] == "tp4"
+
+        # DeepSeek-V4.1 legacy TEP4 (--enable-expert-parallel) -> tep4_fused
         os.environ.clear()
         os.environ["VLLM_DSV41_OPT_PROFILE"] = "auto"
         os.environ["VLLM_DSV41_WOA_FP8"] = "0"  # explicit user override must survive
@@ -79,6 +101,7 @@ try:
         ]
         m.apply()
         assert os.environ["VLLM_DSV41_OPT_PROFILE"] == "tep4_fused"
+        assert os.environ["VLLM_DSV41_COST_MS_FUSED"] == "1"
         assert os.environ["VLLM_DSV41_FUSED_W2_AR"] == "1"
         assert os.environ["VLLM_DSV41_WOA_FP8"] == "0"
 

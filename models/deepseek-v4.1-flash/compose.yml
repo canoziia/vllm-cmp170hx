@@ -1,18 +1,18 @@
-# DeepSeek-V4.1-Flash on 4x SM80 80G (TEP4: TP=4 + EP=4), running the unified
-# `ghcr.io/canoziia/vllm-sm80:latest` image (official vLLM + SM80 kernels,
-# `VLLM_DSV41_OPT_PROFILE=auto`) with LMCache L1+L2 KV tier.
+# DeepSeek-V4.1-Flash on 4x SM80 80G (Pure TP4: TP=4, EP=1, NI=576), running
+# the unified `ghcr.io/canoziia/vllm-sm80:latest` image (official vLLM + SM80
+# kernels, `VLLM_DSV41_OPT_PROFILE=auto`) with LMCache L1+L2 KV tier.
 #
-# Topology-aware: automatically detects parallelism (TEP4 -> `tep4_fused`) and
-# NVLink vs PCIe P2P at startup with zero edits (`ampere_peer_topology()` ->
-# "nvlink" uses full 192-row Lamport collectives; "pcie" uses bounded low-M
-# Lamport + Ring NCCL fallback).
+# Topology-aware: automatically detects parallelism (Pure TP4 -> `tp4_fused`;
+# optional `--enable-expert-parallel` -> `tep4_fused`) and NVLink vs PCIe P2P
+# at startup with zero edits (`ampere_peer_topology()` -> "nvlink" uses full
+# 192-row Lamport collectives; "pcie" uses bounded low-M Lamport + Ring NCCL).
 x-podman:
   in_pod: false
 
 services:
-  deepseek-v4.1-flash-tep4:
+  deepseek-v4.1-flash-tp4:
     image: ${VLLM_IMAGE:-ghcr.io/canoziia/vllm-sm80:latest}
-    container_name: deepseek-v4.1-flash-tep4
+    container_name: deepseek-v4.1-flash-tp4
     restart: "no"
     network_mode: host
     # podman-compose can ignore ipc: host on the pod path; start with
@@ -21,7 +21,7 @@ services:
     pid: host
     privileged: true
     depends_on:
-      deepseek-v4.1-flash-tep4-lmcache:
+      deepseek-v4.1-flash-tp4-lmcache:
         condition: service_healthy
 
     devices:
@@ -44,6 +44,7 @@ services:
 
     environment:
       CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      CUDA_VISIBLE_DEVICES: "${DSV41_GPU_0:-0},${DSV41_GPU_1:-1},${DSV41_GPU_2:-2},${DSV41_GPU_3:-3}"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       HF_HUB_OFFLINE: "1"
       VLLM_WORKER_MULTIPROC_METHOD: "spawn"
@@ -51,8 +52,9 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       NCCL_IB_DISABLE: "1"
       VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS: "192"
-      # Profiles: "auto" (default: selects tep4_fused for TP4+EP and auto-detects
-      # NVLink vs PCIe P2P), "tep4_fused", "tep4_verification", or "off".
+      # Profiles: "auto" (default: selects tp4_fused for Pure TP4, tep4_fused
+      # if --enable-expert-parallel is added, and auto-detects NVLink vs PCIe P2P),
+      # "tp4_fused", "tep4_fused", "tep4_verification", or "off".
       VLLM_DSV41_OPT_PROFILE: "${VLLM_DSV41_OPT_PROFILE:-auto}"
       PYTHONUNBUFFERED: "1"
       TMPDIR: /root/.cache/tmp
@@ -71,7 +73,6 @@ services:
       - --disable-custom-all-reduce
       - --dtype=bfloat16
       - --tensor-parallel-size=4
-      - --enable-expert-parallel
       - --decode-context-parallel-size=1
       - --pipeline-parallel-size=1
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-1048576}
@@ -101,9 +102,9 @@ services:
       start_period: 20m
       retries: 3
 
-  deepseek-v4.1-flash-tep4-lmcache:
+  deepseek-v4.1-flash-tp4-lmcache:
     image: ${LMCACHE_IMAGE:-ghcr.io/canoziia/vllm-sm80/lmcache-server:latest}
-    container_name: deepseek-v4.1-flash-tep4-lmcache
+    container_name: deepseek-v4.1-flash-tp4-lmcache
     entrypoint: ["lmcache"]
     restart: "no"
     network_mode: host

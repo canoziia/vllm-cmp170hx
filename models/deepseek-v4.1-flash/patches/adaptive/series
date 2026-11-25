@@ -5,3 +5,4 @@ adaptive/0004-dsv41-tp-local-greedy-masked-token-ids-compat.patch
 adaptive/0005-dsv41-require-pcie-switch-topology-for-lamport.patch
 adaptive/0006-dsv41-pcie-dma-ring-and-row-shard-prefill.patch
 adaptive/0007-dsv41-pcie-dma-k3-triple-buffer.patch
+adaptive/0008-dsv41-pure-tp4-default-and-mxfp4-ni576.patch
