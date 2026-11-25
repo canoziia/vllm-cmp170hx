@@ -124,7 +124,7 @@ function parseArgs(argv) {
   if (c.concurrencies.some(n => !Number.isInteger(n) || n <= 0)) {
     throw new Error("--concurrency must contain positive integers");
   }
-  const modeMax = { decode: 500, prefill: 1, counting: 1000 };
+  const modeMax = { decode: 500, prefill: 1, counting: 1000, prose: 600, code: 1500 };
   c.maxTokens ??= modeMax[c.mode];
   if (c.inputTokens === null) c.inputTokens = c.mode === "prefill" ? 65536 : 16;
   for (const [name, n] of [["input-tokens", c.inputTokens], ["max-tokens", c.maxTokens], ["timeout-ms", c.timeoutMs], ["seed", c.seed]]) {

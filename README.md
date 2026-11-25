@@ -69,7 +69,8 @@ Exact upstream commits and Docker base image digests are pinned in
 ├── scripts/
 │   ├── apply-deepseek-v41-patches.sh
 │   ├── apply-lmcache-patches.sh
-│   ├── benchmark-vllm.mjs          # decode, prefill, and counting benchmark client
+│   ├── benchmark-vllm.mjs          # decode, prefill, prose, code, and counting benchmark client
+│   ├── run-standard-benchmark.sh   # reproducible 23-point README benchmark + Markdown summary
 │   ├── build-deepseek-v41-image.sh # builds the unified SM80 vLLM image (+ LMCache)
 │   ├── build-lmcache-server-image.sh
 │   ├── ensure-lmcache-server-image.sh
@@ -101,13 +102,17 @@ and upstream vLLM dashboards with `server` / `role` / `instance` selectors.
 ## Benchmark Client
 
 `scripts/benchmark-vllm.mjs` requires Node.js 18+ and has no npm dependencies.
-It supports three standard modes documented in its header:
-
-1. ordinary short-input decode: ~16 user tokens, 500 output tokens, `ignore_eos`;
-2. cold prefill: approximately N input tokens and 1 output token;
-3. deterministic counting output for near-full speculative acceptance.
+It supports `decode`, `prefill`, `prose`, `code`, and `counting` modes:
 
 ```bash
+# Reproducible 23-point benchmark matching the README tables above
+# (prefill 64K..1M + prose/code/counting c=1,2,4,8,16,32 at max_tokens=500):
+VLLM_API_KEY=... bash scripts/run-standard-benchmark.sh
+
+# Quick smoke subset (prefill 64K/128K + c=1,8,32):
+VLLM_API_KEY=... bash scripts/run-standard-benchmark.sh --quick
+
+# Single-mode usage:
 node scripts/benchmark-vllm.mjs --help
 ```
 
