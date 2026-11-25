@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """One switch for the DeepSeek V4.1 Flash SM80 optimisation patches.
 
-VLLM_DSV41_OPT_PROFILE=auto|default|verification|tp_auto|tp_auto_verification|tep4|tep4_verification|tep4_fused
+VLLM_DSV41_OPT_PROFILE=auto|default|verification|tp_auto|tp_auto_verification|tp4_fused|tep4|tep4_verification|tep4_fused
 sets every per-patch switch to its deployed value *unless that variable is
 already set*, so a single switch can still be overridden.
 
 In ``auto`` mode, the launch command line and model ``config.json`` are
 inspected before vLLM imports:
   * non-DeepSeek-V4/V4.1 models are left completely untouched (official vLLM);
-  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP enabled selects ``tep4_fused``
+  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP disabled (default) selects ``tp4_fused``
     (which further auto-detects NVLink vs PCIe P2P via NVML/peer topology);
+  * DeepSeek-V4/V4.1 with TP=4, PP=1, EP enabled selects ``tep4_fused``
+    (legacy TEP4 path, also auto-detecting NVLink vs PCIe P2P);
   * DeepSeek-V4/V4.1 with PP > 1 selects ``verification`` when
     ``enable_adaptive_verification`` is set in ``--speculative-config``, else
     ``default``;
@@ -194,6 +196,13 @@ PROFILES["tep4_fused"] = {
     "VLLM_DSV41_PREFILL_2MB_MOE": "auto",
 }
 
+# Topology-aware deep fusion profile for 4x SM80 pure TP4 (default: EP=1, NI=576).
+PROFILES["tp4_fused"] = {
+    **PROFILES["tep4_fused"],
+    "VLLM_DSV41_COST_MS_FUSED": "tp4",
+    "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "3",
+}
+
 # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).
 _TP_COMMON_EXTRAS: dict[str, str] = {
     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": "0",
@@ -329,6 +338,8 @@ def resolve_auto_profile(argv: list[str] | None = None) -> str | None:
         return None
     if pp > 1:
         return "verification" if adaptive else "default"
+    if tp == 4 and not ep:
+        return "tp4_fused"
     if tp == 4 and ep:
         return "tep4_fused"
     if tp > 1:

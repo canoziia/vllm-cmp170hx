@@ -396,8 +396,7 @@ def fused_marlin_moe(
     assert activation is not None
     moe_output = None
     if (
-        mul_topk_weights_in_gemm2
-        and prefill_block_lists is None
+        prefill_block_lists is None
         and _dsv4_mxfp4_decode.enabled()
     ):
         # VLLM_DSV4_MXFP4_DECODE: weight-streaming MXFP4 decode kernels for
@@ -443,6 +442,7 @@ def fused_marlin_moe(
             moe_sum=moe_sum,
             output=output,
             global_num_experts=global_num_experts,
+            mul_topk_weights_in_gemm2=mul_topk_weights_in_gemm2,
         )
         if moe_output is not None:
             moe_output, summed = moe_output

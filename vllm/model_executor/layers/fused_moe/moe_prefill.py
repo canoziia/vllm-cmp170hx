@@ -48,11 +48,14 @@ def eligible(
     min_m = _MIN_M.get(E)
     if min_m is None:
         return False
+    ni = w2.shape[1] * 16 if w2.ndim == 3 else -1
+    if ni not in (2304, 576):
+        return False
     return (
         min_m <= x.shape[0] <= 4096
         and x.shape[1] == 5120
-        and tuple(w1.shape) == (E, 320, 9216)
-        and tuple(w2.shape) == (E, 144, 10240)
+        and tuple(w1.shape) == (E, 320, 4 * ni)
+        and tuple(w2.shape) == (E, ni // 16, 10240)
         and ids.ndim == 2
         and ids.shape[0] == x.shape[0]
         and ids.shape[1] in _SUPPORTED_TOPK
@@ -61,8 +64,8 @@ def eligible(
         and qt == scalar_types.float4_e2m1f
         and sc1.dtype == torch.float8_e8m0fnu
         and sc2.dtype == torch.float8_e8m0fnu
-        and tuple(sc1.shape) == (E, 160, 4608)
-        and tuple(sc2.shape) == (E, 72, 5120)
+        and tuple(sc1.shape) == (E, 160, 2 * ni)
+        and tuple(sc2.shape) == (E, ni // 32, 5120)
         and (
             expert_map is None
             or (

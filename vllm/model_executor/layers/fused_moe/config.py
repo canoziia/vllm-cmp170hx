@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Union
@@ -1621,9 +1622,10 @@ class FusedMoEConfig:
     def should_defer_moe_finalize(self, num_tokens: int) -> bool:
         """Return whether this invocation may defer the top-k reduction."""
         max_num_tokens = self.defer_moe_finalize_max_num_tokens
+        min_num_tokens = int(os.environ.get("VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS", "1"))
         return (
             self.use_deferred_moe_finalize
-            and num_tokens > 0
+            and num_tokens >= min_num_tokens
             and (max_num_tokens < 0 or num_tokens <= max_num_tokens)
         )
 

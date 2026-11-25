@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _K, _NI = 5120, 2304
+_NI_SUPPORTED = (2304, 576)
 _OPS = None
 _LOAD_ERROR: str | None = None
 _SCALE_OK: dict[int | tuple[int, int], bool] = {}
@@ -346,7 +347,7 @@ def try_fused_gate_topk_align(
         cuda_align_enabled()
         and type(routed_experts).__name__ == "RoutedExperts"
         and getattr(routed_experts, "_lora_context", None) is None
-        and 0 < local_e <= 128
+        and 0 < local_e <= 384
         and (
             emap is None
             or (
@@ -622,6 +623,7 @@ def try_run(
     moe_sum=None,
     output=None,
     global_num_experts=-1,
+    mul_topk_weights_in_gemm2=True,
 ):
     """Return (tensor, summed) or None to keep the Marlin path.
 
@@ -632,10 +634,11 @@ def try_run(
 
     M, K = hidden_states.shape
     topk = topk_ids.size(1)
+    ni = w2.size(1) * 16
     if (
         quant_type != scalar_types.float4_e2m1f
         or K != _K
-        or w2.size(1) * 16 != _NI
+        or ni not in _NI_SUPPORTED
         or M > _max_tokens()
         or block_size_m != 8
         or hidden_states.dtype != torch.bfloat16
@@ -688,7 +691,8 @@ def try_run(
         else None
     )
     fsum = (
-        _fused_sum()
+        mul_topk_weights_in_gemm2
+        and _fused_sum()
         and M <= _sum_max_tokens()
         and _plain_moe_sum(moe_sum)
         and topk <= 8
@@ -701,12 +705,21 @@ def try_run(
             )
         )
     )
-    if dq != 0 or limit is not None or fsum or expert_map is not None:
+    if (
+        dq != 0
+        or limit is not None
+        or fsum
+        or expert_map is not None
+        or ni != _NI
+        or not mul_topk_weights_in_gemm2
+    ):
         return _try_run_v2(
             ops,
             dq,
             limit,
             fsum,
+            ni,
+            mul_topk_weights_in_gemm2,
             hidden_states,
             w1,
             w2,
@@ -814,6 +827,8 @@ def _try_run_v2(
     dq,
     limit,
     fsum,
+    ni,
+    mul_topk_weights_in_gemm2,
     hidden_states,
     w1,
     w2,
@@ -848,13 +863,14 @@ def _try_run_v2(
     if ctr is None or sync is None:
         return None
     if (
-        intermediate_cache13.numel() < slots * max(2 * _NI, _K)
-        or intermediate_cache2.numel() < slots * _NI
+        intermediate_cache13.numel() < slots * max(2 * ni, _K)
+        or intermediate_cache2.numel() < slots * ni
         or not intermediate_cache13.is_contiguous()
         or not intermediate_cache2.is_contiguous()
     ):
         return None
-    if 128 + slots * 36 > _SYNC_SIZE:
+    hp = ni // 64
+    if 128 + slots * hp > _SYNC_SIZE:
         return None
     ops2 = _ops2()
     s_order = _sum_order(moe_sum, expert_map)
@@ -862,17 +878,29 @@ def _try_run_v2(
     if not _LOGGED2:
         _LOGGED2 = True
         logger.info(
-            "VLLM_DSV4_MXFP4_DECODE v2: dq=%d fused_act=%s fused_sum=%s (order %d)",
+            "VLLM_DSV4_MXFP4_DECODE v2: ni=%d dq=%d fused_act=%s fused_sum=%s (order %d)",
+            ni,
             dq,
             limit is not None,
             fsum,
             s_order,
         )
-    cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
+    if ni == 576:
+        w13_cfg = 2 if dq in (0, 3) else 4
+        w2_cfg = int(
+            os.environ.get(
+                "VLLM_DSV4_MXFP4_TP4_W2_CFG",
+                "2" if M <= _v4_tile_max_tokens() else "5",
+            )
+        )
+    else:
+        w13_cfg = (2 if dq in (0, 3) else 4) if M <= _v4_tile_max_tokens() else 5
+        w2_cfg = w13_cfg
     r2_ops = _ops_r2()
     w2_ks = None
     if (
-        r2_ops is not None
+        mul_topk_weights_in_gemm2
+        and r2_ops is not None
         and dq in (0, 2, 3)
         and topk <= 8
         and _plain_moe_sum(moe_sum)
@@ -886,12 +914,23 @@ def _try_run_v2(
             )
         )
     ):
-        w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
-    # W13 split-K partials [4, slots, 2*NI]; split-K W2 reuses the buffer as
+        if ni == 576:
+            if M <= 2:
+                w2_ks = int(os.environ.get("VLLM_DSV4_MXFP4_TP4_W2_KS_SMALL", "3"))
+            else:
+                w2_ks = int(
+                    os.environ.get(
+                        "VLLM_DSV4_MXFP4_TP4_W2_KS_MED",
+                        "2" if (topk <= 3 or M <= 8) else "1",
+                    )
+                )
+        else:
+            w2_ks = 4 if (topk <= 3 or M <= 2) else _w2_splitk_ks(M)
+    # W13 split-K partials [4, slots, 2*ni]; split-K W2 reuses the buffer as
     # [w2_ks, slots, K] after the activation consumed the W13 partials.
-    part_numel = max(4 * slots * 2 * _NI, (w2_ks or 0) * slots * _K)
+    part_numel = max(4 * slots * 2 * ni, (w2_ks or 0) * slots * _K)
     part = torch.empty(part_numel, dtype=torch.float32, device=dev)
-    h = intermediate_cache2.reshape(-1)[: slots * _NI].view(slots, _NI)
+    h = intermediate_cache2.reshape(-1)[: slots * ni].view(slots, ni)
     tw = topk_weights.view(-1)
     w1s = w1_scale.view(torch.uint8)
     w2s = w2_scale.view(torch.uint8)
@@ -908,9 +947,9 @@ def _try_run_v2(
                 topk,
                 slots,
                 _K,
-                2 * _NI,
+                2 * ni,
                 True,
-                cfg,
+                w13_cfg,
                 dq,
                 True,
                 limit,
@@ -932,9 +971,9 @@ def _try_run_v2(
                 topk,
                 slots,
                 _K,
-                2 * _NI,
+                2 * ni,
                 True,
-                cfg,
+                w13_cfg,
                 dq,
                 True,
                 limit,
@@ -961,9 +1000,9 @@ def _try_run_v2(
                 topk,
                 slots,
                 _K,
-                2 * _NI,
+                2 * ni,
                 True,
-                cfg,
+                w13_cfg,
                 dq,
                 False,
                 0.0,
@@ -985,9 +1024,9 @@ def _try_run_v2(
                 topk,
                 slots,
                 _K,
-                2 * _NI,
+                2 * ni,
                 True,
-                cfg,
+                w13_cfg,
                 dq,
                 False,
                 0.0,
@@ -1000,8 +1039,8 @@ def _try_run_v2(
                 expert_map,
                 global_e,
             )
-        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * _NI].view(slots, 2 * _NI)
-        ops.sum(part, ks, slots, 2 * _NI, act_in)
+        act_in = intermediate_cache13.reshape(-1)[: slots * 2 * ni].view(slots, 2 * ni)
+        ops.sum(part, ks, slots, 2 * ni, act_in)
         if activation_func is None:
             from vllm.model_executor.layers.fused_moe.activation import (
                 ApplyMoEActivationConfig,
@@ -1101,10 +1140,10 @@ def _try_run_v2(
                 tw,
                 topk,
                 slots,
-                _NI,
+                ni,
                 _K,
                 False,
-                cfg,
+                w2_cfg,
                 dq,
                 True,
                 0.0,
@@ -1125,10 +1164,10 @@ def _try_run_v2(
                 tw,
                 topk,
                 slots,
-                _NI,
+                ni,
                 _K,
                 False,
-                cfg,
+                w2_cfg,
                 dq,
                 True,
                 0.0,
@@ -1143,6 +1182,7 @@ def _try_run_v2(
             )
         return y, True
     dummy = torch.empty(0, dtype=torch.bfloat16, device=dev)
+    tw_w2 = tw if mul_topk_weights_in_gemm2 else torch.empty(0, dtype=torch.float32, device=dev)
     if expert_map is None:
         ops2.gemm(
             h,
@@ -1151,13 +1191,13 @@ def _try_run_v2(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            tw,
+            tw_w2,
             topk,
             slots,
-            _NI,
+            ni,
             _K,
             False,
-            cfg,
+            w2_cfg,
             dq,
             False,
             0.0,
@@ -1175,13 +1215,13 @@ def _try_run_v2(
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            tw,
+            tw_w2,
             topk,
             slots,
-            _NI,
+            ni,
             _K,
             False,
-            cfg,
+            w2_cfg,
             dq,
             False,
             0.0,

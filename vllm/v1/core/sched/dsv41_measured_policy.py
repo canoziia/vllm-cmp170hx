@@ -38,15 +38,30 @@ COST_MS_FUSED = {
     32: (33.1000, 39.9200, 43.3900, 46.2100, 48.5700),
 }
 
+# Pure-TP4 (EP=1, NI=576) step curve, calibrated on 384-expert DeepSeek-V4.1-Flash
+# weights on 4x GA100 80G PCIe (4x 126 SM, 180W default power limit) with
+# DeferringMarlinExperts + TwoShotAllReduceFinalizePostCollapse (M=3..60),
+# 1-hop OneShot + w2_splitk_ep KS=3 (M=1..2), and fused_gate_topk_align (M<=8),
+# satisfying strict 6-concurrency [5, 1, 5] trim-and-recovery invariants across k=1..5.
+COST_MS_TP4 = {
+    1: (8.5600, 9.1100, 9.4900, 9.7700, 10.0600),
+    2: (9.7400, 10.3100, 10.5500, 11.4500, 11.8000),
+    4: (10.9300, 12.2500, 13.4700, 14.5500, 15.1000),
+    8: (13.4500, 15.7000, 17.3950, 18.9277, 20.2009),
+    16: (18.5000, 22.3110, 25.2018, 26.4637, 27.7114),
+    32: (29.9100, 36.0715, 40.4382, 43.6421, 46.5427),
+}
+
 COST_MS = COST_MS_BASE
 
 
 def _active_cost_ms():
-    return (
-        COST_MS_FUSED
-        if os.environ.get("VLLM_DSV41_COST_MS_FUSED", "0") == "1"
-        else COST_MS
-    )
+    mode = os.environ.get("VLLM_DSV41_COST_MS_FUSED", "0").strip().lower()
+    if mode in ("tp4", "2"):
+        return COST_MS_TP4
+    if mode == "1":
+        return COST_MS_FUSED
+    return COST_MS
 
 
 def costs(c):
