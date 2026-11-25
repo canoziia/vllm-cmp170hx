@@ -89,6 +89,15 @@ echo "  prefill:      $([[ $SKIP_PREFILL -eq 1 ]] && echo 'skipped' || echo "$PR
 echo "  decode:       $([[ $SKIP_DECODE -eq 1 ]] && echo 'skipped' || echo "prose,code,counting c=${DECODE_CONCURRENCIES} max_tokens=${DECODE_MAX_TOKENS}")"
 echo
 
+if [[ $SKIP_PREFILL -eq 0 && $SKIP_DECODE -eq 0 ]]; then
+  echo ">>> Warmup (decode + subwidth + 4K prefill JIT)..."
+  WARM_OUT="$(mktemp)"
+  node "$BENCH_JS" --mode counting --max-tokens 64 --concurrency 1,32 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
+  node "$BENCH_JS" --mode prose --max-tokens 128 --concurrency 1,2,4,8 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
+  node "$BENCH_JS" --mode prefill --input-tokens 4096 --concurrency 1 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
+  rm -f "$WARM_OUT"
+fi
+
 if [[ $SKIP_PREFILL -eq 0 ]]; then
   for LEN in $PREFILL_LENGTHS; do
     echo ">>> Running prefill (${LEN} approx tokens)..."
@@ -97,7 +106,7 @@ if [[ $SKIP_PREFILL -eq 0 ]]; then
 fi
 
 if [[ $SKIP_DECODE -eq 0 ]]; then
-  for MODE in prose code counting; do
+  for MODE in counting code prose; do
     echo ">>> Running ${MODE} (c=${DECODE_CONCURRENCIES}, max_tokens=${DECODE_MAX_TOKENS})..."
     node "$BENCH_JS" --mode "$MODE" --max-tokens "$DECODE_MAX_TOKENS" --concurrency "$DECODE_CONCURRENCIES" "${COMMON_ARGS[@]}" | tee -a "$TMP_RUN"
   done

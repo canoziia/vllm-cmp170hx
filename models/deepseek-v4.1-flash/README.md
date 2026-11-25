@@ -30,7 +30,7 @@ and [`../../manifests/lmcache.env`](../../manifests/lmcache.env)):
 
 ### Self-Contained Native Extensions (`models/deepseek-v4.1-flash/native/`)
 
-All six native extensions are built from source during `scripts/build-deepseek-v41-image.sh`:
+All seven native extensions are built from source during `scripts/build-deepseek-v41-image.sh`:
 
 | directory | artifact | purpose |
 |---|---|---|
@@ -39,6 +39,7 @@ All six native extensions are built from source during `scripts/build-deepseek-v
 | `native/dsv41_indexer` | `vllm/_dsv41_indexer_C.abi3.so` | Fast CUDA prefill sparse-indexer logits + top-512 / top-2048 writer |
 | `native/dsv41_swa` | `vllm/_dsv41_swa_C.abi3.so` | In-place ragged sliding-window metadata builder |
 | `native/dsv41_r2` | `vllm/_dsv41_r2_C.abi3.so` | Single-kernel `fused_gate_topk_align` + `dsv4_topk_v2` (with `is_padding` & `bias_vl`), `w2_splitk_ep` (256-col + fused shared `__hadd2`), C++ Tensor-Core `woa_mxfp8_splitk`, `tp_greedy_*` local verification, `dequant_marlin_mxfp8` |
+| `native/dsv41_pcie_dma` | `vllm/_dsv41_pcie_dma_C.so` | O(1) `K = 3` triple-buffered Copy-Engine Ring DMA (`ce_reduce_scatter`, `ce_all_gather`, `ce_all_reduce_inplace`) with 64-bit bidirectional PTX ACK |
 | `native/dsv41_engram_cpu` | `.../common/_dsv41_engram_cpu.so` | OpenMP + AVX2/FMA packed 264 B FP8+UE8M0 host Engram gather |
 
 ## TEP4 Deployment (`4x 80G SM80`) & Automatic NVLink / PCIe Detection
@@ -76,10 +77,10 @@ Moving the same container image between TEP4 / PP6 or PCIe / NVLink SM80 hosts r
 **zero `.py` changes**.
 
 - **Host PCIe Relaxed Ordering (`NVreg_EnablePCIERelaxedOrderingMode`)**: keep the default `0` on
-  single-switch `PIX` hosts (where P2P already saturates PCIe Gen4 x16; enabling `1` adds
-  `~0.07–0.89 ms/step` sync tail latency across 86 decode barriers). On `PHB` / `NODE` / `SYS`
-  topologies traversing the CPU Root Complex, `1` may improve P2P/DMA throughput and is worth
-  benchmarking locally.
+  single-switch `PIX` hosts (where P2P already saturates PCIe Gen4 x16; enabling `1` trades
+  `+1.8–2.7%` cold prefill throughput for `~0.07–0.89 ms/step` decode sync latency regression
+  across 86 per-step barriers). On `PHB` / `NODE` / `SYS` topologies traversing the CPU Root
+  Complex, `1` may yield larger P2P/DMA gains and is worth benchmarking locally.
 
 ### Quickstart (Prebuilt GHCR Images)
 

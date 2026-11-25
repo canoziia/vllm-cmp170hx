@@ -70,3 +70,9 @@ explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.
      long-context prefill OOM on 4×80G and conditionally enables 2-microbatch MoE when
      `M >= 4096` or `EP >= 6`.
    - Tightens `try_gate_gemv` upper bound from `M <= 8` to `M <= 6` (cuBLAS wins at `M >= 8`).
+
+7. `0007-dsv41-pcie-dma-k3-triple-buffer.patch`
+   - Upgrades the Copy-Engine Ring DMA slab from `2 * (W - 1)` slots (`45 MiB/rank` on TP4,
+     `100–140 MiB` on TP6/8) to a constant `K = 3` triple-buffered circular ring (`22.5 MiB/rank`
+     on TP4, `30 MiB` on TP6/8) using 64-bit bidirectional ACK flow control (zero pipeline bubbles,
+     reuses the open peer IPC handle on `world == 2`).
