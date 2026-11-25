@@ -1115,22 +1115,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.column_gathers = supports_column_gathers(vllm_config)
         if self.column_gathers:
             self._init_engram_column_gathers(vllm_config)
-        if (
-            self.fuse_mhc_all_reduce
-            and not self.parallel_config.enable_expert_parallel
-            and vllm_config.lora_config is None
-        ):
-            # A MoE's top-k finalize folds into the next layer's first mHC
-            # boundary, which the last local layer lacks and an engram layer
-            # replaces with its own all-reduce. Experts with LoRA always
-            # finalize themselves.
-            local_layers = list(islice(self.layers, self.start_layer, self.end_layer))
-            for layer, successor in zip(local_layers, local_layers[1:]):
-                assert isinstance(layer, DeepseekV4DecoderLayer)
-                assert isinstance(successor, DeepseekV4DecoderLayer)
-                if successor.engram is None:
-                    layer.ffn.defer_finalize()
-
         # Decoder-side SWA bounded replay: in eager prefill steps the layers past
         # the last KV source run on each request's trailing window only
         # (decoder_replay_layers.py).
@@ -1172,6 +1156,32 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.end_layer - 1,
                 config.sliding_window,
             )
+
+        if (
+            self.fuse_mhc_all_reduce
+            and not self.parallel_config.enable_expert_parallel
+            and vllm_config.lora_config is None
+        ):
+            # A MoE's top-k finalize folds into the next layer's first mHC
+            # boundary, which the last local layer lacks, an engram layer
+            # replaces with its own all-reduce, and `decoder_replay_layers`
+            # requires a finalized Tensor before trimming rows (when
+            # `mhc_all_reduce_max_tokens()` exceeds `sliding_window`, e.g.
+            # 192 > 128, or when `clip_prefix` trims a shorter chunk).
+            # Experts with LoRA always finalize themselves.
+            local_layers = list(islice(self.layers, self.start_layer, self.end_layer))
+            for layer_idx, (layer, successor) in enumerate(
+                zip(local_layers, local_layers[1:]), start=self.start_layer
+            ):
+                assert isinstance(layer, DeepseekV4DecoderLayer)
+                assert isinstance(successor, DeepseekV4DecoderLayer)
+                if (
+                    self.decoder_replay_layers is not None
+                    and layer_idx == self.decoder_replay_start - 1
+                ):
+                    continue
+                if successor.engram is None:
+                    layer.ffn.defer_finalize()
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
