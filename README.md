@@ -1,6 +1,6 @@
 # vllm-sm80
 
-**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 200–500 tok/s single-stream and up to 10K tok/s prefill (8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
+**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 200–560 tok/s single-stream and up to 10.5K tok/s prefill (8.3K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
 
 ## Prebuilt Images (GHCR)
 
@@ -28,18 +28,18 @@ NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tep4_fused`), `enable_adaptive_verific
 
 | Target Length | 64K | 128K | 256K | 512K | 1M |
 |---|---:|---:|---:|---:|---:|
-| **Prefill (`tok/s`)** | **9,928.7** | **10,027.5** | **9,789.3** | **9,242.6** | **7,992.4** |
+| **Prefill (`tok/s`)** | **10,551.7** | **10,491.8** | **10,205.2** | **9,515.6** | **8,314.6** |
 
 **Decode Throughput & Step Latency (`full_batch_tok_s` / `step_ms`, `max_tokens=500`)**
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | **212.0** (`9.81 ms`, acc 2.07) | **491.6** (`11.17 ms`, acc 5.43) | **567.6** (`10.47 ms`, acc 5.88) |
-| **2** | **353.2** (`11.88 ms`, acc 2.07) | **779.6** (`14.83 ms`, acc 5.51) | **935.3** (`13.15 ms`, acc 5.88) |
-| **4** | **578.2** (`13.57 ms`, acc 1.95) | **1,173.3** (`19.35 ms`, acc 5.41) | **1,480.3** (`16.66 ms`, acc 5.88) |
-| **8** | **813.3** (`18.86 ms`, acc 1.91) | **1,710.7** (`26.25 ms`, acc 5.45) | **2,095.1** (`23.54 ms`, acc 5.88) |
-| **16** | **1,122.6** (`27.42 ms`, acc 1.93) | **2,343.9** (`37.18 ms`, acc 5.46) | **2,651.0** (`36.63 ms`, acc 5.88) |
-| **32** | **1,436.1** (`36.51 ms`, acc 1.64) | **2,894.7** (`59.31 ms`, acc 5.42) | **3,304.5** (`57.58 ms`, acc 5.88) |
+| **1** | **211.9** (`9.94 ms`, acc 2.10) | **488.6** (`11.24 ms`, acc 5.43) | **563.7** (`10.54 ms`, acc 5.88) |
+| **2** | **370.9** (`11.74 ms`, acc 2.18) | **777.1** (`14.36 ms`, acc 5.46) | **932.2** (`12.81 ms`, acc 5.88) |
+| **4** | **564.8** (`13.46 ms`, acc 1.90) | **1,180.1** (`18.74 ms`, acc 5.45) | **1,485.5** (`16.11 ms`, acc 5.88) |
+| **8** | **818.2** (`18.81 ms`, acc 1.93) | **1,770.8** (`24.88 ms`, acc 5.44) | **2,115.5** (`22.66 ms`, acc 5.88) |
+| **16** | **1,133.1** (`27.80 ms`, acc 1.96) | **2,223.0** (`38.91 ms`, acc 5.45) | **2,544.0** (`37.71 ms`, acc 5.88) |
+| **32** | **1,398.2** (`44.25 ms`, acc 1.94) | **2,851.3** (`61.20 ms`, acc 5.41) | **3,192.3** (`60.13 ms`, acc 5.88) |
 
 ## Branch Architecture
 
@@ -84,7 +84,7 @@ Exact upstream commits and Docker base image digests are pinned in
         ├── .env.example            # default TEP4 environment template
         ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
         ├── .env.pp6.example        # optional PP6 environment template
-        ├── native/                 # 6 self-contained SM80 CUDA/C++ extensions built from source
+        ├── native/                 # 7 self-contained SM80 CUDA/C++ extensions built from source
         ├── patches/                # auditable patch archive replaying onto official vLLM
         ├── scripts/                # DeepSeek-only diagnostics
         ├── tests/                  # offline unit & encoding test suites
