@@ -2,9 +2,9 @@
 """SM80 Copy-Engine Ring DMA collective wrapper (lossless BF16).
 
 Uses `_dsv41_pcie_dma_C` (pure `cudaMemcpyAsync` ring on dedicated Copy-Engine
-streams + 1-CTA system-scope PTX flags + <=64-CTA vectorized BF16 local add)
-so large prefill collectives achieve full PCIe Gen4/Gen5 bidirectional bandwidth
-without stealing SM compute or power-cap headroom from concurrent GEMM/MoE.
+streams + 1-CTA system-scope 64-bit PTX flags + <=64-CTA vectorized BF16 local
+add) with a fixed O(1) triple-buffered slab (K = 3 slots regardless of
+world_size) and lightweight bidirectional ACK flow-control.
 
 Canonical chunk ownership: rank `r` owns chunk `r = [r * S : (r + 1) * S]`,
 identical to `torch.distributed.reduce_scatter_single` and `all_gather_single`.
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _CHANNELS: dict[tuple[int, int], "PcieDmaRing | None"] = {}
 _NEXT_CHAN_ID = 0
+_RING_SLOTS = 3
 
 
 def pcie_dma_ring_enabled() -> bool:
@@ -77,6 +78,7 @@ class PcieDmaRing:
         local_flags_ptr: int,
         next_slab_ptr: int,
         next_flags_ptr: int,
+        prev_flags_ptr: int,
     ) -> None:
         self._ext = ext
         self.chan_id = chan_id
@@ -89,6 +91,7 @@ class PcieDmaRing:
         self._local_flags_ptr = local_flags_ptr
         self._next_slab_ptr = next_slab_ptr
         self._next_flags_ptr = next_flags_ptr
+        self._prev_flags_ptr = prev_flags_ptr
 
     def supports_full(self, x: torch.Tensor) -> bool:
         if (
@@ -171,13 +174,17 @@ def get_or_init_pcie_dma_ring(
         return None
 
     cpu_group = tp_group.cpu_group
-    # 1. Verify CUDA P2P access along the ring on every rank.
+    # 1. Verify bidirectional CUDA P2P access along the ring on every rank.
     my_dev = int(device.index or 0)
     all_devs: list[int | None] = [None] * world
     dist.all_gather_object(all_devs, my_dev, group=cpu_group)
     next_rank = (rank + 1) % world
+    prev_rank = (rank - 1 + world) % world
     next_dev = int(all_devs[next_rank])  # type: ignore[arg-type]
-    peer_ok = bool(ext.can_access_peer(my_dev, next_dev))
+    prev_dev = int(all_devs[prev_rank])  # type: ignore[arg-type]
+    peer_ok = bool(ext.can_access_peer(my_dev, next_dev)) and bool(
+        ext.can_access_peer(my_dev, prev_dev)
+    )
     all_ok: list[bool | None] = [None] * world
     dist.all_gather_object(all_ok, peer_ok, group=cpu_group)
     if not all(all_ok):
@@ -189,18 +196,23 @@ def get_or_init_pcie_dma_ring(
         _CHANNELS[key] = None
         return None
 
-    # 2. Size slab to handle up to max_tokens (aligned to world, capped at 8192).
+    # 2. Size O(1) triple-buffered slab (K=3 fixed slots independent of world_size).
     cap_tokens = max(1024, min(int(max_tokens), 8192))
     aligned_tokens = ((cap_tokens + world - 1) // world) * world
     chunk_rows = aligned_tokens // world
     max_chunk_bytes = chunk_rows * hidden_size * 2
     # 16-byte align
     max_chunk_bytes = ((max_chunk_bytes + 15) // 16) * 16
-    slab_bytes = 2 * (world - 1) * max_chunk_bytes
+    num_slots = int(ext.ring_num_slots()) if hasattr(ext, "ring_num_slots") else _RING_SLOTS
+    slab_bytes = num_slots * max_chunk_bytes
 
-    flags_bytes = 256 * 32 * 4
+    # 2 * num_slots 128-byte cachelines (data + ack flags), page-aligned.
+    flags_bytes = 4096
     local_slab_ptr = 0
     local_flags_ptr = 0
+    next_slab_ptr = 0
+    next_flags_ptr = 0
+    prev_flags_ptr = 0
     try:
         # Allocate dedicated 0-offset cudaMalloc buffers outside PyTorch's
         # CUDACachingAllocator (cudaIpcGetMemHandle ignores sub-block offsets!).
@@ -215,6 +227,13 @@ def get_or_init_pcie_dma_ring(
 
         next_slab_ptr = int(ext.open_ipc_handle_bytes(all_slabs[next_rank]))
         next_flags_ptr = int(ext.open_ipc_handle_bytes(all_flags[next_rank]))
+        # For world == 2, prev_rank == next_rank: reuse the open IPC handle
+        # rather than opening the same handle twice (cudaErrorAlreadyMapped).
+        if prev_rank == next_rank:
+            prev_flags_ptr = next_flags_ptr
+        else:
+            prev_flags_ptr = int(ext.open_ipc_handle_bytes(all_flags[prev_rank]))
+
         chan_id = _NEXT_CHAN_ID
         _NEXT_CHAN_ID += 1
         ext.init_channel(
@@ -226,9 +245,16 @@ def get_or_init_pcie_dma_ring(
             next_slab_ptr,
             local_flags_ptr,
             next_flags_ptr,
+            prev_flags_ptr,
         )
         dist.barrier(group=cpu_group)
     except Exception as exc:
+        if prev_flags_ptr and prev_flags_ptr != next_flags_ptr:
+            ext.close_ipc_handle(prev_flags_ptr)
+        if next_flags_ptr:
+            ext.close_ipc_handle(next_flags_ptr)
+        if next_slab_ptr:
+            ext.close_ipc_handle(next_slab_ptr)
         if local_slab_ptr:
             ext.free_ipc_buffer(local_slab_ptr)
         if local_flags_ptr:
@@ -251,12 +277,14 @@ def get_or_init_pcie_dma_ring(
         local_flags_ptr=local_flags_ptr,
         next_slab_ptr=next_slab_ptr,
         next_flags_ptr=next_flags_ptr,
+        prev_flags_ptr=prev_flags_ptr,
     )
     _CHANNELS[key] = ring
     logger.info_once(
-        "DSV4.1 Prefill: Copy-Engine Ring DMA enabled (world=%d, max_tokens=%d, "
-        "slab=%.1f MiB/rank).",
+        "DSV4.1 Prefill: Copy-Engine Ring DMA enabled (world=%d, slots=%d, "
+        "max_tokens=%d, slab=%.1f MiB/rank).",
         world,
+        num_slots,
         aligned_tokens,
         slab_bytes / (1024 * 1024),
     )
