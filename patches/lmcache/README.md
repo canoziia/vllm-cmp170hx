@@ -101,6 +101,14 @@ rather than mixes with any base image package. Verify at runtime that
       `CachedRequestData.resumed_req_ids` was removed upstream) without adding
       compatibility shims to vLLM's core scheduler output.
 
+11. `0011-exact-chunk-multiple-swa-fix.patch`
+    - fixes exact chunk-multiple full-prompt hits (`L % chunk_size == 0`, e.g.
+      `L=1024, 2048, ...`) in `lmcache/integration/vllm/lmcache_mp_connector.py`:
+      when `ret == len(request.all_token_ids)`, drops the final LMCache chunk
+      cleanly and releases its lookup lock via `free_lookup_locks` so vLLM's
+      DeepSeek-V4.1 SWA bounded-replay block-alignment never underflows
+      `RETRIEVE` block IDs.
+
 The server-image build runs `scripts/test-lmcache-patches.py`. It checks native
 extension ABI, salt isolation, mixed-size native-FS round trips, six-rank
 layout lifetime, and existing-file adoption. The DeepSeek client build also

@@ -1,0 +1,183 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] router: bypass prefill hop for prompts shorter than LMCache chunk_size
+
+LMCache discards trailing partial chunks smaller than `chunk_size`
+(e.g. 1024 tokens), so sending a `< chunk_size` prompt to the prefill
+engine stores 0 chunks and forces the decode engine to recompute the
+entire prompt anyway.
+
+When `VLLM_ROUTER_MIN_PREFILL_TOKENS` is set to a positive integer
+(recommended: equal to `LMCACHE_CHUNK_SIZE`, e.g. 1024), requests whose
+conservative upper-bound prompt token estimate is strictly smaller than
+the threshold (and contain no multimodal media parts) bypass the prefill
+hop and go directly to the decode backend. Unset or 0 keeps all requests
+on the two-hop PD path.
+
+--- a/vllm_router/services/request_service/request.py
++++ b/vllm_router/services/request_service/request.py
+@@ -1302,6 +1302,120 @@
+         )
+ 
+ 
++_MULTIMODAL_PART_KEYS = frozenset(
++    {"image_url", "input_image", "image", "audio_url", "input_audio", "video_url", "video"}
++)
++_MULTIMODAL_PART_TYPES = frozenset(
++    {"image_url", "input_image", "image", "audio_url", "input_audio", "video_url", "video"}
++)
++
++
++def _prefill_min_tokens() -> int:
++    raw = os.environ.get("VLLM_ROUTER_MIN_PREFILL_TOKENS", "").strip()
++    if not raw:
++        return 0
++    try:
++        return max(0, int(raw))
++    except ValueError:
++        return 0
++
++
++def _utf8_upper_tokens(text: str) -> int:
++    # Conservative upper bound: ~0.40 tok/ASCII char, ~1.20 tok/CJK char.
++    return int(len(text.encode("utf-8")) / 2.5) + 1 if text else 0
++
++
++def _estimate_prompt_tokens(request_json: dict) -> Optional[int]:
++    """Return a conservative upper bound on prompt tokens, or None if the
++    request should not bypass prefill (e.g. multimodal or unknown shape)."""
++    if not isinstance(request_json, dict):
++        return None
++
++    def _accumulate_content(content) -> Optional[int]:
++        if content is None:
++            return 0
++        if isinstance(content, str):
++            return _utf8_upper_tokens(content)
++        if isinstance(content, list):
++            total = 0
++            for part in content:
++                if isinstance(part, str):
++                    total += _utf8_upper_tokens(part)
++                elif isinstance(part, dict):
++                    ptype = str(part.get("type", "")).lower()
++                    if ptype in _MULTIMODAL_PART_TYPES or any(
++                        k in part for k in _MULTIMODAL_PART_KEYS
++                    ):
++                        return None
++                    text_val = part.get("text")
++                    if isinstance(text_val, str):
++                        total += _utf8_upper_tokens(text_val)
++                    else:
++                        total += _utf8_upper_tokens(json.dumps(part, ensure_ascii=False))
++                else:
++                    return None
++            return total
++        return None
++
++    est = 0
++    if "messages" in request_json:
++        msgs = request_json.get("messages")
++        if not isinstance(msgs, list):
++            return None
++        est += 64 + 16 * len(msgs)
++        for m in msgs:
++            if not isinstance(m, dict):
++                return None
++            c_est = _accumulate_content(m.get("content"))
++            if c_est is None:
++                return None
++            est += c_est
++            if "tool_calls" in m and m["tool_calls"]:
++                est += _utf8_upper_tokens(json.dumps(m["tool_calls"], ensure_ascii=False))
++    elif "prompt" in request_json:
++        prompt = request_json.get("prompt")
++        if isinstance(prompt, str):
++            est += _utf8_upper_tokens(prompt) + 8
++        elif isinstance(prompt, list):
++            if not prompt:
++                est += 0
++            elif all(isinstance(x, int) for x in prompt):
++                est += len(prompt)
++            elif all(isinstance(x, str) for x in prompt):
++                est += sum(_utf8_upper_tokens(x) + 8 for x in prompt)
++            elif all(isinstance(x, list) and all(isinstance(y, int) for y in x) for x in prompt):
++                est += sum(len(x) for x in prompt)
++            else:
++                return None
++        else:
++            return None
++    elif "input" in request_json:
++        inp = request_json.get("input")
++        c_est = _accumulate_content(inp)
++        if c_est is None:
++            return None
++        est += c_est + 64
++    else:
++        return None
++
++    for extra_key in ("instructions", "tools", "functions", "response_format"):
++        val = request_json.get(extra_key)
++        if val:
++            if isinstance(val, str):
++                est += _utf8_upper_tokens(val)
++            else:
++                est += _utf8_upper_tokens(json.dumps(val, ensure_ascii=False))
++    return est
++
++
++def _should_bypass_prefill(request_json: dict) -> tuple[bool, Optional[int], int]:
++    min_tokens = _prefill_min_tokens()
++    if min_tokens <= 0:
++        return False, None, 0
++    est = _estimate_prompt_tokens(request_json)
++    return (est is not None and est < min_tokens), est, min_tokens
++
++
+ async def route_disaggregated_prefill_request(
+     request: Request,
+     endpoint: str,
+@@ -1315,20 +1429,32 @@
+     # Save original request for decode phase
+     orig_request_json = request_json.copy()
+ 
+-    # Prepare prefill request: set max_tokens=1 and remove max_completion_tokens
+-    # (max_completion_tokens takes precedence over max_tokens in OpenAI API,
+-    # so we must remove it to ensure prefill generates only 1 token)
+-    request_json["max_tokens"] = 1
+-    request_json.pop("max_completion_tokens", None)
+-    if endpoint.rstrip("/") == "/v1/responses":
+-        # The Responses API ignores max_tokens: its cap is max_output_tokens.
+-        # Without this the prefill hop generates the whole answer, the router
+-        # waits for it, and the decode hop then regenerates it from scratch.
+-        request_json["max_output_tokens"] = 1
+-
+     st = time.time()
+     prefill_stream = None
+-    if orig_request_json.get("stream", False):
++    bypass_prefill, est_tokens, min_tokens = _should_bypass_prefill(orig_request_json)
++    if bypass_prefill:
++        prefill_usage = None
++        et = st
++        request_json = orig_request_json
++        logger.info(
++            f"Bypassing prefill for short request {_log_safe(request_id)} "
++            f"(est_tokens={est_tokens} < min_tokens={min_tokens})"
++        )
++    else:
++        # Prepare prefill request: set max_tokens=1 and remove max_completion_tokens
++        # (max_completion_tokens takes precedence over max_tokens in OpenAI API,
++        # so we must remove it to ensure prefill generates only 1 token)
++        request_json["max_tokens"] = 1
++        request_json.pop("max_completion_tokens", None)
++        if endpoint.rstrip("/") == "/v1/responses":
++            # The Responses API ignores max_tokens: its cap is max_output_tokens.
++            # Without this the prefill hop generates the whole answer, the router
++            # waits for it, and the decode hop then regenerates it from scratch.
++            request_json["max_output_tokens"] = 1
++
++    if bypass_prefill:
++        pass
++    elif orig_request_json.get("stream", False):
+         # Streaming client: the prefill hop is streamed too, so its SSE
+         # keep-alive comments reach the client while the prompt is prefilled.
+         # Its status is still known before the client's response starts.

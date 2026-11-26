@@ -1,0 +1,34 @@
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -1122,6 +1122,31 @@
+ 
+         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+ 
++        # When the full prompt hits LMCache (len % chunk_size == 0), vLLM
++        # must recompute at least the last token; with SWA bounded replay
++        # (DeepSeek-V4.1), the scheduler floors ext_tokens to block_size,
++        # allocating fewer blocks than `ret` chunks require and triggering
++        # RETRIEVE block ID underflow. Drop the final chunk cleanly and
++        # release its lookup lock so the hit stays strictly below prompt
++        # length and chunk-aligned.
++        if ret == len(request.all_token_ids):
++            chunk_sz = self.scheduler_adapter.lmcache_tokens_per_chunk
++            trimmed_ret = max(0, ret - chunk_sz)
++            self.scheduler_adapter.free_lookup_locks(
++                token_ids=tracker.get_token_ids(),
++                start=trimmed_ret,
++                end=ret,
++                request_id=request.request_id,
++                cache_salt=tracker.cache_salt,
++                request_configs=tracker.request_configs,
++            )
++            ret = trimmed_ret
++            if ret == 0:
++                self.scheduler_adapter.cleanup_lookup_result(request.request_id)
++                tracker.num_lmcache_hit_tokens = 0
++                tracker.state = LMCacheMPRequestState.READY
++                return 0, False
++
+         # Update num stored tokens for the tracker
+         tracker.increase_num_stored_tokens(ret)
+ 

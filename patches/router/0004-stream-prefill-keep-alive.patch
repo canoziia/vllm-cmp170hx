@@ -1,0 +1,345 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] router: stream the PD prefill hop and forward its SSE keep-alive comments
+
+For a `stream: true` client the prefill hop is now requested as a stream
+too (max_tokens=1, stream_options.include_usage for 0001's usage merge;
+the Responses API reports usage in response.completed). The router adds
+no keep-alive timer of its own: it is a shell around the engines, and
+whether keep-alive comments are sent is decided by the engines' own vLLM
+--sse-keep-alive-interval (vllm-project/vllm#51034).
+
+  * the prefill hop's HTTP status is known before the client's response
+    starts; a >=400 status and its body are passed through as-is, like a
+    direct call to vLLM;
+  * after the prefill hop's 200 the client's StreamingResponse starts;
+    SSE comment events (lines starting with ':') are forwarded verbatim,
+    the 1-token data events and [DONE] are dropped and only the usage is
+    kept; an error event is forwarded (followed by [DONE]) and ends the
+    stream; then the decode stream follows unchanged (its comments too);
+  * a client disconnect cancels the generator, which closes the prefill
+    or decode socket so the engine aborts the request (logged);
+  * prompt_tokens_details.multimodal_tokens (null), which the streaming
+    usage omits, is restored so router_hops stays byte-identical.
+
+Non-streaming requests are unchanged.
+---
+--- a/vllm_router/services/request_service/request.py
++++ b/vllm_router/services/request_service/request.py
+@@ -865,6 +865,68 @@ async def _await_or_disconnect(request: Request, coro, request_id: str, phase: s
+             await _cancel_and_wait(hop_task)
+ 
+ 
++async def open_prefill_stream(
++    client: aiohttp.ClientSession, endpoint: str, req_data: dict, request_id: str
++) -> aiohttp.ClientResponse:
++    """Start the prefill hop of a streaming PD request as an SSE stream.
++
++    Streaming lets the router forward the prefill engine's own SSE keep-alive
++    comments (vLLM --sse-keep-alive-interval) while the prompt is prefilled.
++    The response is returned open, after its headers arrived; the caller reads
++    and closes it.
++    """
++    req_data = req_data.copy()
++    req_data["max_tokens"] = 1
++    if "max_completion_tokens" in req_data:
++        req_data["max_completion_tokens"] = 1
++    req_data.pop("min_tokens", None)
++    req_data["stream"] = True
++    if endpoint.rstrip("/") == "/v1/responses":
++        # The Responses API always reports usage in response.completed.
++        req_data.pop("stream_options", None)
++    else:
++        # 0001 needs the prefill usage, so ask for it whatever the client did.
++        req_data["stream_options"] = {"include_usage": True}
++
++    headers = {
++        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
++        "X-Request-Id": request_id,
++    }
++    return await client.post(endpoint, json=req_data, headers=headers)
++
++
++async def _prefill_stream_events(response: aiohttp.ClientResponse):
++    """Yield the raw SSE events (without the blank-line separator)."""
++    buf = bytearray()
++    async for chunk in response.content.iter_any():
++        buf.extend(chunk.replace(b"\r\n", b"\n"))
++        while True:
++            idx = buf.find(b"\n\n")
++            if idx < 0:
++                break
++            event = bytes(buf[:idx])
++            del buf[: idx + 2]
++            yield event
++    if buf.strip():
++        yield bytes(buf)
++
++
++def _prefill_event_payload(event: bytes):
++    """The JSON payload of a prefill `data:` event, or None."""
++    data = [
++        line[5:].strip()
++        for line in event.split(b"\n")
++        if line.startswith(b"data:")
++    ]
++    if not data or data[-1] == b"[DONE]":
++        return None
++    try:
++        payload = json.loads(b"\n".join(data))
++    except Exception:
++        return None
++    return payload if isinstance(payload, dict) else None
++
++
+ class _UsageMergeState:
+     """Rewrite the streamed decode usage so the client sees the merged account.
+ 
+@@ -1265,53 +1327,108 @@ async def route_disaggregated_prefill_request(
+         request_json["max_output_tokens"] = 1
+ 
+     st = time.time()
+-    try:
+-        prefill_response = await _await_or_disconnect(
+-            request,
+-            send_request_to_prefiller(
+-                request.app.state.prefill_client, endpoint, request_json, request_id
+-            ),
+-            request_id,
+-            "prefill",
+-        )
+-        prefill_usage = (
+-            prefill_response.get("usage") if isinstance(prefill_response, dict) else None
+-        )
++    prefill_stream = None
++    if orig_request_json.get("stream", False):
++        # Streaming client: the prefill hop is streamed too, so its SSE
++        # keep-alive comments reach the client while the prompt is prefilled.
++        # Its status is still known before the client's response starts.
++        try:
++            prefill_stream = await _await_or_disconnect(
++                request,
++                open_prefill_stream(
++                    request.app.state.prefill_client, endpoint, request_json, request_id
++                ),
++                request_id,
++                "prefill",
++            )
++        except ClientDisconnect:
++            return Response(status_code=_CLIENT_CLOSED_REQUEST)
++        except Exception as e:
++            logger.error(f"Unexpected error in prefiller: {e}", exc_info=True)
++            return JSONResponse(
++                status_code=500,
++                content={
++                    "error": {
++                        "message": f"Prefiller error: {str(e)}",
++                        "type": "prefiller_error",
++                        "code": 500,
++                    }
++                },
++                headers={"X-Request-Id": request_id},
++            )
++        if prefill_stream.status >= 400:
++            # Pass the engine's error through as-is, as a direct call would.
++            try:
++                error_body = await _await_or_disconnect(
++                    request, prefill_stream.read(), request_id, "prefill"
++                )
++            except ClientDisconnect:
++                return Response(status_code=_CLIENT_CLOSED_REQUEST)
++            finally:
++                prefill_stream.close()
++            logger.error(
++                f"HTTP error in prefiller: {prefill_stream.status} for "
++                f"{_log_safe(request_id)}"
++            )
++            return Response(
++                content=error_body,
++                status_code=prefill_stream.status,
++                media_type=prefill_stream.headers.get(
++                    "content-type", "application/json"
++                ),
++                headers={"X-Request-Id": request_id},
++            )
++        prefill_usage = None
+         et = time.time()
+-        logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
+-        logger.info(
+-            f"Routing request {request_id} with session id None to {request.app.state.prefill_client._base_url} at {et}, process time = {et - in_router_time:.4f}"
+-        )
+-        # Use original request for decode phase
+         request_json = orig_request_json
+-    except ClientDisconnect:
+-        return Response(status_code=_CLIENT_CLOSED_REQUEST)
+-    except aiohttp.ClientResponseError as e:
+-        logger.error(f"HTTP error in prefiller: {e}", exc_info=True)
+-        return JSONResponse(
+-            status_code=e.status,
+-            content={
+-                "error": {
+-                    "message": f"Prefiller error: {e.message}",
+-                    "type": "prefiller_error",
+-                    "code": e.status,
+-                }
+-            },
+-            headers={"X-Request-Id": request_id},
+-        )
+-    except Exception as e:
+-        logger.error(f"Unexpected error in prefiller: {e}", exc_info=True)
+-        return JSONResponse(
+-            status_code=500,
+-            content={
+-                "error": {
+-                    "message": f"Prefiller error: {str(e)}",
+-                    "type": "prefiller_error",
+-                    "code": 500,
+-                }
+-            },
+-            headers={"X-Request-Id": request_id},
+-        )
++    else:
++        try:
++            prefill_response = await _await_or_disconnect(
++                request,
++                send_request_to_prefiller(
++                    request.app.state.prefill_client, endpoint, request_json, request_id
++                ),
++                request_id,
++                "prefill",
++            )
++            prefill_usage = (
++                prefill_response.get("usage") if isinstance(prefill_response, dict) else None
++            )
++            et = time.time()
++            logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
++            logger.info(
++                f"Routing request {request_id} with session id None to {request.app.state.prefill_client._base_url} at {et}, process time = {et - in_router_time:.4f}"
++            )
++            # Use original request for decode phase
++            request_json = orig_request_json
++        except ClientDisconnect:
++            return Response(status_code=_CLIENT_CLOSED_REQUEST)
++        except aiohttp.ClientResponseError as e:
++            logger.error(f"HTTP error in prefiller: {e}", exc_info=True)
++            return JSONResponse(
++                status_code=e.status,
++                content={
++                    "error": {
++                        "message": f"Prefiller error: {e.message}",
++                        "type": "prefiller_error",
++                        "code": e.status,
++                    }
++                },
++                headers={"X-Request-Id": request_id},
++            )
++        except Exception as e:
++            logger.error(f"Unexpected error in prefiller: {e}", exc_info=True)
++            return JSONResponse(
++                status_code=500,
++                content={
++                    "error": {
++                        "message": f"Prefiller error: {str(e)}",
++                        "type": "prefiller_error",
++                        "code": 500,
++                    }
++                },
++                headers={"X-Request-Id": request_id},
++            )
+ 
+     merge_state = _UsageMergeState(prefill_usage, request_id)
+ 
+@@ -1373,7 +1490,78 @@ async def route_disaggregated_prefill_request(
+             status_code=200, content=payload, headers={"X-Request-Id": request_id}
+         )
+ 
++    async def forward_prefill_stream():
++        """Forward the prefill hop's SSE comments; keep only its usage.
++
++        Yields the comment events to send; the 1-token data events and
++        [DONE] are dropped. Returns via StopAsyncIteration; `prefill_failed`
++        is set when an error event was forwarded instead.
++        """
++        nonlocal prefill_failed, et
++        try:
++            async for event in _prefill_stream_events(prefill_stream):
++                lines = [line for line in event.split(b"\n") if line]
++                if lines and all(line.startswith(b":") for line in lines):
++                    yield event + b"\n\n"
++                    continue
++                payload = _prefill_event_payload(event)
++                if payload is None:
++                    continue
++                if "error" in payload:
++                    # vLLM ends a failed stream with [DONE] right after.
++                    prefill_failed = True
++                    yield event + b"\n\ndata: [DONE]\n\n"
++                    return
++                usage = _UsageMergeState._find_usage(payload)
++                if usage is not None:
++                    details = usage.get("prompt_tokens_details")
++                    if isinstance(details, dict):
++                        # The non-streaming prefill hop this replaces reported
++                        # multimodal_tokens (null) here; keep router_hops
++                        # byte-identical.
++                        details.setdefault("multimodal_tokens", None)
++                    merge_state.prefill_usage = usage
++        except asyncio.CancelledError:
++            prefill_stream.close()
++            logger.warning(
++                f"{_log_safe(request_id)} client disconnected during prefill "
++                f"stream after {time.time() - st:.1f}s, aborted the backend request"
++            )
++            raise
++        except Exception as e:
++            prefill_stream.close()
++            logger.error(f"Unexpected error in prefiller: {e}", exc_info=True)
++            prefill_failed = True
++            yield json.dumps(
++                {
++                    "error": {
++                        "message": f"Prefiller error: {str(e)}",
++                        "type": "prefiller_error",
++                        "code": 500,
++                    }
++                }
++            ).encode("utf-8")
++            return
++        finally:
++            prefill_stream.release()
++        et = time.time()
++        logger.info(f"{request_id} prefill time (TTFT): {et - st:.4f}")
++        logger.info(
++            f"Routing request {request_id} with session id None to {request.app.state.prefill_client._base_url} at {et}, process time = {et - in_router_time:.4f}"
++        )
++
++    prefill_failed = False
++
+     async def generate_stream():
++        if prefill_stream is not None:
++            async for event in forward_prefill_stream():
++                yield event
++            if prefill_failed:
++                return
++            curr_time = time.time()
++            logger.info(
++                f"Routing request {request_id} with session id None to {request.app.state.decode_client._base_url} at {curr_time}, process time = {curr_time - et:.4f}"
++            )
+         decode_started = time.time()
+         try:
+             async for chunk in send_request_to_decode(
+@@ -1419,10 +1607,11 @@ async def route_disaggregated_prefill_request(
+             }
+             yield json.dumps(error_response).encode("utf-8")
+ 
+-    curr_time = time.time()
+-    logger.info(
+-        f"Routing request {request_id} with session id None to {request.app.state.decode_client._base_url} at {curr_time}, process time = {curr_time - et:.4f}"
+-    )
++    if prefill_stream is None:
++        curr_time = time.time()
++        logger.info(
++            f"Routing request {request_id} with session id None to {request.app.state.decode_client._base_url} at {curr_time}, process time = {curr_time - et:.4f}"
++        )
+ 
+     return StreamingResponse(
+         generate_stream(),

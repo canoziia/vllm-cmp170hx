@@ -129,3 +129,28 @@ explicitly enabled via `--speculative-config` and `VLLM_DSV41_OPT_PROFILE`.
         clamped to provable monotonic `[5, 1, 5]` trim-and-recovery ratio bounds.
     - Updates `COST_MS_TP4` prior table from full 30-cell 4×80G measurements under the new
       3-regime Ring Lamport + dynks + Engram Local Partial-Dot stack.
+
+15. `0015-dsv41-shared-engram-and-yoco-prefill.patch`
+    - **Cross-Container Zero-Copy Shared Engram (`VLLM_DSV41_ENGRAM_SHM_DIR`,
+      `VLLM_DSV41_ENGRAM_SHM_REGISTER`)**:
+      - TP4 Decode (`REGISTER=1`) maps disjoint 4KiB-aligned host `tmpfs` shards via
+        `cudaHostRegister(cudaHostRegisterMapped)` for native GPU UVA lookup (zero extra RAM).
+      - TP2 Prefill (`REGISTER=0`) maps the same host `tmpfs` shards `PROT_READ` without CUDA
+        registration and runs multi-shard C++ CPU gather (`engram_cpu_gather_bf16_multi` /
+        `engram_cpu_gather_fp8_multi`) into tiny pinned staging buffers + async H2D DMA.
+    - **YOCO Encoder-Only Prefill Mode (`VLLM_DSV41_YOCO_PREFILL_ONLY=1`)**:
+      Loads `layers 0..19` full + `layer 20` (`kv_write_only=True`, skipping `layer 20` MoE +
+      `layers 21..39` + `norm` + `lm_head`, ~70 GiB/GPU weights on TP2), writes the exact 8
+      global MLA+Indexer KV layers to shared LMCache MP Server (`chunk_size=1024`), and returns
+      dummy logits (`1 MB`).
+
+16. `0016-dsv41-fast-streaming-weight-load-and-engram-mlock.patch`
+    - **Streaming Safetensors Load & $O(1)$ Expert Mapping**:
+      Streams `language_model.model.*` shard-by-shard in disk order in `vl_model.py` (replacing
+      full-checkpoint lexicographical `sorted(...)`), skips unused shards via
+      `is_unused_checkpoint_weight` (`vl_model.py` & `dspark.py`), and indexes `expert_mapping`
+      by `weight_name` for $O(1)$ lookup in `model.py` and `dspark.py`.
+    - **`mlock()` for GUP-Pinned Engram SHM**:
+      Moves `cudaHostRegister`-pinned `tmpfs` pages out of `Active/Inactive(anon)` into
+      `Unevictable` LRU so Linux `kswapd`/direct-reclaim never spins scanning 188.8 GiB of
+      un-evictable Engram pages during model loading.

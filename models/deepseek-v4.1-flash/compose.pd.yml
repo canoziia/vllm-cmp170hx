@@ -1,0 +1,281 @@
+# DeepSeek-V4.1-Flash PD Disaggregation on 6x SM80 80G:
+#   - TP2 YOCO Encoder-Only Prefill (layers 0..20, layer 20 KV-write-only, ~70 GiB/GPU)
+#     on GPUs 6,7 (NUMA 1 PIX switch)
+#   - TP4 Full Decode (40 layers + MTP + DSpark adaptive K=5) on GPUs 0,1,2,3 (NUMA 0 PIX)
+#   - Shared LMCache MP Server (world_size=1, 8 global YOCO KV/Indexer layers, 890 B/tok)
+#   - Cross-container zero-copy shared Engram tmpfs (/mnt/engram-shm, 188.83 GiB total)
+#   - Patched vLLM production-stack PD router on :8000 with chunk_size-aligned short-prompt bypass
+#
+# One-time host prep before `up -d`:
+#   sudo mkdir -p /mnt/engram-shm
+#   sudo mount -t tmpfs -o size=195G tmpfs /mnt/engram-shm
+#   python3 models/deepseek-v4.1-flash/scripts/prepare-engram-shm.py \
+#     --model-dir /root/app/models/DeepSeek-V4.1-Flash-1017 \
+#     --out-dir /mnt/engram-shm
+#
+# Start:
+#   podman compose -f compose.pd.yml --env-file .env.pd \
+#     --podman-run-args="--ipc=host --pid=host" up -d
+x-podman:
+  in_pod: false
+
+services:
+  deepseek-v4.1-flash-pd-lmcache:
+    image: ${LMCACHE_IMAGE:-ghcr.io/canoziia/vllm-sm80/lmcache-server:latest}
+    container_name: deepseek-v4.1-flash-pd-lmcache
+    entrypoint: ["lmcache"]
+    restart: "no"
+    stop_grace_period: 3m
+    network_mode: host
+    ipc: host
+    pid: host
+    devices:
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_0:-0}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_1:-1}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_2:-2}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_3:-3}
+      - nvidia.com/gpu=${DSV41_PREFILL_GPU_0:-6}
+      - nvidia.com/gpu=${DSV41_PREFILL_GPU_1:-7}
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ${LMCACHE_L2_PATH:-/root/app/lmcache/deepseek-v41-1017-nvfp4}:/lmcache-l2
+    command:
+      - server
+      - --host=127.0.0.1
+      - --port=${LMCACHE_PORT:-5556}
+      - --http-host=127.0.0.1
+      - --http-port=${LMCACHE_HTTP_PORT:-18556}
+      - --chunk-size=${LMCACHE_CHUNK_SIZE:-1024}
+      - --separate-object-groups
+      - --l1-size-gb=${LMCACHE_L1_SIZE_GB:-8}
+      - --eviction-policy=LRU
+      - --max-workers=8
+      - '--l2-adapter={"type":"fs_native","base_path":"/lmcache-l2","num_workers":2,"use_odirect":false,"max_capacity_gb":${LMCACHE_L2_CAPACITY_GB:-500},"adopt_existing":true,"eviction":{"eviction_policy":"LRU"}}'
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${LMCACHE_HTTP_PORT:-18556}/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 2m
+      retries: 30
+
+  deepseek-v4.1-flash-pd-decode:
+    image: ${VLLM_IMAGE:-ghcr.io/canoziia/vllm-sm80:latest}
+    container_name: deepseek-v4.1-flash-pd-decode
+    restart: "no"
+    stop_grace_period: 5m
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+    depends_on:
+      deepseek-v4.1-flash-pd-lmcache:
+        condition: service_healthy
+    devices:
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_0:-0}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_1:-1}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_2:-2}
+      - nvidia.com/gpu=${DSV41_DECODE_GPU_3:-3}
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      CUDA_VISIBLE_DEVICES: "${DSV41_DECODE_GPU_0:-0},${DSV41_DECODE_GPU_1:-1},${DSV41_DECODE_GPU_2:-2},${DSV41_DECODE_GPU_3:-3}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "64"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      NCCL_IB_DISABLE: "1"
+      VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS: "192"
+      VLLM_DSV41_OPT_PROFILE: "${DSV41_DECODE_OPT_PROFILE:-auto}"
+      VLLM_DSV41_ENGRAM_SHM_DIR: "/engram-shm"
+      VLLM_DSV41_ENGRAM_SHM_REGISTER: "1"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+    volumes:
+      - ${MODEL_ROOT:-/root/app/models}:/models:ro
+      - ${VLLM_CACHE_DECODE:-/root/app/.tmp-tep4/cache}:/root/.cache
+      # rw mount required by Linux/NVIDIA driver for MAP_SHARED+PROT_WRITE cudaHostRegister;
+      # Decode never writes to the Engram shard files.
+      - ${ENGRAM_SHM_DIR:-/mnt/engram-shm}:/engram-shm:rw
+    command:
+      - /models/${DSV41_MODEL_DIR:-DeepSeek-V4.1-Flash-1017}
+      - --host=127.0.0.1
+      - --port=${DSV41_DECODE_PORT:-18001}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
+      - --served-model-name=deepseek-ai/DeepSeek-V4.1-Flash
+      - --trust-remote-code
+      - --disable-custom-all-reduce
+      - --dtype=bfloat16
+      - --tensor-parallel-size=4
+      - --decode-context-parallel-size=1
+      - --pipeline-parallel-size=1
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-1048576}
+      - --max-num-seqs=${DSV41_DECODE_MAX_NUM_SEQS:-32}
+      - --max-num-batched-tokens=${DSV41_DECODE_MAX_BATCHED_TOKENS:-2048}
+      - --kv-cache-dtype=auto
+      - --kv-cache-memory=${DSV41_DECODE_KV_CACHE_MEMORY:-2200000000}
+      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_port":14579,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${LMCACHE_PORT:-5556}}}'
+      - '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":192}'
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - '--engram-config={"cpu_offload":true}'
+      - '--speculative-config={"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true,"enable_adaptive_verification":${VLLM_ADAPTIVE_VERIFICATION:-true},"adaptive_verification_decay":${VLLM_ADAPTIVE_VERIFICATION_DECAY:-0.95}}'
+      - --per-request-spec-decode-metrics=detailed
+      - --tokenizer-mode=deepseek_v41
+      - --enable-auto-tool-choice
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --tool-call-parser=deepseek_v41
+      - --reasoning-parser=deepseek_v41
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY in .env.pd}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:${DSV41_DECODE_PORT:-18001}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10m
+      retries: 3
+
+  deepseek-v4.1-flash-pd-prefill:
+    image: ${VLLM_IMAGE:-ghcr.io/canoziia/vllm-sm80:latest}
+    container_name: deepseek-v4.1-flash-pd-prefill
+    restart: "no"
+    stop_grace_period: 5m
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+    depends_on:
+      deepseek-v4.1-flash-pd-lmcache:
+        condition: service_healthy
+    # Note: on initial cold start after host reboot, start pd-decode ~50s before
+    # pd-prefill so Decode pins all 8 /mnt/engram-shm shards (188.83 GiB) via
+    # cudaHostRegister before Prefill reads safetensors. Do not add depends_on
+    # to pd-decode here so P and D remain independently restartable in Podman.
+    devices:
+      - nvidia.com/gpu=${DSV41_PREFILL_GPU_0:-6}
+      - nvidia.com/gpu=${DSV41_PREFILL_GPU_1:-7}
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      CUDA_DEVICE_ORDER: "PCI_BUS_ID"
+      CUDA_VISIBLE_DEVICES: "${DSV41_PREFILL_GPU_0:-6},${DSV41_PREFILL_GPU_1:-7}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HF_HUB_OFFLINE: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "64"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
+      NCCL_IB_DISABLE: "1"
+      VLLM_DSV41_OPT_PROFILE: "${DSV41_PREFILL_OPT_PROFILE:-auto}"
+      VLLM_DSV41_YOCO_PREFILL_ONLY: "1"
+      # TP2 has ni=1152; disable decode-only ni=576 MXFP4 kernel on Prefill engine
+      VLLM_DSV4_MXFP4_DECODE: "0"
+      VLLM_DSV41_ENGRAM_SHM_DIR: "/engram-shm"
+      VLLM_DSV41_ENGRAM_SHM_REGISTER: "0"
+      VLLM_DSV41_ENGRAM_CPU_THREADS: "12"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: /root/.cache/tmp
+    volumes:
+      - ${MODEL_ROOT:-/root/app/models}:/models:ro
+      - ${VLLM_CACHE_PREFILL:-/root/app/.tmp-pd-prefill/cache}:/root/.cache
+      - ${ENGRAM_SHM_DIR:-/mnt/engram-shm}:/engram-shm:ro
+    command:
+      - /models/${DSV41_MODEL_DIR:-DeepSeek-V4.1-Flash-1017}
+      - --host=127.0.0.1
+      - --port=${DSV41_PREFILL_PORT:-18002}
+      - --sse-keep-alive-interval=${VLLM_SSE_KEEP_ALIVE_INTERVAL:-15}
+      - --served-model-name=deepseek-ai/DeepSeek-V4.1-Flash
+      - --trust-remote-code
+      - --disable-custom-all-reduce
+      - --dtype=bfloat16
+      - --tensor-parallel-size=2
+      - --decode-context-parallel-size=1
+      - --pipeline-parallel-size=1
+      - --max-model-len=${VLLM_MAX_MODEL_LEN:-1048576}
+      - --max-num-seqs=${DSV41_PREFILL_MAX_NUM_SEQS:-4}
+      - --max-num-batched-tokens=${DSV41_PREFILL_MAX_BATCHED_TOKENS:-3072}
+      - --kv-cache-dtype=auto
+      - --kv-cache-memory=${DSV41_PREFILL_KV_CACHE_MEMORY:-3000000000}
+      - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
+      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_port":14580,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${LMCACHE_PORT:-5556}}}'
+      - '--compilation-config={"cudagraph_mode":"NONE"}'
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - '--engram-config={"cpu_offload":true}'
+      - --tokenizer-mode=deepseek_v41
+      - --enable-auto-tool-choice
+      - '--structured-outputs-config={"backend":"auto","disable_any_whitespace":false}'
+      - --tool-call-parser=deepseek_v41
+      - --reasoning-parser=deepseek_v41
+      - --shutdown-timeout=30
+      - --api-key=${VLLM_API_KEY:?set VLLM_API_KEY in .env.pd}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "Authorization: Bearer ${VLLM_API_KEY}", "http://127.0.0.1:${DSV41_PREFILL_PORT:-18002}/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 10m
+      retries: 3
+
+  deepseek-v4.1-flash-pd-router:
+    image: ${ROUTER_IMAGE:-localhost/vllm-router:pd-bypass}
+    container_name: deepseek-v4.1-flash-pd-router
+    restart: "no"
+    network_mode: host
+    security_opt:
+      - label=disable
+      - apparmor=unconfined
+    entrypoint: ["vllm-router"]
+    depends_on:
+      deepseek-v4.1-flash-pd-decode:
+        condition: service_healthy
+      deepseek-v4.1-flash-pd-prefill:
+        condition: service_healthy
+    environment:
+      OPENAI_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env.pd}
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env.pd}
+      # Bypass prefill hop for prompts shorter than LMCache chunk_size (0 chunks stored).
+      VLLM_ROUTER_MIN_PREFILL_TOKENS: "${LMCACHE_CHUNK_SIZE:-1024}"
+      PYTHONUNBUFFERED: "1"
+    command:
+      - --service-discovery=static
+      - --static-backends=http://127.0.0.1:${DSV41_PREFILL_PORT:-18002},http://127.0.0.1:${DSV41_DECODE_PORT:-18001}
+      - --static-models=deepseek-ai/DeepSeek-V4.1-Flash,deepseek-ai/DeepSeek-V4.1-Flash
+      - --static-model-labels=prefill,decode
+      - --prefill-model-labels=prefill
+      - --decode-model-labels=decode
+      - --routing-logic=disaggregated_prefill
+      - --host=0.0.0.0
+      - --port=${DSV41_PD_PORT:-8000}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${DSV41_PD_PORT:-8000}/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5

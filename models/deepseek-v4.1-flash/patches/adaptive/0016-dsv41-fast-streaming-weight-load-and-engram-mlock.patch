@@ -1,0 +1,197 @@
+From 642216aa619327a5cda27be5b46c516ea3c8cd77 Mon Sep 17 00:00:00 2001
+From: Canoziia <canoziia@projectk.org>
+Date: Thu, 26 Nov 2026 19:45:56 +0800
+Subject: [PATCH] perf(deepseek-v4.1): stream safetensors shards, O(1) expert
+ mapping & mlock shared Engram
+
+- Stream language_model.model.* directly in safetensors shard order in vl_model.py
+  instead of materializing and lexicographically sorting all 96K tensors across 48
+  shards, preventing page-cache thrashing when 188.8 GiB Engram is pinned.
+- Add is_unused_checkpoint_weight on vl_model.py (skip MTP shards on decode and
+  layers 21..39 + head on YOCO prefill-only) and dspark.py (skip 45/48 non-MTP shards).
+- Index expert_mapping by weight_name for O(1) lookup in model.py and dspark.py
+  (eliminating 424M linear Python loop iterations across TP4).
+- Best-effort mlock() GUP-pinned Engram shm mappings into Unevictable LRU so kswapd
+  and direct-reclaim never spin scanning 188 GiB of un-evictable tmpfs pages.
+---
+ vllm/models/deepseek_v41/common/engram.py   | 10 ++++
+ vllm/models/deepseek_v41/nvidia/dspark.py   | 18 ++++++-
+ vllm/models/deepseek_v41/nvidia/model.py    | 22 ++++++++-
+ vllm/models/deepseek_v41/nvidia/vl_model.py | 55 +++++++++++++++++++--
+ 4 files changed, 99 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/models/deepseek_v41/common/engram.py b/vllm/models/deepseek_v41/common/engram.py
+index e63fb9e..6576842 100644
+--- a/vllm/models/deepseek_v41/common/engram.py
++++ b/vllm/models/deepseek_v41/common/engram.py
+@@ -2097,6 +2097,16 @@ class ParallelEngramEmbedding(nn.Module):
+                     raise RuntimeError(
+                         f"cudaHostRegister failed for {fpath} ({fsize} bytes): err={err}"
+                     )
++                # Move GUP-pinned tmpfs pages out of Active/Inactive(anon) into
++                # Unevictable LRU so kswapd/direct-reclaim never wastes CPU
++                # scanning 188 GiB of un-evictable Engram pages during model load.
++                try:
++                    libc = ctypes.CDLL("libc.so.6", use_errno=False)
++                    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
++                    libc.mlock.restype = ctypes.c_int
++                    libc.mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(fsize))
++                except Exception:
++                    pass
+ 
+                 def _unreg(m: mmap.mmap, p: int) -> None:
+                     try:
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index f930bb4..610a48d 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -718,6 +718,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
++    def is_unused_checkpoint_weight(self, name: str) -> bool:
++        """Skip all non-MTP safetensors shards when loading the DSpark drafter."""
++        return not name.startswith(("mtp.", "context_wkv_proj."))
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
+ 
+@@ -744,6 +748,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+                 num_experts=n_draft_experts,
+                 num_redundant_experts=first_layer.ffn.n_redundant_experts,
+             )
++        expert_mapping_by_wname: dict[str, list[tuple[str, str, int, str]]] = {}
++        for mapping in expert_mapping:
++            expert_mapping_by_wname.setdefault(mapping[1], []).append(mapping)
+         expert_scale_suffix = (
+             ".weight_scale"
+             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
+@@ -804,7 +811,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
+                     loaded_weight = loaded_weight.view(torch.uint8)
+                 # A checkpoint expert can map to multiple local physical replicas.
+                 # Load every local slot or the remaining replicas stay uninitialized.
+-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
++                candidates = None
++                exp_pos = name.find("experts.")
++                if exp_pos >= 0:
++                    d1 = name.find(".", exp_pos + 8)
++                    d2 = name.find(".", d1 + 1) if d1 >= 0 else -1
++                    if d2 >= 0:
++                        candidates = expert_mapping_by_wname.get(name[exp_pos : d2 + 1])
++                if candidates is None:
++                    candidates = expert_mapping
++                for param_name, weight_name, expert_id, shard_id in candidates:
+                     if weight_name not in name:
+                         continue
+                     name_mapped = name.replace(weight_name, param_name)
+diff --git a/vllm/models/deepseek_v41/nvidia/model.py b/vllm/models/deepseek_v41/nvidia/model.py
+index 8574678..5fd2bbc 100644
+--- a/vllm/models/deepseek_v41/nvidia/model.py
++++ b/vllm/models/deepseek_v41/nvidia/model.py
+@@ -3467,8 +3467,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+ 
+-        # Pre-compute expert mapping ONCE.
++        # Pre-compute expert mapping ONCE and index by weight_name for O(1)
++        # lookup instead of scanning all 3*n_routed_experts entries per tensor.
+         expert_mapping = self.get_expert_mapping()
++        expert_mapping_by_wname: dict[
++            str, list[tuple[str, str, int, str]]
++        ] = {}
++        for mapping in expert_mapping:
++            expert_mapping_by_wname.setdefault(mapping[1], []).append(mapping)
+ 
+         # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
+         # block count so the standard loaders below slice it evenly (trailing
+@@ -3541,7 +3547,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     ):
+                         loaded_weight = loaded_weight.view(torch.uint8)
+                     name_mapped = None
+-                    for mapping in expert_mapping:
++                    # O(1) lookup by "experts.<id>.<proj>." substring.
++                    candidates = None
++                    exp_pos = name.find("experts.")
++                    if exp_pos >= 0:
++                        d1 = name.find(".", exp_pos + 8)
++                        d2 = name.find(".", d1 + 1) if d1 >= 0 else -1
++                        if d2 >= 0:
++                            candidates = expert_mapping_by_wname.get(
++                                name[exp_pos : d2 + 1]
++                            )
++                    if candidates is None:
++                        candidates = expert_mapping
++                    for mapping in candidates:
+                         param_name, weight_name, expert_id, expert_shard_id = mapping
+                         if weight_name not in name:
+                             continue
+diff --git a/vllm/models/deepseek_v41/nvidia/vl_model.py b/vllm/models/deepseek_v41/nvidia/vl_model.py
+index c01ae82..7059f15 100644
+--- a/vllm/models/deepseek_v41/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v41/nvidia/vl_model.py
+@@ -347,10 +347,59 @@ class DeepseekV41ForCausalLM(
+             self.aligner.offload_to_cpu()
+             torch.cuda.empty_cache()
+ 
++    def is_unused_checkpoint_weight(self, name: str) -> bool:
++        """Skip safetensors shards whose tensors this model does not load."""
++        if name.startswith("mtp."):
++            return True
++        if getattr(self.language_model.model, "yoco_prefill_only", False):
++            if name in ("head.weight", "hc_head") or name.startswith(
++                ("norm.", "hc_head.")
++            ):
++                return True
++            if name.startswith("layers."):
++                dot = name.find(".", 7)
++                if dot > 7 and name[7:dot].isdigit():
++                    layer_idx = int(name[7:dot])
++                    if layer_idx >= self.language_model.model.end_layer:
++                        return True
++        return False
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+-        loader = AutoWeightsLoader(self)
+-        loaded_params = loader.load_weights(mapped)
++        # Stream language_model.model.* directly in safetensors shard order so
++        # we never materialize or lexicographically sort all ~96K tensors across
++        # 48 shards (which thrashes Linux page cache when Engram is pinned).
++        # Only buffer the ~267 tiny non-backbone tensors (vision/aligner/
++        # delimiters/lm_head) for AutoWeightsLoader's prefix groupby.
++        other_weights: list[tuple[str, torch.Tensor]] = []
++        lm_model_prefix = "language_model.model."
++        lm_model_prefix_len = len(lm_model_prefix)
++
++        extra_mapper = AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
++        lm_quant = getattr(self.language_model, "quant_config", None) or getattr(
++            self.language_model.model, "quant_config", None
++        )
++        if lm_quant is not None:
++            extra_mapper = (
++                lm_quant.get_cache_scale_mapper()
++                | lm_quant.get_checkpoint_weight_mapper()
++                | extra_mapper
++            )
++
++        def _lm_model_stream() -> Iterable[tuple[str, torch.Tensor]]:
++            for name, tensor in extra_mapper.apply(
++                self.hf_to_vllm_mapper.apply(weights)
++            ):
++                if name.startswith(lm_model_prefix):
++                    yield name[lm_model_prefix_len:], tensor
++                else:
++                    other_weights.append((name, tensor))
++
++        loaded_lm = self.language_model.model.load_weights(_lm_model_stream())
++        loaded_params = {f"{lm_model_prefix}{p}" for p in loaded_lm}
++        if other_weights:
++            other_weights.sort(key=lambda x: x[0])
++            loader = AutoWeightsLoader(self)
++            loaded_params |= loader.load_weights(other_weights)
+         self._maybe_offload_vision_tower()
+         self._weights_finalized = True
+         return loaded_params
+-- 
+2.56.0
+

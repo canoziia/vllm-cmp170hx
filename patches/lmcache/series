@@ -8,3 +8,4 @@
 0008-shared-server-mp-worker-rank.patch
 0009-bounded-pd-object-groups.patch
 0010-cached-request-resumed-req-ids-compat.patch
+0011-exact-chunk-multiple-swa-fix.patch
