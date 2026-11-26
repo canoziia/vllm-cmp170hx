@@ -28,7 +28,6 @@ services:
     stop_grace_period: 3m
     network_mode: host
     ipc: host
-    shm_size: 16g
     pid: host
     devices:
       - nvidia.com/gpu=${DSV41_DECODE_GPU_0:-0}
@@ -76,7 +75,6 @@ services:
     stop_grace_period: 5m
     network_mode: host
     ipc: host
-    shm_size: 16g
     pid: host
     privileged: true
     depends_on:
@@ -164,7 +162,6 @@ services:
     stop_grace_period: 5m
     network_mode: host
     ipc: host
-    shm_size: 16g
     pid: host
     privileged: true
     depends_on:
