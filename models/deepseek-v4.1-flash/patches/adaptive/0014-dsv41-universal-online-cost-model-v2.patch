@@ -1,15 +1,15 @@
-From 6bf9008331f242c33dd204b14dc67435c0650231 Mon Sep 17 00:00:00 2001
+From b1af96f4f15b7345cf15d7ec136c8302435dbda4 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
 Date: Thu, 26 Nov 2026 15:09:35 +0800
 Subject: [PATCH] feat(deepseek-v4.1): hardware-agnostic 2-level
- OnlineCostModel v2 & uniform asymmetric Policy
+ OnlineCostModel v2 & unbiased E[k]/C[k] Policy
 
 ---
- vllm/v1/core/sched/dsv41_measured_policy.py | 288 +++++++++++++-------
- 1 file changed, 186 insertions(+), 102 deletions(-)
+ vllm/v1/core/sched/dsv41_measured_policy.py | 331 ++++++++++++--------
+ 1 file changed, 192 insertions(+), 139 deletions(-)
 
 diff --git a/vllm/v1/core/sched/dsv41_measured_policy.py b/vllm/v1/core/sched/dsv41_measured_policy.py
-index 5ff372e..494db5b 100644
+index 5ff372e..9afeb0f 100644
 --- a/vllm/v1/core/sched/dsv41_measured_policy.py
 +++ b/vllm/v1/core/sched/dsv41_measured_policy.py
 @@ -105,25 +105,13 @@ def _effective_tokens(batch_m: float) -> float:
@@ -407,22 +407,89 @@ index 5ff372e..494db5b 100644
              "c16_ms": [round(v * 1000.0, 2) for v in self.costs(16)],
              "c32_ms": [round(v * 1000.0, 2) for v in self.costs(32)],
          }
-@@ -494,11 +577,12 @@ class Policy:
+@@ -425,39 +508,13 @@ class Policy:
+             C = cost_model.costs(context["concurrency"])
+         else:
+             C = costs(context["concurrency"])
+-        # Calibrate predictions to the SAME current observed level. A bad
+-        # current block cannot punish only the measured arm while unseen arms
+-        # retain their optimistic absolute level. Preserve predicted k ratios.
+         i = self.k - 1
+-        scale = self.y[i] / self.n[i] / E[i] if self.n[i] else 1.0
+-        time_scale = self.t[i] / self.n[i] / C[i] if self.n[i] else 1.0
+-        predicted_y = [e * scale for e in E]
+-        predicted_t = [c * time_scale for c in C]
+-        scores = [
+-            (y + self.w * e) / (t + self.w * c)
+-            for y, t, e, c in zip(self.y, self.t, predicted_y, predicted_t)
+-        ]
+-        # Estimated SE of ratio-of-totals using centered y-rate*t residuals.
+-        # Kish ESS alone does not lose confidence when an arm ages; cap by
+-        # decayed mass so stale evidence really loses influence/confidence.
+-        se = []
+-        for j in range(5):
+-            n = self.n[j]
+-            if n <= 0:
+-                se.append(0.0)
+-                continue
+-            rate = self.y[j] / self.t[j]
+-            variance = max(
+-                0.0, (self.y2[j] - 2 * rate * self.yt[j] + rate * rate * self.t2[j]) / n
+-            )
+-            ess = min(n, n * n / self.q[j])
+-            # nonzero floor prevents a single constant sample claiming certainty
+-            se.append((variance + 1.0) ** 0.5 / (self.t[j] / n) / (ess + 1) ** 0.5)
+-        fractions = [t / (t + self.w * c) for t, c in zip(self.t, predicted_t)]
+-        # All model-only predictions share incumbent calibration; its common
+-        # absolute noise cancels for their relative ordering. Charge uncertainty
+-        # only for candidate's independent actual evidence contribution.
+-        gate = [f * (s * s + se[self.k - 1] ** 2) ** 0.5 for f, s in zip(fractions, se)]
++        # Pure unbiased throughput estimator: shared survival-curve E[k]
++        # divided by live OnlineCostModel latency C[k]. Eliminates the
++        # single-sample arm-attribution bug where one unlucky a=0 step on a
++        # newly tried width k crashed its per-arm y[k]/t[k] score by >50%.
++        scores = [e / c for e, c in zip(E, C)]
++        se = [0.0] * 5
+         hist = self.history[i]
+         mass = sum(hist)
+         model_se = []
+@@ -467,9 +524,7 @@ class Policy:
+                 continue
+             # Paired marginal efficiency on prefixes observed at current width.
+             diffs = [
+-                ((1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i])
+-                * scale
+-                / time_scale
++                (1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i]
+                 for a in range(6)
+             ]
+             mean = sum(w * d for w, d in zip(hist, diffs)) / mass if mass else 0.0
+@@ -479,7 +534,7 @@ class Policy:
+                 else 0.0
+             )
+             model_se.append(0.5 * (variance / (mass + 1)) ** 0.5)
+-        gate = [(a * a + b * b) ** 0.5 for a, b in zip(gate, model_se)]
++        gate = model_se[:]
+         ready = bool(
+             self.latest and self.latest["k"] == self.k and self.latest["timing_valid"]
+         )
+@@ -494,14 +549,12 @@ class Policy:
                      and scores[k - 1] > scores[best - 1] * 1.03
                  ]
                  if cands:
 -                    best = min(cands) if context.get("concurrency", 1) >= 16 else max(cands)
-+                    best = min(cands)
++                    best = max(cands)
              else:
 -                c_now = context.get("concurrency", 1)
                  for k in range(1, min(5, self.k + 1) + 1):
 -                    margin = 0.08 if (self.k == 1 and k == 2 and c_now >= 16) else (0.05 if (k > self.k and c_now >= 16) else 0.03)
-+                    # Exact paired-prefix downward trim (less compute) vs
-+                    # extrapolated upward expansion (more compute).
-+                    margin = 0.01 if k < self.k else 0.03
                      if (
                          scores[k - 1] - scores[self.k - 1]
-                         > margin * scores[self.k - 1] + gate[k - 1]
+-                        > margin * scores[self.k - 1] + gate[k - 1]
++                        > 0.03 * scores[self.k - 1] + gate[k - 1]
+                         and scores[k - 1] > scores[best - 1]
+                     ):
+                         best = k
 -- 
 2.56.0
 
