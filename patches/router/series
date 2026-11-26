@@ -3,3 +3,4 @@
 0003-client-disconnect-cancel.patch
 0004-stream-prefill-keep-alive.patch
 0005-short-prompt-bypass.patch
+0006-prefill-sjf-priority.patch

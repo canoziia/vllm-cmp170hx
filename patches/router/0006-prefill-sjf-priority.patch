@@ -1,0 +1,59 @@
+From: canoziia <canoziia@users.noreply.github.com>
+Subject: [PATCH] router: assign Short-Job-First priority on PD prefill hop
+
+When `VLLM_ROUTER_PREFILL_SJF=1` is set and the caller did not specify an
+explicit `priority`, assign an integer `priority` (lower = higher priority in
+vLLM's `--scheduling-policy=priority` scheduler) on the prefill hop based on
+the router's conservative prompt token estimate bucketed by
+`VLLM_ROUTER_PREFILL_SJF_BUCKET` (default 1024 tokens, capped at 1024).
+
+Combined with vLLM's `--long-prefill-token-threshold` +
+`--long-prefill-token-threshold-adaptive`, short prompts jump ahead of queued
+long prompts and piggyback on the very next prefill step instead of suffering
+head-of-line blocking behind 64K-128K requests. Multimodal/unknown-size
+prompts receive a moderate default priority (16). The decode hop keeps the
+caller's original request unchanged.
+
+--- a/vllm_router/services/request_service/request.py
++++ b/vllm_router/services/request_service/request.py
+@@ -1418,6 +1418,30 @@
+     return (est is not None and est < min_tokens), est, min_tokens
+ 
+ 
++def _prefill_sjf_enabled() -> bool:
++    raw = os.environ.get("VLLM_ROUTER_PREFILL_SJF", "0").strip().lower()
++    return raw in ("1", "true", "yes", "on")
++
++
++def _prefill_sjf_bucket() -> int:
++    raw = os.environ.get("VLLM_ROUTER_PREFILL_SJF_BUCKET", "1024").strip()
++    try:
++        return max(1, int(raw))
++    except ValueError:
++        return 1024
++
++
++def _prefill_sjf_priority(
++    request_json: dict, est_tokens: Optional[int]
++) -> Optional[int]:
++    if not _prefill_sjf_enabled() or "priority" in request_json:
++        return None
++    est = est_tokens if est_tokens is not None else _estimate_prompt_tokens(request_json)
++    if est is None:
++        return 16
++    return min(max(0, est) // _prefill_sjf_bucket(), 1024)
++
++
+ async def route_disaggregated_prefill_request(
+     request: Request,
+     endpoint: str,
+@@ -1454,6 +1478,9 @@
+             # Without this the prefill hop generates the whole answer, the router
+             # waits for it, and the decode hop then regenerates it from scratch.
+             request_json["max_output_tokens"] = 1
++        sjf_prio = _prefill_sjf_priority(orig_request_json, est_tokens)
++        if sjf_prio is not None:
++            request_json["priority"] = sjf_prio
+ 
+     if bypass_prefill:
+         pass

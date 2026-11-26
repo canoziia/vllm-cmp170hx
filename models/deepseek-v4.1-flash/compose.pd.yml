@@ -195,6 +195,7 @@ services:
       NCCL_IB_DISABLE: "1"
       VLLM_DSV41_OPT_PROFILE: "${DSV41_PREFILL_OPT_PROFILE:-auto}"
       VLLM_DSV41_YOCO_PREFILL_ONLY: "1"
+      VLLM_DSV41_PREFILL_ROW_SHARD_ATTN: "${DSV41_PREFILL_ROW_SHARD_ATTN:-1}"
       # TP2 has ni=1152; disable decode-only ni=576 MXFP4 kernel on Prefill engine
       VLLM_DSV4_MXFP4_DECODE: "0"
       VLLM_DSV41_ENGRAM_SHM_DIR: "/engram-shm"
@@ -219,10 +220,13 @@ services:
       - --decode-context-parallel-size=1
       - --pipeline-parallel-size=1
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-1048576}
-      - --max-num-seqs=${DSV41_PREFILL_MAX_NUM_SEQS:-4}
-      - --max-num-batched-tokens=${DSV41_PREFILL_MAX_BATCHED_TOKENS:-3072}
+      - --max-num-seqs=${DSV41_PREFILL_MAX_NUM_SEQS:-16}
+      - --max-num-batched-tokens=${DSV41_PREFILL_MAX_BATCHED_TOKENS:-8192}
+      - --scheduling-policy=${DSV41_PREFILL_SCHEDULING_POLICY:-priority}
+      - --long-prefill-token-threshold=${DSV41_PREFILL_LONG_TOKEN_THRESHOLD:-4096}
+      - --long-prefill-token-threshold-adaptive
       - --kv-cache-dtype=auto
-      - --kv-cache-memory=${DSV41_PREFILL_KV_CACHE_MEMORY:-3000000000}
+      - --kv-cache-memory=${DSV41_PREFILL_KV_CACHE_MEMORY:-4000000000}
       - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_port":14580,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${LMCACHE_PORT:-5556}}}'
       - '--compilation-config={"cudagraph_mode":"NONE"}'
@@ -244,7 +248,7 @@ services:
       retries: 3
 
   deepseek-v4.1-flash-pd-router:
-    image: ${ROUTER_IMAGE:-localhost/vllm-router:pd-bypass}
+    image: ${ROUTER_IMAGE:-localhost/vllm-router:pd-sjf}
     container_name: deepseek-v4.1-flash-pd-router
     restart: "no"
     network_mode: host
@@ -262,6 +266,9 @@ services:
       VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env.pd}
       # Bypass prefill hop for prompts shorter than LMCache chunk_size (0 chunks stored).
       VLLM_ROUTER_MIN_PREFILL_TOKENS: "${LMCACHE_CHUNK_SIZE:-1024}"
+      # Assign token-length-bucketed SJF priority on prefill hop (matches --scheduling-policy=priority).
+      VLLM_ROUTER_PREFILL_SJF: "${VLLM_ROUTER_PREFILL_SJF:-1}"
+      VLLM_ROUTER_PREFILL_SJF_BUCKET: "${VLLM_ROUTER_PREFILL_SJF_BUCKET:-1024}"
       PYTHONUNBUFFERED: "1"
     command:
       - --service-discovery=static
