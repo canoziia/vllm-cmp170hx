@@ -105,25 +105,13 @@ def _effective_tokens(batch_m: float) -> float:
     return 0.75 * batch_m + 0.25 * cg
 
 
-_SQRT_SHIFT = 12.0
-_SQRT_SHIFT_ROOT = math.sqrt(_SQRT_SHIFT)
-
-
-def _cost_features(batch_m: float) -> tuple[float, float, float]:
-    me = _effective_tokens(batch_m)
-    return (
-        1.0 / _FEAT_SCALE[0],
-        me / _FEAT_SCALE[1],
-        (math.sqrt(max(0.0, me) + _SQRT_SHIFT) - _SQRT_SHIFT_ROOT) / _FEAT_SCALE[2],
-    )
-
-
-def _solve_3x3(a: list[list[float]], b: list[float]) -> list[float] | None:
+def _solve_nxn(a: list[list[float]], b: list[float]) -> list[float] | None:
+    n = len(b)
     m = [row[:] + [b[i]] for i, row in enumerate(a)]
-    for i in range(3):
+    for i in range(n):
         piv = i
         best = abs(m[i][i])
-        for r in range(i + 1, 3):
+        for r in range(i + 1, n):
             v = abs(m[r][i])
             if v > best:
                 best = v
@@ -133,146 +121,204 @@ def _solve_3x3(a: list[list[float]], b: list[float]) -> list[float] | None:
         if piv != i:
             m[i], m[piv] = m[piv], m[i]
         diag = m[i][i]
-        for r in range(i + 1, 3):
+        for r in range(i + 1, n):
             factor = m[r][i] / diag
-            for c in range(i, 4):
+            for c in range(i, n + 1):
                 m[r][c] -= factor * m[i][c]
-    x = [0.0, 0.0, 0.0]
-    for i in range(2, -1, -1):
-        s = m[i][3]
-        for c in range(i + 1, 3):
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        s = m[i][n]
+        for c in range(i + 1, n):
             s -= m[i][c] * x[c]
         x[i] = s / m[i][i]
     return x
 
 
+def _solve_nnls_4(a: list[list[float]], b: list[float]) -> list[float] | None:
+    """Exact active-set NNLS over 4 physics parameters (theta_0 > 0.5, theta_1..3 >= 0)."""
+    best_x = None
+    best_obj = float("inf")
+    for mask in range(1, 16):
+        if not (mask & 1):
+            continue
+        idx = [i for i in range(4) if (mask >> i) & 1]
+        sub_a = [[a[r][c] for c in idx] for r in idx]
+        sub_b = [b[r] for r in idx]
+        sol = _solve_nxn(sub_a, sub_b)
+        if sol is None or any(not math.isfinite(v) for v in sol):
+            continue
+        if sol[0] <= 0.5 or any(v < 0.0 for v in sol[1:]):
+            continue
+        x = [0.0] * 4
+        for pos, i in enumerate(idx):
+            x[i] = sol[pos]
+        obj = 0.0
+        for r in range(4):
+            ax_r = sum(a[r][c] * x[c] for c in range(4))
+            obj += 0.5 * x[r] * ax_r - b[r] * x[r]
+        if obj < best_obj:
+            best_obj = obj
+            best_x = x
+    return best_x
+
+
 class OnlineCostModel:
-    """Two-level online self-calibrating step-latency model (pure CPU, ~5 us/step).
+    """Hardware-agnostic two-level online step-latency model (pure CPU, ~8 us/step).
 
-    Level 1 (global non-collinear 3-parameter Bayesian WLS over bounded cells):
-        T_global(M) = theta_0 + theta_1 * M + theta_2 * sqrt(M)
-        Captures fixed per-step floor (1), linear bandwidth/compute (M), and
-        sublinear MoE unique-expert weight-loading saturation (sqrt(M)).
-        Omitting a separate linear-B term eliminates M = (k+1)*B collinearity
-        during uniform-k traffic (so observing k=5 across concurrencies alone
-        identifies the entire k=1..5 curve to ~1.3-2.1% MAPE), while handling
-        mixed-k heterogeneous batches directly via M = sum(1 + k_r).
-        Each observed (B, M) cell carries a bounded weight (<= 1.0), eliminating
-        scalar-RLS covariance windup during long single-concurrency runs while
-        gentle global aging tracks live power-limit (180W <-> 250W), thermal,
-        interconnect (PCIe/NVLink), and context-length shifts.
+    Level 1 (4-parameter physical MoE decode surface with scale-free live prior):
+        T_phys(B, M) = theta_0
+                     + theta_B   * (B / 32)
+                     + theta_moe * (1 - (1 - K / E)^M)
+                     + theta_M   * (M / 192)
+        Decouples per-request draft/scheduler cost (B), coupon-collector MoE
+        unique-expert saturation (smooth and linear near M -> 0, eliminating
+        the sqrt(M) derivative singularity at c=1), and linear token compute/
+        collective cost (M). A live multiplicative scale factor rescales the
+        weak Ridge prior to any host GPU/power cap/interconnect automatically.
 
-    Level 2 (local empirical-Bayes cell refinement):
-        Blends fresh repeated observations of exact (B, M) cells with the
-        global physics surface to capture per-B KV overhead and discrete
-        CUDA-graph / kernel-regime steps while decaying stale cells back to
-        the live global surface.
+    Level 2 (per-concurrency empirical-Bayes cell shrinkage in costs(c)):
+        Each concurrency c computes a local anchor from its fresh direct cell
+        observations and shrinks each observed (c, k) cell toward its exact
+        measured EMA, followed by bounded monotone step-ratio projection so
+        high-c traffic can never distort c=1 or c=8 decisions.
     """
 
     def __init__(
         self,
         prior_table: dict[int, tuple[float, ...]] | None = None,
         local_gamma: float = 0.92,
-        age_gamma: float = 0.999,
-        age_floor: float = 0.12,
-        prior_obs: float = 10.0,
+        age_gamma: float = 0.996,
+        age_floor: float = 0.05,
+        prior_obs: float = 8.0,
         huber_delta: float = 0.25,
         cell_kappa: float = 4.0,
         max_cells: int = 128,
         refit_interval: int = 4,
+        moe_topk: int = 8,
+        num_experts: int = 384,
     ) -> None:
-        if not 0.5 <= local_gamma < 1.0 or not 0.9 <= age_gamma < 1.0:
-            raise ValueError("invalid online cost model decay")
         self.local_gamma = float(local_gamma)
         self.age_gamma = float(age_gamma)
         self.age_floor = float(age_floor)
+        self.prior_obs = float(prior_obs)
         self.huber_delta = float(huber_delta)
         self.cell_kappa = float(cell_kappa)
         self.max_cells = int(max_cells)
         self.refit_interval = max(1, int(refit_interval))
+        self.moe_p = max(1e-4, min(0.5, float(moe_topk) / max(1, int(num_experts))))
 
+        # Fit dimensionless shape prior from prior_table (or universal defaults)
         tbl = prior_table if prior_table is not None else _active_cost_ms()
-        a_prior = [[0.0] * 3 for _ in range(3)]
-        b_prior = [0.0] * 3
+        a_p = [[0.0] * 4 for _ in range(4)]
+        b_p = [0.0] * 4
         n_pts = 0
         for c, vals in tbl.items():
             for idx, y_ms in enumerate(vals):
-                k = idx + 1
-                f = _cost_features(float(c * (k + 1)))
+                f = self._features(float(c), float(c * (idx + 2)))
                 w = 1.0 / max(1.0, y_ms * y_ms)
-                for r in range(3):
-                    b_prior[r] += w * f[r] * y_ms
-                    for j in range(3):
-                        a_prior[r][j] += w * f[r] * f[j]
+                for r in range(4):
+                    b_p[r] += w * f[r] * y_ms
+                    for j in range(4):
+                        a_p[r][j] += w * f[r] * f[j]
                 n_pts += 1
-        scale = float(prior_obs) / max(1, n_pts)
-        self._prior_a = [[v * scale for v in row] for row in a_prior]
         a_fit = [
-            [a_prior[r][j] + (1e-6 if r == j else 0.0) for j in range(3)]
-            for r in range(3)
+            [a_p[r][j] + (1e-6 if r == j else 0.0) for j in range(4)]
+            for r in range(4)
         ]
-        theta_prior = _solve_3x3(a_fit, b_prior)
+        theta_prior = _solve_nnls_4(a_fit, b_p)
         if theta_prior is None or not all(math.isfinite(v) for v in theta_prior):
-            theta_prior = [5.5, 7.5, 11.5]
-        self._theta_prior = theta_prior
-        self._prior_b = [
-            sum(self._prior_a[r][j] * theta_prior[j] for j in range(3))
-            for r in range(3)
-        ]
-
+            theta_prior = [6.6, 5.4, 7.5, 30.2]
+        self._shape_prior = theta_prior
+        # Unit-scale prior precision matrix (rescaled live by 1 / live_scale^2)
+        scale = float(prior_obs) / max(1, n_pts)
+        self._prior_a_unit = [[v * scale for v in row] for row in a_p]
+        self._live_scale = 1.0
         self._theta = theta_prior[:]
         # (B, M) -> [local_mass, dt_ema_ms, last_obs_step]
         self._cells: dict[tuple[int, int], list[float]] = {}
         self.obs_count = 0
 
-    def _predict_global_ms(self, batch_m: float) -> float:
-        f = _cost_features(batch_m)
-        val = f[0] * self._theta[0] + f[1] * self._theta[1] + f[2] * self._theta[2]
+    def _features(self, batch_b: float, batch_m: float) -> tuple[float, float, float, float]:
+        me = _effective_tokens(batch_m)
+        return (
+            1.0,
+            batch_b / 32.0,
+            1.0 - (1.0 - self.moe_p) ** max(0.0, me),
+            me / 192.0,
+        )
+
+    def _predict_global_ms(self, batch_b: float, batch_m: float) -> float:
+        f = self._features(batch_b, batch_m)
+        val = (
+            f[0] * self._theta[0]
+            + f[1] * self._theta[1]
+            + f[2] * self._theta[2]
+            + f[3] * self._theta[3]
+        )
         return max(0.5, val)
 
     def _refit_global(self) -> None:
-        a = [row[:] for row in self._prior_a]
-        b = self._prior_b[:]
-        for i in range(3):
-            a[i][i] += 1e-7
         step = self.obs_count
         ag = self.age_gamma
         af = self.age_floor
-        for (_cb, cm), cell in self._cells.items():
+        num_s = 0.0
+        den_s = 0.0
+        weighted_cells: list[tuple[float, float, tuple[float, float, float, float]]] = []
+        for (cb, cm), cell in self._cells.items():
             mass, ema_ms, last_step = cell
             age = max(0, step - int(last_step))
-            freshness = max(af, ag**age) if age < 5000 else af
-            cell_w = freshness * (mass / (mass + 2.0))
-            inv_ref = 1.0 / max(2.0, ema_ms)
-            w = cell_w * inv_ref * inv_ref
-            f = _cost_features(float(cm))
-            for r in range(3):
+            fresh = max(af, ag**age) if age < 3000 else af
+            cw = fresh * (mass / (mass + 2.0))
+            f = self._features(float(cb), float(cm))
+            y_shape = max(
+                0.5,
+                f[0] * self._shape_prior[0]
+                + f[1] * self._shape_prior[1]
+                + f[2] * self._shape_prior[2]
+                + f[3] * self._shape_prior[3],
+            )
+            num_s += cw * (ema_ms / y_shape)
+            den_s += cw
+            weighted_cells.append((cw, ema_ms, f))
+        if den_s > 1e-6:
+            self._live_scale = max(0.05, min(20.0, num_s / den_s))
+
+        ls = self._live_scale
+        prior_th = [v * ls for v in self._shape_prior]
+        inv_ls2 = 1.0 / max(1e-4, ls * ls)
+        a = [[v * inv_ls2 for v in row] for row in self._prior_a_unit]
+        b = [
+            sum(a[r][j] * prior_th[j] for j in range(4))
+            for r in range(4)
+        ]
+        for i in range(4):
+            a[i][i] += 1e-7 * inv_ls2
+
+        for cw, ema_ms, f in weighted_cells:
+            inv_ref = 1.0 / max(1.0, ema_ms)
+            w = cw * inv_ref * inv_ref
+            for r in range(4):
                 b[r] += w * f[r] * ema_ms
                 fr = w * f[r]
                 row = a[r]
-                for j in range(3):
+                for j in range(4):
                     row[j] += fr * f[j]
-        cand = _solve_3x3(a, b)
-        if (
-            cand is not None
-            and all(math.isfinite(v) for v in cand)
-            and cand[0] > 0.5
-        ):
-            self._theta = [cand[0], max(0.80 * self._theta_prior[1], cand[1]), min(1.25 * self._theta_prior[2], max(0.0, cand[2]))]
+
+        cand = _solve_nnls_4(a, b)
+        if cand is not None:
+            self._theta = cand
 
     def predict_ms(self, batch_b: int, batch_m: int) -> float:
-        base = self._predict_global_ms(float(batch_m))
+        base = self._predict_global_ms(float(batch_b), float(batch_m))
         cell = self._cells.get((int(batch_b), int(batch_m)))
         if cell is not None and cell[0] > 0.0:
             mass, ema_ms, last_step = cell
             age = max(0, self.obs_count - int(last_step))
-            # Only trust direct local refinement while reasonably fresh;
-            # stale cells decay back to the live global physics surface.
-            fresh = self.age_gamma**age if age < 4000 else 0.0
+            fresh = self.age_gamma**age if age < 3000 else 0.0
             eff_n = mass * fresh
             if eff_n > 0.05:
                 alpha = eff_n / (eff_n + self.cell_kappa)
-                ratio = max(0.75, min(1.35, ema_ms / base))
+                ratio = max(0.70, min(1.40, ema_ms / base))
                 base *= 1.0 + alpha * (ratio - 1.0)
         return max(0.5, base)
 
@@ -290,20 +336,24 @@ class OnlineCostModel:
             return False
         key = (int(batch_b), int(batch_m))
         cell = self._cells.get(key)
-        ref_ms = cell[1] if cell is not None else self._predict_global_ms(
-            float(batch_m)
+        ref_ms = (
+            cell[1]
+            if cell is not None
+            else self._predict_global_ms(float(batch_b), float(batch_m))
         )
         rel_err = abs(dt_ms - ref_ms) / max(1.0, ref_ms)
         huber = (
             self.huber_delta / rel_err if rel_err > self.huber_delta else 1.0
         )
+        # Allow rapid cold-start scale adaptation on an unfamiliar host/power cap
+        if self.obs_count < 16 and 0.5 < dt_ms < 250.0:
+            huber = 1.0
         self.obs_count += 1
         is_new = cell is None
         if is_new:
             if len(self._cells) >= self.max_cells:
                 oldest = min(self._cells, key=lambda k: self._cells[k][2])
                 del self._cells[oldest]
-            # Softly pull first noisy observation via Huber toward ref_ms
             init_ms = ref_ms + huber * (dt_ms - ref_ms)
             self._cells[key] = [huber, init_ms, float(self.obs_count)]
         else:
@@ -321,7 +371,38 @@ class OnlineCostModel:
 
     def costs(self, concurrency: int) -> list[float]:
         c = max(1, int(concurrency))
-        raw = [self._predict_global_ms(float(c * (k + 1))) for k in range(1, 6)]
+        g = [self._predict_global_ms(float(c), float(c * (k + 1))) for k in range(1, 6)]
+        num_a = 0.0
+        den_a = 0.0
+        cell_info: list[tuple[float, float]] = []
+        for idx in range(5):
+            m = c * (idx + 2)
+            cell = self._cells.get((c, m))
+            eff_n = 0.0
+            ema = g[idx]
+            if cell is not None and cell[0] > 0.0:
+                age = max(0, self.obs_count - int(cell[2]))
+                fresh = self.age_gamma**age if age < 3000 else 0.0
+                eff_n = cell[0] * fresh
+                ema = cell[1]
+                if eff_n > 0.05:
+                    w = eff_n / (eff_n + self.cell_kappa)
+                    num_a += w * (ema / g[idx])
+                    den_a += w
+            cell_info.append((eff_n, ema))
+        c_anchor = (num_a / den_a) if den_a > 0.0 else 1.0
+        c_anchor = max(0.65, min(1.50, c_anchor))
+
+        raw: list[float] = []
+        for idx in range(5):
+            base = g[idx] * c_anchor
+            eff_n, ema = cell_info[idx]
+            if eff_n > 0.05:
+                alpha = eff_n / (eff_n + self.cell_kappa)
+                ratio = max(0.70, min(1.40, ema / base))
+                base *= 1.0 + alpha * (ratio - 1.0)
+            raw.append(max(0.5, base))
+
         out = [raw[0]]
         for i in range(4):
             raw_ratio = raw[i + 1] / raw[i] if raw[i] > 0.0 else _MIN_STEP_RATIO[i]
@@ -332,10 +413,12 @@ class OnlineCostModel:
     def diagnostics(self) -> dict:
         return {
             "obs_count": self.obs_count,
-            "theta_ms": [round(v, 4) for v in self._theta],
+            "scale": round(self._live_scale, 3),
+            "theta_ms": [round(v, 3) for v in self._theta],
             "cells": len(self._cells),
             "c1_ms": [round(v * 1000.0, 2) for v in self.costs(1)],
             "c4_ms": [round(v * 1000.0, 2) for v in self.costs(4)],
+            "c8_ms": [round(v * 1000.0, 2) for v in self.costs(8)],
             "c16_ms": [round(v * 1000.0, 2) for v in self.costs(16)],
             "c32_ms": [round(v * 1000.0, 2) for v in self.costs(32)],
         }
@@ -425,39 +508,13 @@ class Policy:
             C = cost_model.costs(context["concurrency"])
         else:
             C = costs(context["concurrency"])
-        # Calibrate predictions to the SAME current observed level. A bad
-        # current block cannot punish only the measured arm while unseen arms
-        # retain their optimistic absolute level. Preserve predicted k ratios.
         i = self.k - 1
-        scale = self.y[i] / self.n[i] / E[i] if self.n[i] else 1.0
-        time_scale = self.t[i] / self.n[i] / C[i] if self.n[i] else 1.0
-        predicted_y = [e * scale for e in E]
-        predicted_t = [c * time_scale for c in C]
-        scores = [
-            (y + self.w * e) / (t + self.w * c)
-            for y, t, e, c in zip(self.y, self.t, predicted_y, predicted_t)
-        ]
-        # Estimated SE of ratio-of-totals using centered y-rate*t residuals.
-        # Kish ESS alone does not lose confidence when an arm ages; cap by
-        # decayed mass so stale evidence really loses influence/confidence.
-        se = []
-        for j in range(5):
-            n = self.n[j]
-            if n <= 0:
-                se.append(0.0)
-                continue
-            rate = self.y[j] / self.t[j]
-            variance = max(
-                0.0, (self.y2[j] - 2 * rate * self.yt[j] + rate * rate * self.t2[j]) / n
-            )
-            ess = min(n, n * n / self.q[j])
-            # nonzero floor prevents a single constant sample claiming certainty
-            se.append((variance + 1.0) ** 0.5 / (self.t[j] / n) / (ess + 1) ** 0.5)
-        fractions = [t / (t + self.w * c) for t, c in zip(self.t, predicted_t)]
-        # All model-only predictions share incumbent calibration; its common
-        # absolute noise cancels for their relative ordering. Charge uncertainty
-        # only for candidate's independent actual evidence contribution.
-        gate = [f * (s * s + se[self.k - 1] ** 2) ** 0.5 for f, s in zip(fractions, se)]
+        # Pure unbiased throughput estimator: shared survival-curve E[k]
+        # divided by live OnlineCostModel latency C[k]. Eliminates the
+        # single-sample arm-attribution bug where one unlucky a=0 step on a
+        # newly tried width k crashed its per-arm y[k]/t[k] score by >50%.
+        scores = [e / c for e, c in zip(E, C)]
+        se = [0.0] * 5
         hist = self.history[i]
         mass = sum(hist)
         model_se = []
@@ -467,9 +524,7 @@ class Policy:
                 continue
             # Paired marginal efficiency on prefixes observed at current width.
             diffs = [
-                ((1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i])
-                * scale
-                / time_scale
+                (1 + min(a, j + 1)) / C[j] - (1 + min(a, self.k)) / C[i]
                 for a in range(6)
             ]
             mean = sum(w * d for w, d in zip(hist, diffs)) / mass if mass else 0.0
@@ -479,7 +534,7 @@ class Policy:
                 else 0.0
             )
             model_se.append(0.5 * (variance / (mass + 1)) ** 0.5)
-        gate = [(a * a + b * b) ** 0.5 for a, b in zip(gate, model_se)]
+        gate = model_se[:]
         ready = bool(
             self.latest and self.latest["k"] == self.k and self.latest["timing_valid"]
         )
@@ -494,14 +549,12 @@ class Policy:
                     and scores[k - 1] > scores[best - 1] * 1.03
                 ]
                 if cands:
-                    best = min(cands) if context.get("concurrency", 1) >= 16 else max(cands)
+                    best = max(cands)
             else:
-                c_now = context.get("concurrency", 1)
                 for k in range(1, min(5, self.k + 1) + 1):
-                    margin = 0.08 if (self.k == 1 and k == 2 and c_now >= 16) else (0.05 if (k > self.k and c_now >= 16) else 0.03)
                     if (
                         scores[k - 1] - scores[self.k - 1]
-                        > margin * scores[self.k - 1] + gate[k - 1]
+                        > 0.03 * scores[self.k - 1] + gate[k - 1]
                         and scores[k - 1] > scores[best - 1]
                     ):
                         best = k
