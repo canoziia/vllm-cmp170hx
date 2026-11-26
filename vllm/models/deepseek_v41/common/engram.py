@@ -19,6 +19,7 @@ streams tokens chunk-by-chunk:
 
 import ctypes
 import hashlib
+import json
 import mmap
 import os
 import platform
@@ -543,6 +544,14 @@ def _engram_cpu_compact_h2d_enabled() -> bool:
     return os.environ.get("VLLM_DSV41_ENGRAM_CPU_COMPACT_H2D", "0") == "1"
 
 
+def _engram_shm_dir() -> str:
+    return os.environ.get("VLLM_DSV41_ENGRAM_SHM_DIR", "").strip()
+
+
+def _engram_shm_register_cuda() -> bool:
+    return os.environ.get("VLLM_DSV41_ENGRAM_SHM_REGISTER", "1") == "1"
+
+
 def _is_graph_capture_active() -> bool:
     if torch.cuda.is_current_stream_capturing():
         return True
@@ -869,6 +878,47 @@ def _load_engram_cpu_lib() -> ctypes.CDLL:
             ctypes.c_int,
         ]
         lib.engram_cpu_gather_fp8.restype = None
+        if hasattr(lib, "engram_cpu_gather_bf16_multi"):
+            lib.engram_cpu_gather_bf16_multi.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int,
+            ]
+            lib.engram_cpu_gather_bf16_multi.restype = None
+        if hasattr(lib, "engram_cpu_gather_fp8_multi"):
+            lib.engram_cpu_gather_fp8_multi.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int,
+            ]
+            lib.engram_cpu_gather_fp8_multi.restype = None
         _CPU_GATHER_LIB = lib
         return lib
 
@@ -1039,6 +1089,9 @@ def _engram_head_shard_weight_loader(
 ) -> None:
     """Load this rank's complete head buckets. ue8m0 scales arrive as
     float8_e8m0fnu; keep the raw bytes (the param stores uint8)."""
+    if getattr(param, "_engram_shm_preloaded", False):
+        param._engram_load_ver = getattr(param, "_engram_load_ver", 0) + 1
+        return
     part_rows = param.shape[0]
     if loaded_weight.dtype == torch.float8_e8m0fnu:
         loaded_weight = loaded_weight.view(torch.uint8)
@@ -1652,11 +1705,13 @@ class ParallelEngramEmbedding(nn.Module):
         use_thp: bool = False,
         packed_fp4: bool = False,
         peer_group: EngramPeerGroup | None = None,
+        layer_id: int | None = None,
     ) -> None:
         super().__init__()
         assert head_sizes and all(size > 0 for size in head_sizes)
         assert sum(head_sizes) <= num_embeddings
         assert not packed_fp4 or dim % 2 == 0
+        self.layer_id = layer_id
         self.packed_fp4 = packed_fp4
         self.row_bytes = dim // 2 if packed_fp4 else dim
         self.cpu_offload = cpu_offload
@@ -1754,6 +1809,14 @@ class ParallelEngramEmbedding(nn.Module):
         self._async_worker: _EngramAsyncWorker | None = None
         self._default_cpu_threads: int | None = None
         self._packed_host: torch.Tensor | None = None
+        # Cross-container shared host memory (VLLM_DSV41_ENGRAM_SHM_DIR).
+        self._shm_preloaded: bool = False
+        self._shm_cpu_only: bool = False
+        self._shm_keepalive: list[object] = []
+        self._shm_multi_shards: list[tuple[np.ndarray, np.ndarray, int]] | None = None
+        self._shm_w_ptrs: object = None
+        self._shm_s_ptrs: object = None
+        self._shm_row_ends: object = None
 
         weight, scales = self._allocate_weights()
         self.weight = nn.Parameter(weight, requires_grad=False)
@@ -1766,27 +1829,34 @@ class ParallelEngramEmbedding(nn.Module):
                     "engram_vocab_start": row_start,
                 },
             )
+            if self._shm_preloaded:
+                param._engram_shm_preloaded = True
         if cpu_offload and not self.weight.is_meta:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
+            if self._shm_preloaded:
+                mode_desc = (
+                    f"cross-container shm ({len(self._shm_multi_shards or [1])} shard(s), "
+                    f"{'CPU-only mmap' if self._shm_cpu_only else 'UVA pinned mmap'})"
+                )
+            elif self._shared_memory is None:
+                mode_desc = "per rank"
+            else:
+                mode_desc = "shared across DP replicas via " + (
+                    ("HIP VMM" if current_platform.is_rocm() else "cuMem")
+                    if self._shared_memory.huge_pages
+                    else "/dev/shm"
+                )
             logger.info(
-                "Engram table offloaded to pinned host memory: %d rows x %d, "
-                "%.2f GiB %s",
+                "Engram table offloaded to host memory: %d rows x %d, %.2f GiB (%s)",
                 self.part_num_embeddings,
                 dim,
                 self.part_num_embeddings
                 * (self.row_bytes + dim // block_size)
                 / 1024**3,
-                "per rank"
-                if self._shared_memory is None
-                else "shared across DP replicas via "
-                + (
-                    ("HIP VMM" if current_platform.is_rocm() else "cuMem")
-                    if self._shared_memory.huge_pages
-                    else "/dev/shm"
-                ),
+                mode_desc,
             )
 
     def _get_shard_info(self) -> tuple[int, int]:
@@ -1854,6 +1924,9 @@ class ParallelEngramEmbedding(nn.Module):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
+        shm_dir = _engram_shm_dir()
+        if shm_dir and self.cpu_offload and self.layer_id is not None:
+            return self._allocate_from_shm_dir(shm_dir, weight_dtype, scale_dim)
         # pin_memory rounds up to a power of two. ROCm pins huge pages either way.
         if self.use_thp or current_platform.is_rocm():
             weight_bytes = self.part_num_embeddings * self.row_bytes
@@ -1920,6 +1993,191 @@ class ParallelEngramEmbedding(nn.Module):
                     pin_memory=True,
                 ),
             )
+
+    def _allocate_from_shm_dir(
+        self,
+        shm_dir: str,
+        weight_dtype: torch.dtype,
+        scale_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map pre-materialized cross-container shared Engram shards from
+        ``VLLM_DSV41_ENGRAM_SHM_DIR`` (e.g. host ``tmpfs``).
+
+        Single-shard consumers with ``VLLM_DSV41_ENGRAM_SHM_REGISTER=1`` (e.g.
+        TP4 Decode) register their disjoint shard with ``cudaHostRegister`` for
+        native GPU UVA lookup. Multi-shard or ``REGISTER=0`` consumers (e.g.
+        TP2 Prefill) map ``PROT_READ`` without CUDA registration and read via
+        C++ ``engram_cpu_gather_*_multi`` -> pinned staging -> async H2D DMA.
+        """
+        root = Path(shm_dir)
+        manifest_path = root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"VLLM_DSV41_ENGRAM_SHM_DIR={shm_dir!r} is missing manifest.json; "
+                "run prepare-engram-shm.py first."
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        layer_key = str(self.layer_id)
+        layers_meta = manifest.get("layers", {})
+        if layer_key not in layers_meta:
+            raise KeyError(
+                f"Engram layer {layer_key} not found in {manifest_path} "
+                f"(available: {sorted(layers_meta)})"
+            )
+        lmeta = layers_meta[layer_key]
+        if (
+            int(lmeta["dim"]) != self.dim
+            or int(lmeta["block_size"]) != self.block_size
+            or bool(lmeta.get("packed_fp4", False)) != bool(self.packed_fp4)
+        ):
+            raise ValueError(
+                f"Engram shm manifest mismatch for layer {layer_key}: "
+                f"manifest=({lmeta['dim']}, {lmeta['block_size']}, {lmeta.get('packed_fp4')}) "
+                f"vs model=({self.dim}, {self.block_size}, {self.packed_fp4})"
+            )
+
+        selected = sorted(
+            (
+                s
+                for s in lmeta["shards"]
+                if int(s["vocab_start"]) >= self.vocab_start_idx
+                and int(s["vocab_end"]) <= self.vocab_end_idx
+            ),
+            key=lambda s: int(s["vocab_start"]),
+        )
+        if (
+            not selected
+            or int(selected[0]["vocab_start"]) != self.vocab_start_idx
+            or int(selected[-1]["vocab_end"]) != self.vocab_end_idx
+            or any(
+                int(selected[i + 1]["vocab_start"]) != int(selected[i]["vocab_end"])
+                for i in range(len(selected) - 1)
+            )
+        ):
+            raise ValueError(
+                f"Engram shm shards in {manifest_path} do not contiguously cover "
+                f"layer {layer_key} range [{self.vocab_start_idx}, {self.vocab_end_idx})"
+            )
+
+        want_cuda_reg = (
+            _engram_shm_register_cuda()
+            and current_platform.is_cuda()
+            and len(selected) == 1
+        )
+        if want_cuda_reg:
+            from cuda.bindings import runtime as cudart
+
+            torch.cuda.init()
+            shard = selected[0]
+            rows = int(shard["vocab_end"]) - int(shard["vocab_start"])
+            assert rows == self.part_num_embeddings
+
+            def _map_and_reg(rel_file: str, exact_bytes: int) -> np.ndarray:
+                fpath = root / rel_file
+                fsize = fpath.stat().st_size
+                if fsize < exact_bytes:
+                    raise ValueError(
+                        f"Engram shm file {fpath} too small: {fsize} < {exact_bytes}"
+                    )
+                with open(fpath, "r+b") as f:
+                    mm = mmap.mmap(
+                        f.fileno(),
+                        fsize,
+                        flags=mmap.MAP_SHARED,
+                        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                arr_full = np.frombuffer(mm, dtype=np.uint8)
+                ptr = int(arr_full.ctypes.data)
+                (err,) = cudart.cudaHostRegister(
+                    ptr, fsize, int(cudart.cudaHostRegisterMapped)
+                )
+                if int(err) != 0:
+                    del arr_full
+                    mm.close()
+                    raise RuntimeError(
+                        f"cudaHostRegister failed for {fpath} ({fsize} bytes): err={err}"
+                    )
+
+                def _unreg(m: mmap.mmap, p: int) -> None:
+                    try:
+                        cudart.cudaHostUnregister(p)
+                    except Exception:
+                        pass
+                    try:
+                        m.close()
+                    except Exception:
+                        pass
+
+                weakref.finalize(arr_full, _unreg, mm, ptr)
+                self._shm_keepalive.append((mm, arr_full))
+                return arr_full[:exact_bytes]
+
+            w_arr = _map_and_reg(shard["weight_file"], rows * self.row_bytes)
+            s_arr = _map_and_reg(shard["scale_file"], rows * scale_dim)
+            w_t = torch.from_numpy(w_arr).view(weight_dtype).view(rows, self.row_bytes)
+            s_t = torch.from_numpy(s_arr).view(torch.uint8).view(rows, scale_dim)
+            self._shm_preloaded = True
+            self._shm_cpu_only = False
+            return w_t, s_t
+
+        # CPU-only MAP_SHARED PROT_READ path (zero CUDA registration conflict).
+        def _map_ro(rel_file: str, exact_bytes: int) -> np.ndarray:
+            fpath = root / rel_file
+            fsize = fpath.stat().st_size
+            if fsize < exact_bytes:
+                raise ValueError(
+                    f"Engram shm file {fpath} too small: {fsize} < {exact_bytes}"
+                )
+            with open(fpath, "rb") as f:
+                mm = mmap.mmap(
+                    f.fileno(),
+                    fsize,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ,
+                )
+            arr_full = np.frombuffer(mm, dtype=np.uint8)
+            self._shm_keepalive.append((mm, arr_full))
+            return arr_full[:exact_bytes]
+
+        if len(selected) == 1:
+            shard = selected[0]
+            rows = int(shard["vocab_end"]) - int(shard["vocab_start"])
+            assert rows == self.part_num_embeddings
+            w_arr = _map_ro(shard["weight_file"], rows * self.row_bytes)
+            s_arr = _map_ro(shard["scale_file"], rows * scale_dim)
+            w_t = torch.from_numpy(w_arr).view(weight_dtype).view(rows, self.row_bytes)
+            s_t = torch.from_numpy(s_arr).view(torch.uint8).view(rows, scale_dim)
+            self._shm_preloaded = True
+            self._shm_cpu_only = True
+            return w_t, s_t
+
+        multi: list[tuple[np.ndarray, np.ndarray, int]] = []
+        w_ptrs: list[int] = []
+        s_ptrs: list[int] = []
+        row_ends: list[int] = []
+        running_rows = 0
+        for shard in selected:
+            rows = int(shard["vocab_end"]) - int(shard["vocab_start"])
+            w_arr = _map_ro(shard["weight_file"], rows * self.row_bytes)
+            s_arr = _map_ro(shard["scale_file"], rows * scale_dim)
+            multi.append((w_arr, s_arr, rows))
+            w_ptrs.append(int(w_arr.ctypes.data))
+            s_ptrs.append(int(s_arr.ctypes.data))
+            running_rows += rows
+            row_ends.append(running_rows)
+        assert running_rows == self.part_num_embeddings
+        n = len(multi)
+        self._shm_multi_shards = multi
+        self._shm_w_ptrs = (ctypes.c_void_p * n)(*w_ptrs)
+        self._shm_s_ptrs = (ctypes.c_void_p * n)(*s_ptrs)
+        self._shm_row_ends = (ctypes.c_int64 * n)(*row_ends)
+        self._shm_preloaded = True
+        self._shm_cpu_only = True
+        # Zero-byte CPU placeholder parameters (actual rows live in _shm_multi_shards).
+        return (
+            torch.empty((0, self.row_bytes), dtype=weight_dtype, device="cpu"),
+            torch.empty((0, scale_dim), dtype=torch.uint8, device="cpu"),
+        )
 
     def process_weights_after_loading(self) -> None:
         """Peers read this table's rows directly, so serve only once every GPU
@@ -2003,6 +2261,15 @@ class ParallelEngramEmbedding(nn.Module):
         return self._default_cpu_threads
 
     def should_use_cpu_prefetch(self, num_tokens: int) -> bool:
+        if self._shm_cpu_only:
+            return (
+                self.cpu_offload
+                and not self.packed_fp4
+                and self.dp_size == 1
+                and not self.peer_rows
+                and self._shared_memory is None
+                and not _is_graph_capture_active()
+            )
         return (
             self.cpu_offload
             and not self.packed_fp4
@@ -2087,6 +2354,51 @@ class ParallelEngramEmbedding(nn.Module):
     def _run_cpu_gather_kernel(self, num_tokens: int, compact: bool) -> None:
         assert self._host_ids is not None
         lib = _load_engram_cpu_lib()
+        if self._shm_multi_shards is not None:
+            num_shards = len(self._shm_multi_shards)
+            scale_dim = self.dim // self.block_size
+            if compact:
+                assert self._host_fp8 is not None and self._host_scales is not None
+                lib.engram_cpu_gather_fp8_multi(
+                    ctypes.byref(self._shm_w_ptrs),
+                    self.row_bytes,
+                    ctypes.byref(self._shm_s_ptrs),
+                    scale_dim,
+                    ctypes.byref(self._shm_row_ends),
+                    num_shards,
+                    ctypes.c_void_p(self._host_ids.data_ptr()),
+                    ctypes.c_void_p(self._host_fp8.data_ptr()),
+                    ctypes.c_void_p(self._host_scales.data_ptr()),
+                    self.vocab_start_idx,
+                    self.vocab_end_idx,
+                    num_tokens,
+                    self.part_n_hash_cols,
+                    self.local_valid_heads,
+                    self.dim,
+                    self.block_size,
+                    self._resolve_cpu_threads(),
+                )
+            else:
+                assert self._host_bf16 is not None
+                lib.engram_cpu_gather_bf16_multi(
+                    ctypes.byref(self._shm_w_ptrs),
+                    self.row_bytes,
+                    ctypes.byref(self._shm_s_ptrs),
+                    scale_dim,
+                    ctypes.byref(self._shm_row_ends),
+                    num_shards,
+                    ctypes.c_void_p(self._host_ids.data_ptr()),
+                    ctypes.c_void_p(self._host_bf16.data_ptr()),
+                    self.vocab_start_idx,
+                    self.vocab_end_idx,
+                    num_tokens,
+                    self.part_n_hash_cols,
+                    self.local_valid_heads,
+                    self.dim,
+                    self.block_size,
+                    self._resolve_cpu_threads(),
+                )
+            return
         w_data = self.weight.data
         s_data = self.weight_scale_inv.data
         if compact:
@@ -2915,6 +3227,11 @@ class Engram(nn.Module):
             peer_group = join_engram_peer_group(
                 engram_config.peer_group_size, engram_config.peer_group_store
             )
+        layer_id = (
+            int(layout.layer_ids[layer_hash_index])
+            if 0 <= layer_hash_index < len(layout.layer_ids)
+            else None
+        )
         return ParallelEngramEmbedding(
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
@@ -2924,6 +3241,7 @@ class Engram(nn.Module):
             use_thp=engram_config.use_thp,
             packed_fp4=layout.packed_fp4,
             peer_group=peer_group,
+            layer_id=layer_id,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:

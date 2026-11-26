@@ -332,3 +332,261 @@ extern "C" void engram_cpu_gather_fp8(
         std::memcpy(dst_s, scales + local * s_stride, static_cast<size_t>(s_cols));
     }
 }
+
+namespace {
+
+static inline void resolve_multi_shard(
+    int64_t local,
+    const uint8_t* const* weight_ptrs,
+    const uint8_t* const* scale_ptrs,
+    const int64_t* shard_row_ends,
+    int num_shards,
+    int64_t w_stride,
+    int64_t s_stride,
+    const uint8_t*& w_row,
+    const uint8_t*& s_row
+) {
+    int64_t base = 0;
+    for (int s = 0; s < num_shards; ++s) {
+        const int64_t end = shard_row_ends[s];
+        if (local < end || s == num_shards - 1) {
+            const int64_t off = local - base;
+            w_row = weight_ptrs[s] + off * w_stride;
+            s_row = scale_ptrs[s] + off * s_stride;
+            return;
+        }
+        base = end;
+    }
+    w_row = weight_ptrs[0];
+    s_row = scale_ptrs[0];
+}
+
+}  // namespace
+
+extern "C" void engram_cpu_gather_bf16_multi(
+    const uint8_t* const* __restrict__ weight_ptrs,
+    int64_t w_stride,
+    const uint8_t* const* __restrict__ scale_ptrs,
+    int64_t s_stride,
+    const int64_t* __restrict__ shard_row_ends,
+    int num_shards,
+    const int64_t* __restrict__ local_ids,
+    uint16_t* __restrict__ out_bf16,
+    int64_t vocab_start,
+    int64_t vocab_end,
+    int64_t num_tokens,
+    int64_t local_heads,
+    int64_t local_valid_heads,
+    int64_t dim,
+    int64_t quant_block,
+    int num_threads
+) {
+    const int64_t total_rows = num_tokens * local_heads;
+    if (total_rows <= 0 || dim <= 0 || num_shards <= 0) {
+        return;
+    }
+    if (num_threads <= 0) {
+        num_threads = omp_get_max_threads();
+    }
+    if (total_rows < 64) {
+        num_threads = 1;
+    } else if (total_rows < int64_t(num_threads) * 16) {
+        num_threads = static_cast<int>((total_rows + 15) / 16);
+        if (num_threads < 1) num_threads = 1;
+    }
+
+    constexpr int64_t PREFETCH_DIST = 8;
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+#if defined(__x86_64__) || defined(_M_X64)
+        const unsigned int saved_mxcsr = _mm_getcsr();
+        const bool altered_mxcsr = (saved_mxcsr & 0x8040u) != 0u;
+        if (altered_mxcsr) {
+            _mm_setcsr(saved_mxcsr & ~0x8040u);
+        }
+#endif
+
+        #pragma omp for schedule(static, 64)
+        for (int64_t row = 0; row < total_rows; ++row) {
+            const int64_t pf_row = row + PREFETCH_DIST;
+            if (pf_row < total_rows) {
+                const int64_t pf_lh = pf_row % local_heads;
+                if (pf_lh < local_valid_heads) {
+                    const int64_t pf_tok = pf_row / local_heads;
+                    const int64_t pf_idx =
+                        local_ids[pf_tok * local_valid_heads + pf_lh];
+                    if (pf_idx >= vocab_start && pf_idx < vocab_end) {
+                        const uint8_t* pf_w = nullptr;
+                        const uint8_t* pf_s = nullptr;
+                        resolve_multi_shard(
+                            pf_idx - vocab_start,
+                            weight_ptrs,
+                            scale_ptrs,
+                            shard_row_ends,
+                            num_shards,
+                            w_stride,
+                            s_stride,
+                            pf_w,
+                            pf_s);
+                        for (int64_t off = 0; off < dim; off += 64) {
+                            __builtin_prefetch(pf_w + off, 0, 1);
+                        }
+                        __builtin_prefetch(pf_s, 0, 1);
+                    }
+                }
+            }
+
+            uint16_t* row_out = out_bf16 + row * dim;
+            const int64_t lh = row % local_heads;
+            if (lh >= local_valid_heads) {
+                std::memset(row_out, 0, static_cast<size_t>(dim) * sizeof(uint16_t));
+                continue;
+            }
+            const int64_t tok = row / local_heads;
+            const int64_t idx = local_ids[tok * local_valid_heads + lh];
+            if (idx < vocab_start || idx >= vocab_end) {
+                std::memset(row_out, 0, static_cast<size_t>(dim) * sizeof(uint16_t));
+                continue;
+            }
+
+            const uint8_t* w_row = nullptr;
+            const uint8_t* s_row = nullptr;
+            resolve_multi_shard(
+                idx - vocab_start,
+                weight_ptrs,
+                scale_ptrs,
+                shard_row_ends,
+                num_shards,
+                w_stride,
+                s_stride,
+                w_row,
+                s_row);
+
+#if defined(__AVX2__)
+            if (quant_block == 32 && (dim & 31) == 0) {
+                const int64_t n_blocks = dim >> 5;
+                for (int64_t b = 0; b < n_blocks; ++b) {
+                    dequant_block32_avx2(
+                        w_row + (b << 5),
+                        s_row[b],
+                        row_out + (b << 5));
+                }
+            } else
+#endif
+            {
+                for (int64_t c = 0; c < dim; ++c) {
+                    const uint8_t sb = s_row[c / quant_block];
+                    const float sf = bits_to_f32(uint32_t(sb) << 23);
+                    const float wf = g_e4m3_to_f32[w_row[c]];
+                    row_out[c] = f32_to_bf16_sm80_bits(wf * sf);
+                }
+            }
+        }
+
+#if defined(__x86_64__) || defined(_M_X64)
+        if (altered_mxcsr) {
+            _mm_setcsr(saved_mxcsr);
+        }
+#endif
+    }
+}
+
+extern "C" void engram_cpu_gather_fp8_multi(
+    const uint8_t* const* __restrict__ weight_ptrs,
+    int64_t w_stride,
+    const uint8_t* const* __restrict__ scale_ptrs,
+    int64_t s_stride,
+    const int64_t* __restrict__ shard_row_ends,
+    int num_shards,
+    const int64_t* __restrict__ local_ids,
+    uint8_t* __restrict__ out_fp8,
+    uint8_t* __restrict__ out_scales,
+    int64_t vocab_start,
+    int64_t vocab_end,
+    int64_t num_tokens,
+    int64_t local_heads,
+    int64_t local_valid_heads,
+    int64_t dim,
+    int64_t quant_block,
+    int num_threads
+) {
+    const int64_t total_rows = num_tokens * local_heads;
+    const int64_t s_cols = dim / quant_block;
+    if (total_rows <= 0 || dim <= 0 || num_shards <= 0) {
+        return;
+    }
+    if (num_threads <= 0) {
+        num_threads = omp_get_max_threads();
+    }
+    if (total_rows < 64) {
+        num_threads = 1;
+    } else if (total_rows < int64_t(num_threads) * 16) {
+        num_threads = static_cast<int>((total_rows + 15) / 16);
+        if (num_threads < 1) num_threads = 1;
+    }
+
+    constexpr int64_t PREFETCH_DIST = 8;
+
+    #pragma omp parallel for schedule(static, 64) num_threads(num_threads)
+    for (int64_t row = 0; row < total_rows; ++row) {
+        const int64_t pf_row = row + PREFETCH_DIST;
+        if (pf_row < total_rows) {
+            const int64_t pf_lh = pf_row % local_heads;
+            if (pf_lh < local_valid_heads) {
+                const int64_t pf_tok = pf_row / local_heads;
+                const int64_t pf_idx =
+                    local_ids[pf_tok * local_valid_heads + pf_lh];
+                if (pf_idx >= vocab_start && pf_idx < vocab_end) {
+                    const uint8_t* pf_w = nullptr;
+                    const uint8_t* pf_s = nullptr;
+                    resolve_multi_shard(
+                        pf_idx - vocab_start,
+                        weight_ptrs,
+                        scale_ptrs,
+                        shard_row_ends,
+                        num_shards,
+                        w_stride,
+                        s_stride,
+                        pf_w,
+                        pf_s);
+                    for (int64_t off = 0; off < dim; off += 64) {
+                        __builtin_prefetch(pf_w + off, 0, 1);
+                    }
+                    __builtin_prefetch(pf_s, 0, 1);
+                }
+            }
+        }
+
+        uint8_t* dst_w = out_fp8 + row * dim;
+        uint8_t* dst_s = out_scales + row * s_cols;
+        const int64_t lh = row % local_heads;
+        if (lh >= local_valid_heads) {
+            std::memset(dst_w, 0, static_cast<size_t>(dim));
+            std::memset(dst_s, 0, static_cast<size_t>(s_cols));
+            continue;
+        }
+        const int64_t tok = row / local_heads;
+        const int64_t idx = local_ids[tok * local_valid_heads + lh];
+        if (idx < vocab_start || idx >= vocab_end) {
+            std::memset(dst_w, 0, static_cast<size_t>(dim));
+            std::memset(dst_s, 0, static_cast<size_t>(s_cols));
+            continue;
+        }
+
+        const uint8_t* w_row = nullptr;
+        const uint8_t* s_row = nullptr;
+        resolve_multi_shard(
+            idx - vocab_start,
+            weight_ptrs,
+            scale_ptrs,
+            shard_row_ends,
+            num_shards,
+            w_stride,
+            s_stride,
+            w_row,
+            s_row);
+        std::memcpy(dst_w, w_row, static_cast<size_t>(dim));
+        std::memcpy(dst_s, s_row, static_cast<size_t>(s_cols));
+    }
+}

@@ -357,6 +357,10 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     return DeepseekV4FlashMLAAttention
 
 
+def _yoco_prefill_only_enabled() -> bool:
+    return os.environ.get("VLLM_DSV41_YOCO_PREFILL_ONLY", "0") == "1"
+
+
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     moe_needs_token_sharded_input = (
@@ -427,6 +431,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         run_gemm_rs: bool = False,
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
+        kv_write_only: bool = False,
     ):
         super().__init__()
 
@@ -434,6 +439,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.mhc_stream = mhc_stream
         self.fuse_mhc_all_reduce = fuse_mhc_all_reduce
+        self.kv_write_only = kv_write_only
         # SM80 runs every mHC boundary through its CuTe DSL kernels, SM90 the
         # small ones, with the coefficients on mhc_stream in FULL graphs of up
         # to this many tokens.
@@ -472,15 +478,20 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # forward keeps the separate reduce-scatter below.
                 self.attn.bind_gemm_rs()
         self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
-        self.ffn = DeepseekV4MoE(
-            vllm_config,
-            prefix=f"{prefix}.ffn",
-            use_sequence_parallel=self.use_sequence_parallel,
-            reduce_results=not fuse_mhc_all_reduce,
-        )
+        if kv_write_only:
+            self.ffn = PPMissingLayer()
+            self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+            self.ffn_norm = PPMissingLayer()
+        else:
+            self.ffn = DeepseekV4MoE(
+                vllm_config,
+                prefix=f"{prefix}.ffn",
+                use_sequence_parallel=self.use_sequence_parallel,
+                reduce_results=not fuse_mhc_all_reduce,
+            )
 
-        self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
-        self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+            self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+            self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -579,21 +590,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
         self.hc_attn_fn_broadcast: torch.Tensor | None = None
-        self.hc_ffn_fn = nn.Parameter(
-            torch.empty(
-                (mix_hc, hc_dim),
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
         self.hc_attn_base = nn.Parameter(
-            torch.empty(
-                mix_hc,
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
-        self.hc_ffn_base = nn.Parameter(
             torch.empty(
                 mix_hc,
                 dtype=torch.float32,
@@ -607,20 +604,46 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.hc_ffn_scale = nn.Parameter(
-            torch.empty(
-                3,
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
+        if not kv_write_only:
+            self.hc_ffn_fn = nn.Parameter(
+                torch.empty(
+                    (mix_hc, hc_dim),
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_ffn_base = nn.Parameter(
+                torch.empty(
+                    mix_hc,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_ffn_scale = nn.Parameter(
+                torch.empty(
+                    3,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
         # The mixer weights laid out for the CuTe DSL mHC boundary, filled after
         # loading; None where that kernel cannot run.
-        for name in ("hc_attn_boundary_weight", "hc_ffn_boundary_weight"):
-            weight = mhc_boundary_weight(
+        self.register_buffer(
+            "hc_attn_boundary_weight",
+            mhc_boundary_weight(
                 self.hidden_size, self.hc_mult, self.hc_attn_fn.device
-            )
-            self.register_buffer(name, weight, persistent=False)
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "hc_ffn_boundary_weight",
+            None
+            if kv_write_only
+            else mhc_boundary_weight(
+                self.hidden_size, self.hc_mult, self.hc_attn_fn.device
+            ),
+            persistent=False,
+        )
 
     def process_weights_after_loading(self) -> None:
         """Lay out the mHC mixer weights for the CuTe DSL boundary kernel (see
@@ -630,7 +653,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         from .ops.mhc_boundary import prepare_boundary_weight
 
         self.hc_attn_boundary_weight.copy_(prepare_boundary_weight(self.hc_attn_fn))
-        self.hc_ffn_boundary_weight.copy_(prepare_boundary_weight(self.hc_ffn_fn))
+        if not self.kv_write_only and self.hc_ffn_boundary_weight is not None:
+            self.hc_ffn_boundary_weight.copy_(prepare_boundary_weight(self.hc_ffn_fn))
 
     def forward(
         self,
@@ -1236,22 +1260,73 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks to belong to one NVLink domain. Collective: run before layers.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: DeepseekV4DecoderLayer(
-                vllm_config,
-                prefix=prefix,
-                topk_indices_buffer=self.topk_indices_buffer,
-                aux_stream_list=aux_stream_list,
-                candidate_block_buffer=self.candidate_block_buffer,
-                engram_layout=self.engram_layout,
-                engram_prefetch_stream=engram_prefetch_stream,
-                run_gemm_rs=self.run_gemm_rs,
-                mhc_stream=mhc_stream,
-                fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
-            ),
-            prefix=f"{prefix}.layers",
-        )
+        self.yoco_prefill_only = _yoco_prefill_only_enabled()
+        if self.yoco_prefill_only:
+            if pp_size != 1:
+                raise ValueError(
+                    "VLLM_DSV41_YOCO_PREFILL_ONLY=1 requires pipeline_parallel_size == 1"
+                )
+            if vllm_config.speculative_config is not None:
+                raise ValueError(
+                    "VLLM_DSV41_YOCO_PREFILL_ONLY=1 is incompatible with speculative decoding"
+                )
+            if self.use_sequence_parallel:
+                raise ValueError(
+                    "VLLM_DSV41_YOCO_PREFILL_ONLY=1 is incompatible with sequence parallelism"
+                )
+            kv_source_ids = getattr(config, "kv_source_layer_ids", None)
+            if not kv_source_ids:
+                raise ValueError(
+                    "VLLM_DSV41_YOCO_PREFILL_ONLY=1 requires config.kv_source_layer_ids"
+                )
+            cut = max(kv_source_ids)
+            self.start_layer = 0
+            self.end_layer = cut + 1
+            self.layers = nn.ModuleList(
+                [
+                    DeepseekV4DecoderLayer(
+                        vllm_config,
+                        prefix=f"{prefix}.layers.{i}",
+                        topk_indices_buffer=self.topk_indices_buffer,
+                        aux_stream_list=aux_stream_list,
+                        candidate_block_buffer=self.candidate_block_buffer,
+                        engram_layout=self.engram_layout,
+                        engram_prefetch_stream=engram_prefetch_stream,
+                        run_gemm_rs=self.run_gemm_rs,
+                        mhc_stream=mhc_stream,
+                        fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
+                        kv_write_only=(i == cut),
+                    )
+                    if i <= cut
+                    else PPMissingLayer()
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
+            logger.info_once(
+                "YOCO prefill-only mode: loaded encoder layers 0-%d "
+                "(layer %d KV-write-only, MoE/layers %d-%d/norm/lm_head skipped).",
+                cut,
+                cut,
+                cut + 1,
+                config.num_hidden_layers - 1,
+            )
+        else:
+            self.start_layer, self.end_layer, self.layers = make_layers(
+                config.num_hidden_layers,
+                lambda prefix: DeepseekV4DecoderLayer(
+                    vllm_config,
+                    prefix=prefix,
+                    topk_indices_buffer=self.topk_indices_buffer,
+                    aux_stream_list=aux_stream_list,
+                    candidate_block_buffer=self.candidate_block_buffer,
+                    engram_layout=self.engram_layout,
+                    engram_prefetch_stream=engram_prefetch_stream,
+                    run_gemm_rs=self.run_gemm_rs,
+                    mhc_stream=mhc_stream,
+                    fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
+                ),
+                prefix=f"{prefix}.layers",
+            )
         if self.pipeline_relay is not None:
             self.pipeline_relay.configure(
                 self.layers[self.start_layer].attn, vllm_config
@@ -1295,7 +1370,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.decoder_replay_layers: DecoderReplayLayers | None = None
         self.decoder_replay_start = self.end_layer
         cut = max(config.kv_source_layer_ids)
-        if (
+        if self.yoco_prefill_only:
+            self.decoder_replay_start = cut
+        elif (
             cut < self.end_layer - 1
             and self._decoder_replay_supported(vllm_config, cut)
             and self.layers[cut].attn.swa_cache_layer.bounded_replay
@@ -1350,7 +1427,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 assert isinstance(layer, DeepseekV4DecoderLayer)
                 assert isinstance(successor, DeepseekV4DecoderLayer)
                 if (
-                    self.decoder_replay_layers is not None
+                    (self.decoder_replay_layers is not None or self.yoco_prefill_only)
                     and layer_idx == self.decoder_replay_start - 1
                 ):
                     continue
@@ -1388,7 +1465,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not self.yoco_prefill_only:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -1592,6 +1669,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             engram_hashes,
             engram_mask,
         )
+        if self.yoco_prefill_only:
+            cut_layer = typing.cast(
+                DeepseekV4DecoderLayer, self.layers[self.decoder_replay_start]
+            )
+            cut_layer.write_kv(
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+            )
+            return torch.zeros(
+                (full_num_tokens, self.config.hidden_size),
+                dtype=self.vllm_config.model_config.dtype,
+                device=positions.device,
+            )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -3477,6 +3572,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    if (
+                        self.yoco_prefill_only
+                        and ".hc_ffn_" in name
+                        and name not in params_dict
+                    ):
+                        continue
                     # Non-LoRA params on a LoRA-wrapped module live at
                     # ``<head>.base_layer.<leaf>``; the checkpoint is plain.
                     if name not in params_dict:
@@ -3664,7 +3765,7 @@ class DeepseekV41LLMForCausalLM(
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not self.model.yoco_prefill_only:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -3719,6 +3820,17 @@ class DeepseekV41LLMForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        if self.model.yoco_prefill_only:
+            logits = torch.zeros(
+                (hidden_states.shape[0], self.config.vocab_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            eos_id = getattr(self.config, "eos_token_id", 0)
+            if isinstance(eos_id, list):
+                eos_id = eos_id[0] if eos_id else 0
+            logits[:, int(eos_id or 0)] = 1.0
+            return logits
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
@@ -3726,6 +3838,18 @@ class DeepseekV41LLMForCausalLM(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        if self.model.yoco_prefill_only:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            shard_vocab = cdiv(self.config.vocab_size, tp_size)
+            logits = torch.zeros(
+                (hidden_states.shape[0], shard_vocab),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            if tp_rank == 0:
+                logits[:, 0] = 1.0
+            return logits
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
 
     def build_specialized_decode(self) -> "SpecializedDecode":
