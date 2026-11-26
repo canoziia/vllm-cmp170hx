@@ -127,11 +127,59 @@ try:
             == "verification"
         )
 
-        # DeepSeek-V4.1 TP8 -> tp_auto
+        # DeepSeek-V4.1 TP8 -> tp_auto, and >=6 sharded GPUs disables vision/embed CPU offload
         assert (
             m.resolve_auto_profile(["vllm", "serve", "deepseek-ai/DeepSeek-V4.1-Flash", "-tp", "8"])
             == "tp_auto"
         )
+
+        # Vision/embed CPU offload policy: enabled for <6 weight-sharding GPUs, disabled for >=6
+        offload_cases = [
+            (["vllm", "serve", str(dsv41_dir), "-tp", "4"], "tp4_fused", "1"),
+            (["vllm", "serve", str(dsv41_dir), "-tp", "4", "-dp", "2"], "tp4_fused", "1"),
+            (["vllm", "serve", str(dsv41_dir), "-tp", "2"], "tp_auto", "1"),
+            (
+                ["vllm", "serve", str(dsv41_dir), "-tp", "2", "-dp", "3", "--enable-expert-parallel"],
+                "tp_auto",
+                "0",
+            ),
+            (["vllm", "serve", str(dsv41_dir), "-tp", "8"], "tp_auto", "0"),
+            (
+                ["vllm", "serve", str(dsv41_dir), "-tp", "4", "-dp", "2", "--enable-expert-parallel"],
+                "tp_auto",
+                "0",
+            ),
+            (["vllm", "serve", str(dsv41_dir), "-pp", "6"], "default", "0"),
+        ]
+        for argv, expected_prof, expected_offload in offload_cases:
+            os.environ.clear()
+            os.environ["VLLM_DSV41_OPT_PROFILE"] = "auto"
+            sys.argv = list(argv)
+            m.apply()
+            assert os.environ["VLLM_DSV41_OPT_PROFILE"] == expected_prof, (argv, os.environ["VLLM_DSV41_OPT_PROFILE"])
+            assert os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED") == expected_offload, (
+                argv,
+                os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED"),
+            )
+            # Spawned worker must inherit parent's offload decision unchanged
+            sys.argv = ["python3", "-c", "from multiprocessing.spawn import spawn_main"]
+            m.apply()
+            assert os.environ.get("VLLM_DSV41_OFFLOAD_VISION_EMBED") == expected_offload, argv
+
+        # Explicit user override of VLLM_DSV41_OFFLOAD_VISION_EMBED always survives
+        os.environ.clear()
+        os.environ["VLLM_DSV41_OPT_PROFILE"] = "auto"
+        os.environ["VLLM_DSV41_OFFLOAD_VISION_EMBED"] = "1"
+        sys.argv = ["vllm", "serve", str(dsv41_dir), "-tp", "2", "-dp", "3", "--enable-expert-parallel"]
+        m.apply()
+        assert os.environ["VLLM_DSV41_OFFLOAD_VISION_EMBED"] == "1"
+
+        os.environ.clear()
+        os.environ["VLLM_DSV41_OPT_PROFILE"] = "auto"
+        os.environ["VLLM_DSV41_OFFLOAD_VISION_EMBED"] = "0"
+        sys.argv = ["vllm", "serve", str(dsv41_dir), "-tp", "4"]
+        m.apply()
+        assert os.environ["VLLM_DSV41_OFFLOAD_VISION_EMBED"] == "0"
 
         # NCCL_PROTO=Simple only set on switch-connected PCIe (PIX/PXB), not cross-RC (PHB/NODE/SYS)
         orig_nvl = m._has_active_nvlink_nvml

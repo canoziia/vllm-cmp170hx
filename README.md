@@ -8,6 +8,7 @@ One unified SM80 vLLM image serves all DeepSeek parallelism splits (auto-selecti
 
 - **vLLM SM80**: `ghcr.io/canoziia/vllm-sm80:latest`
 - **Shared LMCache Server**: `ghcr.io/canoziia/vllm-sm80/lmcache-server:latest`
+- **PD Disaggregation Router**: `ghcr.io/canoziia/vllm-sm80/vllm-router:latest`
 
 ## Models
 
@@ -68,7 +69,7 @@ Exact upstream commits and Docker base image digests are pinned in
 ├── monitoring/                     # standalone Prometheus + Grafana stack
 ├── patches/
 │   ├── lmcache/                    # official LMCache patch series (0001..0011)
-│   └── router/                     # vLLM production-stack PD router patch series (0001..0005)
+│   └── router/                     # vLLM production-stack PD router patch series (0001..0006)
 ├── scripts/
 │   ├── apply-lmcache-patches.sh
 │   ├── benchmark-vllm.mjs          # decode, prefill, prose, code, and counting benchmark client

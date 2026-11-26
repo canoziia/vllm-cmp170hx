@@ -9,6 +9,12 @@ deployments for `deepseek-ai/DeepSeek-V4.1-Flash-1017` built directly on officia
   prefill, `nvfp4_ds_mla` KV cache, `2,014,502` GPU KV tokens = `1.92x 1M` at `2.20 GB/rank` +
   LMCache 8 GiB L1 / 500 GiB L2, topology-aware NVLink / PCIe P2P collectives).
   *(Legacy `TEP4` remains supported by adding `--enable-expert-parallel`, auto-selecting `tep4_fused`.)*
+- **Optional — 6x 80G SM80 PD Disaggregation (`compose.pd.yml` / `.env.pd.example`)**: `TP=4`
+  Decode (`tp4_decode`, `mnbt=1024`, `3.0 GB` KV = `3,068,748` tokens) + `TP=2` YOCO Encoder-Only
+  Prefill (`tp2_prefill`, layers `0..20`, `VLLM_DSV41_PREFILL_ROW_SHARD_ATTN=1`, `mnbt=8192`,
+  `4.0 GB` KV = `3,487,248` tokens, concurrent SJF scheduling) + shared LMCache (`890 B/tok`,
+  8 global YOCO layers) + cross-container zero-copy `/mnt/engram-shm` + patched PD Router
+  (`VLLM_ROUTER_MIN_PREFILL_TOKENS=1024` bypass + `VLLM_ROUTER_PREFILL_SJF=1`).
 - **Optional — 6x CMP 170HX PP6 (`compose.pp6.yml` / `.env.pp6.example`)**: `TP=1 x PP=6`
   (`7,7,7,7,7,5`, LMCache KV tier, CPU Engram offload).
 
@@ -133,8 +139,10 @@ always take precedence:
 
 | profile | target topology | description |
 |---|---|---|
-| `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tp4_fused` for Pure TP4 (default), `tep4_fused` for legacy TEP4, `default`/`verification` for PP>1, `tp_auto` for other TP>1 |
-| `tp4_fused` (4×80G default) | 4x 80G Pure TP4 (PCIe or NVLink) | Pure TP4 deep-fusion profile (`EP=1, NI=576`): 3-regime push-Lamport finalize (`OneShot M=1..2`, `TwoShot M=3..15`, `Ring M=16..192`), GPU-side `dynks` W13 + occ=5 `M=4..6`, Engram Local Partial-Dot (`M>=160`), `fused_gate_topk_align` (`local_e<=384`), `moe_prefill` split-list (`NI=576`), online self-calibrating `OnlineCostModel` + `COST_MS_TP4` |
+| `auto` (image default) | Any SM80 / any model | Inspects model `config.json` + `-tp`/`-pp`/`-dp`/`--enable-expert-parallel`: leaves non-DeepSeek models untouched; selects `tp4_fused` for Pure TP4, `tep4_fused` for 4-GPU TEP4, `tp2_prefill` for TP2 YOCO prefill, `default`/`verification` for PP>1, `tp_auto` for other TP>1. Auto-enables `VLLM_DSV41_OFFLOAD_VISION_EMBED=1` only when weight-sharding GPUs (`tp * pp * (dp if ep else 1)`) `< 6`, and `0` for `>= 6` GPUs |
+| `tp4_fused` (4×80G default) | 4x 80G Pure TP4 (PCIe or NVLink) | Pure TP4 PD-mixed deep-fusion profile (`EP=1, NI=576`): 3-regime push-Lamport finalize (`OneShot M=1..2`, `TwoShot M=3..15`, `Ring M=16..192`), GPU-side `dynks` W13 + occ=5 `M=4..6`, Engram Local Partial-Dot (`M>=160`), `fused_gate_topk_align` (`local_e<=384`), `moe_prefill` split-list (`NI=576`), online self-calibrating `OnlineCostModel` + `COST_MS_TP4` |
+| `tp4_decode` | 4x 80G PD Decode (`compose.pd.yml`) | Inherits full `tp4_fused` decode/DSpark fusions while disabling unused prefill-only DMA/overlap/MXFP8-cuBLAS slabs and setting `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=32`, freeing ~650 MiB/GPU for `3.0 GB` KV (`3,068,748` tokens) at `mnbt=1024` |
+| `tp2_prefill` | 2x 80G PD YOCO Prefill (`compose.pd.yml`) | Encoder-only YOCO prefill (`VLLM_DSV41_YOCO_PREFILL_ONLY=1`, layers `0..20`), row-sharded replicated attention (`VLLM_DSV41_PREFILL_ROW_SHARD_ATTN=1`), whole-MoE (`2mb_moe=0`), `moe_prefill` split-list (`NI=1152`), `mnbt=8192`, `4.0 GB` KV (`3,487,248` tokens) |
 | `default` | PP6 / general SM80 | Base 1x-HBM MXFP8/MXFP4 decode & long-context prefill kernels |
 | `verification` | PP6 + DSpark | Adds sub-width & mixed-`spec_k` FULL CUDA graphs, metadata replay, live-load PP cohorts |
 | `tp_auto` / `tp_auto_verification` | General DeepSeek TP>1 | TP-safe SM80 optimisations (Engram NUMA interleave, FP8 `wo_a`, vision offload, cuBLAS MXFP8 prefill, topology-aware collectives) |
@@ -207,3 +215,45 @@ full 1M prefill + 32-concurrency stress).
 | **1** | **240.1** (`8.65 ms`) | — |
 | **8** | **866.9** (`15.00 ms`) | — |
 | **32** | **1,217.9** | **2,314.7** |
+
+---
+
+## Measured PD Disaggregation Benchmarks (`6x 80G SM80`, 180W, `compose.pd.yml`)
+
+Measured on the live `compose.pd.yml` stack using pure GHCR `:latest` images (`vllm-sm80:latest`,
+`lmcache-server:latest`, `vllm-router:latest`) at `180W` power cap:
+- **Decode (`GPUs 0–3`, NUMA 0 PIX x16)**: `TP=4`, `tp4_decode`, `mnbt=1024`, `KV=3.0 GB`
+  (`3,068,748` tokens, `~1.2 GiB` free/GPU).
+- **Prefill (`GPUs 6–7`, NUMA 1 PIX x8+x16)**: `TP=2` YOCO Encoder-Only, `tp2_prefill`
+  (`VLLM_DSV41_PREFILL_ROW_SHARD_ATTN=1`, `moe_prefill` `NI=1152`), `mnbt=8192`, `max_num_seqs=16`,
+  `scheduling_policy=priority` + adaptive `long_prefill_token_threshold=4096`, `KV=4.0 GB`
+  (`3,487,248` tokens, `~1.05 GiB` free/GPU).
+- **Router (`:8000`)**: `VLLM_ROUTER_MIN_PREFILL_TOKENS=1024` short-prompt bypass +
+  `VLLM_ROUTER_PREFILL_SJF=1` (1K-token bucketed shortest-job-first prefill priority).
+
+### Prefill Instance Cold Throughput (`TP=2` YOCO, `c=1`, `cached_tokens=0`, 180W)
+
+| Target Length | Isolated `P` (GPUs 6–7, x8+x16 + LMCache) | Isolated `P` (GPUs 4–5, dual x16) | End-to-End via Router `:8000` (Cold Needle) |
+|---:|---:|---:|---:|
+| **8K** (`11,383` E2E) | `7,230 tok/s` | — | `7,554.6 tok/s` (`TTFT 1.507 s`, PASS) |
+| **32K** (`45,107` E2E) | **`9,267 tok/s`** | **`9,424 tok/s`** | **`8,799.2 tok/s`** (`TTFT 5.126 s`, PASS) |
+| **64K** (`90,778` E2E) | **`9,197 tok/s`** | **`9,313 tok/s`** | **`8,147.4 tok/s`** (`TTFT 11.142 s`, PASS) |
+| **128K** (`178,657` E2E) | **`8,810 tok/s`** | **`8,810 tok/s`** | **`7,758.2 tok/s`** (`TTFT 23.028 s`, PASS) |
+
+### Decode Throughput via Router `:8000` (`scripts/benchmark-vllm.mjs`, `max_tokens=500`, 180W)
+
+| Concurrency `c` | `prose` | `code` | `counting` |
+|---:|---:|---:|---:|
+| **1** | **250.9** (`7.83 ms`, acc 1.96) | **580.6** (`9.51 ms`, acc 5.46) | **664.6** (`8.94 ms`, acc 5.88) |
+| **8** | **1,034.0** (`16.72 ms`, acc 2.15) | — | — |
+| **16** | **1,293.9** (`24.19 ms`, acc 1.95) | **2,630.4** (`32.97 ms`, acc 5.42) | **3,210.1** (`29.89 ms`, acc 5.88) |
+
+### PD Anti-Jitter & Concurrent SJF Stress (`:8000`, 180W)
+
+- **Zero-Jitter Isolation (`c=16` streaming Decode + simultaneous `90,155`-token cold Prefill)**:
+  - Concurrent `90,155`-token Prefill: `TTFT = 10.610 s` (**`8,497.3 tok/s`**), `cached=0`, Needle PASS.
+  - Decode `c=16` during 90K Prefill: **`723.6 tok/s`** aggregate, `ITL P50 = 29.4 ms` / `P95 = 32.8 ms`
+    (zero degradation vs `659.6 tok/s` / `30.9 ms` Decode-only baseline).
+- **6-Way Staggered Mixed-Length SJF Prefill (`179K + 88.5K` at `t=0`, `22.8K / 5.8K / 2.8K / 748` at `t=+0.40..0.55 s`)**:
+  - Strict shortest-job-first completion order: `748` (`+4.09 s`) → `2,831` (`+4.29 s`) → `5,775` (`+5.91 s`) → `22,754` (`+10.94 s`) → `88,482` (`+31.14 s`) → `179,025` (`+35.54 s`).
+  - Total **`299,615` cold tokens** processed in `35.54 s` (**`8,430 tok/s`** aggregate), `6/6` Needles PASS, `0` OOM, `0` leaked LMCache locks.
