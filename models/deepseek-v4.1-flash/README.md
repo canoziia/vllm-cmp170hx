@@ -115,11 +115,10 @@ podman logs -f deepseek-v4.1-flash-tp4
 # 1. Offline validation gate (all test suites + py_compile, no container build):
 VALIDATE_ONLY=1 bash scripts/build-deepseek-v41-image.sh
 
-# 2. Build the unified SM80 vLLM image locally from our `vllm` branch + 6 native extensions:
+# 2. Build the unified SM80 vLLM image locally from our `vllm` branch + native extensions:
 CONTAINER_ENGINE=podman \
 OUTPUT_IMAGE=localhost/vllm-sm80:latest \
 bash scripts/build-deepseek-v41-image.sh
-# (Optional: set SOURCE_MODE=patch-upstream to rebuild from official upstream + patches/)
 ```
 
 Host paths in `.env*.example` and Compose defaults (`/srv/models`, `/root/app/...`) are

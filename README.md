@@ -47,47 +47,51 @@ NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tp4_fused`), `enable_adaptive_verifica
 This repository uses a two-branch layout directly anchored to official
 `vllm-project/vllm`:
 
-- **`vllm` branch**: Complete patched vLLM source tree (official upstream
-  snapshot followed by feature-scoped SM80 commits matching
-  `models/deepseek-v4.1-flash/patches/`).
+- **`vllm` branch**: Single source of truth for the patched vLLM source tree
+  (official upstream snapshot followed by clean feature-scoped SM80 commits).
 - **`main` branch** (this branch): Pinned upstream manifests, Compose
-  deployments, self-contained native CUDA/C++ extensions, LMCache patches,
-  build/validation scripts, offline tests, monitoring, and documentation.
+  deployments (Pure TP4, PD disaggregation, PP6), self-contained native
+  CUDA/C++ extensions, LMCache & Router patches, build/validation scripts,
+  offline tests, monitoring, and documentation.
 
 Exact upstream commits and Docker base image digests are pinned in
-[`manifests/vllm.env`](manifests/vllm.env) and
-[`manifests/lmcache.env`](manifests/lmcache.env).
+[`manifests/vllm.env`](manifests/vllm.env),
+[`manifests/lmcache.env`](manifests/lmcache.env), and
+[`manifests/router.env`](manifests/router.env).
 
 ## Repository Layout
 
 ```text
 .
 ├── .github/workflows/              # automated validation & GHCR/Docker Hub image builds
-├── manifests/                      # pinned upstream vLLM & LMCache commits / Docker base digests
+├── manifests/                      # pinned upstream vLLM, LMCache & Router commits / base digests
 ├── monitoring/                     # standalone Prometheus + Grafana stack
 ├── patches/
-│   └── lmcache/                    # official LMCache patch series (0001..0010)
+│   ├── lmcache/                    # official LMCache patch series (0001..0011)
+│   └── router/                     # vLLM production-stack PD router patch series (0001..0005)
 ├── scripts/
-│   ├── apply-deepseek-v41-patches.sh
 │   ├── apply-lmcache-patches.sh
 │   ├── benchmark-vllm.mjs          # decode, prefill, prose, code, and counting benchmark client
 │   ├── run-standard-benchmark.sh   # reproducible 23-point README benchmark + Markdown summary
-│   ├── build-deepseek-v41-image.sh # builds the unified SM80 vLLM image (+ LMCache)
+│   ├── build-deepseek-v41-image.sh # builds the unified SM80 vLLM image from the `vllm` branch (+ LMCache)
 │   ├── build-lmcache-server-image.sh
+│   ├── build-router-image.sh       # builds the patched PD router image
 │   ├── ensure-lmcache-server-image.sh
 │   ├── test-lmcache-bounded-pd-groups.py
 │   ├── test-lmcache-patches.py
+│   ├── test-router-patches.py
 │   └── test-vllm-common-patches.py
 └── models/
     └── deepseek-v4.1-flash/
         ├── README.md               # DeepSeek V4.1 Flash build, deploy, and full benchmarks
         ├── compose.yml             # default: 4x 80G SM80 Pure TP4 (TP=4, EP=1 + LMCache)
         ├── .env.example            # default Pure TP4 environment template
+        ├── compose.pd.yml          # optional: 6x 80G SM80 PD disaggregation (TP4 Decode + TP2 YOCO Prefill)
+        ├── .env.pd.example         # optional PD disaggregation environment template
         ├── compose.pp6.yml         # optional: 6x CMP 170HX (PP=6 + LMCache + CPU Engram)
         ├── .env.pp6.example        # optional PP6 environment template
         ├── native/                 # 7 self-contained SM80 CUDA/C++ extensions built from source
-        ├── patches/                # auditable patch archive replaying onto official vLLM
-        ├── scripts/                # DeepSeek-only diagnostics
+        ├── scripts/                # DeepSeek-only utilities (e.g. prepare-engram-shm.py)
         ├── tests/                  # offline unit & encoding test suites
         └── docs/                   # design notes and historical PP6 investigation records
 ```

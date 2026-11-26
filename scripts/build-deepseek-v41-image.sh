@@ -23,10 +23,6 @@ PREPARE_CONTEXT_ONLY=${PREPARE_CONTEXT_ONLY:-}
 #   "payload-image": always extract & patch directly from LMCACHE_PAYLOAD_IMAGE.
 #   "server-image": ensure/build lmcache-server:latest and copy from it.
 LMCACHE_PAYLOAD_SOURCE=${LMCACHE_PAYLOAD_SOURCE:-auto}
-# SOURCE_MODE:
-#   "vllm-branch" (default): build directly from this repo's `vllm` branch.
-#   "patch-upstream": clone official upstream SOURCE_COMMIT and apply patches/.
-SOURCE_MODE=${SOURCE_MODE:-vllm-branch}
 VLLM_REF=${VLLM_REF:-$VLLM_BRANCH}
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_OUTPUT_IMAGE}
 PATCH_LABEL="sm80"
@@ -49,7 +45,7 @@ req_cmds=(git "$PYTHON")
 if [[ $VALIDATE_ONLY != 1 ]]; then
   req_cmds+=("$ENGINE")
 fi
-if [[ $SOURCE_MODE == "patch-upstream" || $WITH_LMCACHE == 1 ]]; then
+if [[ $WITH_LMCACHE == 1 ]]; then
   req_cmds+=(patch)
 fi
 for command in "${req_cmds[@]}"; do
@@ -82,6 +78,7 @@ validate_vllm_tree() {
     "$src/vllm/models/deepseek_v41/attention.py" \
     "$src/vllm/models/deepseek_v41/nvidia/model.py" \
     "$src/vllm/models/deepseek_v41/nvidia/vl_model.py" \
+    "$src/vllm/models/deepseek_v41/nvidia/dspark.py" \
     "$src/vllm/models/deepseek_v41/nvidia/model_state.py" \
     "$src/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/all_reduce.py" \
     "$src/vllm/models/deepseek_v41/nvidia/specialized_decode/ampere/columns.py" \
@@ -103,41 +100,27 @@ validate_vllm_tree() {
     "$src/vllm/v1/worker/gpu_worker.py"
 }
 
-VLLM_SOURCE_LABEL=
-if [[ $SOURCE_MODE == "vllm-branch" ]]; then
-  if git -C "$REPO_ROOT" rev-parse --verify --quiet "${VLLM_REF}^{commit}" >/dev/null; then
-    VLLM_REV=$(git -C "$REPO_ROOT" rev-parse "${VLLM_REF}^{commit}")
-    echo "Exporting vLLM source from local branch/ref $VLLM_REF ($VLLM_REV)"
-    git -C "$REPO_ROOT" archive "$VLLM_REV" | tar -x -C "$WORKDIR/source"
-  elif git -C "$REPO_ROOT" rev-parse --verify --quiet "origin/${VLLM_REF}^{commit}" >/dev/null; then
-    VLLM_REV=$(git -C "$REPO_ROOT" rev-parse "origin/${VLLM_REF}^{commit}")
-    echo "Exporting vLLM source from origin/$VLLM_REF ($VLLM_REV)"
-    git -C "$REPO_ROOT" archive "$VLLM_REV" | tar -x -C "$WORKDIR/source"
-  else
-    echo "Fetching vLLM branch $VLLM_REF from $VLLM_BRANCH_REPO"
-    git -C "$WORKDIR/source" init -q
-    git -C "$WORKDIR/source" remote add origin "$VLLM_BRANCH_REPO"
-    git -C "$WORKDIR/source" fetch --depth=1 origin "$VLLM_REF"
-    git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
-    VLLM_REV=$(git -C "$WORKDIR/source" rev-parse HEAD)
-  fi
-  if [[ -n ${VLLM_BRANCH_COMMIT:-} && ${ALLOW_UNPINNED_VLLM_BRANCH:-0} != 1 && $VLLM_REV != "$VLLM_BRANCH_COMMIT" ]]; then
-    echo "Warning: $VLLM_REF is at $VLLM_REV (manifest pins $VLLM_BRANCH_COMMIT); set ALLOW_UNPINNED_VLLM_BRANCH=1 to suppress." >&2
-  fi
-  validate_vllm_tree "$WORKDIR/source"
-  VLLM_SOURCE_LABEL="${VLLM_BRANCH}@${VLLM_REV}"
-elif [[ $SOURCE_MODE == "patch-upstream" ]]; then
-  git -C "$WORKDIR/source" init -q
-  git -C "$WORKDIR/source" remote add origin "$SOURCE_REPO"
-  git -C "$WORKDIR/source" fetch --depth=1 origin "$SOURCE_COMMIT"
-  git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
-  APPLY_SCRIPT=${APPLY_SCRIPT:-$REPO_ROOT/scripts/apply-deepseek-v41-patches.sh}
-  PYTHON="$PYTHON" "$APPLY_SCRIPT" "$WORKDIR/source"
-  VLLM_SOURCE_LABEL="${SOURCE_REPO}@${SOURCE_COMMIT}+patches"
+if git -C "$REPO_ROOT" rev-parse --verify --quiet "${VLLM_REF}^{commit}" >/dev/null; then
+  VLLM_REV=$(git -C "$REPO_ROOT" rev-parse "${VLLM_REF}^{commit}")
+  echo "Exporting vLLM source from local branch/ref $VLLM_REF ($VLLM_REV)"
+  git -C "$REPO_ROOT" archive "$VLLM_REV" | tar -x -C "$WORKDIR/source"
+elif git -C "$REPO_ROOT" rev-parse --verify --quiet "origin/${VLLM_REF}^{commit}" >/dev/null; then
+  VLLM_REV=$(git -C "$REPO_ROOT" rev-parse "origin/${VLLM_REF}^{commit}")
+  echo "Exporting vLLM source from origin/$VLLM_REF ($VLLM_REV)"
+  git -C "$REPO_ROOT" archive "$VLLM_REV" | tar -x -C "$WORKDIR/source"
 else
-  echo "Unknown SOURCE_MODE=$SOURCE_MODE (expected vllm-branch or patch-upstream)" >&2
-  exit 2
+  echo "Fetching vLLM branch $VLLM_REF from $VLLM_BRANCH_REPO"
+  git -C "$WORKDIR/source" init -q
+  git -C "$WORKDIR/source" remote add origin "$VLLM_BRANCH_REPO"
+  git -C "$WORKDIR/source" fetch --depth=1 origin "$VLLM_REF"
+  git -C "$WORKDIR/source" checkout -q --detach FETCH_HEAD
+  VLLM_REV=$(git -C "$WORKDIR/source" rev-parse HEAD)
 fi
+if [[ -n ${VLLM_BRANCH_COMMIT:-} && ${ALLOW_UNPINNED_VLLM_BRANCH:-0} != 1 && $VLLM_REV != "$VLLM_BRANCH_COMMIT" ]]; then
+  echo "Warning: $VLLM_REF is at $VLLM_REV (manifest pins $VLLM_BRANCH_COMMIT); set ALLOW_UNPINNED_VLLM_BRANCH=1 to suppress." >&2
+fi
+validate_vllm_tree "$WORKDIR/source"
+VLLM_SOURCE_LABEL="${VLLM_BRANCH}@${VLLM_REV}"
 
 if [[ $VALIDATE_ONLY == 1 ]]; then
   echo "Validated vLLM source ($VLLM_SOURCE_LABEL) successfully (VALIDATE_ONLY=1)."

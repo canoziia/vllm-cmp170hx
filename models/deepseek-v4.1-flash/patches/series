@@ -1,8 +1,0 @@
-0001-sm80-marlin-aux-locks-and-1m-indexer-metadata.patch
-0002-common-async-pp-mamba-and-structured-spec-fixes.patch
-0003-openai-thinking-sse-keepalive-and-1017-encoding.patch
-0004-dsv41-memory-engram-cpu-offload-and-vision-offload.patch
-0005-dsv41-sm80-moe-decode-and-prefill-split.patch
-0006-dsv41-sm80-dense-mxfp8-thin-woa-and-fast-router.patch
-0007-dsv41-sm80-attention-indexer-swa-yoco-and-dspark.patch
-0008-dsv41-opt-profiles-and-prefill-sched-helper.patch
