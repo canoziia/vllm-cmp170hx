@@ -196,13 +196,26 @@ PROFILES["tep4_fused"] = {
     "VLLM_DSV41_PREFILL_2MB_MOE": "auto",
 }
 
-# Topology-aware deep fusion profile for 4x SM80 pure TP4 (default: EP=1, NI=576).
+# Topology-aware deep fusion profile for 4x SM80 pure TP4 PD-mixed (default: EP=1, NI=576).
 PROFILES["tp4_fused"] = {
     **PROFILES["tep4_fused"],
     "VLLM_DSV41_COST_MS_FUSED": "tp4",
     "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "1",
     "VLLM_DSV41_FUSED_W2_AR": "0",
     "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
+}
+
+# PD Decode-only 4x SM80 TP4 profile: inherits full decode/DSpark fusions from
+# tp4_fused while disabling unused prefill-only DMA/overlap slabs and trimming
+# indexer logits scratch to free GPU memory for larger KV cache (e.g. 3.0 GB).
+PROFILES["tp4_decode"] = {
+    **PROFILES["tp4_fused"],
+    "VLLM_DSV41_PREFILL_DMA_RING": "0",
+    "VLLM_DSV41_PREFILL_ROW_SHARD": "0",
+    "VLLM_DSV41_PREFILL_AR_OVERLAP": "0",
+    "VLLM_DSV41_PREFILL_MXFP8_CUBLAS": "0",
+    "VLLM_DSV41_PREFILL_2MB_MOE": "0",
+    "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": "32",
 }
 
 # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).
@@ -230,6 +243,17 @@ _TP_COMMON_EXTRAS: dict[str, str] = {
 }
 PROFILES["tp_auto"] = {**PROFILES["default"], **_TP_COMMON_EXTRAS}
 PROFILES["tp_auto_verification"] = {**PROFILES["verification"], **_TP_COMMON_EXTRAS}
+
+# PD YOCO Encoder-only 2x SM80 TP2 Prefill profile: replicates encoder layers
+# 0..19 attention weights across TP2 (eliminates attention AG/RS collectives),
+# disables decode-only ni=576 MXFP4 kernel, and keeps whole-MoE (2mb_moe=0).
+PROFILES["tp2_prefill"] = {
+    **PROFILES["tp_auto"],
+    "VLLM_DSV41_YOCO_PREFILL_ONLY": "1",
+    "VLLM_DSV41_PREFILL_ROW_SHARD_ATTN": "1",
+    "VLLM_DSV4_MXFP4_DECODE": "0",
+    "VLLM_DSV41_PREFILL_2MB_MOE": "0",
+}
 
 
 def _parse_launch_args(argv: list[str]) -> tuple[str | None, int, int, bool, bool]:
@@ -344,6 +368,12 @@ def resolve_auto_profile(argv: list[str] | None = None) -> str | None:
         return "tp4_fused"
     if tp == 4 and ep:
         return "tep4_fused"
+    if (
+        tp == 2
+        and not ep
+        and os.environ.get("VLLM_DSV41_YOCO_PREFILL_ONLY", "0") == "1"
+    ):
+        return "tp2_prefill"
     if tp > 1:
         return "tp_auto_verification" if adaptive else "tp_auto"
     return "verification" if adaptive else "default"
@@ -475,7 +505,7 @@ def pcie_switch_connected_nvml(
 
 
 def apply() -> None:
-    name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower()
+    name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower().replace("-", "_")
     if name == "auto":
         resolved = resolve_auto_profile()
         if resolved is None:
