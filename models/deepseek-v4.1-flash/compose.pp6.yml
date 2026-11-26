@@ -79,6 +79,9 @@ services:
       - --max-model-len=1048576
       - --max-num-batched-tokens=4096
       - --max-num-seqs=32
+      - --scheduling-policy=${VLLM_SCHEDULING_POLICY:-priority}
+      - --long-prefill-token-threshold=${VLLM_LONG_PREFILL_TOKEN_THRESHOLD:-2048}
+      - --long-prefill-token-threshold-adaptive
       - --kv-cache-dtype=fp8_ds_mla
       # 6 GiB GPU KV per rank with max_num_seqs=32.
       - --kv-cache-memory=6442450944
