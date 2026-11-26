@@ -1,6 +1,6 @@
 # vllm-sm80
 
-**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 265–711 tok/s single-stream, up to 1.9–4.3K tok/s at c=32, and up to 12.9K tok/s prefill (9.8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
+**The fastest open-source DeepSeek-V4.1-Flash inference stack on NVIDIA SM80 — 278–719 tok/s single-stream, up to 2.0–4.3K tok/s at c=32, and up to 12.9K tok/s prefill (9.8K at 1M) on 4× 80G PCIe GPUs with unmodified official weights, built directly on official `vllm-project/vllm` and `LMCache`.**
 
 ## Prebuilt Images (GHCR)
 
@@ -35,12 +35,12 @@ NVMe L2), `VLLM_DSV41_OPT_PROFILE=auto` (`tp4_fused`), `enable_adaptive_verifica
 
 | Concurrency `c` | `prose` | `code` | `counting` |
 |---:|---:|---:|---:|
-| **1** | **264.6** (`7.39 ms`, acc 1.95) | **618.0** (`8.93 ms`, acc 5.46) | **711.4** (`8.35 ms`, acc 5.88) |
-| **2** | **429.7** (`8.82 ms`, acc 1.90) | **932.2** (`11.95 ms`, acc 5.47) | **1,145.6** (`10.42 ms`, acc 5.88) |
-| **4** | **700.6** (`10.89 ms`, acc 1.91) | **1,499.5** (`15.13 ms`, acc 5.61) | **1,805.6** (`13.26 ms`, acc 5.88) |
-| **8** | **1,139.9** (`14.15 ms`, acc 2.02) | **2,101.3** (`20.99 ms`, acc 5.46) | **2,779.2** (`17.25 ms`, acc 5.88) |
-| **16** | **1,462.8** (`17.91 ms`, acc 1.64) | **2,991.0** (`29.64 ms`, acc 5.48) | **3,557.1** (`26.97 ms`, acc 5.88) |
-| **32** | **1,897.1** (`32.35 ms`, acc 1.93) | **3,722.0** (`47.18 ms`, acc 5.46) | **4,277.1** (`44.88 ms`, acc 5.88) |
+| **1** | **278.3** (`7.73 ms`, acc 2.15) | **621.9** (`8.88 ms`, acc 5.46) | **718.5** (`8.27 ms`, acc 5.88) |
+| **2** | **432.4** (`8.76 ms`, acc 1.89) | **936.8** (`11.89 ms`, acc 5.47) | **1,152.5** (`10.36 ms`, acc 5.88) |
+| **4** | **719.9** (`10.80 ms`, acc 1.95) | **1,403.9** (`15.66 ms`, acc 5.48) | **1,818.8** (`13.16 ms`, acc 5.88) |
+| **8** | **1,098.7** (`13.77 ms`, acc 1.88) | **2,141.1** (`20.62 ms`, acc 5.46) | **2,767.0** (`17.32 ms`, acc 5.88) |
+| **16** | **1,460.6** (`21.26 ms`, acc 1.94) | **2,858.0** (`30.44 ms`, acc 5.40) | **3,572.1** (`26.86 ms`, acc 5.88) |
+| **32** | **1,979.7** (`26.59 ms`, acc 1.65) | **3,624.4** (`47.96 ms`, acc 5.44) | **4,310.0** (`44.53 ms`, acc 5.88) |
 
 ## Branch Architecture
 
