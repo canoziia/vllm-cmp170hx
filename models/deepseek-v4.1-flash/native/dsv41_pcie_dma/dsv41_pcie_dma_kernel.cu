@@ -16,6 +16,7 @@
 // matching PyTorch dist.reduce_scatter_single / dist.all_gather_single.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -248,6 +249,207 @@ void init_channel(int chan_id, int rank, int world, int64_t max_chunk_bytes,
                 cudaSuccess);
   }
   g_channels[chan_id] = std::move(c);
+}
+
+
+// Vectorized Block-32 symmetric INT8 + FP16-scale quantize:
+//   inp: [chunk_elems] bf16 (chunk_elems % 32 == 0)
+//   out_bytes layout: [chunk_elems] int8_t followed by [chunk_elems / 32] __half scales.
+// 4 threads per 32-element block, each thread handles 8 BF16 elements (128-bit load, 64-bit store).
+__global__ void dma_quant_bf16_to_int8_blk32_kernel(
+    const __nv_bfloat16* __restrict__ inp,
+    uint8_t* __restrict__ out_bytes,
+    int64_t n_blocks32) {
+  int8_t* q_ptr = reinterpret_cast<int8_t*>(out_bytes);
+  __half* s_ptr = reinterpret_cast<__half*>(out_bytes + n_blocks32 * 32);
+  const uint4* inp4 = reinterpret_cast<const uint4*>(inp);
+  uint2* q2 = reinterpret_cast<uint2*>(q_ptr);
+
+  const int64_t lane_in_blk = threadIdx.x & 3;
+  const int64_t blk_start = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 2;
+  const int64_t blk_stride = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 2;
+
+  for (int64_t b = blk_start; b < n_blocks32; b += blk_stride) {
+    const int64_t v_idx = b * 4 + lane_in_blk;
+    uint4 v = inp4[v_idx];
+    float f[8];
+    const uint32_t words[4] = {v.x, v.y, v.z, v.w};
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      __nv_bfloat162 bx = *reinterpret_cast<const __nv_bfloat162*>(&words[i]);
+      float2 fx = __bfloat1622float2(bx);
+      f[2 * i] = fx.x;
+      f[2 * i + 1] = fx.y;
+      amax = fmaxf(amax, fmaxf(fabsf(fx.x), fabsf(fx.y)));
+    }
+    // 4-thread warp-subgroup reduction (zero SMEM, zero __syncthreads)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+
+    // Clamp tiny/zero amax safely; round scale to __half so quant & dequant match exactly.
+    float raw_scale = (amax > 0.0f) ? (amax / 127.0f) : 0.0f;
+    __half h_scale = __float2half_rn(raw_scale);
+    float f_scale = __half2float(h_scale);
+    if (amax > 0.0f && f_scale == 0.0f) {
+      // Handle subnormal amax that underflowed fp16: bump to smallest positive fp16
+      unsigned short min_pos = 1;
+      h_scale = *reinterpret_cast<const __half*>(&min_pos);
+      f_scale = __half2float(h_scale);
+    }
+    float inv_scale = (f_scale > 0.0f) ? (1.0f / f_scale) : 0.0f;
+
+    uint32_t p0 = 0, p1 = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int qv = __float2int_rn(f[i] * inv_scale);
+      qv = max(-127, min(127, qv));
+      p0 |= (static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(qv))) << (i * 8));
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int qv = __float2int_rn(f[i + 4] * inv_scale);
+      qv = max(-127, min(127, qv));
+      p1 |= (static_cast<uint32_t>(static_cast<uint8_t>(static_cast<int8_t>(qv))) << (i * 8));
+    }
+    q2[v_idx] = make_uint2(p0, p1);
+    if (lane_in_blk == 0) {
+      s_ptr[b] = h_scale;
+    }
+  }
+}
+
+// Vectorized Block-32 symmetric INT8 + FP16-scale dequantize -> BF16.
+__global__ void dma_dequant_int8_blk32_to_bf16_kernel(
+    const uint8_t* __restrict__ inp_bytes,
+    __nv_bfloat16* __restrict__ out,
+    int64_t n_blocks32) {
+  const int8_t* q_ptr = reinterpret_cast<const int8_t*>(inp_bytes);
+  const __half* s_ptr = reinterpret_cast<const __half*>(inp_bytes + n_blocks32 * 32);
+  const uint2* q2 = reinterpret_cast<const uint2*>(q_ptr);
+  uint4* out4 = reinterpret_cast<uint4*>(out);
+
+  const int64_t lane_in_blk = threadIdx.x & 3;
+  const int64_t blk_start = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 2;
+  const int64_t blk_stride = (static_cast<int64_t>(gridDim.x) * blockDim.x) >> 2;
+
+  for (int64_t b = blk_start; b < n_blocks32; b += blk_stride) {
+    const int64_t v_idx = b * 4 + lane_in_blk;
+    const uint2 pv = q2[v_idx];
+    const float sc = __half2float(s_ptr[b]);
+    const int8_t* qb = reinterpret_cast<const int8_t*>(&pv);
+
+    uint4 vo;
+    __nv_bfloat162 b0 = __float22bfloat162_rn(make_float2(qb[0] * sc, qb[1] * sc));
+    __nv_bfloat162 b1 = __float22bfloat162_rn(make_float2(qb[2] * sc, qb[3] * sc));
+    __nv_bfloat162 b2 = __float22bfloat162_rn(make_float2(qb[4] * sc, qb[5] * sc));
+    __nv_bfloat162 b3 = __float22bfloat162_rn(make_float2(qb[6] * sc, qb[7] * sc));
+    vo.x = *reinterpret_cast<uint32_t*>(&b0);
+    vo.y = *reinterpret_cast<uint32_t*>(&b1);
+    vo.z = *reinterpret_cast<uint32_t*>(&b2);
+    vo.w = *reinterpret_cast<uint32_t*>(&b3);
+    out4[v_idx] = vo;
+  }
+}
+
+// Block-32 INT8 compressed Ring All-Gather with hop-overlapped dequantization:
+//   shard: [S, H] bf16 -> out: [W*S, H] bf16 (bitwise identical across ALL W ranks!)
+//   q_scratch: contiguous uint8 buffer with numel >= chunk_elems * 17 / 16
+void ce_all_gather_int8(int chan_id, torch::Tensor shard, torch::Tensor out,
+                        torch::Tensor q_scratch, int64_t caller_stream_int) {
+  auto* c = get_chan(chan_id);
+  const int W = c->world;
+  const int r = c->rank;
+  TORCH_CHECK(shard.scalar_type() == torch::kBFloat16 &&
+                  out.scalar_type() == torch::kBFloat16,
+              "ce_all_gather_int8 requires bfloat16 shard and out");
+  TORCH_CHECK(q_scratch.scalar_type() == torch::kUInt8 && q_scratch.is_contiguous(),
+              "ce_all_gather_int8 requires contiguous uint8 q_scratch");
+  TORCH_CHECK(shard.is_contiguous() && out.is_contiguous(),
+              "ce_all_gather_int8 requires contiguous shard and out");
+  const int64_t chunk_elems = shard.numel();
+  TORCH_CHECK(chunk_elems % 32 == 0, "shard numel must be divisible by 32");
+  TORCH_CHECK(out.numel() == chunk_elems * W, "out numel mismatch");
+  const int64_t n_blocks32 = chunk_elems / 32;
+  const int64_t packed_bytes = chunk_elems + n_blocks32 * 2;
+  TORCH_CHECK(q_scratch.numel() >= packed_bytes, "q_scratch too small");
+  TORCH_CHECK(packed_bytes <= c->max_chunk_bytes,
+              "packed_bytes exceeds channel max_chunk_bytes");
+
+  cudaStream_t caller_s = reinterpret_cast<cudaStream_t>(caller_stream_int);
+  const __nv_bfloat16* shard_ptr =
+      reinterpret_cast<const __nv_bfloat16*>(shard.data_ptr());
+  __nv_bfloat16* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  uint8_t* q_ptr = reinterpret_cast<uint8_t*>(q_scratch.data_ptr());
+  uint8_t* local_base = reinterpret_cast<uint8_t*>(c->local_slab);
+  uint8_t* next_base = reinterpret_cast<uint8_t*>(c->next_slab);
+
+  // 1. Quantize local shard into q_scratch on caller stream (~6.5 us for S=768, H=5120)
+  const int q_threads = 256;
+  const int q_grid = static_cast<int>(
+      std::min<int64_t>(256, (n_blocks32 * 4 + q_threads - 1) / q_threads));
+  dma_quant_bf16_to_int8_blk32_kernel<<<q_grid, q_threads, 0, caller_s>>>(
+      shard_ptr, q_ptr, n_blocks32);
+
+  cudaEventRecord(c->ev_entry, caller_s);
+  cudaStreamWaitEvent(c->copy_stream, c->ev_entry, 0);
+  cudaStreamWaitEvent(c->add_stream, c->ev_entry, 0);
+
+  // 2. Dequantize local shard into out[r] on add_stream so ALL W ranks get
+  //    bitwise identical outputs (hidden behind hop 0 PCIe DMA!).
+  const int dq_grid = static_cast<int>(
+      std::min<int64_t>(128, (n_blocks32 * 4 + q_threads - 1) / q_threads));
+  dma_dequant_int8_blk32_to_bf16_kernel<<<dq_grid, q_threads, 0, c->add_stream>>>(
+      q_ptr, out_ptr + r * chunk_elems, n_blocks32);
+
+  // 3. Pipelined W-1 ring hops with hop-overlapped dequantization on add_stream
+  for (int h = 0; h < W - 1; ++h) {
+    const uint64_t s_seq = ++c->seq;
+    const int slot = static_cast<int>((s_seq - 1) % kRingSlots);
+    const uint64_t prev_seq = s_seq - 1;
+    const int prev_slot =
+        (h > 0) ? static_cast<int>((prev_seq - 1) % kRingSlots) : 0;
+
+    const int recv_chunk = (r - 1 - h + 2 * W) % W;
+    const uint8_t* src_base =
+        (h == 0) ? q_ptr : (local_base + prev_slot * c->max_chunk_bytes);
+    uint8_t* dst_remote = next_base + slot * c->max_chunk_bytes;
+    const uint8_t* recv_local = local_base + slot * c->max_chunk_bytes;
+
+    if (h > 0) {
+      dma_wait_flag_kernel<<<1, 1, 0, c->copy_stream>>>(
+          data_flag_slot(c->local_flags, prev_slot), prev_seq);
+    }
+    if (s_seq > static_cast<uint64_t>(kRingSlots)) {
+      dma_wait_flag_kernel<<<1, 1, 0, c->copy_stream>>>(
+          ack_flag_slot(c->local_flags, slot), s_seq - kRingSlots);
+    }
+    cudaMemcpyAsync(dst_remote, src_base, packed_bytes,
+                    cudaMemcpyDeviceToDevice, c->copy_stream);
+    dma_publish_flag_kernel<<<1, 1, 0, c->copy_stream>>>(
+        data_flag_slot(c->next_flags, slot), s_seq);
+    if (h > 0) {
+      cudaStreamWaitEvent(c->copy_stream, c->ev_ag_hop[h - 1], 0);
+      dma_publish_flag_kernel<<<1, 1, 0, c->copy_stream>>>(
+          ack_flag_slot(c->prev_flags, prev_slot), prev_seq);
+    }
+
+    dma_wait_flag_kernel<<<1, 1, 0, c->add_stream>>>(
+        data_flag_slot(c->local_flags, slot), s_seq);
+    dma_dequant_int8_blk32_to_bf16_kernel<<<dq_grid, q_threads, 0, c->add_stream>>>(
+        recv_local, out_ptr + recv_chunk * chunk_elems, n_blocks32);
+    if (h < W - 2) {
+      cudaEventRecord(c->ev_ag_hop[h], c->add_stream);
+    } else {
+      dma_publish_flag_kernel<<<1, 1, 0, c->add_stream>>>(
+          ack_flag_slot(c->prev_flags, slot), s_seq);
+    }
+  }
+
+  cudaEventRecord(c->ev_exit_add, c->add_stream);
+  cudaEventRecord(c->ev_exit_copy, c->copy_stream);
+  cudaStreamWaitEvent(caller_s, c->ev_exit_add, 0);
+  cudaStreamWaitEvent(caller_s, c->ev_exit_copy, 0);
 }
 
 // Canonical Ring Reduce-Scatter: inp [M, H] bf16 -> out [M/W, H] bf16
@@ -577,6 +779,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("close_ipc_handle", &close_ipc_handle);
   m.def("init_channel", &init_channel);
   m.def("ce_reduce_scatter", &ce_reduce_scatter);
+  m.def("ce_all_gather_int8", &ce_all_gather_int8, "Block-32 INT8 Ring All-Gather");
   m.def("ce_all_gather", &ce_all_gather);
   m.def("ce_all_reduce_inplace", &ce_all_reduce_inplace);
 }
