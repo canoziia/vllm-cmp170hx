@@ -3065,7 +3065,7 @@ class Engram(nn.Module):
         if (
             self._gather_columns is not None
             and not self.use_sequence_parallel
-            and num_kv_tokens >= 160
+            and num_kv_tokens >= 48
             and os.environ.get("VLLM_DSV41_ENGRAM_LOCAL_DOT", "1") == "1"
         ):
             tp_size = get_tensor_model_parallel_world_size()
@@ -3142,17 +3142,40 @@ class Engram(nn.Module):
             BLOCK_SIZE=block_size,
             num_warps=num_warps,
         )
-        dist.all_reduce(stats, group=tp_group.device_group)
+        # P2P Lamport all-gather of tiny [M, 8] FP32 stats (32B/row) -> local sum
+        from vllm.models.deepseek_v41.nvidia.specialized_decode.ampere.columns import (
+            _gathers as _ampere_col_gathers,
+            all_gather_columns as _ampere_ag_cols,
+        )
+        if stats.shape[1] * stats.element_size() in _ampere_col_gathers:
+            stats = (
+                _ampere_ag_cols(stats)
+                .view(num_tokens, tp_size, hc_mult * 2)
+                .sum(dim=1)
+            )
+        else:
+            dist.all_reduce(stats, group=tp_group.device_group)
 
+        from vllm.models.deepseek_v41.nvidia.ops.mhc import (
+            _ampere_all_reduce as _ampere_ar,
+        )
         if tp_rank == tp_size - 1:
             v_buf = kv_shard[:, c_part - dim : c_part].contiguous()
         else:
             v_buf = torch.empty(
                 (num_kv_tokens, dim), dtype=kv_shard.dtype, device=kv_shard.device
             )
-        dist.broadcast(
-            v_buf, src=tp_group.ranks[tp_size - 1], group=tp_group.device_group
-        )
+        if _ampere_ar is not None and _ampere_ar.supports(v_buf):
+            if v_buf.shape[0] >= 16 and getattr(_ampere_ar, "ring_broadcast_kernel", None) is not None:
+                v_buf = _ampere_ar.broadcast(v_buf, tp_size - 1)
+            else:
+                if tp_rank != tp_size - 1:
+                    v_buf.zero_()
+                v_buf = _ampere_ar(v_buf)
+        else:
+            dist.broadcast(
+                v_buf, src=tp_group.ranks[tp_size - 1], group=tp_group.device_group
+            )
 
         mask = token_mask if token_mask is not None else hidden_states
         _engram_apply_gate_v_kernel[(num_tokens * hc_mult,)](

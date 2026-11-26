@@ -208,18 +208,25 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """The FULL graph's context step: combine the staged target hidden
         states, publish the context anchor and store the context K/V."""
-        num_context = self._num_graph_context_tokens(num_reqs)
-        if self._aux_staging is not None:
-            self.hidden_states[:num_context].copy_(
-                self.model.combine_hidden_states(self._aux_staging[:num_context])
+        if not (getattr(self, "_capturing_ctx_split", False) and num_reqs >= 8):
+            num_context = self._num_graph_context_tokens(num_reqs)
+            if self._aux_staging is not None:
+                self.hidden_states[:num_context].copy_(
+                    self.model.combine_hidden_states(self._aux_staging[:num_context])
+                )
+            self.prepare_context_anchor(
+                num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
             )
-        self.prepare_context_anchor(
-            num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
-        )
-        self._precompute_context_kv(0, num_context)
+            self._precompute_context_kv(0, num_context)
         # Recorded in the FULL graph so replays skip the eager metadata build.
         if attn_metadata is not None and self.supports_decode_metadata_update:
             self._update_draft_decode_metadata(attn_metadata, num_reqs)
+
+    def _select_ctx_bucket(self, num_graph_reqs: int, num_target_tokens: int) -> int:
+        return self._num_graph_context_tokens(num_graph_reqs)
+
+    def _before_fullgraph_replay(self, batch_desc: Any, num_context: int) -> None:
+        pass
 
     def _prepare_graph_replay(
         self,
@@ -229,12 +236,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         aux_hidden_states: list[torch.Tensor] | None,
         num_rejected: torch.Tensor,
         dummy_run: bool,
+        num_context_override: int | None = None,
     ) -> None:
         """Eager work before a FULL replay: stage the inputs _prepare_graph_forward
         reads and store the context rows past the graph's num_context rows."""
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
-        num_context = self._num_graph_context_tokens(num_graph_reqs)
+        num_context = (
+            num_context_override
+            if num_context_override is not None
+            else self._num_graph_context_tokens(num_graph_reqs)
+        )
         self._store_hidden_states(
             num_target_tokens, last_hidden_states, aux_hidden_states, num_context
         )
@@ -396,6 +408,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 inputs_embeds=None,
             )
         return last_hidden_states
+
+    def _after_fullgraph_replay(
+        self, batch_desc: Any, num_speculative_tokens: int | None
+    ) -> None:
+        pass
 
     def _generate_draft(
         self,
@@ -674,8 +691,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             batch_sync.num_tokens_across_dp if batch_sync is not None else None
         )
 
+        _selected_ctx = 0
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert batch_desc.num_reqs is not None
+            _selected_ctx = self._select_ctx_bucket(
+                batch_desc.num_reqs, num_target_tokens
+            )
             self._prepare_graph_replay(
                 input_batch,
                 batch_desc.num_reqs,
@@ -683,6 +704,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 aux_hidden_states,
                 num_rejected,
                 dummy_run,
+                num_context_override=_selected_ctx,
             )
         else:
             self._store_hidden_states(
@@ -715,7 +737,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if is_full_cudagraph:
             assert self.query_cudagraph_manager is not None
+            self._before_fullgraph_replay(batch_desc, _selected_ctx)
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._after_fullgraph_replay(batch_desc, num_speculative_tokens)
         else:
             draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
                 self.block_tables.slot_mappings[:, :num_tokens_padded],

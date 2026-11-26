@@ -548,8 +548,9 @@ class SparseMlaPartial:
         if cutlass.const_expr(self.has_compressed):
             cmp_len = load_s32(cmp_lens + Int64(row) * 4)
         chunks = (swa_len + cmp_len + KEYS - 1) // KEYS
-        chunk_begin = split * chunks_per_split
-        chunk_end = cutlass.min(chunk_begin + chunks_per_split, chunks)
+        dyn_cps = (chunks + splits - 1) // splits
+        chunk_begin = split * dyn_cps
+        chunk_end = cutlass.min(chunk_begin + dyn_cps, chunks)
 
         # The first chunk's key records: thread k < 64 stages key k.
         if tid < KEYS and chunk_begin < chunk_end:
@@ -750,10 +751,12 @@ class SparseMlaPartial:
         sO = storage.k.get_tensor(
             cute.make_layout((head_rows, DIM), stride=(DIM + 4, 1)), dtype=Float32
         )
-        for i in cutlass.range_constexpr(cute.size(acc_O)):
-            dim, head = tOcO[i]
-            sO[head, dim] = acc_O[i]
-        cute.arch.barrier()
+        has_work = chunk_begin < chunk_end
+        if splits == 1 or has_work:
+            for i in cutlass.range_constexpr(cute.size(acc_O)):
+                dim, head = tOcO[i]
+                sO[head, dim] = acc_O[i]
+            cute.arch.barrier()
         # Thread (head, l) takes the dim pairs 2 l + 2 lanes j of its head.
         lanes = THREADS // head_rows
         out_head = tid // lanes
@@ -795,7 +798,7 @@ class SparseMlaPartial:
         else:
             # ---- the item's partial output and row statistics ----
             item = (Int64(row) * Int64(splits) + Int64(split)) * Int64(heads)
-            if head0 + out_head < heads:
+            if has_work and head0 + out_head < heads:
                 gPart = cute.make_tensor(
                     part_base + (item + Int64(head0 + out_head)) * DIM,
                     cute.make_layout(DIM),
@@ -881,10 +884,12 @@ class SparseMlaMerge:
         denominator = Float32(0.0)
         if top != -Float32.inf:
             for s in cutlass.range(splits, unroll=4):
-                weight = cute.math.exp2(gStats[0, s] - top, fastmath=True)
-                denominator = denominator + gStats[1, s] * weight
-                for i in cutlass.range_constexpr(4):
-                    acc[i] = acc[i] + gPart[i, s] * weight
+                ms = gStats[0, s]
+                if ms != -Float32.inf:
+                    weight = cute.math.exp2(ms - top, fastmath=True)
+                    denominator = denominator + gStats[1, s] * weight
+                    for i in cutlass.range_constexpr(4):
+                        acc[i] = acc[i] + gPart[i, s] * weight
             gSink = cute.make_tensor(sink, cute.make_layout(heads))
             denominator = denominator + cute.math.exp2(
                 gSink[head] * LOG2E - top, fastmath=True

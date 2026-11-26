@@ -1154,6 +1154,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q_raw, precomputed_index_q = self._wq_b_idx_proj(qr, qr_scale)
             else:
                 q_raw = self._wq_b_proj(qr, qr_scale)
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                fire_pending_mhc_coeff,
+            )
+
+            fire_pending_mhc_coeff(qr.device)
             q = q_raw.view(-1, self.n_local_heads, self.head_dim)
             return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
@@ -1474,6 +1479,34 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 and q.shape[0] >= _Q_PAD_COPY_MIN_TOKENS
                 and not torch.cuda.is_current_stream_capturing()
             )
+            if (
+                not self.accepts_unnormed_unroped_query
+                and self.kv_mxfp8
+                and not copy_q
+                and pad_to == q.shape[1]
+                and q.shape[2] == 512
+                and q.is_contiguous()
+                and kv.is_contiguous()
+                and cos_sin_cache.dtype == torch.float32
+                and cos_sin_cache.shape[1] == 64
+                and not self.use_pcp
+            ):
+                from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                    _ops_r2,
+                )
+
+                r2 = _ops_r2()
+                if r2 is not None and hasattr(r2, "fast_qrope_kv_mxfp8_insert"):
+                    r2.fast_qrope_kv_mxfp8_insert(
+                        q,
+                        kv,
+                        swa_kv_cache_2d,
+                        slot_mapping,
+                        positions,
+                        cos_sin_cache,
+                        swa_metadata.block_size,
+                    )
+                    return q
             q_padded = _dsv41_swa_ops().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,

@@ -1885,6 +1885,32 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if (
+            drafts_needed
+            and num_spec_tokens_to_schedule > 1
+            and num_scheduled_tokens
+        ):
+            max_draft_k = 0
+            for rid in num_scheduled_tokens:
+                req = self.requests.get(rid)
+                if req is None or req.is_prefill_chunk or req.use_structured_output:
+                    max_draft_k = num_spec_tokens_to_schedule
+                    break
+                vlim = getattr(req, "verification_draft_limit", None)
+                if vlim is not None:
+                    rk = max(1, min(num_spec_tokens_to_schedule, int(vlim)))
+                elif self.dsv41_history_policy is not None:
+                    rk = self.dsv41_history_policy.draft_budget(req)
+                    if rk is None:
+                        rk = num_spec_tokens_to_schedule
+                else:
+                    rk = num_spec_tokens_to_schedule
+                if rk > max_draft_k:
+                    max_draft_k = rk
+                    if max_draft_k >= num_spec_tokens_to_schedule:
+                        break
+            if 0 < max_draft_k < num_spec_tokens_to_schedule:
+                num_spec_tokens_to_schedule = max_draft_k
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

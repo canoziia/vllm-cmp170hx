@@ -589,6 +589,7 @@ def mhc_shifted_post_pre(
     stream: torch.cuda.Stream | None = None,
     reduce_results: bool = False,
     boundary_weight: torch.Tensor | None = None,
+    defer_coeff: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -730,6 +731,31 @@ def mhc_shifted_post_pre(
                         norm_eps,
                         capture_aux,
                     )
+            if defer_coeff and stream is not None and residual.shape[0] <= 192:
+                from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                    register_pending_mhc_coeff,
+                )
+
+                def _launch_coeff():
+                    _p, _c, _pr = mhc_coefficients(
+                        None,
+                        residual,
+                        None,
+                        None,
+                        fn,
+                        hc_scale,
+                        hc_base,
+                        rms_eps,
+                        hc_pre_eps,
+                        hc_sinkhorn_eps,
+                        hc_post_mult_value,
+                        sinkhorn_repeat,
+                        stream=stream,
+                    )
+                    return _p.unsqueeze(-1), _c, _pr
+
+                register_pending_mhc_coeff(residual.device, _launch_coeff)
+                return residual, None, None, layer_input, None, aux
             post, comb, pre = mhc_coefficients(
                 None,
                 residual,

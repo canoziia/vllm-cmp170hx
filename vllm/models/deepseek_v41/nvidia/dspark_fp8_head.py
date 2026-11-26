@@ -90,7 +90,7 @@ class Fp8DraftHead:
         packed = q.view(torch.int32).T.contiguous()
         del q
         self.qweight = ops.gptq_marlin_repack(
-            b_q_weight=packed, size_k=k, size_n=n, num_bits=8, is_a_8bit=False
+            b_q_weight=packed, size_k=k, size_n=n, num_bits=8
         )
         del packed
         s = marlin_permute_scales(

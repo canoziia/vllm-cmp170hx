@@ -62,6 +62,7 @@ TUNED = {
     # DSpark draft projections (replicated on TP=4)
     (15360, 5120): (1, 108),  # DSpark main_proj
     (5120, 1536): (3, 72),    # DSpark context_wkv_proj
+    (6144, 6400): (1, 100),   # Engram wkv (TP=4)
 }
 # Shapes where static split-K beats stream-K even at M <= 8 (cold-L2 on 108-SM GA100):
 SPLITK_M8 = {
@@ -74,13 +75,27 @@ SPLITK_M8 = {
 #   shared_w13 12.43->7.39us, shared_w2 7.05->4.80us (-0.63ms/step, 0 extra HBM!)
 KSPLIT_NOBAR_M8 = {
     (5120, 1792): 0,   # qkv_a: W8 TP1 ST3 GPU1 S=2 (56 CTAs)
-    (5120, 1536): 0,   # context_wkv_proj: W8 TP1 ST3 GPU1 S=2 (48 CTAs)
-    (2048, 5120): 1,   # wo_b: W4 TP1 ST4 GPU1 S=1 (80 CTAs, 0-part)
+    (5120, 1536): 8,   # context_wkv_proj: W8 TP1 ST3 GPU1 S=5 (120 CTAs on 126 SMs)
+    (2048, 5120): 5,   # wo_b: W8 TP1 ST3 GPU1 S=1 (80 CTAs, 0-part, -0.60us vs c1)
     (1280, 12288): 2,  # wq_b+idx: W4 TP2 ST3 GPU2 S=1 (96 CTAs, 0-part, supports SPLIT)
-    (1280, 8192): 2,   # wq_b: W4 TP2 ST3 GPU2 S=1 (64 CTAs, 0-part)
-    (5120, 1152): 3,   # shared_w13: W4 TP1 ST4 GPU1 S=6 (108 CTAs)
-    (576, 5120): 4,    # shared_w2: W4 TP1 ST3 GPU1 S=1 (80 CTAs, 0-part)
+    (1280, 8192): 1,   # wq_b: W4 TP1 ST4 GPU1 S=1 (128 CTAs on 126 SMs, 0-part; M<=4 uses cfg=9)
+    (5120, 1152): 7,   # shared_w13: W4 TP1 ST4 GPU1 S=2 (36 CTAs, low W13 contention)
+    (576, 5120): 1,    # shared_w2: W4 TP1 ST4 GPU1 S=1 (80 CTAs, 0-part)
+    (6144, 6400): 5,   # engram_wkv: W8 TP1 ST3 GPU1 S=1 (100 CTAs, 0-part, 1685 GB/s!)
     (15360, 5120): 5,  # main_proj: W8 TP1 ST3 GPU1 S=1 (80 CTAs, 0-part)
+}
+# Round 12 TB=2 no-barrier warp K-split (M = 9..16, cold-L2 A/B on 126-SM GA100):
+#   qkv_a 16.3->11.6us, wo_b 15.5->11.2us, wq_b+idx 19.5->14.7us,
+#   wq_b 16.8->13.3us, shared_w2 9.9->6.6us, shared_w13 15.6->12.6us (-0.95ms/step!)
+KSPLIT_NOBAR_M16 = {
+    (5120, 1792): 14,   # qkv_a: W8 TP1 ST3 GPU1 S=4 TB=2 (112 CTAs)
+    (5120, 1536): 15,   # context_wkv_proj: W8 TP1 ST3 GPU1 S=5 TB=2 (120 CTAs)
+    (2048, 5120): 13,   # wo_b: W8 TP1 ST3 GPU1 S=1 TB=2 (80 CTAs, 0-part)
+    (1280, 12288): 12,  # wq_b+idx: W4 TP2 ST3 GPU2 S=1 TB=2 (96 CTAs, 0-part, supports SPLIT)
+    (1280, 8192): 17,   # wq_b: W4 TP1 ST3 GPU1 S=1 TB=2 (128 CTAs, 0-part)
+    (576, 5120): 17,    # shared_w2: W4 TP1 ST3 GPU1 S=1 TB=2 (80 CTAs, 0-part)
+    (6144, 6400): 13,   # engram_wkv: W8 TP1 ST3 GPU1 S=1 TB=2 (100 CTAs, 0-part)
+    (15360, 5120): 13,  # main_proj: W8 TP1 ST3 GPU1 S=1 TB=2 (80 CTAs, 0-part)
 }
 MAX_WARPS = 128 * 2 * 4
 _SCRATCH: dict[tuple[int | None, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -152,17 +167,25 @@ def select(M: int, K: int, N: int):
     if M <= 8:
         kn = KSPLIT_NOBAR_M8.get((K, N))
         if kn is not None and os.environ.get("VLLM_DSV41_DENSE_KSPLIT_NOBAR", "0") == "1":
+            if K == 1280 and N == 8192 and M <= 4:
+                kn = 9
             return ("ksplit_nobar", kn, 0)
         sp8 = SPLITK_M8.get((K, N))
         if sp8 is not None and os.environ.get("VLLM_DSV41_DENSE_SPLITK_M8", "1") == "1":
             return ("splitk",) + sp8
         e = TUNED.get((K, N))
         return ("streamk",) + e if e else None
+    if M <= 16:
+        kn16 = KSPLIT_NOBAR_M16.get((K, N))
+        if kn16 is not None and os.environ.get("VLLM_DSV41_DENSE_KSPLIT_NOBAR", "0") == "1":
+            return ("ksplit_nobar", kn16, 0)
     tab, kind = (_T.SPLITK_TIERS, "splitk") if M <= 64 else (_T.SPLITK_WIDE_TIERS, "splitk_wide")
     for t in sorted(tab):
         if M <= t:
             e = tab[t].get((K, N))
-            return (kind,) + tuple(e) if e else None
+            if not e:
+                return None
+            return tuple(e) if len(e) == 3 else (kind,) + tuple(e)
     return None
 
 
@@ -232,6 +255,63 @@ def try_apply(x: torch.Tensor, layer, size_n: int, size_k: int, bias):
     else:
         ops.splitk_wide(x2, w, s, out, part4, cfg, arg)
     return out.reshape(*x.shape[:-1], size_n)
+
+
+
+
+def try_apply_swiglu(x: torch.Tensor, layer, limit: float = 0.0) -> torch.Tensor | None:
+    """Fused gate_up_proj + SiluAndMul(WithClamp) writing [..., N//2] directly."""
+    if (
+        not getattr(layer, "_dense_mxfp8_ok", False)
+        or getattr(layer, "bias", None) is not None
+        or getattr(layer, "gather_output", False)
+    ):
+        return None
+    size_k = layer.input_size_per_partition
+    size_n = layer.output_size_per_partition
+    if size_n % 128 != 0:
+        return None
+    x2 = x.reshape(-1, x.shape[-1])
+    M = x2.size(0)
+    if (
+        M < 1
+        or M > 192
+        or x2.dtype != torch.bfloat16
+        or x2.stride(1) != 1
+        or x2.stride(0) % 8
+        or x2.data_ptr() % 16
+    ):
+        return None
+    ops = _ops()
+    scr = scratch(x2.device)
+    if scr is None:
+        return None
+    part, _cnt, part4 = scr
+    w, s = layer.weight, layer.weight_scale.view(torch.uint8)
+    half_n = size_n // 2
+    if M <= 16:
+        if size_k == 5120 and size_n == 1152 and hasattr(ops, "ksplit_nobarrier_swiglu"):
+            out = torch.empty(M, half_n, dtype=torch.bfloat16, device=x2.device)
+            cfg_sw = 0 if M <= 8 else 13  # 36 CTAs (low W13 contention)
+            ops.ksplit_nobarrier_swiglu(x2, w, s, out, part, cfg_sw, float(limit))
+            return out.reshape(*x.shape[:-1], half_n)
+        if M <= 8:
+            return None
+    sel = select(M, size_k, size_n)
+    if sel is None:
+        return None
+    kind, cfg, arg = sel
+    if arg < 2 or part4.numel() < arg * M * size_n:
+        return None
+    if kind == "splitk" and hasattr(ops, "splitk_swiglu"):
+        out = torch.empty(M, half_n, dtype=torch.bfloat16, device=x2.device)
+        ops.splitk_swiglu(x2, w, s, out, part4, cfg, arg, float(limit))
+        return out.reshape(*x.shape[:-1], half_n)
+    if kind == "splitk_wide" and hasattr(ops, "splitk_wide_swiglu"):
+        out = torch.empty(M, half_n, dtype=torch.bfloat16, device=x2.device)
+        ops.splitk_wide_swiglu(x2, w, s, out, part4, cfg, arg, float(limit))
+        return out.reshape(*x.shape[:-1], half_n)
+    return None
 
 
 def try_apply_split(

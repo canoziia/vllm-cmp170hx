@@ -105,6 +105,18 @@ class DSparkSpeculator(DFlashSpeculator):
         # Whether the markov bias is fused into the Gumbel sample kernel.
         self._fuse_markov_bias: bool = False
         self._fused_markov: FusedMarkovSampler | None = None
+        # Round 12: k-aware DSpark tail split (layers[-1].ffn + draft_head + markov
+        # run only on num_reqs * active_k rows; 100% bitwise identical to full k=5).
+        self._tail_split_ready: bool = False
+        self._capturing_tail_split: bool = False
+        self._tail_bufs: tuple[torch.Tensor, ...] | None = None
+        self._tail_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._tail_k_offsets: dict[tuple[int, int], torch.Tensor] = {}
+        # Round 13: context-prep bucket split (avoids running main_proj+ctx_wkv on 192 rows when M=64)
+        self._ctx_split_ready: bool = False
+        self._capturing_ctx_split: bool = False
+        self._ctx_prep_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._ctx_buckets_by_nr: dict[int, tuple[int, ...]] = {}
 
     def load_model(self, target_model: torch.nn.Module) -> None:
         super().load_model(target_model)
@@ -568,6 +580,230 @@ class DSparkSpeculator(DFlashSpeculator):
                 num_reqs, n_spec
             )
 
+    def _can_tail_split(self) -> bool:
+        import os
+
+        if os.environ.get("VLLM_DSV41_DSPARK_TAIL_SPLIT", "1") != "1":
+            return False
+        if (
+            self.num_speculative_steps <= 1
+            or self._draft_topk is not None
+            or self._sharded_sequential_comm is not None
+            or self._fused_markov is None
+            or self.use_confidence_head
+            or getattr(self.model, "sample_sequential", None) is not None
+            or not self.use_local_argmax_reduction
+        ):
+            return False
+        can_fn = getattr(self.model, "can_split_tail", None)
+        return bool(can_fn is not None and can_fn())
+
+    @torch.inference_mode()
+    def _run_model_prefix(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> tuple[torch.Tensor, ...]:
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+
+        batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+        with set_forward_context(
+            attn_metadata,
+            self.vllm_config,
+            num_tokens=num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            num_tokens_across_dp=num_tokens_across_dp,
+            slot_mapping=slot_mappings,
+            batch_descriptor=batch_descriptor,
+            is_padding=self.input_buffers.is_padding[:num_tokens],
+        ):
+            return self.model.forward_prefix(
+                input_ids=self.input_buffers.input_ids[:num_tokens],
+                positions=self.input_buffers.positions[:num_tokens],
+                inputs_embeds=None,
+            )
+
+    @torch.inference_mode()
+    def _run_tail(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        active_k: int,
+    ) -> None:
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+
+        assert self._tail_bufs is not None and self._fused_markov is not None
+        n_spec = self.num_speculative_steps
+        if active_k >= n_spec:
+            x, res, pm, rm, pre = (b[:num_tokens_padded] for b in self._tail_bufs)
+            ids = self.input_buffers.input_ids[:num_tokens_padded]
+            num_tail = num_tokens_padded
+            is_pad = self.input_buffers.is_padding[:num_tokens_padded]
+        else:
+            keep_idx = self.sample_indices[self._tail_k_offsets[(num_reqs, active_k)]]
+            x, res, pm, rm, pre = (b.index_select(0, keep_idx) for b in self._tail_bufs)
+            ids = self.input_buffers.input_ids.index_select(0, keep_idx)
+            num_tail = num_reqs * active_k
+            is_pad = self.input_buffers.is_padding.index_select(0, keep_idx)
+
+        batch_descriptor = BatchDescriptor(num_tokens=num_tail)
+        with set_forward_context(
+            None,
+            self.vllm_config,
+            num_tokens=num_tail,
+            cudagraph_runtime_mode=CUDAGraphMode.FULL,
+            num_tokens_across_dp=None,
+            slot_mapping=None,
+            batch_descriptor=batch_descriptor,
+            is_padding=is_pad,
+        ):
+            head_hidden = self.model.forward_tail(x, res, pm, rm, pre, ids)
+
+        if active_k >= n_spec:
+            sample_hidden = head_hidden[self.sample_indices[: num_reqs * n_spec]]
+            k_eff = n_spec
+        else:
+            sample_hidden = head_hidden
+            k_eff = active_k
+
+        base_logits = self.model.compute_draft_logits_shard(sample_hidden)
+        base_logits = base_logits.view(num_reqs, k_eff, base_logits.shape[-1])
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        self._fused_markov.sample(
+            num_reqs, base_logits, prev, self.draft_tokens, num_steps=k_eff
+        )
+
+    def capture(self) -> None:
+        if not self._can_tail_split() or (
+            self.query_cudagraph_manager is None
+            or self.query_cudagraph_manager.cudagraph_mode == CUDAGraphMode.NONE
+        ):
+            super().capture()
+            return
+
+        import os
+        use_ctx_split = os.environ.get("VLLM_DSV41_DSPARK_CTX_SPLIT", "1") == "1"
+        self._capturing_tail_split = True
+        self._capturing_ctx_split = use_ctx_split
+        try:
+            super().capture()
+        finally:
+            self._capturing_tail_split = False
+            self._capturing_ctx_split = False
+
+        if self._tail_bufs is None:
+            return
+
+        mgr = self.query_cudagraph_manager
+        pool = mgr.pool
+        cap_stream = mgr.capture_stream
+        n_spec = self.num_speculative_steps
+        # Collect unique FULL-captured (num_reqs, num_tokens) pairs.
+        full_pairs = sorted(
+            {
+                (desc.num_reqs, desc.num_tokens)
+                for desc in mgr.graphs
+                if desc.cg_mode == CUDAGraphMode.FULL
+                and desc.num_reqs is not None
+                and desc.num_reqs >= 8
+            },
+            reverse=True,
+        )
+        # Ensure sample_indices holds valid in-range indices during tail capture.
+        self.sample_indices.zero_()
+        ctx_stream = (
+            torch.cuda.stream(cap_stream) if cap_stream is not None else torch.cuda.stream(torch.cuda.current_stream())
+        )
+        with ctx_stream:
+            for nr, nt in full_pairs:
+                for k in range(n_spec, 0, -1):
+                    if k < n_spec:
+                        offs = (
+                            torch.arange(nr, device=self.device, dtype=torch.int64)[:, None] * n_spec
+                            + torch.arange(k, device=self.device, dtype=torch.int64)[None, :]
+                        ).reshape(-1)
+                        self._tail_k_offsets[(nr, k)] = offs
+                    # Eager warmup outside graph capture for JIT/attribute init.
+                    self._run_tail(nr, nt, k)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool, stream=cap_stream):
+                        self._run_tail(nr, nt, k)
+                    self._tail_graphs[(nr, k)] = g
+        if use_ctx_split:
+            with ctx_stream:
+                for nr, _nt in full_pairs:
+                    max_c = self._num_graph_context_tokens(nr)
+                    buckets = tuple(sorted({
+                        min(nr * 2, max_c),
+                        min(nr * 4, max_c),
+                        max_c,
+                    }))
+                    self._ctx_buckets_by_nr[nr] = buckets
+                    for nc in reversed(buckets):
+                        self._run_ctx_prep(nr, nc)
+                        torch.cuda.synchronize()
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, pool=pool, stream=cap_stream):
+                            self._run_ctx_prep(nr, nc)
+                        self._ctx_prep_graphs[(nr, nc)] = g
+            self._ctx_split_ready = True
+        torch.cuda.synchronize()
+        self._tail_split_ready = True
+        logger.info(
+            "DSpark k-aware tail+ctx split enabled: captured %d tail graphs + %d ctx graphs (%d req sizes)",
+            len(self._tail_graphs),
+            len(self._ctx_prep_graphs),
+            len(full_pairs),
+        )
+
+    @torch.inference_mode()
+    def _run_ctx_prep(self, num_reqs: int, num_context: int) -> None:
+        if self._aux_staging is not None:
+            self.hidden_states[:num_context].copy_(
+                self.model.combine_hidden_states(self._aux_staging[:num_context])
+            )
+        self.prepare_context_anchor(
+            num_reqs, self.target_input_buffers.query_start_loc, self._num_rejected
+        )
+        self._precompute_context_kv(0, num_context)
+
+    def _select_ctx_bucket(self, num_graph_reqs: int, num_target_tokens: int) -> int:
+        if not self._ctx_split_ready:
+            return self._num_graph_context_tokens(num_graph_reqs)
+        buckets = self._ctx_buckets_by_nr.get(num_graph_reqs)
+        if not buckets:
+            return self._num_graph_context_tokens(num_graph_reqs)
+        for b in buckets:
+            if b >= num_target_tokens:
+                return b
+        return buckets[-1]
+
+    def _before_fullgraph_replay(self, batch_desc: Any, num_context: int) -> None:
+        if not self._ctx_split_ready:
+            return
+        g = self._ctx_prep_graphs.get((batch_desc.num_reqs, num_context))
+        if g is not None:
+            g.replay()
+
+    def _after_fullgraph_replay(
+        self, batch_desc: Any, num_speculative_tokens: int | None
+    ) -> None:
+        if not self._tail_split_ready:
+            return
+        nr = batch_desc.num_reqs
+        k = (
+            self.num_speculative_steps
+            if num_speculative_tokens is None
+            else max(1, min(int(num_speculative_tokens), self.num_speculative_steps))
+        )
+        g = self._tail_graphs.get((nr, k))
+        if g is not None:
+            g.replay()
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -577,7 +813,25 @@ class DSparkSpeculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        # Full draft step (captured under CUDA graph): parallel backbone forward
+        if self._capturing_tail_split and num_reqs >= 8:
+            outs = self._run_model_prefix(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
+            if self._tail_bufs is None:
+                assert not torch.cuda.is_current_stream_capturing()
+                max_q = self.max_num_reqs * self.num_query_per_req
+                self._tail_bufs = tuple(
+                    torch.zeros((max_q, *t.shape[1:]), dtype=t.dtype, device=t.device)
+                    for t in outs
+                )
+            for dst, src in zip(self._tail_bufs, outs):
+                dst[:num_tokens_padded].copy_(src)
+            return
+        # Full draft step (eager fallback): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
         head_hidden = self._run_model(
             num_tokens_padded,

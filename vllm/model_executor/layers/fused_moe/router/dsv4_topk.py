@@ -183,6 +183,7 @@ def dsv4_topk(
             if os.environ.get("VLLM_DSV41_FAST_GATE_TOPK", "0") == "1":
                 from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
                     _ops_r2,
+                    fire_pending_mhc_coeff,
                 )
 
                 r2 = _ops_r2()
@@ -193,6 +194,7 @@ def dsv4_topk(
                     topk_ids = gating_output.new_empty(
                         (num_tokens, topk), dtype=indices_dtype
                     )
+                    fire_pending_mhc_coeff(gating_output.device)
                     r2.dsv4_topk_v2(
                         gating_output,
                         correction_bias,

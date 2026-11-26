@@ -233,7 +233,7 @@ _WOA_MARLIN_CAPTURE: dict[int | None, torch.Tensor] = {}
 
 def _alloc_woa_marlin_sent(device: torch.device, stream: torch.cuda.Stream, g: int) -> torch.Tensor:
     key = (device.index, stream.cuda_stream)
-    need = max(g, 2) * 16 * 2 * 16 * 64
+    need = max(g, 2) * 16 * 2 * 32 * 64
     buf = _WOA_MARLIN_SENT.get(key)
     if buf is None or buf.numel() < need:
         with torch.cuda.stream(stream):

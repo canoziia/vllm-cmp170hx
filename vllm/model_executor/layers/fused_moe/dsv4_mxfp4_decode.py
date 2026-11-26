@@ -51,6 +51,28 @@ _PREALIGNED: dict[
 ] = {}
 _PENDING_SHARED: dict[tuple[int | None, int], tuple[object, bool]] = {}
 _FUSED_SHARED_OUT: dict[tuple[int | None, int], tuple[int, int]] = {}
+_PENDING_MHC_COEFF: dict[tuple[int | None, int], list] = {}
+
+
+def register_pending_mhc_coeff(dev: torch.device, fn) -> None:
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    _PENDING_MHC_COEFF[key] = [fn, None]
+
+
+def fire_pending_mhc_coeff(dev: torch.device) -> None:
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    entry = _PENDING_MHC_COEFF.get(key)
+    if entry is not None and entry[1] is None:
+        entry[1] = entry[0]()
+
+
+def finish_pending_mhc_coeff(dev: torch.device):
+    key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
+    entry = _PENDING_MHC_COEFF.pop(key, None)
+    assert entry is not None, "pending mhc_coefficients missing"
+    if entry[1] is None:
+        entry[1] = entry[0]()
+    return entry[1]
 _DEFER_W2_SUM: dict[tuple[int | None, int], bool] = {}
 _DEFERRED_W2_SPLITK: dict[tuple[int | None, int], tuple] = {}
 
@@ -123,13 +145,17 @@ def _tp4_w13_cfg(M: int, dq: int, fused_act: bool) -> tuple[int, int]:
         return 4, 4
     if M == 1:
         return 4, 4
-    if 4 <= M <= 6:
-        # occ=5 (2520 warps on 126 SMs) fits M=6 (<=36*18*4 = 2592 items) in
-        # ~1 wave vs 2 waves on occ=4 c2 (-13.3us/layer = -0.53ms/step at c=1 k=5).
-        return 0, 4
     if M <= 48:
-        return 2, 4
-    return (10, 4) if fused_act else (2, 4)
+        # dynks3 (c11): GPU-side nblk-aware KS=5 (<28) / KS=4 (28..44) / KS=2 (>=45)
+        # with zero-atomic static warp scheduling; beats c10 across M=2..48 on 126 SMs.
+        return (11, 5) if fused_act else (0, 4)
+    if M <= 127:
+        # c1 (KS=2, CR=4, TW=1, occ=5): beats c10 across M=49..127 (nblk=60..295)
+        # by halving partial traffic & sync atomics in the nblk=60..129 regime.
+        return (1, 2) if fused_act else (2, 4)
+    # Pure PAIRED_GU KS=1 (c13) for M >= 128 (c=32 code/count/k>=3): eliminates
+    # 840 MB/step FP32 partial traffic (-1.99ms @ c=32 code, -0.70ms @ c=32 count!).
+    return (13, 1) if fused_act else (2, 4)
 
 
 def _tp4_w2_cfg(M: int) -> int:
@@ -141,11 +167,20 @@ def _tp4_w2_cfg(M: int) -> int:
     env = os.environ.get("VLLM_DSV4_MXFP4_TP4_W2_CFG")
     if env is not None:
         return int(env)
-    if M == 1:
-        return 4
-    if M == 2:
-        return 5
-    return 2
+    # Cold-L2 verified table for deferred W2 (fuse=False, 34 layers) at 180W:
+    # M=1..3, 6..8, >=129: c13 (CR=6, TW=1, static)
+    # M=4, 5:              c11 (CR=4, TW=2, static)
+    # M=9..128:            c2  (CR=6, TW=1, dynamic load balancing)
+    # Steady-state 180W verified table for deferred W2 (fuse=False) on 126-SM GA100:
+    # M=1..3, 9..32: c13 (CR=6, TW=1, static)
+    # M=4, 6..8:     c11 (CR=4, TW=2, static)
+    # M=5, >=33:     c12 (CR=4, TW=1, static, occ=5: -0.45ms@M=48, -0.57ms@M=64,
+    #                     -0.41ms@M=96, -0.70ms@M=128, -1.88ms@M=192 prose)
+    if M in (4, 6, 7, 8):
+        return 11
+    if M in (5, 10, 24) or M >= 33:
+        return 12
+    return 13
 
 
 def _w2_splitk_ks(M: int) -> int:
@@ -200,10 +235,10 @@ def _fgta_cnt(dev: torch.device) -> torch.Tensor | None:
     if t is None:
         if torch.cuda.is_current_stream_capturing():
             return _FGTA_CNT_CAPTURE.get(dev_key)
-        t = torch.zeros(4, dtype=torch.int32, device=dev)
+        t = torch.zeros(64, dtype=torch.int32, device=dev)
         _FGTA_CNT[key] = t
         if dev_key not in _FGTA_CNT_CAPTURE:
-            _FGTA_CNT_CAPTURE[dev_key] = torch.zeros(4, dtype=torch.int32, device=dev)
+            _FGTA_CNT_CAPTURE[dev_key] = torch.zeros(64, dtype=torch.int32, device=dev)
     return t
 
 
@@ -303,7 +338,7 @@ def try_fused_gate_topk_align(
     M, K = hidden_states.shape
     if (
         M < 1
-        or M > 8
+        or M > 16
         or K != _K
         or hidden_states.dtype != torch.bfloat16
         or not hidden_states.is_contiguous()
@@ -327,6 +362,8 @@ def try_fused_gate_topk_align(
     E = w.shape[0]
     topk = getattr(router, "top_k", -1)
     if (E, topk) not in ((384, 6), (128, 3)):
+        return None
+    if M > 8 and (E, topk) != (384, 6):
         return None
     cb_param = getattr(router, "e_score_correction_bias", None)
     if (
@@ -404,7 +441,7 @@ def try_fused_gate_topk_align(
     )
 
     dev = hidden_states.device
-    sk_scr = 4 if E == 384 else 10
+    sk_scr = 7 if E == 384 else 10
     fgta_sent = _fgta_sent(dev) if (M >= 3 and E != 384) else None
     use_sentinel = fgta_sent is not None and fgta_sent.numel() >= sk_scr * 8 * E
     logits_scr = (
@@ -423,6 +460,8 @@ def try_fused_gate_topk_align(
         e_ids = torch.empty((M * topk,), dtype=torch.int32, device=dev)
         ntpp = torch.empty((1,), dtype=torch.int32, device=dev)
 
+    if M > 8:
+        fire_pending_mhc_coeff(dev)
     r2.fused_gate_topk_align(
         hidden_states,
         w,
@@ -444,6 +483,8 @@ def try_fused_gate_topk_align(
         pad_mask,
         use_sentinel,
     )
+    if M <= 8:
+        fire_pending_mhc_coeff(dev)
     if do_align:
         assert s_ids is not None and e_ids is not None and ntpp is not None
         key = (dev.index, torch.cuda.current_stream(dev).cuda_stream)
@@ -540,7 +581,7 @@ def try_det_align(
         == torch.int32
     ):
         return False
-    if s > 512 and r2 is not None:
+    if r2 is not None:
         r2.det_align_v2(
             topk_ids.view(-1),
             expert_map,
@@ -945,7 +986,7 @@ def _try_run_v2(
         and topk <= 8
         and _plain_moe_sum(moe_sum)
         and (
-            (topk <= 3 or M <= 8)
+            False
             if ni == 576
             else (topk <= 3 or M <= 2 or M <= _w2_splitk_max_tokens())
         )

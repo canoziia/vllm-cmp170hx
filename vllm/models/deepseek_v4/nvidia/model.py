@@ -187,6 +187,26 @@ class DeepseekV4MLP(nn.Module):
             self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if getattr(self.gate_up_proj, "_dense_mxfp8_ok", False):
+            from vllm.model_executor.kernels.linear.mxfp8 import dsv41_dense_mxfp8
+
+            act = self.act_fn
+            if (
+                isinstance(act, SiluAndMulWithClamp)
+                and act.alpha == 1.0
+                and act.beta == 0.0
+            ):
+                fused = dsv41_dense_mxfp8.try_apply_swiglu(
+                    x, self.gate_up_proj, act.swiglu_limit
+                )
+                if fused is not None:
+                    x, _ = self.down_proj(fused)
+                    return x
+            elif type(act) is SiluAndMul:
+                fused = dsv41_dense_mxfp8.try_apply_swiglu(x, self.gate_up_proj, 0.0)
+                if fused is not None:
+                    x, _ = self.down_proj(fused)
+                    return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

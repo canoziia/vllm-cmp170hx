@@ -1214,7 +1214,7 @@ class CoefficientsMma(Coefficients):
             post_mult,
             iterations,
             Storage,
-        ).launch(grid=(self.ctas, 1, 1), block=[COEF_THREADS, 1, 1], stream=stream)
+        ).launch(grid=(self.ctas, cutlass.min(cutlass.max((rows + ROW_GROUP - 1) // ROW_GROUP, 1), 6), 1), block=[COEF_THREADS, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -1240,7 +1240,8 @@ class CoefficientsMma(Coefficients):
         Storage: cutlass.Constexpr,
     ):
         tid, _, _ = cute.arch.thread_idx()
-        cta, _, _ = cute.arch.block_idx()
+        cta, gy_id, _ = cute.arch.block_idx()
+        _, gy_dim, _ = cute.arch.grid_dim()
         warp = tid // 32
         lane = tid % 32
         # The fragment coordinates: rows g and g + 8, word t of a k-tile.
@@ -1285,10 +1286,10 @@ class CoefficientsMma(Coefficients):
             g * MMA_ROW_WORDS + stream * (MMA_SLICE // 2) + half * (MMA_WARP_K // 2) + t
         )
 
-        for i in cutlass.range(groups, unroll=1):
-            # The CTAs start at different groups, so that the last arrivals
-            # at the groups, which finish them, fall on different CTAs.
-            group = (cta + i) % groups
+        my_groups = (groups - gy_id + gy_dim - 1) // gy_dim
+        for i in cutlass.range(my_groups, unroll=1):
+            step_idx = (cta + i) % my_groups
+            group = gy_id + step_idx * gy_dim
             first = group * ROW_GROUP
             # Stage the group: 16 threads per row, each four columns of
             # every stream in five quads. A row past the batch stages the

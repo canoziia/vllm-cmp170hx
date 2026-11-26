@@ -202,6 +202,7 @@ PROFILES["tp4_fused"] = {
     "VLLM_DSV41_COST_MS_FUSED": "tp4",
     "VLLM_DSV41_DEFER_FINALIZE_MIN_TOKENS": "1",
     "VLLM_DSV41_FUSED_W2_AR": "0",
+    "VLLM_DSPARK_DRAFT_HEAD_FP8": "1",
 }
 
 # General TP-safe SM80 optimisations for non-TEP4 TP>1 splits (e.g. TP2/TP8).

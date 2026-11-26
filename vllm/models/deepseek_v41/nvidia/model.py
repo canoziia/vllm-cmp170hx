@@ -775,6 +775,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 stream=mhc_stream,
                 reduce_results=self.fuse_mhc_all_reduce,
                 boundary_weight=self.hc_attn_boundary_weight,
+                defer_coeff=(
+                    mhc_stream is not None
+                    and self.ampere_mhc
+                    and positions.shape[0] <= 192
+                    and self.fuse_mhc_all_reduce
+                    and not self.use_sequence_parallel
+                ),
             )
             if capture_previous_aux:
                 previous_aux = aux
@@ -783,6 +790,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = sp_all_gather(x)[: positions.shape[0]]
 
         x = self.attn(positions, x, None)
+        if post_mix is None:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                finish_pending_mhc_coeff,
+            )
+
+            post_mix, res_mix, attn_pre = finish_pending_mhc_coeff(residual.device)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
@@ -809,15 +822,176 @@ class DeepseekV4DecoderLayer(nn.Module):
             stream=mhc_stream,
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_ffn_boundary_weight,
+            defer_coeff=(mhc_stream is not None and self.ampere_mhc and x.shape[0] <= 192 and self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0])),
         )
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
         else:
             x = self.ffn(x, input_ids, mega_gate_metadata)
+        if post_mix is None:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                finish_pending_mhc_coeff,
+            )
+
+            post_mix, res_mix, ffn_pre = finish_pending_mhc_coeff(residual.device)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
+
+    def forward_attn_only(
+        self,
+        x: torch.Tensor | MoEOutput,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        pre_mix: torch.Tensor | None = None,
+        post_mix: torch.Tensor | None = None,
+        res_mix: torch.Tensor | None = None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run the attention half of the decoder layer up to FFN entry (for DSpark tail split)."""
+        assert self.engram is None and not self.use_sequence_parallel
+        mhc_stream = self.mhc_stream
+        if mhc_stream is not None and (
+            in_piecewise_cudagraph()
+            or not 0 < positions.shape[0] <= self.mhc_overlap_max_tokens
+            or not torch.cuda.is_current_stream_capturing()
+        ):
+            mhc_stream = None
+        if self.ampere_mhc:
+            mhc_pre = partial(mhc_pre_delayed_ampere, stream=mhc_stream)
+        else:
+            mhc_pre = (
+                partial(mhc_pre_delayed_overlap, stream=mhc_stream)
+                if mhc_stream is not None
+                else mhc_pre_delayed_tilelang
+            )
+        if residual is None:
+            assert isinstance(x, torch.Tensor)
+            residual = x
+            post_mix, res_mix, x, attn_pre = mhc_pre(
+                residual,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+        else:
+            residual, post_mix, res_mix, x, attn_pre, _ = mhc_shifted_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+                capture_aux=False,
+                stream=mhc_stream,
+                reduce_results=self.fuse_mhc_all_reduce,
+                boundary_weight=self.hc_attn_boundary_weight,
+                defer_coeff=(
+                    mhc_stream is not None
+                    and self.ampere_mhc
+                    and positions.shape[0] <= 192
+                    and self.fuse_mhc_all_reduce
+                    and not self.use_sequence_parallel
+                ),
+            )
+        x = self.attn(positions, x, None)
+        if post_mix is None:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                finish_pending_mhc_coeff,
+            )
+
+            post_mix, res_mix, attn_pre = finish_pending_mhc_coeff(residual.device)
+        if mhc_stream is not None:
+            torch.cuda.current_stream().wait_stream(mhc_stream)
+        return x, residual, post_mix, res_mix, attn_pre
+
+    def forward_ffn_only(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        attn_pre: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[
+        torch.Tensor | MoEOutput,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Run the token-wise FFN half of the decoder layer (for DSpark tail split)."""
+        mhc_stream = self.mhc_stream
+        if mhc_stream is not None and (
+            in_piecewise_cudagraph()
+            or not 0 < x.shape[0] <= self.mhc_overlap_max_tokens
+            or not torch.cuda.is_current_stream_capturing()
+        ):
+            mhc_stream = None
+        residual, post_mix, res_mix, x, ffn_pre, _ = mhc_shifted_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            pre_mix=attn_pre,
+            norm_weight=self.ffn_norm.weight,
+            norm_eps=self.ffn_norm.variance_epsilon,
+            stream=mhc_stream,
+            reduce_results=self.fuse_mhc_all_reduce,
+            boundary_weight=self.hc_ffn_boundary_weight,
+            defer_coeff=(
+                mhc_stream is not None
+                and self.ampere_mhc
+                and x.shape[0] <= 192
+                and self.fuse_mhc_all_reduce
+                and self.ffn.defers_finalize(x.shape[0])
+            ),
+        )
+        if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
+            x = self.ffn.forward_unfinalized(x, input_ids)
+        else:
+            x = self.ffn(x, input_ids, None)
+        if post_mix is None:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                finish_pending_mhc_coeff,
+            )
+
+            post_mix, res_mix, ffn_pre = finish_pending_mhc_coeff(residual.device)
+        if mhc_stream is not None:
+            torch.cuda.current_stream().wait_stream(mhc_stream)
+        return x, residual, post_mix, res_mix, ffn_pre
 
     def write_kv(
         self,
@@ -954,7 +1128,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Keep mHC independent of the streams used inside attention.
         mhc_overlap = supports_mhc_overlap(vllm_config)
         ampere_mhc_overlap = supports_ampere_mhc_overlap(vllm_config)
-        mhc_stream = torch.cuda.Stream() if mhc_overlap or ampere_mhc_overlap else None
+        mhc_stream = torch.cuda.Stream(priority=-1) if mhc_overlap or ampere_mhc_overlap else None
         # SM100's overlap path and SM90's SM80-kernel boundaries (which
         # supports_mhc_all_reduce tells apart) fuse the all-reduce; SM80's
         # boundaries take it with their own two-shot kernel.
@@ -2949,7 +3123,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             supports_column_gathers,
         )
 
-        row_sizes: list[int] = [16] if supports_column_gathers(vllm_config) else []
+        row_sizes: list[int] = [16, 32] if supports_column_gathers(vllm_config) else []
         engrams = [
             layer.engram
             for layer in islice(self.layers, self.start_layer, self.end_layer)

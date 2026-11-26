@@ -1037,7 +1037,7 @@ class MoERunner(MoERunnerInterface):
             and not self.do_naive_dispatch_combine
             and self.moe_config.pcp_size <= 1
             and not self.routed_experts.quant_method.is_monolithic
-            and 0 < hidden_states.shape[0] <= 8
+            and 0 < hidden_states.shape[0] <= 16
         ):
             from vllm.model_executor.layers.fused_moe import (
                 dsv4_mxfp4_decode as _dsv4_dec,
@@ -1063,6 +1063,11 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
+        if self.gate is not None and pre_routed is None and hidden_states.shape[0] > 16:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                fire_pending_mhc_coeff as _fire_mhc,
+            )
+            _fire_mhc(hidden_states.device)
         if self.gate is not None:
             if pre_routed is not None:
                 router_logits = pre_routed  # type: ignore[assignment]

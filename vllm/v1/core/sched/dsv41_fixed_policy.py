@@ -114,6 +114,9 @@ class FixedHistoryPolicy:
                     )
                     if type(k) is not int or not 1 <= k <= 5 or k > entry.k + 1:
                         raise ValueError("policy width outside allowed transition")
+                    avail = len(getattr(r, "spec_token_ids", ()) or ())
+                    if avail > 0 and k > avail:
+                        k = avail
                     self.trace(
                         dict(
                             event="choose",
@@ -296,6 +299,23 @@ class FixedHistoryPolicy:
             entry.fresh = True
         except Exception as exc:
             self.fail(rid, entry, exc)
+
+    def draft_budget(self, request) -> int | None:
+        """Max draft tokens this request can possibly use on the next step."""
+        entry = self.active.get(request.request_id)
+        if entry is None or self.is_disabled(entry):
+            return None
+        if not getattr(entry.plugin, "trimmed", False) or entry.k >= 5:
+            return 5
+        diag = getattr(entry.plugin, "diagnostics", None)
+        scores = diag.get("score") if isinstance(diag, dict) else None
+        if (
+            isinstance(scores, list)
+            and len(scores) >= 5
+            and scores[entry.k] >= scores[entry.k - 1] * 1.01
+        ):
+            return min(5, entry.k + 1)
+        return entry.k
 
     def forget(self, request_id):
         self.active.pop(request_id, None)

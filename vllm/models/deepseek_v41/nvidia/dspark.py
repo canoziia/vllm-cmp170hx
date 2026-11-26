@@ -329,6 +329,96 @@ class DSparkDeepseekV4Model(nn.Module):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
         return hidden_states
 
+    def can_split_tail(self) -> bool:
+        return (
+            not self.use_sequence_parallel
+            and not self.use_mega_gate
+            and len(self.layers) >= 1
+            and all(layer.engram is None for layer in self.layers)
+        )
+
+    def forward_prefix(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        full_num_tokens = positions.shape[0]
+        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        residual = post_mix = res_mix = pre_mix = None
+        can_defer_w2 = (
+            os.environ.get("VLLM_DSV41_FUSED_W2_AR", "0") == "1"
+            and 3 <= full_num_tokens <= 32
+            and ampere_all_reduce_ready()
+        )
+        _set_defer = None
+        if can_defer_w2:
+            from vllm.model_executor.layers.fused_moe.dsv4_mxfp4_decode import (
+                set_defer_w2_sum as _set_defer,
+            )
+        dev = positions.device
+        n_layers = len(self.layers)
+        for i in range(n_layers - 1):
+            layer = self.layers[i]
+            defer_this = (
+                _set_defer is not None
+                and self.layers[i + 1].engram is None
+                and self.layers[i + 1].fuse_mhc_all_reduce
+            )
+            if defer_this:
+                _set_defer(dev, True)
+            try:
+                hidden_states, residual, post_mix, res_mix, pre_mix, _ = layer(
+                    hidden_states,
+                    positions,
+                    input_ids,
+                    pre_mix,
+                    post_mix,
+                    res_mix,
+                    residual,
+                    mega_gate_metadata=None,
+                )
+            finally:
+                if defer_this:
+                    _set_defer(dev, False)
+        return self.layers[-1].forward_attn_only(
+            hidden_states,
+            positions,
+            input_ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+        )
+
+    def forward_tail(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        attn_pre: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states, residual, post_mix, res_mix, pre_mix = (
+            self.layers[-1].forward_ffn_only(
+                x, residual, post_mix, res_mix, attn_pre, input_ids
+            )
+        )
+        if self.fuse_mhc_all_reduce:
+            hidden_states = boundary_all_reduce(hidden_states)
+        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        assert pre_mix is not None
+        return hc_collapse_triton(hidden_states, pre_mix)
+
 
 def _insert_context_kv(
     attn: nn.Module,
@@ -502,6 +592,30 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         step = None if decode is None else decode.plan(positions)
         return self.model(input_ids, positions, inputs_embeds, decode_step=step)
 
+    def can_split_tail(self) -> bool:
+        return self.specialized_decode is None and self.model.can_split_tail()
+
+    def forward_prefix(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ):
+        return self.model.forward_prefix(input_ids, positions, inputs_embeds)
+
+    def forward_tail(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        attn_pre: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.forward_tail(
+            x, residual, post_mix, res_mix, attn_pre, input_ids
+        )
+
     def build_fp8_draft_head(self) -> None:
         from .dspark_fp8_head import Fp8DraftHead
 
@@ -519,14 +633,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._fp8_draft_head is not None:
+        if self._fp8_draft_head is not None and hidden_states.shape[0] <= 80:
             local = self._fp8_draft_head(self.model.norm(hidden_states))
             return self.logits_processor._gather_logits(local)
         return self.compute_logits(hidden_states)
 
     def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This TP rank's vocab shard of compute_draft_logits, not gathered."""
-        if self._fp8_draft_head is not None:
+        if self._fp8_draft_head is not None and hidden_states.shape[0] <= 80:
             return self._fp8_draft_head(self.model.norm(hidden_states))
         return self.logits_processor(
             self.lm_head, self.model.norm(hidden_states), skip_gather=True
@@ -534,7 +648,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
 
     def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Same logits, this rank's vocab columns only (masked, no gather)."""
-        if self._fp8_draft_head is not None:
+        if self._fp8_draft_head is not None and hidden_states.shape[0] <= 80:
             logits = self._fp8_draft_head(self.model.norm(hidden_states))
             self.logits_processor._mask_outside_vocab(logits, self.lm_head)
             return logits

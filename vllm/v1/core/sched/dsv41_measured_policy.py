@@ -46,12 +46,12 @@ COST_MS_FUSED = {
 # Partial-Dot (M>=160), and fused_gate_topk_align (M<=8), satisfying strict
 # 6-concurrency [5, 1, 5] trim-and-recovery invariants across k=1..5.
 COST_MS_TP4 = {
-    1: (8.3500, 9.2000, 9.6200, 10.1700, 10.6800),
-    2: (9.7600, 10.8700, 11.7600, 12.7008, 13.4479),
-    4: (11.4800, 13.8449, 15.2274, 16.4456, 17.5310),
-    8: (15.5700, 18.4300, 20.6785, 22.3328, 23.8068),
-    16: (20.5500, 24.7833, 27.8069, 30.0315, 32.0136),
-    32: (30.9500, 37.3257, 41.8794, 45.2298, 48.2150),
+    1: (7.1800, 7.6200, 8.1200, 8.5800, 8.9000),
+    2: (8.2000, 9.1000, 9.7500, 10.7000, 11.1000),
+    4: (9.6000, 11.2000, 11.8000, 13.4000, 13.7500),
+    8: (11.1000, 14.3000, 16.6000, 18.4000, 19.5000),
+    16: (18.3000, 22.8000, 26.2000, 29.5000, 30.6000),
+    32: (26.5000, 35.0000, 42.2000, 48.4000, 51.8000),
 }
 
 COST_MS = COST_MS_BASE
@@ -83,11 +83,11 @@ def costs(c):
 # Provable per-step cost-ratio bounds guaranteeing strict monotonicity,
 # trim eligibility under 0% acceptance (clearing Policy's 3% + gate margin),
 # and [5, 1, 5] recovery convergence under any online trajectory.
-_MIN_STEP_RATIO = (1.045, 1.035, 1.035, 1.035)
-_MAX_STEP_RATIO = (1.206, 1.122, 1.080, 1.066)
+_MIN_STEP_RATIO = (1.045, 1.035, 1.030, 1.020)
+_MAX_STEP_RATIO = (1.380, 1.240, 1.160, 1.110)
 _FEAT_SCALE = (1.0, 50.0, 7.0)
 _CG_CAPTURE_SIZES = (
-    1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32,
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32,
     40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120,
     128, 136, 144, 152, 160, 168, 176, 184, 192,
 )
@@ -105,12 +105,16 @@ def _effective_tokens(batch_m: float) -> float:
     return 0.75 * batch_m + 0.25 * cg
 
 
+_SQRT_SHIFT = 12.0
+_SQRT_SHIFT_ROOT = math.sqrt(_SQRT_SHIFT)
+
+
 def _cost_features(batch_m: float) -> tuple[float, float, float]:
     me = _effective_tokens(batch_m)
     return (
         1.0 / _FEAT_SCALE[0],
         me / _FEAT_SCALE[1],
-        math.sqrt(max(1.0, me)) / _FEAT_SCALE[2],
+        (math.sqrt(max(0.0, me) + _SQRT_SHIFT) - _SQRT_SHIFT_ROOT) / _FEAT_SCALE[2],
     )
 
 
@@ -169,9 +173,9 @@ class OnlineCostModel:
         self,
         prior_table: dict[int, tuple[float, ...]] | None = None,
         local_gamma: float = 0.92,
-        age_gamma: float = 0.997,
+        age_gamma: float = 0.999,
         age_floor: float = 0.12,
-        prior_obs: float = 2.0,
+        prior_obs: float = 10.0,
         huber_delta: float = 0.25,
         cell_kappa: float = 4.0,
         max_cells: int = 128,
@@ -237,7 +241,7 @@ class OnlineCostModel:
         for (_cb, cm), cell in self._cells.items():
             mass, ema_ms, last_step = cell
             age = max(0, step - int(last_step))
-            freshness = max(af, ag**age) if age < 2000 else af
+            freshness = max(af, ag**age) if age < 5000 else af
             cell_w = freshness * (mass / (mass + 2.0))
             inv_ref = 1.0 / max(2.0, ema_ms)
             w = cell_w * inv_ref * inv_ref
@@ -254,7 +258,7 @@ class OnlineCostModel:
             and all(math.isfinite(v) for v in cand)
             and cand[0] > 0.5
         ):
-            self._theta = [cand[0], max(0.0, cand[1]), max(0.0, cand[2])]
+            self._theta = [cand[0], max(0.65 * self._theta_prior[1], cand[1]), max(0.0, cand[2])]
 
     def predict_ms(self, batch_b: int, batch_m: int) -> float:
         base = self._predict_global_ms(float(batch_m))
@@ -264,7 +268,7 @@ class OnlineCostModel:
             age = max(0, self.obs_count - int(last_step))
             # Only trust direct local refinement while reasonably fresh;
             # stale cells decay back to the live global physics surface.
-            fresh = self.age_gamma**age if age < 1500 else 0.0
+            fresh = self.age_gamma**age if age < 4000 else 0.0
             eff_n = mass * fresh
             if eff_n > 0.05:
                 alpha = eff_n / (eff_n + self.cell_kappa)
@@ -317,7 +321,7 @@ class OnlineCostModel:
 
     def costs(self, concurrency: int) -> list[float]:
         c = max(1, int(concurrency))
-        raw = [self.predict_ms(c, c * (k + 1)) for k in range(1, 6)]
+        raw = [self._predict_global_ms(float(c * (k + 1))) for k in range(1, 6)]
         out = [raw[0]]
         for i in range(4):
             raw_ratio = raw[i + 1] / raw[i] if raw[i] > 0.0 else _MIN_STEP_RATIO[i]
@@ -409,7 +413,7 @@ class Policy:
         previous = 1.0
         for n, s in zip(self.risk, self.success):
             previous = min(
-                previous, (s + self.prior + 0.5 * previous) / (n + self.prior + 1)
+                previous, (s + self.prior + (0.5 + 0.4 * (previous ** 6)) * previous) / (n + self.prior + 1)
             )
             p.append(previous)
         E = [1 + sum(p[:k]) for k in range(1, 6)]
@@ -471,7 +475,7 @@ class Policy:
                 if mass
                 else 0.0
             )
-            model_se.append((variance / (mass + 1)) ** 0.5)
+            model_se.append(0.5 * (variance / (mass + 1)) ** 0.5)
         gate = [(a * a + b * b) ** 0.5 for a, b in zip(gate, model_se)]
         ready = bool(
             self.latest and self.latest["k"] == self.k and self.latest["timing_valid"]
@@ -483,16 +487,18 @@ class Policy:
                 cands = [
                     k
                     for k in range(1, 6)
-                    if scores[k - 1] >= 0.98 * peak
+                    if scores[k - 1] >= 0.995 * peak
                     and scores[k - 1] > scores[best - 1] * 1.03
                 ]
                 if cands:
                     best = max(cands)
             else:
+                c_now = context.get("concurrency", 1)
                 for k in range(1, min(5, self.k + 1) + 1):
+                    margin = 0.08 if (self.k == 1 and k == 2 and c_now >= 16) else (0.05 if (k > self.k and c_now >= 16) else 0.03)
                     if (
                         scores[k - 1] - scores[self.k - 1]
-                        > 0.03 * scores[self.k - 1] + gate[k - 1]
+                        > margin * scores[self.k - 1] + gate[k - 1]
                         and scores[k - 1] > scores[best - 1]
                     ):
                         best = k
