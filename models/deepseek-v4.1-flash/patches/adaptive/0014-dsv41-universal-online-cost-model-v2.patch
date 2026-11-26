@@ -1,15 +1,15 @@
-From 738fd8c906cd26f1d89cc63306c931a29debcbbc Mon Sep 17 00:00:00 2001
+From 6bf9008331f242c33dd204b14dc67435c0650231 Mon Sep 17 00:00:00 2001
 From: Canoziia <canoziia@projectk.org>
-Date: Thu, 26 Nov 2026 14:33:37 +0800
+Date: Thu, 26 Nov 2026 15:09:35 +0800
 Subject: [PATCH] feat(deepseek-v4.1): hardware-agnostic 2-level
- OnlineCostModel v2 & uniform Policy
+ OnlineCostModel v2 & uniform asymmetric Policy
 
 ---
- vllm/v1/core/sched/dsv41_measured_policy.py | 287 +++++++++++++-------
- 1 file changed, 184 insertions(+), 103 deletions(-)
+ vllm/v1/core/sched/dsv41_measured_policy.py | 288 +++++++++++++-------
+ 1 file changed, 186 insertions(+), 102 deletions(-)
 
 diff --git a/vllm/v1/core/sched/dsv41_measured_policy.py b/vllm/v1/core/sched/dsv41_measured_policy.py
-index 5ff372e..058331a 100644
+index 5ff372e..494db5b 100644
 --- a/vllm/v1/core/sched/dsv41_measured_policy.py
 +++ b/vllm/v1/core/sched/dsv41_measured_policy.py
 @@ -105,25 +105,13 @@ def _effective_tokens(batch_m: float) -> float:
@@ -407,23 +407,22 @@ index 5ff372e..058331a 100644
              "c16_ms": [round(v * 1000.0, 2) for v in self.costs(16)],
              "c32_ms": [round(v * 1000.0, 2) for v in self.costs(32)],
          }
-@@ -494,14 +577,12 @@ class Policy:
+@@ -494,11 +577,12 @@ class Policy:
                      and scores[k - 1] > scores[best - 1] * 1.03
                  ]
                  if cands:
 -                    best = min(cands) if context.get("concurrency", 1) >= 16 else max(cands)
-+                    best = max(cands)
++                    best = min(cands)
              else:
 -                c_now = context.get("concurrency", 1)
                  for k in range(1, min(5, self.k + 1) + 1):
 -                    margin = 0.08 if (self.k == 1 and k == 2 and c_now >= 16) else (0.05 if (k > self.k and c_now >= 16) else 0.03)
++                    # Exact paired-prefix downward trim (less compute) vs
++                    # extrapolated upward expansion (more compute).
++                    margin = 0.01 if k < self.k else 0.03
                      if (
                          scores[k - 1] - scores[self.k - 1]
--                        > margin * scores[self.k - 1] + gate[k - 1]
-+                        > 0.03 * scores[self.k - 1] + gate[k - 1]
-                         and scores[k - 1] > scores[best - 1]
-                     ):
-                         best = k
+                         > margin * scores[self.k - 1] + gate[k - 1]
 -- 
 2.56.0
 
