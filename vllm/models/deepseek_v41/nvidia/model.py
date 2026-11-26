@@ -1835,6 +1835,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         from .specialized_decode.ampere.pcie_dma_ring import (
             prefill_2mb_moe_enabled,
+            prefill_2mb_oproj_enabled,
+            prefill_ag_int8_enabled,
+            prefill_async_engram_enabled,
         )
 
         assert isinstance(hidden_states, torch.Tensor)
@@ -1892,9 +1895,39 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             else:
                 dist.reduce_scatter_single(out_shard, inp, group=tp_dev_group)
 
+        use_ag_int8 = (
+            dma is not None
+            and prefill_ag_int8_enabled()
+            and hasattr(dma, "supports_shard_int8")
+            and (S * H) % 32 == 0
+        )
+        use_2mb_oproj = (
+            dma is not None
+            and prefill_2mb_oproj_enabled()
+            and M >= 1024
+            and M == M_pad
+            and (S % 16) == 0
+        )
+        use_async_engram = (
+            dma is not None
+            and prefill_async_engram_enabled()
+            and not use_2mb_moe
+        )
+        q_scratch = (
+            torch.empty(S * H + (S * H // 32) * 2, dtype=torch.uint8, device=dev)
+            if use_ag_int8
+            else None
+        )
+
         def _ag_bf16(shard: torch.Tensor, out_full: torch.Tensor) -> None:
             sc = shard.contiguous()
-            if dma is not None and dma.supports_shard(sc):
+            if (
+                q_scratch is not None
+                and dma is not None
+                and dma.supports_shard_int8(sc)
+            ):
+                dma.all_gather_int8(sc, out_full[:M_pad], q_scratch, stream=def_stream)
+            elif dma is not None and dma.supports_shard(sc):
                 dma.all_gather(sc, out_full[:M_pad], stream=def_stream)
             else:
                 dist.all_gather_single(out_full[:M_pad], sc, group=tp_dev_group)
@@ -1915,70 +1948,84 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 dist.all_gather_single(out, sc, group=tp_dev_group)
             return out[:M]
 
-        def _engram_local(
+        def _engram_prep_kv(
+            engram_mod: typing.Any,
+            layer_hashes: torch.Tensor,
+            run_stream: torch.cuda.Stream,
+            ev_dma_done: torch.cuda.Event | None = None,
+        ) -> torch.Tensor:
+            with torch.cuda.stream(run_stream):
+                if engram_mod._batch is not None:
+                    if ev_dma_done is not None:
+                        ev_dma_done.record(run_stream)
+                    kv = engram_mod.wkv(
+                        engram_mod._batch.wkv_input(engram_mod, layer_hashes.shape[0])
+                    )
+                else:
+                    if (
+                        engram_mod._gather_columns is not None
+                        and dma is not None
+                        and engram_mod.embed_tokens.tp_size == W
+                    ):
+                        emb_rows = engram_mod._ready_rows(layer_hashes.shape[0])
+                        emb_flat = emb_rows.flatten(1).contiguous()
+                        if dma.supports_shard(emb_flat):
+                            emb_g = torch.empty(
+                                (W, emb_flat.shape[0], emb_flat.shape[1]),
+                                dtype=emb_flat.dtype,
+                                device=dev,
+                            )
+                            dma.all_gather(
+                                emb_flat,
+                                emb_g.view(W * emb_flat.shape[0], emb_flat.shape[1]),
+                                stream=run_stream,
+                            )
+                            if ev_dma_done is not None:
+                                ev_dma_done.record(run_stream)
+                            emb_full = (
+                                emb_g.permute(1, 0, 2)
+                                .reshape(emb_flat.shape[0], -1, emb_rows.shape[-1])[
+                                    :, : engram_mod.embed_tokens.n_hash_cols
+                                ]
+                                .flatten(-2)
+                                .contiguous()
+                            )
+                            del emb_g
+                            kv = engram_mod.wkv(emb_full)
+                            del emb_full
+                        else:
+                            if ev_dma_done is not None:
+                                ev_dma_done.record(run_stream)
+                            kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
+                    else:
+                        if ev_dma_done is not None:
+                            ev_dma_done.record(run_stream)
+                        kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
+                if engram_mod._gather_columns is not None:
+                    c_part = kv.shape[1]
+                    if M == M_pad and kv.is_contiguous():
+                        send = kv.view(W, S, c_part)
+                    else:
+                        send = kv.new_zeros((M_pad, c_part))
+                        send[:M].copy_(kv)
+                        send = send.view(W, S, c_part)
+                    del kv
+                    recv = torch.empty_like(send)
+                    dist.all_to_all_single(recv, send, group=tp_dev_group)
+                    del send
+                    kv_local = recv.permute(1, 0, 2).reshape(S, W * c_part).contiguous()
+                    del recv
+                else:
+                    kv_local = _slice_pad_local(kv)
+                    del kv
+                return kv_local
+
+        def _engram_apply_kv(
             engram_mod: typing.Any,
             prev_post_local: torch.Tensor,
-            layer_hashes: torch.Tensor,
+            kv_local: torch.Tensor,
             tok_mask: torch.Tensor | None,
         ) -> torch.Tensor:
-            if engram_mod._batch is not None:
-                kv = engram_mod.wkv(
-                    engram_mod._batch.wkv_input(engram_mod, layer_hashes.shape[0])
-                )
-            else:
-                if (
-                    engram_mod._gather_columns is not None
-                    and dma is not None
-                    and engram_mod.embed_tokens.tp_size == W
-                ):
-                    emb_rows = engram_mod._ready_rows(layer_hashes.shape[0])
-                    emb_flat = emb_rows.flatten(1).contiguous()
-                    if dma.supports_shard(emb_flat):
-                        emb_g = torch.empty(
-                            (W, emb_flat.shape[0], emb_flat.shape[1]),
-                            dtype=emb_flat.dtype,
-                            device=dev,
-                        )
-                        dma.all_gather(
-                            emb_flat,
-                            emb_g.view(W * emb_flat.shape[0], emb_flat.shape[1]),
-                            stream=def_stream,
-                        )
-                        emb_full = (
-                            emb_g.permute(1, 0, 2)
-                            .reshape(emb_flat.shape[0], -1, emb_rows.shape[-1])[
-                                :, : engram_mod.embed_tokens.n_hash_cols
-                            ]
-                            .flatten(-2)
-                            .contiguous()
-                        )
-                        del emb_g
-                        kv = engram_mod.wkv(emb_full)
-                        del emb_full
-                    else:
-                        kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
-                else:
-                    kv = engram_mod.wkv(engram_mod.embed(layer_hashes).flatten(-2))
-            if engram_mod._gather_columns is not None:
-                # Row-sharded prefill only needs local [S, W * C_part] rows:
-                # exchange [W, S, C_part] via AllToAll (1/W bytes vs AllGather
-                # + slice, 100% bitwise identical, -118 MB peak VRAM at M=3072).
-                c_part = kv.shape[1]
-                if M == M_pad and kv.is_contiguous():
-                    send = kv.view(W, S, c_part)
-                else:
-                    send = kv.new_zeros((M_pad, c_part))
-                    send[:M].copy_(kv)
-                    send = send.view(W, S, c_part)
-                del kv
-                recv = torch.empty_like(send)
-                dist.all_to_all_single(recv, send, group=tp_dev_group)
-                del send
-                kv_local = recv.permute(1, 0, 2).reshape(S, W * c_part).contiguous()
-                del recv
-            else:
-                kv_local = _slice_pad_local(kv)
-                del kv
             mask_local: torch.Tensor | None = None
             if tok_mask is not None:
                 if valid == S:
@@ -1988,6 +2035,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     if valid > 0:
                         mask_local[:valid].copy_(tok_mask[r_lo : r_lo + valid])
             return engram_mod._post_wkv(prev_post_local, kv_local, mask_local, valid)
+
+        def _engram_local(
+            engram_mod: typing.Any,
+            prev_post_local: torch.Tensor,
+            layer_hashes: torch.Tensor,
+            tok_mask: torch.Tensor | None,
+        ) -> torch.Tensor:
+            kv_local = _engram_prep_kv(engram_mod, layer_hashes, def_stream)
+            return _engram_apply_kv(engram_mod, prev_post_local, kv_local, tok_mask)
 
         def _mhc_pre_fn(layer: DeepseekV4DecoderLayer):
             return (
@@ -2154,16 +2210,61 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             del x_in, qr, qr_scale, kv, kv_score, indexer_weights
 
             orig_wob_reduce = layer.attn.wo_b.reduce_results
-            try:
-                layer.attn.wo_b.reduce_results = False
-                y_partial = layer.attn._o_proj(attn_out, positions)
-            finally:
-                layer.attn.wo_b.reduce_results = orig_wob_reduce
-            del attn_out
+            if (
+                use_2mb_oproj
+                and isinstance(attn_out, torch.Tensor)
+                and attn_out.dim() >= 2
+                and dma is not None
+            ):
+                s_half = S // 2
+                m_half = W * s_half
+                a_view = attn_out.view(W, 2, s_half, *attn_out.shape[1:])
+                y0_buf = full_buf[:m_half]
+                y1_buf = full_buf[m_half:M]
+                try:
+                    layer.attn.wo_b.reduce_results = False
+                    a0 = a_view[:, 0].reshape(m_half, *attn_out.shape[1:]).contiguous()
+                    layer.attn._o_proj(a0, positions[:m_half], out=y0_buf)
+                    del a0
+                    ev_h0_ready.record(def_stream)
+                    comm_stream.wait_event(ev_h0_ready)
+                    if dma.supports_full(y0_buf):
+                        dma.reduce_scatter(y0_buf, shard_buf[:s_half], stream=comm_stream)
+                    else:
+                        with torch.cuda.stream(comm_stream):
+                            dist.reduce_scatter_single(
+                                shard_buf[:s_half], y0_buf, group=tp_dev_group
+                            )
+                    ev_h0_done.record(comm_stream)
 
-            # Reduce-Scatter attention partial output into local S rows
-            _rs_bf16(y_partial, shard_buf)
-            del y_partial
+                    a1 = a_view[:, 1].reshape(m_half, *attn_out.shape[1:]).contiguous()
+                    del attn_out, a_view
+                    layer.attn._o_proj(a1, positions[:m_half], out=y1_buf)
+                    del a1
+                    ev_h1_ready.record(def_stream)
+                    comm_stream.wait_event(ev_h1_ready)
+                    if dma.supports_full(y1_buf):
+                        dma.reduce_scatter(y1_buf, shard_buf[s_half:], stream=comm_stream)
+                    else:
+                        with torch.cuda.stream(comm_stream):
+                            dist.reduce_scatter_single(
+                                shard_buf[s_half:], y1_buf, group=tp_dev_group
+                            )
+                    ev_h1_done.record(comm_stream)
+                finally:
+                    layer.attn.wo_b.reduce_results = orig_wob_reduce
+                def_stream.wait_event(ev_h1_done)
+            else:
+                try:
+                    layer.attn.wo_b.reduce_results = False
+                    y_partial = layer.attn._o_proj(attn_out, positions)
+                finally:
+                    layer.attn.wo_b.reduce_results = orig_wob_reduce
+                del attn_out
+
+                # Reduce-Scatter attention partial output into local S rows
+                _rs_bf16(y_partial, shard_buf)
+                del y_partial
 
             # 2. FFN mHC + RMSNorm on ONLY S local rows (1/W memory & compute!)
             res_loc, pm_loc, rm_loc, x_ffn_loc, pre_loc, _ = mhc_shifted_post_pre(
@@ -2255,9 +2356,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         if n1 > 0:
                             shard_buf[n0 : n0 + n1].copy_(h1_buf[lo1:hi1])
                     del h0
+                    async_eng_g = None
                 elif moe_cfg is not None:
                     # 4-card M<=3072 optimal path: whole MoE (0 extra weight reads)
                     # followed by Copy-Engine Ring Reduce-Scatter (1.31x vs NCCL RS).
+                    # If the next layer has Engram, overlap its DMA AllGather + wkv +
+                    # AllToAll on comm_stream behind this layer's MoE FFN!
+                    nxt_peek = self.layers[idx + 1]
+                    async_eng_g = None
+                    async_eng_rows_dim = 0
+                    async_eng_flat = None
+                    if (
+                        use_async_engram
+                        and isinstance(nxt_peek, DeepseekV4DecoderLayer)
+                        and nxt_peek.engram is not None
+                        and engram_hashes is not None
+                        and nxt_peek.engram._batch is None
+                        and nxt_peek.engram._gather_columns is not None
+                        and nxt_peek.engram.embed_tokens.tp_size == W
+                    ):
+                        emb_rows_p = nxt_peek.engram._ready_rows(M)
+                        emb_flat_p = emb_rows_p.flatten(1).contiguous()
+                        if dma.supports_shard(emb_flat_p):
+                            async_eng_g = torch.empty(
+                                (W, emb_flat_p.shape[0], emb_flat_p.shape[1]),
+                                dtype=emb_flat_p.dtype,
+                                device=dev,
+                            )
+                            async_eng_rows_dim = emb_rows_p.shape[-1]
+                            async_eng_flat = emb_flat_p
+                            ev_h0_ready.record(def_stream)
+                            comm_stream.wait_event(ev_h0_ready)
+                            dma.all_gather(
+                                emb_flat_p,
+                                async_eng_g.view(
+                                    W * emb_flat_p.shape[0], emb_flat_p.shape[1]
+                                ),
+                                stream=comm_stream,
+                            )
+                            ev_h0_done.record(comm_stream)
+
                     orig_skip = moe_cfg.skip_final_all_reduce
                     try:
                         moe_cfg.skip_final_all_reduce = True
@@ -2265,9 +2403,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     finally:
                         moe_cfg.skip_final_all_reduce = orig_skip
                     del x_ffn_in
+                    if async_eng_g is not None:
+                        def_stream.wait_event(ev_h0_done)
+                        del async_eng_flat
                     _rs_bf16(h_raw, shard_buf)
                     del h_raw
                 else:
+                    async_eng_g = None
                     h_full = layer.ffn(x_ffn_in, input_ids, mega_gate_metadata)
                     del x_ffn_in
                     shard_buf.copy_(_slice_pad_local(h_full))
@@ -2286,12 +2428,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         aux_hidden_by_layer[nxt_idx] = _ag_generic(
                             prev_post_loc.mean(dim=1)
                         )
-                    res_loc = _engram_local(
-                        nxt.engram,
-                        prev_post_loc,
-                        engram_hashes[:, nxt.engram.layer_hash_index],
-                        engram_mask,
-                    )
+                    if async_eng_g is not None:
+                        emb_full = (
+                            async_eng_g.permute(1, 0, 2)
+                            .reshape(M, -1, async_eng_rows_dim)[
+                                :, : nxt.engram.embed_tokens.n_hash_cols
+                            ]
+                            .flatten(-2)
+                            .contiguous()
+                        )
+                        del async_eng_g
+                        kv_e = nxt.engram.wkv(emb_full)
+                        del emb_full
+                        c_part = kv_e.shape[1]
+                        if M == M_pad and kv_e.is_contiguous():
+                            send = kv_e.view(W, S, c_part)
+                        else:
+                            send = kv_e.new_zeros((M_pad, c_part))
+                            send[:M].copy_(kv_e)
+                            send = send.view(W, S, c_part)
+                        del kv_e
+                        recv = torch.empty_like(send)
+                        dist.all_to_all_single(recv, send, group=tp_dev_group)
+                        del send
+                        kv_loc_e = recv.permute(1, 0, 2).reshape(S, W * c_part).contiguous()
+                        del recv
+                        res_loc = _engram_apply_kv(
+                            nxt.engram,
+                            prev_post_loc,
+                            kv_loc_e,
+                            engram_mask,
+                        )
+                        del kv_loc_e
+                    else:
+                        res_loc = _engram_local(
+                            nxt.engram,
+                            prev_post_loc,
+                            engram_hashes[:, nxt.engram.layer_hash_index],
+                            engram_mask,
+                        )
                     del prev_post_loc
                     pm_loc, rm_loc, x_nxt_loc, attn_pre_loc = _mhc_pre_fn(nxt)(
                         res_loc,

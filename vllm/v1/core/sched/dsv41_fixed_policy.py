@@ -10,7 +10,7 @@ import math
 import os
 import time
 from types import SimpleNamespace
-from .dsv41_measured_policy import OnlineCostModel, Policy
+from .dsv41_measured_policy import OnlineCostModel, Policy, _CG_CAPTURE_SIZES
 
 
 class FixedHistoryPolicy:
@@ -151,6 +151,64 @@ class FixedHistoryPolicy:
                     if entry is not None and not self.is_disabled(entry):
                         entry.k = cohort_k
                     result[rid] = cohort_k
+        if (
+            len(result) >= 8
+            and self.cost_model is not None
+            and os.environ.get("VLLM_DSV41_BATCH_CAP", "1") != "0"
+        ):
+            rids = list(result.keys())
+            entries = [self.active.get(rid) for rid in rids]
+            trimmed_cnt = sum(
+                1
+                for e in entries
+                if e is not None and getattr(e.plugin, "trimmed", False)
+            )
+            if trimmed_cnt >= len(rids) // 2 and all(
+                e is not None and hasattr(e.plugin, "expected_tokens")
+                for e in entries
+            ):
+                Es = [e.plugin.expected_tokens() for e in entries]
+                cur_ks = [result[rid] for rid in rids]
+                b_cnt = len(rids)
+                dspark_step_ms = 0.40 if b_cnt >= 32 else (0.25 if b_cnt >= 16 else 0.15)
+
+                def _batch_ms(ks_vec):
+                    m_val = sum(1 + kv for kv in ks_vec)
+                    cg_val = m_val
+                    for sz in _CG_CAPTURE_SIZES:
+                        if sz >= m_val:
+                            cg_val = sz
+                            break
+                    base = self.cost_model._predict_global_ms(
+                        0.4 * m_val + 0.6 * cg_val
+                    )
+                    return base + (max(ks_vec) - 1) * dspark_step_ms
+
+                max_minority = max(2, b_cnt // 4)
+                while max(cur_ks) > 1:
+                    hi = max(cur_ks)
+                    at_hi = [i for i, kv in enumerate(cur_ks) if kv == hi]
+                    # Only cap a true minority (<=25%) of trimmed outlier requests;
+                    # never cap a large high-acceptance cohort (e.g. 50/50 mixed
+                    # counting+prose) or untrimmed k=5 requests still warming up.
+                    if len(at_hi) > max_minority or any(
+                        not getattr(entries[i].plugin, "trimmed", False)
+                        for i in at_hi
+                    ):
+                        break
+                    cand_ks = [min(kv, hi - 1) for kv in cur_ks]
+                    cur_tps = sum(Es[i][cur_ks[i] - 1] for i in range(b_cnt)) / _batch_ms(cur_ks)
+                    cand_tps = sum(Es[i][cand_ks[i] - 1] for i in range(b_cnt)) / _batch_ms(cand_ks)
+                    if cand_tps > cur_tps * 1.005:
+                        cur_ks = cand_ks
+                    else:
+                        break
+                for i, rid in enumerate(rids):
+                    if cur_ks[i] != result[rid]:
+                        result[rid] = cur_ks[i]
+                        e = entries[i]
+                        if e is not None and not self.is_disabled(e):
+                            e.k = cur_ks[i]
         return result
 
     def scheduled(self, output, residents, concurrency):

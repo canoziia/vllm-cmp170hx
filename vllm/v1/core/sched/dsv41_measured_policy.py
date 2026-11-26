@@ -258,7 +258,7 @@ class OnlineCostModel:
             and all(math.isfinite(v) for v in cand)
             and cand[0] > 0.5
         ):
-            self._theta = [cand[0], max(0.65 * self._theta_prior[1], cand[1]), max(0.0, cand[2])]
+            self._theta = [cand[0], max(0.80 * self._theta_prior[1], cand[1]), min(1.25 * self._theta_prior[2], max(0.0, cand[2]))]
 
     def predict_ms(self, batch_b: int, batch_m: int) -> float:
         base = self._predict_global_ms(float(batch_m))
@@ -407,8 +407,7 @@ class Policy:
             self.t2[j] += dt * dt
             self.yt[j] += y * dt
 
-    def choose(self, context):
-        self.k = context["current_k"]
+    def expected_tokens(self) -> list[float]:
         p = []
         previous = 1.0
         for n, s in zip(self.risk, self.success):
@@ -416,7 +415,11 @@ class Policy:
                 previous, (s + self.prior + (0.5 + 0.4 * (previous ** 6)) * previous) / (n + self.prior + 1)
             )
             p.append(previous)
-        E = [1 + sum(p[:k]) for k in range(1, 6)]
+        return [1 + sum(p[:k]) for k in range(1, 6)]
+
+    def choose(self, context):
+        self.k = context["current_k"]
+        E = self.expected_tokens()
         cost_model = context.get("cost_model")
         if cost_model is not None:
             C = cost_model.costs(context["concurrency"])
@@ -491,7 +494,7 @@ class Policy:
                     and scores[k - 1] > scores[best - 1] * 1.03
                 ]
                 if cands:
-                    best = max(cands)
+                    best = min(cands) if context.get("concurrency", 1) >= 16 else max(cands)
             else:
                 c_now = context.get("concurrency", 1)
                 for k in range(1, min(5, self.k + 1) + 1):

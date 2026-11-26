@@ -36,6 +36,21 @@ def prefill_row_shard_enabled() -> bool:
     return raw in ("1", "true", "yes", "auto", "force")
 
 
+def prefill_ag_int8_enabled() -> bool:
+    raw = os.environ.get("VLLM_DSV41_PREFILL_AG_INT8", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def prefill_2mb_oproj_enabled() -> bool:
+    raw = os.environ.get("VLLM_DSV41_PREFILL_2MB_OPROJ", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def prefill_async_engram_enabled() -> bool:
+    raw = os.environ.get("VLLM_DSV41_PREFILL_ASYNC_ENGRAM", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def prefill_2mb_moe_enabled(num_tokens: int, ep_size: int) -> bool:
     raw = os.environ.get("VLLM_DSV41_PREFILL_2MB_MOE", "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
@@ -136,6 +151,33 @@ class PcieDmaRing:
     ) -> None:
         s = stream if stream is not None else torch.cuda.current_stream(self.device)
         self._ext.ce_all_gather(self.chan_id, shard, out, int(s.cuda_stream))
+
+    def supports_shard_int8(self, shard: torch.Tensor) -> bool:
+        if (
+            not hasattr(self._ext, "ce_all_gather_int8")
+            or shard.dtype != torch.bfloat16
+            or not shard.is_cuda
+            or not shard.is_contiguous()
+            or shard.device != self.device
+        ):
+            return False
+        numel = shard.numel()
+        if numel == 0 or (numel % 32) != 0:
+            return False
+        packed_bytes = numel + (numel // 32) * 2
+        return packed_bytes <= self.max_chunk_bytes
+
+    def all_gather_int8(
+        self,
+        shard: torch.Tensor,
+        out: torch.Tensor,
+        q_scratch: torch.Tensor,
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        s = stream if stream is not None else torch.cuda.current_stream(self.device)
+        self._ext.ce_all_gather_int8(
+            self.chan_id, shard, out, q_scratch, int(s.cuda_stream)
+        )
 
     def all_reduce_inplace(
         self,
