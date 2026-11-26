@@ -20,6 +20,10 @@ on:
         description: "Build and push shared LMCache server image"
         type: boolean
         default: false
+      build_router:
+        description: "Build and push patched vLLM PD router image"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -42,6 +46,7 @@ jobs:
     outputs:
       build_vllm: ${{ steps.plan.outputs.build_vllm }}
       build_lmcache: ${{ steps.plan.outputs.build_lmcache }}
+      build_router: ${{ steps.plan.outputs.build_router }}
       vllm_sha: ${{ steps.plan.outputs.vllm_sha }}
     steps:
       - name: Checkout main
@@ -67,10 +72,12 @@ jobs:
           vllm_sha=$(git rev-parse --short=12 refs/heads/vllm)
           build_vllm=false
           build_lmc=false
+          build_rtr=false
 
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             build_vllm="${{ inputs.build_vllm }}"
             build_lmc="${{ inputs.build_lmcache }}"
+            build_rtr="${{ inputs.build_router }}"
           elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             if [[ "${GITHUB_REF_NAME}" == "vllm" ]]; then
               build_vllm=true
@@ -84,6 +91,9 @@ jobs:
               if grep -qE '^(manifests/lmcache\.env|patches/lmcache/|scripts/(apply|build|ensure|test)-lmcache|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
                 build_lmc=true
               fi
+              if grep -qE '^(manifests/router\.env|patches/router/|scripts/(build|test)-router|\.github/workflows/docker-publish\.yml)' <<<"$changed"; then
+                build_rtr=true
+              fi
             fi
           fi
 
@@ -91,8 +101,9 @@ jobs:
             echo "vllm_sha=${vllm_sha}"
             echo "build_vllm=${build_vllm}"
             echo "build_lmcache=${build_lmc}"
+            echo "build_router=${build_rtr}"
           } >> "$GITHUB_OUTPUT"
-          echo "plan: vllm_sha=${vllm_sha} build_vllm=${build_vllm} build_lmcache=${build_lmc}"
+          echo "plan: vllm_sha=${vllm_sha} build_vllm=${build_vllm} build_lmcache=${build_lmc} build_router=${build_rtr}"
 
   build_lmcache:
     name: Push LMCache server image
@@ -203,6 +214,113 @@ jobs:
         run: |
           {
             echo "### LMCache server image published"
+            echo
+            echo "- digest: \`${DIGEST}\`"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build_router:
+    name: Push vLLM PD router image
+    needs: validate
+    if: github.event_name != 'pull_request' && needs.validate.outputs.build_router == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Prepare patched vLLM router context
+        run: |
+          set -euo pipefail
+          ROUTER_BASE_IMAGE=python:3.12-slim \
+          ROUTER_PIP_INDEX_URL=https://pypi.org/simple \
+          PREPARE_CONTEXT_ONLY="${RUNNER_TEMP}/context-router" \
+          bash scripts/build-router-image.sh
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Compute image names
+        id: image
+        run: |
+          set -euo pipefail
+          repo_lc="${IMAGE_NAME,,}"
+          imgs=("${REGISTRY}/${repo_lc}/vllm-router")
+          if [[ -n "${DOCKERHUB_USER:-}" ]]; then
+            imgs+=("docker.io/${DOCKERHUB_USER,,}/${IMAGE_NAME##*/}-vllm-router")
+          fi
+          {
+            echo "primary=${REGISTRY}/${repo_lc}/vllm-router"
+            echo "images<<__EOF__"
+            printf '%s\n' "${imgs[@]}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USER != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.images }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-
+
+      - name: Build and push vLLM router image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/context-router
+          file: ${{ runner.temp }}/context-router/Containerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign the published Docker image
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          PRIMARY: ${{ steps.image.outputs.primary }}
+        run: |
+          test -n "$DIGEST"
+          cosign sign --yes "${PRIMARY}@${DIGEST}"
+
+      - name: Summary
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### vLLM PD router image published"
             echo
             echo "- digest: \`${DIGEST}\`"
             echo

@@ -426,5 +426,55 @@ class ShortPromptBypassTests(unittest.TestCase):
                 os.environ["VLLM_ROUTER_MIN_PREFILL_TOKENS"] = old
 
 
+class PrefillSJFPriorityTests(unittest.TestCase):
+    """patches/router/0006: token-length-bucketed SJF priority on prefill hop."""
+
+    def test_sjf_priority_assignment(self):
+        import os
+
+        import vllm_router.services.request_service.request as mod
+
+        old_en = os.environ.get("VLLM_ROUTER_PREFILL_SJF")
+        old_bk = os.environ.get("VLLM_ROUTER_PREFILL_SJF_BUCKET")
+        try:
+            os.environ["VLLM_ROUTER_PREFILL_SJF"] = "1"
+            os.environ["VLLM_ROUTER_PREFILL_SJF_BUCKET"] = "1024"
+            p_2k = mod._prefill_sjf_priority({"prompt": [1] * 2048}, 2048)
+            p_16k = mod._prefill_sjf_priority({"prompt": [1] * 16384}, 16384)
+            p_128k = mod._prefill_sjf_priority({"prompt": [1] * 131072}, 131072)
+            self.assertEqual(p_2k, 2)
+            self.assertEqual(p_16k, 16)
+            self.assertEqual(p_128k, 128)
+            self.assertLess(p_2k, p_16k)
+            self.assertLess(p_16k, p_128k)
+
+            # Explicit caller priority is respected (never clobbered)
+            self.assertIsNone(
+                mod._prefill_sjf_priority({"prompt": [1] * 4096, "priority": 0}, 4096)
+            )
+
+            # Multimodal / unknown shape gets moderate default priority
+            self.assertEqual(
+                mod._prefill_sjf_priority(
+                    {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
+                    None,
+                ),
+                16,
+            )
+
+            # Disabled when off
+            os.environ["VLLM_ROUTER_PREFILL_SJF"] = "0"
+            self.assertIsNone(mod._prefill_sjf_priority({"prompt": [1] * 2048}, 2048))
+        finally:
+            if old_en is None:
+                os.environ.pop("VLLM_ROUTER_PREFILL_SJF", None)
+            else:
+                os.environ["VLLM_ROUTER_PREFILL_SJF"] = old_en
+            if old_bk is None:
+                os.environ.pop("VLLM_ROUTER_PREFILL_SJF_BUCKET", None)
+            else:
+                os.environ["VLLM_ROUTER_PREFILL_SJF_BUCKET"] = old_bk
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

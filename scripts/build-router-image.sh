@@ -11,13 +11,18 @@ set -euo pipefail
 # exactly what the series produced.
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+_ENV_BASE_IMAGE=${ROUTER_BASE_IMAGE:-}
+_ENV_PIP_INDEX=${ROUTER_PIP_INDEX_URL:-}
 # shellcheck disable=SC1091
 source "$REPO_ROOT/manifests/router.env"
+ROUTER_BASE_IMAGE=${_ENV_BASE_IMAGE:-$ROUTER_BASE_IMAGE}
+ROUTER_PIP_INDEX_URL=${_ENV_PIP_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
 ENGINE=${CONTAINER_ENGINE:-podman}
+PREPARE_CONTEXT_ONLY=${PREPARE_CONTEXT_ONLY:-}
 REVISION=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo nogit)
 OUTPUT_IMAGE=${OUTPUT_IMAGE:-$DEFAULT_ROUTER_OUTPUT_IMAGE:$REVISION}
 SERIES="$REPO_ROOT/patches/router/series"
-CACHE=${ROUTER_TARBALL_CACHE:-/root/app/.cmp-build/router}
+CACHE=${ROUTER_TARBALL_CACHE:-${TMPDIR:-/tmp}/cmp-build-router}
 TARBALL="$CACHE/production-stack-$ROUTER_VERSION.tar.gz"
 WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/router-image-build.XXXXXX")
 cleanup() { [[ ${KEEP_WORKDIR:-0} == 1 ]] && echo "Keeping $WORKDIR" || rm -rf "$WORKDIR"; }
@@ -27,7 +32,9 @@ if [[ -f "$REPO_ROOT/manifests/patches.sha256" ]]; then
   (cd "$REPO_ROOT" && sha256sum -c manifests/patches.sha256 >/dev/null)
 fi
 
-for command in "$ENGINE" curl tar patch; do
+REQ_CMDS=(curl tar patch)
+[[ -n $PREPARE_CONTEXT_ONLY ]] || REQ_CMDS+=("$ENGINE")
+for command in "${REQ_CMDS[@]}"; do
   command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 2; }
 done
 
@@ -53,7 +60,7 @@ cp "$REPO_ROOT/scripts/test-router-patches.py" "$WORKDIR/context/"
 cat > "$WORKDIR/context/Containerfile" <<CONTAINERFILE
 FROM $ROUTER_BASE_IMAGE
 USER root
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \\
+ENV PIP_INDEX_URL=$ROUTER_PIP_INDEX_URL \\
     SETUPTOOLS_SCM_PRETEND_VERSION=${ROUTER_VERSION#vllm-stack-} \\
     PYTHONUNBUFFERED=1
 COPY router.tar.gz /tmp/router.tar.gz
@@ -63,11 +70,19 @@ COPY src/vllm_router/ /usr/local/lib/python3.12/site-packages/vllm_router/
 COPY test-router-patches.py /tmp/
 RUN python3 -m compileall -q /usr/local/lib/python3.12/site-packages/vllm_router \\
  && python3 /tmp/test-router-patches.py
-LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-cmp170hx" \\
+LABEL org.opencontainers.image.source="https://github.com/canoziia/vllm-sm80" \\
       org.opencontainers.image.revision="$REVISION" \\
       io.canoziia.router.version="$ROUTER_VERSION" \\
       io.canoziia.router.patch-series="patches/router/series"
 CONTAINERFILE
+
+if [[ -n $PREPARE_CONTEXT_ONLY ]]; then
+  rm -rf "$PREPARE_CONTEXT_ONLY"
+  mkdir -p "$(dirname "$PREPARE_CONTEXT_ONLY")"
+  mv "$WORKDIR/context" "$PREPARE_CONTEXT_ONLY"
+  echo "Prepared router build context in $PREPARE_CONTEXT_ONLY"
+  exit 0
+fi
 
 unset ALL_PROXY HTTPS_PROXY HTTP_PROXY all_proxy https_proxy http_proxy
 if [[ $ENGINE == podman ]]; then

@@ -101,11 +101,11 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       HF_HUB_OFFLINE: "1"
       VLLM_WORKER_MULTIPROC_METHOD: "spawn"
-      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "64"
+      VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "32"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       NCCL_IB_DISABLE: "1"
       VLLM_DSV4_MXFP4_DECODE_MAX_TOKENS: "192"
-      VLLM_DSV41_OPT_PROFILE: "${DSV41_DECODE_OPT_PROFILE:-auto}"
+      VLLM_DSV41_OPT_PROFILE: "${DSV41_DECODE_OPT_PROFILE:-tp4_decode}"
       VLLM_DSV41_ENGRAM_SHM_DIR: "/engram-shm"
       VLLM_DSV41_ENGRAM_SHM_REGISTER: "1"
       PYTHONUNBUFFERED: "1"
@@ -130,9 +130,9 @@ services:
       - --pipeline-parallel-size=1
       - --max-model-len=${VLLM_MAX_MODEL_LEN:-1048576}
       - --max-num-seqs=${DSV41_DECODE_MAX_NUM_SEQS:-32}
-      - --max-num-batched-tokens=${DSV41_DECODE_MAX_BATCHED_TOKENS:-2048}
+      - --max-num-batched-tokens=${DSV41_DECODE_MAX_BATCHED_TOKENS:-1024}
       - --kv-cache-dtype=auto
-      - --kv-cache-memory=${DSV41_DECODE_KV_CACHE_MEMORY:-2200000000}
+      - --kv-cache-memory=${DSV41_DECODE_KV_CACHE_MEMORY:-3000000000}
       - --prefix-cache-retention-interval=${LMCACHE_CHUNK_SIZE:-1024}
       - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_port":14579,"kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":${LMCACHE_PORT:-5556}}}'
       - '--compilation-config={"cudagraph_mode":"FULL_DECODE_ONLY","max_cudagraph_capture_size":192}'
@@ -193,7 +193,7 @@ services:
       VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: "64"
       PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:False"
       NCCL_IB_DISABLE: "1"
-      VLLM_DSV41_OPT_PROFILE: "${DSV41_PREFILL_OPT_PROFILE:-auto}"
+      VLLM_DSV41_OPT_PROFILE: "${DSV41_PREFILL_OPT_PROFILE:-tp2_prefill}"
       VLLM_DSV41_YOCO_PREFILL_ONLY: "1"
       VLLM_DSV41_PREFILL_ROW_SHARD_ATTN: "${DSV41_PREFILL_ROW_SHARD_ATTN:-1}"
       # TP2 has ni=1152; disable decode-only ni=576 MXFP4 kernel on Prefill engine
@@ -248,7 +248,7 @@ services:
       retries: 3
 
   deepseek-v4.1-flash-pd-router:
-    image: ${ROUTER_IMAGE:-localhost/vllm-router:pd-sjf}
+    image: ${ROUTER_IMAGE:-ghcr.io/canoziia/vllm-sm80/vllm-router:latest}
     container_name: deepseek-v4.1-flash-pd-router
     restart: "no"
     network_mode: host
