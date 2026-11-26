@@ -225,7 +225,6 @@ _TP_COMMON_EXTRAS: dict[str, str] = {
     "VLLM_DSV41_DENSE_MXFP8_DECODE": "1",
     "VLLM_DSV41_ENGRAM_NUMA_INTERLEAVE": "1",
     "VLLM_DSV41_WOA_FP8": "1",
-    "VLLM_DSV41_OFFLOAD_VISION_EMBED": "1",
     "VLLM_DSV41_MARLIN_CLEAN_REPACK": "1",
     "VLLM_DSV41_YOCO_PARTIAL_FFN": "1",
     "VLLM_DSV41_TOPK_RAGGED_REUSE": "1",
@@ -249,6 +248,7 @@ PROFILES["tp_auto_verification"] = {**PROFILES["verification"], **_TP_COMMON_EXT
 # disables decode-only ni=576 MXFP4 kernel, and keeps whole-MoE (2mb_moe=0).
 PROFILES["tp2_prefill"] = {
     **PROFILES["tp_auto"],
+    "VLLM_DSV41_OFFLOAD_VISION_EMBED": "1",
     "VLLM_DSV41_YOCO_PREFILL_ONLY": "1",
     "VLLM_DSV41_PREFILL_ROW_SHARD_ATTN": "1",
     "VLLM_DSV4_MXFP4_DECODE": "0",
@@ -256,12 +256,25 @@ PROFILES["tp2_prefill"] = {
 }
 
 
-def _parse_launch_args(argv: list[str]) -> tuple[str | None, int, int, bool, bool]:
-    """Extract (model, tp, pp, ep, adaptive_verification) from vLLM CLI argv."""
+# Below this many weight-sharding GPUs (tp * pp * (dp if ep else 1)), offload
+# the vision tower and embed_tokens to CPU/UVA to preserve GPU KV headroom.
+_VISION_EMBED_OFFLOAD_MAX_GPUS = 6
+
+
+def _model_sharded_gpus(tp: int, pp: int, dp: int, ep: bool) -> int:
+    """Number of GPUs sharding the MoE model weights for one replica."""
+    return tp * pp * (dp if ep else 1)
+
+
+def _parse_launch_args(
+    argv: list[str],
+) -> tuple[str | None, int, int, int, bool, bool]:
+    """Extract (model, tp, pp, dp, ep, adaptive_verification) from vLLM CLI argv."""
     model: str | None = None
     positional_model: str | None = None
     tp = 1
     pp = 1
+    dp = 1
     ep = False
     adaptive = False
 
@@ -309,6 +322,14 @@ def _parse_launch_args(argv: list[str]) -> tuple[str | None, int, int, bool, boo
             pp = _safe_int(tok.split("=", 1)[1], pp)
         elif tok.startswith("--pipeline-parallel-size="):
             pp = _safe_int(tok.split("=", 1)[1], pp)
+        elif tok in ("-dp", "--data-parallel-size") and i + 1 < len(args):
+            dp = _safe_int(args[i + 1], dp)
+            i += 2
+            continue
+        elif tok.startswith("-dp="):
+            dp = _safe_int(tok.split("=", 1)[1], dp)
+        elif tok.startswith("--data-parallel-size="):
+            dp = _safe_int(tok.split("=", 1)[1], dp)
         elif tok == "--enable-expert-parallel":
             ep = True
         elif tok == "--speculative-config" and i + 1 < len(args):
@@ -319,7 +340,7 @@ def _parse_launch_args(argv: list[str]) -> tuple[str | None, int, int, bool, boo
             adaptive = _check_spec(tok.split("=", 1)[1])
         i += 1
 
-    return (model or positional_model, tp, pp, ep, adaptive)
+    return (model or positional_model, tp, pp, dp, ep, adaptive)
 
 
 def _is_deepseek_v41_model(model: str | None) -> bool:
@@ -357,7 +378,7 @@ def _is_deepseek_v41_model(model: str | None) -> bool:
 
 def resolve_auto_profile(argv: list[str] | None = None) -> str | None:
     """Resolve the best SM80 profile for the launch command, or None for other models."""
-    model, tp, pp, ep, adaptive = _parse_launch_args(
+    model, tp, pp, dp, ep, adaptive = _parse_launch_args(
         sys.argv if argv is None else argv
     )
     if not _is_deepseek_v41_model(model):
@@ -366,7 +387,7 @@ def resolve_auto_profile(argv: list[str] | None = None) -> str | None:
         return "verification" if adaptive else "default"
     if tp == 4 and not ep:
         return "tp4_fused"
-    if tp == 4 and ep:
+    if tp == 4 and ep and dp == 1:
         return "tep4_fused"
     if (
         tp == 2
@@ -506,20 +527,32 @@ def pcie_switch_connected_nvml(
 
 def apply() -> None:
     name = os.environ.get("VLLM_DSV41_OPT_PROFILE", "").strip().lower().replace("-", "_")
+    parsed_sharded_gpus: int | None = None
     if name == "auto":
+        model, tp, pp, dp, ep, _ = _parse_launch_args(sys.argv)
         resolved = resolve_auto_profile()
         if resolved is None:
             name = ""
         else:
             name = resolved
+            parsed_sharded_gpus = _model_sharded_gpus(tp, pp, dp, ep)
             # Propagate resolved profile so spawned workers inherit it cleanly
             # even though worker argv lacks the CLI serve flags.
             os.environ["VLLM_DSV41_OPT_PROFILE"] = resolved
+    elif name in ("tp_auto", "tp_auto_verification"):
+        model, tp, pp, dp, ep, _ = _parse_launch_args(sys.argv)
+        if model is not None:
+            parsed_sharded_gpus = _model_sharded_gpus(tp, pp, dp, ep)
     if name not in ("", "0", "off", "none"):
         if name not in PROFILES:
             raise ValueError(
                 f"VLLM_DSV41_OPT_PROFILE={name!r}: unknown profile "
                 f"(known: auto, {', '.join(sorted(PROFILES))})"
+            )
+        if parsed_sharded_gpus is not None:
+            os.environ.setdefault(
+                "VLLM_DSV41_OFFLOAD_VISION_EMBED",
+                "1" if parsed_sharded_gpus < _VISION_EMBED_OFFLOAD_MAX_GPUS else "0",
             )
         for key, value in PROFILES[name].items():
             os.environ.setdefault(key, value)
