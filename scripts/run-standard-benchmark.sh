@@ -92,9 +92,13 @@ echo
 if [[ $SKIP_PREFILL -eq 0 && $SKIP_DECODE -eq 0 ]]; then
   echo ">>> Warmup (decode + subwidth + 4K prefill JIT)..."
   WARM_OUT="$(mktemp)"
-  node "$BENCH_JS" --mode counting --max-tokens 64 --concurrency 1,32 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
-  node "$BENCH_JS" --mode prose --max-tokens 128 --concurrency 1,2,4,8 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
-  node "$BENCH_JS" --mode prefill --input-tokens 4096 --concurrency 1 "${COMMON_ARGS[@]/--output "$OUTPUT_FILE"/--output "$WARM_OUT"}" >/dev/null
+  WARM_ARGS=(--base-url "$BASE_URL" --output "$WARM_OUT")
+  if [[ -n "$MODEL" ]]; then
+    WARM_ARGS+=(--model "$MODEL")
+  fi
+  node "$BENCH_JS" --mode counting --max-tokens 64 --concurrency 1,32 "${WARM_ARGS[@]}" >/dev/null
+  node "$BENCH_JS" --mode prose --max-tokens 128 --concurrency 1,2,4,8 "${WARM_ARGS[@]}" >/dev/null
+  node "$BENCH_JS" --mode prefill --input-tokens 4096 --concurrency 1 "${WARM_ARGS[@]}" >/dev/null
   rm -f "$WARM_OUT"
 fi
 
