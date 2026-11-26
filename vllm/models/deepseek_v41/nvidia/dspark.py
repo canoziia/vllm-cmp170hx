@@ -718,6 +718,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
 
     # --- Weight loading ----------------------------------------------------
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Skip all non-MTP safetensors shards when loading the DSpark drafter."""
+        return not name.startswith(("mtp.", "context_wkv_proj."))
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the `mtp.{0,1,2}.*` draft weights from the target checkpoint.
 
@@ -744,6 +748,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
                 num_experts=n_draft_experts,
                 num_redundant_experts=first_layer.ffn.n_redundant_experts,
             )
+        expert_mapping_by_wname: dict[str, list[tuple[str, str, int, str]]] = {}
+        for mapping in expert_mapping:
+            expert_mapping_by_wname.setdefault(mapping[1], []).append(mapping)
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -804,7 +811,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV4MixtureOfExperts):
                     loaded_weight = loaded_weight.view(torch.uint8)
                 # A checkpoint expert can map to multiple local physical replicas.
                 # Load every local slot or the remaining replicas stay uninitialized.
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                candidates = None
+                exp_pos = name.find("experts.")
+                if exp_pos >= 0:
+                    d1 = name.find(".", exp_pos + 8)
+                    d2 = name.find(".", d1 + 1) if d1 >= 0 else -1
+                    if d2 >= 0:
+                        candidates = expert_mapping_by_wname.get(name[exp_pos : d2 + 1])
+                if candidates is None:
+                    candidates = expert_mapping
+                for param_name, weight_name, expert_id, shard_id in candidates:
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)

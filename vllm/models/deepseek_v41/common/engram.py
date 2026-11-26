@@ -2097,6 +2097,16 @@ class ParallelEngramEmbedding(nn.Module):
                     raise RuntimeError(
                         f"cudaHostRegister failed for {fpath} ({fsize} bytes): err={err}"
                     )
+                # Move GUP-pinned tmpfs pages out of Active/Inactive(anon) into
+                # Unevictable LRU so kswapd/direct-reclaim never wastes CPU
+                # scanning 188 GiB of un-evictable Engram pages during model load.
+                try:
+                    libc = ctypes.CDLL("libc.so.6", use_errno=False)
+                    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                    libc.mlock.restype = ctypes.c_int
+                    libc.mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(fsize))
+                except Exception:
+                    pass
 
                 def _unreg(m: mmap.mmap, p: int) -> None:
                     try:

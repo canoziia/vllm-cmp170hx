@@ -347,10 +347,59 @@ class DeepseekV41ForCausalLM(
             self.aligner.offload_to_cpu()
             torch.cuda.empty_cache()
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        """Skip safetensors shards whose tensors this model does not load."""
+        if name.startswith("mtp."):
+            return True
+        if getattr(self.language_model.model, "yoco_prefill_only", False):
+            if name in ("head.weight", "hc_head") or name.startswith(
+                ("norm.", "hc_head.")
+            ):
+                return True
+            if name.startswith("layers."):
+                dot = name.find(".", 7)
+                if dot > 7 and name[7:dot].isdigit():
+                    layer_idx = int(name[7:dot])
+                    if layer_idx >= self.language_model.model.end_layer:
+                        return True
+        return False
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
-        loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        # Stream language_model.model.* directly in safetensors shard order so
+        # we never materialize or lexicographically sort all ~96K tensors across
+        # 48 shards (which thrashes Linux page cache when Engram is pinned).
+        # Only buffer the ~267 tiny non-backbone tensors (vision/aligner/
+        # delimiters/lm_head) for AutoWeightsLoader's prefix groupby.
+        other_weights: list[tuple[str, torch.Tensor]] = []
+        lm_model_prefix = "language_model.model."
+        lm_model_prefix_len = len(lm_model_prefix)
+
+        extra_mapper = AutoWeightsLoader.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
+        lm_quant = getattr(self.language_model, "quant_config", None) or getattr(
+            self.language_model.model, "quant_config", None
+        )
+        if lm_quant is not None:
+            extra_mapper = (
+                lm_quant.get_cache_scale_mapper()
+                | lm_quant.get_checkpoint_weight_mapper()
+                | extra_mapper
+            )
+
+        def _lm_model_stream() -> Iterable[tuple[str, torch.Tensor]]:
+            for name, tensor in extra_mapper.apply(
+                self.hf_to_vllm_mapper.apply(weights)
+            ):
+                if name.startswith(lm_model_prefix):
+                    yield name[lm_model_prefix_len:], tensor
+                else:
+                    other_weights.append((name, tensor))
+
+        loaded_lm = self.language_model.model.load_weights(_lm_model_stream())
+        loaded_params = {f"{lm_model_prefix}{p}" for p in loaded_lm}
+        if other_weights:
+            other_weights.sort(key=lambda x: x[0])
+            loader = AutoWeightsLoader(self)
+            loaded_params |= loader.load_weights(other_weights)
         self._maybe_offload_vision_tower()
         self._weights_finalized = True
         return loaded_params

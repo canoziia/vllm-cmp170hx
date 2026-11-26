@@ -3467,8 +3467,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # Pre-compute expert mapping ONCE.
+        # Pre-compute expert mapping ONCE and index by weight_name for O(1)
+        # lookup instead of scanning all 3*n_routed_experts entries per tensor.
         expert_mapping = self.get_expert_mapping()
+        expert_mapping_by_wname: dict[
+            str, list[tuple[str, str, int, str]]
+        ] = {}
+        for mapping in expert_mapping:
+            expert_mapping_by_wname.setdefault(mapping[1], []).append(mapping)
 
         # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
         # block count so the standard loaders below slice it evenly (trailing
@@ -3541,7 +3547,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
                     name_mapped = None
-                    for mapping in expert_mapping:
+                    # O(1) lookup by "experts.<id>.<proj>." substring.
+                    candidates = None
+                    exp_pos = name.find("experts.")
+                    if exp_pos >= 0:
+                        d1 = name.find(".", exp_pos + 8)
+                        d2 = name.find(".", d1 + 1) if d1 >= 0 else -1
+                        if d2 >= 0:
+                            candidates = expert_mapping_by_wname.get(
+                                name[exp_pos : d2 + 1]
+                            )
+                    if candidates is None:
+                        candidates = expert_mapping
+                    for mapping in candidates:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue
