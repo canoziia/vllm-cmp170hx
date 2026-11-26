@@ -49,10 +49,10 @@ def eligible(
     if min_m is None:
         return False
     ni = w2.shape[1] * 16 if w2.ndim == 3 else -1
-    if ni not in (2304, 576):
+    if ni not in (2304, 1152, 576):
         return False
     return (
-        min_m <= x.shape[0] <= 4096
+        min_m <= x.shape[0] <= 8192
         and x.shape[1] == 5120
         and tuple(w1.shape) == (E, 320, 4 * ni)
         and tuple(w2.shape) == (E, ni // 16, 10240)

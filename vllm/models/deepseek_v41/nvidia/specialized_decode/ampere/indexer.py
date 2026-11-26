@@ -221,6 +221,7 @@ def _prefill_topk(
     candidate_block_size: int,
     candidate_write: bool,
     topk_backend: str,
+    local_row_range: tuple[int, int] | None = None,
 ) -> None:
     """Top-k of the prefill tokens, chunk by chunk over gathered keys."""
     prefill = metadata.prefill
@@ -259,7 +260,15 @@ def _prefill_topk(
     # candidate consumers read their source's index K cache, so they narrow
     # by the source's metadata, a rank's consumers read only the candidate
     # blocks its own source wrote, and only the top-k indices are exchanged.
-    row_shard = PrefillRowShard.from_metadata(prefill, num_decode_tokens)
+    # When local_row_range=(r_lo, r_hi) is provided (Row-Sharded Attention),
+    # q_values/q_scales/weights hold ONLY [r_lo, r_hi) and no top-k exchange
+    # is needed because each rank only attends to its own [r_lo, r_hi) rows.
+    q_offset = local_row_range[0] if local_row_range is not None else 0
+    row_shard = (
+        None
+        if local_row_range is not None
+        else PrefillRowShard.from_metadata(prefill, num_decode_tokens)
+    )
     for chunk in prefill.chunks:
         use_compact_reader = (
             reader_compact_env
@@ -283,7 +292,17 @@ def _prefill_topk(
             )
         row_start, row_end = chunk.token_start, chunk.token_end
         row_ks, row_ke = chunk.cu_seqlen_ks, chunk.cu_seqlen_ke
-        if row_shard is not None:
+        if local_row_range is not None:
+            r_lo, r_hi = local_row_range
+            s_win = max(chunk.token_start, r_lo)
+            e_win = min(chunk.token_end, r_hi)
+            if s_win >= e_win:
+                continue
+            lo = s_win - chunk.token_start
+            hi = e_win - chunk.token_start
+            row_start, row_end = s_win, e_win
+            row_ks, row_ke = chunk.cu_seqlen_ks[lo:hi], chunk.cu_seqlen_ke[lo:hi]
+        elif row_shard is not None:
             narrowed = row_shard.narrow(chunk)
             if narrowed is None:
                 continue
@@ -309,13 +328,17 @@ def _prefill_topk(
             for sub in range(0, row_end - row_start, compact_step):
                 rows = slice(sub, min(sub + compact_step, row_end - row_start))
                 tokens = slice(row_start + rows.start, row_start + rows.stop)
+                q_tokens = slice(
+                    row_start - q_offset + rows.start,
+                    row_start - q_offset + rows.stop,
+                )
                 sub_rows = rows.stop - rows.start
                 row_ends = (row_ke[rows] - row_ks[rows]).contiguous()
                 logits, compact_lens = logits_kernels.candidate_mqa_logits(
-                    q_values[tokens],
-                    q_scales[tokens],
+                    q_values[q_tokens],
+                    q_scales[q_tokens],
                     k_quant_view,
-                    weights[tokens].contiguous(),
+                    weights[q_tokens].contiguous(),
                     row_ends,
                     chunk.block_table,
                     sub_rows,
@@ -338,13 +361,17 @@ def _prefill_topk(
         for sub in range(0, row_end - row_start, step):
             rows = slice(sub, min(sub + step, row_end - row_start))
             tokens = slice(row_start + rows.start, row_start + rows.stop)
+            q_tokens = slice(
+                row_start - q_offset + rows.start,
+                row_start - q_offset + rows.stop,
+            )
             # Row m's scores start at column zero.
             logits = logits_kernels.mqa_logits(
-                q_values[tokens],
-                q_scales[tokens],
+                q_values[q_tokens],
+                q_scales[q_tokens],
                 k_values,
                 k_scales,
-                weights[tokens].contiguous(),
+                weights[q_tokens].contiguous(),
                 row_ks[rows],
                 row_ke[rows],
                 chunk.max_seqlen_k,
@@ -833,6 +860,57 @@ class AmpereSparseAttnIndexer(SparseAttnIndexer):
             candidate_write=self.candidate_write,
             topk_backend=self.topk_backend,
         )
+
+    def forward_row_sharded(
+        self,
+        r_lo: int,
+        r_hi: int,
+        q_quant: tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Row-sharded prefill indexer: scores ONLY [r_lo, r_hi) with no top-k exchange."""
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        assert isinstance(attn_metadata, dict)
+        metadata = attn_metadata[self.k_cache.prefix]
+        assert isinstance(metadata, DeepseekV32IndexerMetadata)
+        assert metadata.num_decodes == 0
+        dense_mha_layer = self.dense_mha_metadata_layer_name
+        if dense_mha_layer:
+            mla_metadata = attn_metadata.get(dense_mha_layer)
+            if (
+                getattr(getattr(mla_metadata, "prefill", None), "use_dense_mha", False)
+                and getattr(mla_metadata, "num_decode_tokens", -1) == 0
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                return self.topk_indices_buffer
+        forward_context._dsv41_topk_ver = (
+            getattr(forward_context, "_dsv41_topk_ver", 0) + 1
+        )
+        topk_cache = getattr(forward_context, "_dsv41_topk_cache", None)
+        if topk_cache:
+            topk_cache.clear()
+        if r_hi > r_lo:
+            self.topk_indices_buffer[r_lo:r_hi] = -1
+        q_values, q_scale = q_quant
+        q_scales = _scale_bytes(q_scale)
+        if metadata.num_prefills > 0:
+            _prefill_topk(
+                metadata,
+                self.k_cache.kv_cache,
+                q_values,
+                q_scales,
+                weights,
+                self.topk_tokens,
+                self.head_dim,
+                self.topk_indices_buffer,
+                self.candidate_blocks,
+                self.candidate_block_size,
+                self.candidate_write,
+                self.topk_backend,
+                local_row_range=(r_lo, r_hi),
+            )
+        return self.topk_indices_buffer
 
 
 class AmpereIndexer(DeepseekV4Indexer):

@@ -323,3 +323,256 @@ class DeepseekV41AmpereAttention(DeepseekV4Attention):
                 rope_table_f32(self.rotary_emb),
                 output[rows],
             )
+
+    def forward_mqa_row_sharded(
+        self,
+        q_loc: torch.Tensor,
+        pos_loc: torch.Tensor,
+        output_loc: torch.Tensor,
+        r_lo: int,
+        r_hi: int,
+    ) -> None:
+        """Sparse MLA for ONLY local prefill query rows [r_lo, r_hi) with all heads."""
+        if r_hi <= r_lo:
+            return
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        assert isinstance(attn_metadata, dict)
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata", attn_metadata[self.swa_cache_layer.prefix]
+        )
+        assert swa_metadata.num_decode_tokens == 0
+        assert swa_metadata.prefill_swa_indices is not None
+        assert swa_metadata.prefill_swa_lens is not None
+        rows = slice(r_lo, r_hi)
+        swa_indices = swa_metadata.prefill_swa_indices.view(
+            swa_metadata.num_prefill_tokens, -1
+        )[rows]
+        swa_lens = swa_metadata.prefill_swa_lens[rows].contiguous()
+
+        compressed_metadata = (
+            cast(
+                DeepseekV4FlashMLAMetadata, attn_metadata[self.compressed_cache_prefix]
+            )
+            if self.compressed_cache_prefix is not None
+            else None
+        )
+        compressed_cache = compressed_indices = compressed_lens = None
+        if compressed_metadata is not None:
+            assert self.topk_indices_buffer is not None
+            assert swa_metadata.token_to_req_indices is not None
+            assert swa_metadata.is_valid_token is not None
+            reuse_topk = (
+                os.environ.get("VLLM_DSV41_TOPK_RAGGED_REUSE", "1") == "1"
+            )
+            blk_size = compressed_metadata.block_size // self.compress_ratio
+            topk_cache: dict | None = None
+            cache_key = None
+            if reuse_topk:
+                topk_cache = getattr(forward_context, "_dsv41_topk_cache", None)
+                if topk_cache is None:
+                    topk_cache = {}
+                    forward_context._dsv41_topk_cache = topk_cache
+                cache_key = (
+                    getattr(forward_context, "_dsv41_topk_ver", 0),
+                    self.topk_indices_buffer.data_ptr(),
+                    r_lo,
+                    r_hi - r_lo,
+                    swa_metadata.token_to_req_indices.data_ptr(),
+                    compressed_metadata.block_table.data_ptr(),
+                    blk_size,
+                    swa_metadata.is_valid_token.data_ptr(),
+                )
+            cached_pair = (
+                topk_cache.get(cache_key)
+                if topk_cache is not None and cache_key is not None
+                else None
+            )
+            if cached_pair is not None:
+                compressed_indices, compressed_lens = cached_pair
+            else:
+                compressed_indices, compressed_lens = (
+                    compute_global_topk_indices_and_lens(
+                        self.topk_indices_buffer[rows],
+                        swa_metadata.token_to_req_indices[rows],
+                        compressed_metadata.block_table,
+                        blk_size,
+                        swa_metadata.is_valid_token[rows],
+                    )
+                )
+                if topk_cache is not None and cache_key is not None:
+                    topk_cache[cache_key] = (compressed_indices, compressed_lens)
+            compressed_cache = self._compressed_kv_cache()
+        sparse_mla(
+            q_loc,
+            self.swa_cache_layer.kv_cache,
+            swa_indices,
+            swa_lens,
+            compressed_cache,
+            compressed_indices,
+            compressed_lens,
+            self.attn_sink[: self.n_local_heads],
+            self.scale,
+            pos_loc,
+            rope_table_f32(self.rotary_emb),
+            output_loc,
+        )
+
+    def _prepare_and_attn_row_sharded(
+        self,
+        qr_loc: torch.Tensor,
+        kv_full: torch.Tensor,
+        kv_score_full: torch.Tensor | None,
+        indexer_weights_loc: torch.Tensor | None,
+        positions: torch.Tensor,
+        r_lo: int,
+        r_hi: int,
+        attn_out_loc: torch.Tensor,
+    ) -> None:
+        """Row-sharded prefill attention: full-M KV/compressor cache writes,
+        local [r_lo, r_hi) query projection, RoPE, indexer scoring, and MLA."""
+        from vllm.models.deepseek_v4.attention import fill_short_context_topk_indices
+        from vllm.models.deepseek_v41.attention import _dsv41_swa_ops
+        from vllm.triton_utils import triton
+        from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+        attn_metadata = get_forward_context().attn_metadata
+        assert isinstance(attn_metadata, dict)
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata", attn_metadata[self.swa_cache_layer.prefix]
+        )
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        slot_mapping = swa_metadata.slot_mapping
+
+        valid = r_hi - r_lo
+        pos_loc = positions[r_lo:r_hi].contiguous() if valid > 0 else positions[:0]
+        indexer = self.indexer
+        compressor = self.compressor
+        aux_streams = self.aux_stream_list
+        aux_stream = (
+            aux_streams[0] if aux_streams is not None and not self.use_pcp else None
+        )
+        precomputed_index_q_loc: torch.Tensor | None = None
+
+        def project_local_q_and_cache_full_kv() -> torch.Tensor | None:
+            nonlocal precomputed_index_q_loc
+            # 1. Publish ALL M tokens' SWA KV records identically on every rank.
+            _dsv41_swa_ops().fused_deepseek_v4_kv_rope_insert(
+                kv_full.contiguous(),
+                swa_kv_cache,
+                slot_mapping,
+                positions,
+                cos_sin_cache,
+                swa_metadata.block_size,
+                self._flashinfer_fp8_kv_scale
+                if swa_kv_cache.dtype == torch.float8_e4m3fn
+                else None,
+                self.kv_mxfp8,
+            )
+            if valid <= 0:
+                return None
+            # 2. Project & RoPE ONLY local [r_lo, r_hi) queries (all 64 heads).
+            if self._wq_b_idx_fused:
+                q_raw, precomputed_index_q_loc = self._wq_b_idx_proj(qr_loc, None)
+            else:
+                q_raw = self._wq_b_proj(qr_loc, None)
+            q_loc = q_raw.view(valid, self.n_local_heads, self.head_dim)
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            q_roped = _dsv41_swa_ops().fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q_loc,
+                kv_full[r_lo:r_hi].contiguous(),
+                swa_kv_cache_2d,
+                slot_mapping[:0],
+                pos_loc,
+                cos_sin_cache,
+                self.padded_heads,
+                self.eps,
+                swa_metadata.block_size,
+                False,
+                self.kv_mxfp8,
+                True,
+                False,
+            )
+            return q_roped
+
+        latent: torch.Tensor | None = None
+        if compressor is not None:
+            assert kv_score_full is not None
+            q_loc, latent = maybe_execute_in_parallel(
+                project_local_q_and_cache_full_kv,
+                lambda: compressor(kv_score_full, positions),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            q_loc = project_local_q_and_cache_full_kv()
+
+        def prepare_indexer_local():
+            if indexer is None:
+                return None, None, None
+            indexer_metadata = cast(Any, attn_metadata[indexer.k_cache.prefix])
+            if (
+                indexer_metadata.max_seq_len // indexer.compress_ratio
+                <= indexer.topk_tokens
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                if indexer.owns_k:
+                    indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+                assert indexer.topk_indices_buffer is not None
+                num_tokens = (
+                    indexer_metadata.num_decode_tokens
+                    + indexer_metadata.num_prefill_tokens
+                )
+                if num_tokens > 0:
+                    fill_short_context_topk_indices[(num_tokens,)](
+                        indexer.topk_indices_buffer,
+                        positions,
+                        TOP_K=indexer.topk_tokens,
+                        COMPRESS_RATIO=indexer.compress_ratio,
+                        PADDED_TOP_K=triton.next_power_of_2(indexer.topk_tokens),
+                        num_warps=8,
+                    )
+                return None, None, None
+            if indexer.owns_k:
+                indexer._produce_k(latent, positions, self.indexer_rotary_emb)
+            if valid <= 0:
+                return None, None, None
+            assert indexer_weights_loc is not None
+            return indexer.forward_q(
+                qr_loc,
+                None,
+                indexer_weights_loc,
+                pos_loc,
+                self.indexer_rotary_emb,
+                precomputed_index_q=precomputed_index_q_loc,
+            )
+
+        if compressor is not None:
+            indexer_result, _ = maybe_execute_in_parallel(
+                prepare_indexer_local,
+                lambda: compressor.insert_cache(latent, positions, self.rotary_emb),
+                self.ln_events[0],
+                self.ln_events[1],
+                aux_stream,
+            )
+        else:
+            indexer_result = prepare_indexer_local()
+
+        index_q_loc, index_q_scale_loc, index_weights_out_loc = indexer_result
+        if (
+            indexer is not None
+            and index_q_loc is not None
+            and index_q_scale_loc is not None
+            and index_weights_out_loc is not None
+        ):
+            indexer.indexer_op.forward_row_sharded(
+                r_lo,
+                r_hi,
+                (index_q_loc, index_q_scale_loc),
+                index_weights_out_loc,
+            )
+
+        if q_loc is not None and valid > 0:
+            self.forward_mqa_row_sharded(q_loc, pos_loc, attn_out_loc, r_lo, r_hi)

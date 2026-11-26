@@ -36,6 +36,11 @@ def prefill_row_shard_enabled() -> bool:
     return raw in ("1", "true", "yes", "auto", "force")
 
 
+def prefill_row_shard_attn_enabled() -> bool:
+    raw = os.environ.get("VLLM_DSV41_PREFILL_ROW_SHARD_ATTN", "0").strip().lower()
+    return raw in ("1", "true", "yes", "force")
+
+
 def prefill_ag_int8_enabled() -> bool:
     raw = os.environ.get("VLLM_DSV41_PREFILL_AG_INT8", "1").strip().lower()
     return raw not in ("0", "false", "no", "off")
@@ -51,15 +56,21 @@ def prefill_async_engram_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def prefill_2mb_moe_enabled(num_tokens: int, ep_size: int) -> bool:
+def prefill_2mb_moe_enabled(
+    num_tokens: int, ep_size: int, world_size: int = 4
+) -> bool:
     raw = os.environ.get("VLLM_DSV41_PREFILL_2MB_MOE", "auto").strip().lower()
     if raw in ("0", "false", "no", "off"):
         return False
     if raw in ("1", "true", "yes", "force"):
         return num_tokens >= 1024
-    # Auto: Batch 1-B hardware proof on SM80 Marlin W4A16 shows splitting MoE
-    # at EP=4, M<=3072 costs +2.16 ms/layer (net loss), while EP>=6 / M>=4096
-    # costs only +0.66..0.93 ms/layer against 4-6+ ms collectives (big win).
+    # Auto: splitting MoE into 2 microbatches re-reads all 384 experts' weights
+    # from HBM. On TP2 (world_size<=2, ni=1152), per-GPU MoE weights are 2x larger
+    # (~3.35 GiB/layer) while ring traffic is 0.5x (1 hop), so 2-MB MoE loses ~11%
+    # even at M=4096. On EP>=6 or 4+ GPUs with M>=4096, smaller per-GPU weights
+    # against heavier multi-hop collectives make 2-MB MoE a net win.
+    if world_size <= 2:
+        return False
     return (num_tokens >= 4096) or (ep_size >= 6 and num_tokens >= 3072)
 
 

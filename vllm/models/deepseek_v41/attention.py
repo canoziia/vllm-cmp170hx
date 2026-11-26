@@ -431,6 +431,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
+        replicated_attn: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -439,20 +440,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         tp_size = get_tensor_model_parallel_world_size()
         layer_id = extract_layer_index(prefix)
         self.layer_id = layer_id
+        self.replicated_attn = replicated_attn
+        attn_tp_size = 1 if replicated_attn else tp_size
 
         self.prefix = prefix  # Alias for compatibility with compressor
         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
-        assert self.n_heads % tp_size == 0
-        self.n_local_heads = self.n_heads // tp_size
+        assert self.n_heads % attn_tp_size == 0
+        self.n_local_heads = self.n_heads // attn_tp_size
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = self.head_dim - self.rope_head_dim
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
+        self.n_local_groups = self.n_groups // attn_tp_size
         self.window_size = config.sliding_window
         # ---- v4.1 sparse-attention topology ----
         # compress_ratios has one entry per layer (MTP layers included):
@@ -512,6 +515,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Sink padded to the same head count, initialized to -inf (no sink
         # effect). Weight loading fills the first n_local_heads slots.
         self.attn_sink = make_attention_sink(self.padded_heads, torch.float32)
+        if replicated_attn:
+            def _load_replicated_sink(
+                param: torch.Tensor, loaded_weight: torch.Tensor
+            ) -> None:
+                heads = loaded_weight.numel()
+                param.data[:heads].copy_(loaded_weight.view(-1))
+                param.data[heads:].fill_(-float("inf"))
+
+            self.attn_sink.weight_loader = _load_replicated_sink  # type: ignore[attr-defined]
 
         self.fused_wqa_wkv = MergedColumnParallelLinear(
             self.hidden_size,
@@ -529,6 +541,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wq_b",
+            disable_tp=replicated_attn,
         )
 
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
@@ -540,6 +553,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_a",
+            disable_tp=replicated_attn,
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
@@ -550,9 +564,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
             bias=False,
+            reduce_results=not replicated_attn,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wo_b",
+            disable_tp=replicated_attn,
         )
         # Set by ``bind_gemm_rs`` when the decoder layer runs sequence
         # parallel and the fused GEMM + reduce-scatter kernel accepts wo_b.

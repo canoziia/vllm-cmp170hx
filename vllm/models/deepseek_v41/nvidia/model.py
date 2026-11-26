@@ -432,6 +432,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         mhc_stream: torch.cuda.Stream | None = None,
         fuse_mhc_all_reduce: bool = False,
         kv_write_only: bool = False,
+        replicated_attn: bool = False,
     ):
         super().__init__()
 
@@ -440,6 +441,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_stream = mhc_stream
         self.fuse_mhc_all_reduce = fuse_mhc_all_reduce
         self.kv_write_only = kv_write_only
+        self.replicated_attn = replicated_attn
         # SM80 runs every mHC boundary through its CuTe DSL kernels, SM90 the
         # small ones, with the coefficients on mhc_stream in FULL graphs of up
         # to this many tokens.
@@ -470,14 +472,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
             candidate_block_buffer=candidate_block_buffer,
+            replicated_attn=replicated_attn,
         )
-        if self.use_sequence_parallel or fuse_mhc_all_reduce:
+        if replicated_attn:
             self.attn.wo_b.reduce_results = False
-            if run_gemm_rs:
-                # Binds only when wo_b's kernel and shape qualify; otherwise
-                # forward keeps the separate reduce-scatter below.
-                self.attn.bind_gemm_rs()
-        self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
+            self.attn.shard_fused_wqa_wkv = False
+        else:
+            if self.use_sequence_parallel or fuse_mhc_all_reduce:
+                self.attn.wo_b.reduce_results = False
+                if run_gemm_rs:
+                    # Binds only when wo_b's kernel and shape qualify; otherwise
+                    # forward keeps the separate reduce-scatter below.
+                    self.attn.bind_gemm_rs()
+            self.attn.shard_fused_wqa_wkv = _shard_fused_wqa_wkv(vllm_config)
         if kv_write_only:
             self.ffn = PPMissingLayer()
             self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -844,7 +851,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
             stream=mhc_stream,
-            reduce_results=self.fuse_mhc_all_reduce,
+            reduce_results=self.fuse_mhc_all_reduce and not self.replicated_attn,
             boundary_weight=self.hc_ffn_boundary_weight,
             defer_coeff=(mhc_stream is not None and self.ampere_mhc and x.shape[0] <= 192 and self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0])),
         )
@@ -993,7 +1000,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
             stream=mhc_stream,
-            reduce_results=self.fuse_mhc_all_reduce,
+            reduce_results=self.fuse_mhc_all_reduce and not self.replicated_attn,
             boundary_weight=self.hc_ffn_boundary_weight,
             defer_coeff=(
                 mhc_stream is not None
@@ -1282,6 +1289,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             cut = max(kv_source_ids)
             self.start_layer = 0
             self.end_layer = cut + 1
+            from .specialized_decode.ampere.pcie_dma_ring import (
+                prefill_row_shard_attn_enabled,
+            )
+
+            use_row_shard_attn = (
+                prefill_row_shard_attn_enabled()
+                and get_tensor_model_parallel_world_size() > 1
+                and is_ampere()
+                and not self.use_sequence_parallel
+            )
             self.layers = nn.ModuleList(
                 [
                     DeepseekV4DecoderLayer(
@@ -1296,6 +1313,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         mhc_stream=mhc_stream,
                         fuse_mhc_all_reduce=self.fuse_mhc_all_reduce,
                         kv_write_only=(i == cut),
+                        replicated_attn=(use_row_shard_attn and i < cut),
                     )
                     if i <= cut
                     else PPMissingLayer()
@@ -1304,9 +1322,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
             logger.info_once(
                 "YOCO prefill-only mode: loaded encoder layers 0-%d "
-                "(layer %d KV-write-only, MoE/layers %d-%d/norm/lm_head skipped).",
+                "(layer %d KV-write-only, row_shard_attn=%s, "
+                "MoE/layers %d-%d/norm/lm_head skipped).",
                 cut,
                 cut,
+                use_row_shard_attn,
                 cut + 1,
                 config.num_hidden_layers - 1,
             )
@@ -1962,7 +1982,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ep_size = (
             W if self.parallel_config.enable_expert_parallel else 1
         )
-        use_2mb_moe = prefill_2mb_moe_enabled(M, ep_size)
+        use_2mb_moe = prefill_2mb_moe_enabled(M, ep_size, world_size=W)
         m0_2mb = ((M // 2) // (W * 64)) * (W * 64) if use_2mb_moe else 0
         if m0_2mb < 256 or (M - m0_2mb) < 256:
             use_2mb_moe = False
@@ -2271,9 +2291,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     aux_hidden_by_layer[layer_ids.start] = _ag_generic(aux_loc)
             del pre_loc_in
 
-        _ag_bf16(x_loc, full_buf)
-        del x_loc
-        x_in = full_buf[:M]
+        attn_metadata = get_forward_context().attn_metadata
+        use_row_shard_attn = (
+            isinstance(attn_metadata, dict)
+            and all(
+                getattr(self.layers[i].attn, "replicated_attn", False)
+                for i in layer_ids
+            )
+            and hasattr(first_layer.attn, "_prepare_and_attn_row_sharded")
+        )
+        if use_row_shard_attn:
+            swa_meta0 = attn_metadata.get(first_layer.attn.swa_cache_layer.prefix)
+            if swa_meta0 is None or getattr(swa_meta0, "num_decode_tokens", 1) != 0:
+                use_row_shard_attn = False
+
+        if use_row_shard_attn:
+            x_in = None
+        else:
+            _ag_bf16(x_loc, full_buf)
+            del x_loc
+            x_in = full_buf[:M]
 
         final_hidden: torch.Tensor | MoEOutput | None = None
         pre_loc: torch.Tensor | None = None
@@ -2284,82 +2321,131 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert isinstance(layer, DeepseekV4DecoderLayer)
             is_last = (idx + 1) >= layer_ids.stop
 
-            # 1. Attention on full M rows
-            qr_kv, kv_score, indexer_weights = (
-                layer.attn._run_parallel_input_projections(x_in)
-            )
-            qr, qr_scale, kv = layer.attn._split_qkv_and_norm(qr_kv)
-            del qr_kv
-            attn_out = layer.attn._alloc_attn_out(M, x_in)
-            assert kv is not None
-            layer.attn._prepare_and_attn(
-                x_in,
-                qr,
-                kv,
-                qr_scale,
-                kv_score,
-                indexer_weights,
-                positions,
-                attn_out,
-            )
-            del x_in, qr, qr_scale, kv, kv_score, indexer_weights
+            if use_row_shard_attn:
+                # 1. Row-sharded Attention: ZERO H=5120 AllGather/ReduceScatter!
+                #    Each rank runs projections & 64-head MLA on ONLY its S local rows,
+                #    all-gathering only the tiny 512-dim KV (+ 1024-dim compressor on 3 layers).
+                qr_kv_loc, kv_score_loc, idx_w_loc = (
+                    layer.attn._run_parallel_input_projections(x_loc)
+                )
+                qr_loc, _, kv_loc = layer.attn._split_qkv_and_norm(qr_kv_loc)
+                del x_loc, qr_kv_loc
+                assert kv_loc is not None
+                kv_full = _ag_generic(kv_loc)
+                kv_score_full = (
+                    _ag_generic(kv_score_loc) if kv_score_loc is not None else None
+                )
+                del kv_loc, kv_score_loc
 
-            orig_wob_reduce = layer.attn.wo_b.reduce_results
-            if (
-                use_2mb_oproj
-                and isinstance(attn_out, torch.Tensor)
-                and attn_out.dim() >= 2
-                and dma is not None
-            ):
-                s_half = S // 2
-                m_half = W * s_half
-                a_view = attn_out.view(W, 2, s_half, *attn_out.shape[1:])
-                y0_buf = full_buf[:m_half]
-                y1_buf = full_buf[m_half:M]
-                try:
-                    layer.attn.wo_b.reduce_results = False
-                    a0 = a_view[:, 0].reshape(m_half, *attn_out.shape[1:]).contiguous()
-                    layer.attn._o_proj(a0, positions[:m_half], out=y0_buf)
-                    del a0
-                    ev_h0_ready.record(def_stream)
-                    comm_stream.wait_event(ev_h0_ready)
-                    if dma.supports_full(y0_buf):
-                        dma.reduce_scatter(y0_buf, shard_buf[:s_half], stream=comm_stream)
-                    else:
-                        with torch.cuda.stream(comm_stream):
-                            dist.reduce_scatter_single(
-                                shard_buf[:s_half], y0_buf, group=tp_dev_group
-                            )
-                    ev_h0_done.record(comm_stream)
-
-                    a1 = a_view[:, 1].reshape(m_half, *attn_out.shape[1:]).contiguous()
-                    del attn_out, a_view
-                    layer.attn._o_proj(a1, positions[:m_half], out=y1_buf)
-                    del a1
-                    ev_h1_ready.record(def_stream)
-                    comm_stream.wait_event(ev_h1_ready)
-                    if dma.supports_full(y1_buf):
-                        dma.reduce_scatter(y1_buf, shard_buf[s_half:], stream=comm_stream)
-                    else:
-                        with torch.cuda.stream(comm_stream):
-                            dist.reduce_scatter_single(
-                                shard_buf[s_half:], y1_buf, group=tp_dev_group
-                            )
-                    ev_h1_done.record(comm_stream)
-                finally:
-                    layer.attn.wo_b.reduce_results = orig_wob_reduce
-                def_stream.wait_event(ev_h1_done)
+                qr_v = qr_loc[:valid].contiguous() if valid < S else qr_loc
+                idx_w_v = (
+                    (idx_w_loc[:valid].contiguous() if valid < S else idx_w_loc)
+                    if idx_w_loc is not None
+                    else None
+                )
+                del qr_loc, idx_w_loc
+                attn_out_loc = layer.attn._alloc_attn_out(valid, qr_v)
+                layer.attn._prepare_and_attn_row_sharded(
+                    qr_v,
+                    kv_full,
+                    kv_score_full,
+                    idx_w_v,
+                    positions,
+                    r_lo,
+                    r_lo + valid,
+                    attn_out_loc,
+                )
+                del qr_v, kv_full, kv_score_full, idx_w_v
+                if valid > 0:
+                    pos_loc = positions[r_lo : r_lo + valid].contiguous()
+                    layer.attn._o_proj(attn_out_loc, pos_loc, out=shard_buf[:valid])
+                    del pos_loc
+                if valid < S:
+                    shard_buf[valid:].zero_()
+                del attn_out_loc
             else:
-                try:
-                    layer.attn.wo_b.reduce_results = False
-                    y_partial = layer.attn._o_proj(attn_out, positions)
-                finally:
-                    layer.attn.wo_b.reduce_results = orig_wob_reduce
-                del attn_out
+                assert x_in is not None
+                # 1. Attention on full M rows
+                qr_kv, kv_score, indexer_weights = (
+                    layer.attn._run_parallel_input_projections(x_in)
+                )
+                qr, qr_scale, kv = layer.attn._split_qkv_and_norm(qr_kv)
+                del qr_kv
+                attn_out = layer.attn._alloc_attn_out(M, x_in)
+                assert kv is not None
+                layer.attn._prepare_and_attn(
+                    x_in,
+                    qr,
+                    kv,
+                    qr_scale,
+                    kv_score,
+                    indexer_weights,
+                    positions,
+                    attn_out,
+                )
+                del x_in, qr, qr_scale, kv, kv_score, indexer_weights
 
-                # Reduce-Scatter attention partial output into local S rows
-                _rs_bf16(y_partial, shard_buf)
-                del y_partial
+                orig_wob_reduce = layer.attn.wo_b.reduce_results
+                if getattr(layer.attn, "replicated_attn", False):
+                    y_full = layer.attn._o_proj(attn_out, positions)
+                    del attn_out
+                    shard_buf.copy_(_slice_pad_local(y_full))
+                    del y_full
+                elif (
+                    use_2mb_oproj
+                    and isinstance(attn_out, torch.Tensor)
+                    and attn_out.dim() >= 2
+                    and dma is not None
+                ):
+                    s_half = S // 2
+                    m_half = W * s_half
+                    a_view = attn_out.view(W, 2, s_half, *attn_out.shape[1:])
+                    y0_buf = full_buf[:m_half]
+                    y1_buf = full_buf[m_half:M]
+                    try:
+                        layer.attn.wo_b.reduce_results = False
+                        a0 = a_view[:, 0].reshape(m_half, *attn_out.shape[1:]).contiguous()
+                        layer.attn._o_proj(a0, positions[:m_half], out=y0_buf)
+                        del a0
+                        ev_h0_ready.record(def_stream)
+                        comm_stream.wait_event(ev_h0_ready)
+                        if dma.supports_full(y0_buf):
+                            dma.reduce_scatter(y0_buf, shard_buf[:s_half], stream=comm_stream)
+                        else:
+                            with torch.cuda.stream(comm_stream):
+                                dist.reduce_scatter_single(
+                                    shard_buf[:s_half], y0_buf, group=tp_dev_group
+                                )
+                        ev_h0_done.record(comm_stream)
+
+                        a1 = a_view[:, 1].reshape(m_half, *attn_out.shape[1:]).contiguous()
+                        del attn_out, a_view
+                        layer.attn._o_proj(a1, positions[:m_half], out=y1_buf)
+                        del a1
+                        ev_h1_ready.record(def_stream)
+                        comm_stream.wait_event(ev_h1_ready)
+                        if dma.supports_full(y1_buf):
+                            dma.reduce_scatter(y1_buf, shard_buf[s_half:], stream=comm_stream)
+                        else:
+                            with torch.cuda.stream(comm_stream):
+                                dist.reduce_scatter_single(
+                                    shard_buf[s_half:], y1_buf, group=tp_dev_group
+                                )
+                        ev_h1_done.record(comm_stream)
+                    finally:
+                        layer.attn.wo_b.reduce_results = orig_wob_reduce
+                    def_stream.wait_event(ev_h1_done)
+                else:
+                    try:
+                        layer.attn.wo_b.reduce_results = False
+                        y_partial = layer.attn._o_proj(attn_out, positions)
+                    finally:
+                        layer.attn.wo_b.reduce_results = orig_wob_reduce
+                    del attn_out
+
+                    # Reduce-Scatter attention partial output into local S rows
+                    _rs_bf16(y_partial, shard_buf)
+                    del y_partial
 
             # 2. FFN mHC + RMSNorm on ONLY S local rows (1/W memory & compute!)
             res_loc, pm_loc, rm_loc, x_ffn_loc, pre_loc, _ = mhc_shifted_post_pre(
@@ -2604,9 +2690,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     if capture_nxt_aux and aux_loc is not None:
                         aux_hidden_by_layer[nxt_idx] = _ag_generic(aux_loc)
                 del pre_loc
-                _ag_bf16(x_nxt_loc, full_buf)
-                del x_nxt_loc
-                x_in = full_buf[:M]
+                if use_row_shard_attn:
+                    x_loc = x_nxt_loc
+                else:
+                    _ag_bf16(x_nxt_loc, full_buf)
+                    del x_nxt_loc
+                    x_in = full_buf[:M]
             else:
                 # Last layer: preserve native reduce_results contract for _collapse
                 # / decoder_replay_layers.
@@ -3251,7 +3340,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             norm_weight=layer.ffn_norm.weight,
                             norm_eps=layer.ffn_norm.variance_epsilon,
                             stream=None,
-                            reduce_results=layer.fuse_mhc_all_reduce,
+                            reduce_results=layer.fuse_mhc_all_reduce and not layer.replicated_attn,
                             boundary_weight=layer.hc_ffn_boundary_weight,
                         )
                     )
