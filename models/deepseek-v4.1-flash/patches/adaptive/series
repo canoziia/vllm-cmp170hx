@@ -8,3 +8,5 @@ adaptive/0007-dsv41-pcie-dma-k3-triple-buffer.patch
 adaptive/0008-dsv41-pure-tp4-default-and-mxfp4-ni576.patch
 adaptive/0009-dsv41-3regime-ring-lamport-engram-dot-and-moe-dynks.patch
 adaptive/0010-dsv41-online-self-calibrating-cost-model.patch
+adaptive/0011-dsv41-fix-decoder-replay-deferred-moe-finalize.patch
+adaptive/0012-dsv41-lossless-sm80-tp4-decode-optimizations.patch

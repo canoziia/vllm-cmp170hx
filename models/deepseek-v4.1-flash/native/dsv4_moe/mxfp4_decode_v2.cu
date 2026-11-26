@@ -130,7 +130,7 @@ struct Frags {
   uint2 s[CR / 2][TW];
 };
 
-template <int DQ, int R, int CR, int TW, int K, int N, bool W13>
+template <int DQ, int R, int CR, int TW, int K, int N, bool W13, bool STATIC_SCHED = false, bool PAIRED_GU = false>
 __device__ __forceinline__ void mxfp4_dec2_body(
     const __nv_bfloat16* __restrict__ A, int64_t a_stride,
     const int4* __restrict__ W, const uint8_t* __restrict__ S,
@@ -149,8 +149,11 @@ __device__ __forceinline__ void mxfp4_dec2_body(
   constexpr int KS = K / 16 / R;
   constexpr int SLOT = CR * TW * 32;
   constexpr int NH = N / 2;
-  constexpr int HP = TG / 2;  // w13: gate/up tile pairs
-  static_assert(!W13 || (NH % (64 * TW) == 0), "w13 gate/up tiles must pair up");
+  constexpr int HP = PAIRED_GU ? TG : (TG / 2);  // w13: gate/up tile pairs
+  constexpr int W_USTRIDE = PAIRED_GU ? (NH >> 1) : 32;
+  constexpr int S_USTRIDE = PAIRED_GU ? NH : 64;
+  static_assert(!W13 || PAIRED_GU || (NH % (64 * TW) == 0), "w13 gate/up tiles must pair up");
+  static_assert(!PAIRED_GU || (W13 && TW == 2 && (NH % 64 == 0)), "paired gate/up shape");
   extern __shared__ int4 smem_raw[];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int g = lane >> 2, c = lane & 3;
@@ -176,9 +179,11 @@ __device__ __forceinline__ void mxfp4_dec2_body(
     return;
   }
   const int items = nblk * TG * KS;
+  const int total_warps = gridDim.x * WARPS;
+  int static_next = blockIdx.x * WARPS + warp;
 
   auto split = [&](int item, int& b, int& ks, int& t0) {
-    t0 = (item % TG) * TW;
+    t0 = PAIRED_GU ? (item % TG) : ((item % TG) * TW);
     const int rest = item / TG;
     ks = rest % KS;
     b = rest / KS;
@@ -189,9 +194,14 @@ __device__ __forceinline__ void mxfp4_dec2_body(
   const uint8_t* l_s = S;
   const uint32_t* l_x = reinterpret_cast<const uint32_t*>(A);
   auto grab = [&]() {
-    int v = 0;
-    if (lane == 0) v = atomicAdd(ctr, 1);
-    l_item = __shfl_sync(0xffffffffu, v, 0);
+    if constexpr (STATIC_SCHED) {
+      l_item = static_next;
+      static_next += total_warps;
+    } else {
+      int v = 0;
+      if (lane == 0) v = atomicAdd(ctr, 1);
+      l_item = __shfl_sync(0xffffffffu, v, 0);
+    }
     l_ch = 0;
     if (l_item < items) {
       int b, ks, t0;
@@ -211,14 +221,14 @@ __device__ __forceinline__ void mxfp4_dec2_body(
 #pragma unroll
     for (int i = 0; i < CR; i++)
 #pragma unroll
-      for (int u = 0; u < TW; u++) cp_async16(dst + (i * TW + u) * 32, src + i * wrow + u * 32);
+      for (int u = 0; u < TW; u++) cp_async16(dst + (i * TW + u) * 32, src + i * wrow + u * W_USTRIDE);
     cp_async_commit();
     const uint8_t* sp = l_s + (int64_t)(l_ch * (CR / 2)) * N;
 #pragma unroll
     for (int gi = 0; gi < CR / 2; gi++)
 #pragma unroll
       for (int u = 0; u < TW; u++)
-        f.s[gi][u] = __ldg(reinterpret_cast<const uint2*>(sp + (int64_t)gi * N + u * 64));
+        f.s[gi][u] = __ldg(reinterpret_cast<const uint2*>(sp + (int64_t)gi * N + u * S_USTRIDE));
     const uint32_t* ap = l_x + l_ch * CR * 8;
 #pragma unroll
     for (int i = 0; i < CR; i++) {
@@ -237,14 +247,14 @@ __device__ __forceinline__ void mxfp4_dec2_body(
 
   // ---- fused w13 tail: fixed-order split-K sum + clamp-silu-mul (== v1 act) ----
   auto act_pair = [&](int b, int pair) {
-    constexpr int C4 = 16 * TW;  // float4 per slot row in one tile
+    constexpr int C4 = PAIRED_GU ? 16 : (16 * TW);  // float4 per slot row in one tile
     const int64_t row = (int64_t)n_slots * N;
     const bool ok = eids[b] >= 0;
     for (int task = lane; task < 8 * C4; task += 32) {
       const int r = task / C4, c4 = task - r * C4;
       const int slot = sorted[b * 8 + r];
       if (!ok || slot >= n_slots) continue;
-      const int n = pair * 64 * TW + 4 * c4;
+      const int n = pair * (PAIRED_GU ? 64 : (64 * TW)) + 4 * c4;
       const float* p = part + (int64_t)slot * N + n;
       float4 gv[KS], uv[KS];
 #pragma unroll
@@ -353,16 +363,17 @@ __device__ __forceinline__ void mxfp4_dec2_body(
 
   // returns true in all lanes of the warp that arrived last (and resets the counter)
   auto arrive = [&](int* cp, int need) {
-    __threadfence();
+    asm volatile("fence.acq_rel.gpu;\n" ::: "memory");
     __syncwarp();
     int last = 0;
     if (lane == 0) {
-      last = atomicAdd(cp, 1) == need - 1;
+      uint32_t prev;
+      asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], 1;\n"
+                   : "=r"(prev) : "l"(cp) : "memory");
+      last = ((int)prev == need - 1);
       if (last) *cp = 0;
     }
-    last = __shfl_sync(0xffffffffu, last, 0);
-    if (last) __threadfence();
-    return last != 0;
+    return __shfl_sync(0xffffffffu, last, 0) != 0;
   };
 
   auto epilogue = [&](int item) {
@@ -380,7 +391,23 @@ __device__ __forceinline__ void mxfp4_dec2_body(
 #pragma unroll
           for (int v = 0; v < 4; v++) acc[u][j][v] *= EPI;
     }
-    if constexpr (W13) {
+    if constexpr (W13 && PAIRED_GU && KS == 1) {
+      __nv_bfloat16* o0 = aux + (int64_t)s0 * NH + t0 * 64 + g;
+      __nv_bfloat16* o1 = aux + (int64_t)s1 * NH + t0 * 64 + g;
+      auto act = [&](float gv, float uv) {
+        const float gf = fminf(__bfloat162float(__float2bfloat16(gv)), limit);
+        const float uf = fmaxf(fminf(__bfloat162float(__float2bfloat16(uv)), limit), -limit);
+        const float sl = __bfloat162float(__float2bfloat16(gf / (1.0f + expf(-gf))));
+        return __float2bfloat16(sl * uf);
+      };
+#pragma unroll
+      for (int j = 0; j < 4; j++)
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+          if (v0) o0[16 * j + 8 * h] = act(acc[0][j][2 * h], acc[1][j][2 * h]);
+          if (v1) o1[16 * j + 8 * h] = act(acc[0][j][2 * h + 1], acc[1][j][2 * h + 1]);
+        }
+    } else if constexpr (W13) {
       float* p0 = part + ((int64_t)ks * n_slots + s0) * N + t0 * 64 + g;
       float* p1 = part + ((int64_t)ks * n_slots + s1) * N + t0 * 64 + g;
 #pragma unroll
@@ -389,12 +416,13 @@ __device__ __forceinline__ void mxfp4_dec2_body(
         for (int j = 0; j < 4; j++)
 #pragma unroll
           for (int h = 0; h < 2; h++) {
-            if (v0) p0[64 * u + 16 * j + 8 * h] = acc[u][j][2 * h];
-            if (v1) p1[64 * u + 16 * j + 8 * h] = acc[u][j][2 * h + 1];
+            if (v0) p0[S_USTRIDE * u + 16 * j + 8 * h] = acc[u][j][2 * h];
+            if (v1) p1[S_USTRIDE * u + 16 * j + 8 * h] = acc[u][j][2 * h + 1];
           }
       if (fuse) {
-        const int pair = (t0 / TW) % HP;
-        if (arrive(sync + SYNC_W13 + b * HP + pair, 2 * KS)) act_pair(b, pair);
+        const int pair = PAIRED_GU ? t0 : ((t0 / TW) % HP);
+        const int need = PAIRED_GU ? KS : (2 * KS);
+        if (arrive(sync + SYNC_W13 + b * HP + pair, need)) act_pair(b, pair);
       }
     } else {
       __nv_bfloat16* o0 = out + (int64_t)s0 * N + t0 * 64 + g;
@@ -535,7 +563,7 @@ __device__ __forceinline__ void mxfp4_dec2_body(
   cp_async_wait0();
 }
 
-template <int DQ, int R, int CR, int TW, int K, int N, bool W13>
+template <int DQ, int R, int CR, int TW, int K, int N, bool W13, bool STATIC_SCHED = false, bool PAIRED_GU = false>
 __global__ void __launch_bounds__(
     WARPS * 32,
     (CR * TW <= 2) ? 7 : ((CR * TW <= 4) ? 5 : ((CR * TW <= 8) ? (DQ == 0 ? 5 : 4) : 2)))
@@ -549,9 +577,85 @@ __global__ void __launch_bounds__(
                     __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
                     bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
                     int local_E) {
-  mxfp4_dec2_body<DQ, R, CR, TW, K, N, W13>(
+  mxfp4_dec2_body<DQ, R, CR, TW, K, N, W13, STATIC_SCHED, PAIRED_GU>(
       A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
       fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+}
+
+// 3-regime GPU-side dynamic nblk-aware Split-K with zero-atomic static warp scheduling for
+// Pure TP4 NI=576 W13 small/medium M (100% CUDA-Graph safe):
+//   nblk < 28       -> KS=5 (R=64): fills 1 wave of 2520 warps on 126 SMs (M=1..5)
+//   28 <= nblk < 45 -> KS=4 (R=80): fills 1 wave without spilling (M=5..8)
+//   nblk >= 45      -> KS=2 (R=160): halves partial traffic on diverse batches
+template <int DQ, int CR, int TW, int K, int N, int T_KS5, int T_KS4>
+__global__ void __launch_bounds__(WARPS * 32, (CR * TW <= 4) ? 5 : 4)
+    mxfp4_dec2_gemm_dynks3(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+                           const int4* __restrict__ W, const uint8_t* __restrict__ S,
+                           const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
+                           const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+                           int topk, int n_slots, int* __restrict__ ctr, int* __restrict__ ctr_other,
+                           float* __restrict__ part, __nv_bfloat16* __restrict__ out, int fuse,
+                           float limit, int sum_order, int* __restrict__ sync,
+                           __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+                           bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+                           int local_E) {
+  const int nblk = ntpp[0] >> 3;
+  if (nblk < T_KS5) {
+    mxfp4_dec2_body<DQ, 64, CR, TW, K, N, true, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  } else if (nblk < T_KS4) {
+    mxfp4_dec2_body<DQ, 80, CR, TW, K, N, true, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  } else {
+    mxfp4_dec2_body<DQ, 160, CR, TW, K, N, true, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  }
+}
+
+template <int DQ, int CR, int TW, int KK, int NN, int T_KS5, int T_KS4>
+static int64_t launch_dynks3(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
+                             at::Tensor const& sorted, at::Tensor const& eids,
+                             at::Tensor const& ntpp, at::Tensor const& topk_w, int64_t topk,
+                             int64_t n_slots, int cap, bool fuse, double limit, int64_t sum_order,
+                             at::Tensor& ctr, at::Tensor& sync, at::Tensor& out, at::Tensor& aux,
+                             const void* topk_ids_raw, bool topk_i64, const int32_t* expert_map_ptr,
+                             int64_t global_E) {
+  TORCH_CHECK(fuse, "dynks3 w13 requires fuse=true");
+  constexpr int T = WARPS * 32;
+  constexpr int SMEM = WARPS * 2 * CR * TW * 32 * (int)sizeof(int4);
+  constexpr int TG = NN / 64 / TW;
+  auto kern = mxfp4_dec2_gemm_dynks3<DQ, CR, TW, KK, NN, T_KS5, T_KS4>;
+  static const int occ = [&] {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    int n = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, T, SMEM);
+    return n > 0 ? n : 1;
+  }();
+  const int64_t max_blk = std::min<int64_t>(sorted.numel() / 8, n_slots);
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= 5 * n_slots * NN,
+              "w13 dynks3 partial buffer");
+  TORCH_CHECK(aux.scalar_type() == at::kBFloat16 && aux.is_contiguous() &&
+                  aux.numel() >= n_slots * (NN / 2) &&
+                  sync.numel() >= SYNC_W13 + max_blk * (TG / 2),
+              "fused act: h [n_slots, N/2] bf16 and sync counters");
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t max_items = max_blk * 5 * TG;
+  const int64_t grid = std::min<int64_t>(
+      (max_items + WARPS - 1) / WARPS,
+      (int64_t)sms * (cap > 0 ? std::min(cap, occ) : occ));
+  if (grid > 0)
+    kern<<<grid, T, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+        (const __nv_bfloat16*)a.data_ptr(), a.stride(0), (const int4*)w.data_ptr(),
+        (const uint8_t*)s.data_ptr(), sorted.data_ptr<int32_t>(), eids.data_ptr<int32_t>(),
+        ntpp.data_ptr<int32_t>(), topk_w.numel() > 0 ? topk_w.data_ptr<float>() : nullptr,
+        (int)topk, (int)n_slots, ctr.data_ptr<int32_t>(), ctr.data_ptr<int32_t>() + 1,
+        out.data_ptr<float>(), nullptr, 1, (float)limit, (int)sum_order,
+        sync.data_ptr<int32_t>(), (__nv_bfloat16*)aux.data_ptr(), topk_ids_raw, topk_i64,
+        expert_map_ptr, (int)global_E, (int)w.size(0));
+  return 5;
 }
 
 // GPU-side dynamic nblk-aware Split-K for Pure TP4 NI=576 W13 (100% CUDA-Graph safe):
@@ -624,7 +728,83 @@ static int64_t launch_dynks(at::Tensor const& a, at::Tensor const& w, at::Tensor
   return 4;
 }
 
-template <int DQ, int R, int CR, int TW, int KK, int NN, bool W13>
+// 3-regime GPU-side dynamic nblk-aware Split-K + PAIRED_GU KS=1 for Pure TP4 NI=576 W13 high-M:
+//   nblk >= T_PGU       -> PAIRED_GU KS=1 (R=320, CR=4, TW=2, static, 0 partials, 0 sync atomics!)
+//   T_KS2 <= nblk < PGU -> KS=2 (R=160, CR=4, TW=1, static)
+//   nblk < T_KS2        -> KS=4 (R=80, CR=4, TW=1, static)
+template <int DQ, int K, int N, int T_KS2, int T_PGU>
+__global__ void __launch_bounds__(WARPS * 32, 4)
+    mxfp4_dec2_gemm_dynks_pgu(const __nv_bfloat16* __restrict__ A, int64_t a_stride,
+                              const int4* __restrict__ W, const uint8_t* __restrict__ S,
+                              const int32_t* __restrict__ sorted, const int32_t* __restrict__ eids,
+                              const int32_t* __restrict__ ntpp, const float* __restrict__ topk_w,
+                              int topk, int n_slots, int* __restrict__ ctr,
+                              int* __restrict__ ctr_other, float* __restrict__ part,
+                              __nv_bfloat16* __restrict__ out, int fuse, float limit,
+                              int sum_order, int* __restrict__ sync,
+                              __nv_bfloat16* __restrict__ aux, const void* __restrict__ topk_ids_raw,
+                              bool topk_i64, const int32_t* __restrict__ expert_map, int global_E,
+                              int local_E) {
+  const int nblk = ntpp[0] >> 3;
+  if (nblk >= T_PGU) {
+    mxfp4_dec2_body<DQ, 320, 4, 2, K, N, true, true, true>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  } else if (nblk >= T_KS2) {
+    mxfp4_dec2_body<DQ, 160, 4, 1, K, N, true, true, false>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  } else {
+    mxfp4_dec2_body<DQ, 80, 4, 1, K, N, true, true, false>(
+        A, a_stride, W, S, sorted, eids, ntpp, topk_w, topk, n_slots, ctr, ctr_other, part, out,
+        fuse, limit, sum_order, sync, aux, topk_ids_raw, topk_i64, expert_map, global_E, local_E);
+  }
+}
+
+template <int DQ, int KK, int NN, int T_KS2, int T_PGU>
+static int64_t launch_dynks_pgu(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
+                                at::Tensor const& sorted, at::Tensor const& eids,
+                                at::Tensor const& ntpp, at::Tensor const& topk_w, int64_t topk,
+                                int64_t n_slots, int cap, bool fuse, double limit,
+                                int64_t sum_order, at::Tensor& ctr, at::Tensor& sync,
+                                at::Tensor& out, at::Tensor& aux, const void* topk_ids_raw,
+                                bool topk_i64, const int32_t* expert_map_ptr, int64_t global_E) {
+  TORCH_CHECK(fuse, "dynks_pgu w13 requires fuse=true");
+  constexpr int T = WARPS * 32;
+  constexpr int SMEM = WARPS * 2 * 4 * 2 * 32 * (int)sizeof(int4);  // CR=4, TW=2 (32 KB)
+  constexpr int TG = NN / 64;  // 18 tiles (TW=1) -> 9 pairs
+  auto kern = mxfp4_dec2_gemm_dynks_pgu<DQ, KK, NN, T_KS2, T_PGU>;
+  static const int occ = [&] {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+    int n = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, T, SMEM);
+    return n > 0 ? n : 1;
+  }();
+  const int64_t max_blk = std::min<int64_t>(sorted.numel() / 8, n_slots);
+  TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= 4 * n_slots * NN,
+              "w13 dynks_pgu partial buffer");
+  TORCH_CHECK(aux.scalar_type() == at::kBFloat16 && aux.is_contiguous() &&
+                  aux.numel() >= n_slots * (NN / 2) &&
+                  sync.numel() >= SYNC_W13 + max_blk * (TG / 2),
+              "fused act: h [n_slots, N/2] bf16 and sync counters");
+  const int sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  const int64_t max_items = max_blk * 4 * TG;
+  const int64_t grid = std::min<int64_t>(
+      (max_items + WARPS - 1) / WARPS,
+      (int64_t)sms * (cap > 0 ? std::min(cap, occ) : occ));
+  if (grid > 0)
+    kern<<<grid, T, SMEM, at::cuda::getCurrentCUDAStream()>>>(
+        (const __nv_bfloat16*)a.data_ptr(), a.stride(0), (const int4*)w.data_ptr(),
+        (const uint8_t*)s.data_ptr(), sorted.data_ptr<int32_t>(), eids.data_ptr<int32_t>(),
+        ntpp.data_ptr<int32_t>(), topk_w.numel() > 0 ? topk_w.data_ptr<float>() : nullptr,
+        (int)topk, (int)n_slots, ctr.data_ptr<int32_t>(), ctr.data_ptr<int32_t>() + 1,
+        out.data_ptr<float>(), nullptr, 1, (float)limit, (int)sum_order,
+        sync.data_ptr<int32_t>(), (__nv_bfloat16*)aux.data_ptr(), topk_ids_raw, topk_i64,
+        expert_map_ptr, (int)global_E, (int)w.size(0));
+  return 4;
+}
+
+template <int DQ, int R, int CR, int TW, int KK, int NN, bool W13, bool STATIC_SCHED = false, bool PAIRED_GU = false>
 static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const& s,
                       at::Tensor const& sorted, at::Tensor const& eids, at::Tensor const& ntpp,
                       at::Tensor const& topk_w, int64_t topk, int64_t n_slots, int cap,
@@ -636,7 +816,7 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
   constexpr int SMEM = WARPS * 2 * CR * TW * 32 * (int)sizeof(int4);
   constexpr int KS = KK / 16 / R;
   constexpr int TG = NN / 64 / TW;
-  auto kern = mxfp4_dec2_gemm<DQ, R, CR, TW, KK, NN, W13>;
+  auto kern = mxfp4_dec2_gemm<DQ, R, CR, TW, KK, NN, W13, STATIC_SCHED, PAIRED_GU>;
   static const int occ = [&] {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     int n = 0;
@@ -645,12 +825,14 @@ static int64_t launch(at::Tensor const& a, at::Tensor const& w, at::Tensor const
   }();
   const int64_t max_blk = std::min<int64_t>(sorted.numel() / 8, n_slots);
   if (W13) {
-    TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= KS * n_slots * NN,
-                "w13 partial buffer");
+    if constexpr (!(PAIRED_GU && KS == 1)) {
+      TORCH_CHECK(out.scalar_type() == at::kFloat && out.numel() >= KS * n_slots * NN,
+                  "w13 partial buffer");
+    }
     if (fuse)
       TORCH_CHECK(aux.scalar_type() == at::kBFloat16 && aux.is_contiguous() &&
                       aux.numel() >= n_slots * (NN / 2) &&
-                      sync.numel() >= SYNC_W13 + max_blk * (TG / 2),
+                      sync.numel() >= SYNC_W13 + max_blk * (PAIRED_GU ? TG : (TG / 2)),
                   "fused act: h [n_slots, N/2] bf16 and sync counters");
   } else {
     TORCH_CHECK(KS == 1 && out.scalar_type() == at::kBFloat16 && out.numel() >= n_slots * NN,
@@ -855,12 +1037,74 @@ int64_t dsv4_mxfp4_gemm2_ep(at::Tensor const& a, at::Tensor const& w, at::Tensor
                                                     sync, out, aux, topk_ids_raw, topk_i64,
                                                     expert_map_ptr, global_E);
   }
+  if (w13 == true && K == 5120 && N == 1152 && (cfg & 15) == 11) {
+    if (dq == 0)
+      return launch_dynks3<0, 4, 1, 5120, 1152, 28, 45>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                        n_slots, cap, fuse, limit, sum_order, ctr,
+                                                        sync, out, aux, topk_ids_raw, topk_i64,
+                                                        expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch_dynks3<3, 4, 1, 5120, 1152, 28, 45>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                        n_slots, cap, fuse, limit, sum_order, ctr,
+                                                        sync, out, aux, topk_ids_raw, topk_i64,
+                                                        expert_map_ptr, global_E);
+  }
   DSV4_CASE2(false, 576, 5120, 36, 0, 4, 1)
   DSV4_CASE2(false, 576, 5120, 36, 1, 4, 2)
   DSV4_CASE2(false, 576, 5120, 36, 2, 6, 1)
   DSV4_CASE2(false, 576, 5120, 36, 3, 2, 1)
   DSV4_CASE2(false, 576, 5120, 36, 4, 12, 1)
   DSV4_CASE2(false, 576, 5120, 36, 5, 6, 2)
+  if (w13 == true && K == 5120 && N == 1152 && (cfg & 15) == 13) {
+    if (dq == 0)
+      return launch<0, 320, 4, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 1)
+      return launch<1, 320, 4, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 2)
+      return launch<2, 320, 4, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch<3, 320, 4, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+  }
+  if (w13 == true && K == 5120 && N == 1152 && (cfg & 15) == 14) {
+    if (dq == 0)
+      return launch<0, 320, 2, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 1)
+      return launch<1, 320, 2, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 2)
+      return launch<2, 320, 2, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch<3, 320, 2, 2, 5120, 1152, true, true, true>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+  }
+  if (w13 == true && K == 5120 && N == 1152 && (cfg & 15) == 15) {
+    if (dq == 0)
+      return launch_dynks_pgu<0, 5120, 1152, 56, 56>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch_dynks_pgu<3, 5120, 1152, 56, 56>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+  }
+  if (w13 == false && K == 576 && N == 5120 && (cfg & 15) == 12) {
+    if (dq == 0)
+      return launch<0, 36, 4, 1, 576, 5120, false, true, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch<3, 36, 4, 1, 576, 5120, false, true, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+  }
+  if (w13 == false && K == 576 && N == 5120 && (cfg & 15) == 13) {
+    if (dq == 0)
+      return launch<0, 36, 6, 1, 576, 5120, false, true, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch<3, 36, 6, 1, 576, 5120, false, true, false>(a, w, s, sorted, eids, ntpp, topk_w, topk, n_slots, cap, fuse, limit, sum_order, ctr, sync, out, aux, topk_ids_raw, topk_i64, expert_map_ptr, global_E);
+  }
+  if (w13 == false && K == 576 && N == 5120 && (cfg & 15) == 11) {
+    if (dq == 0)
+      return launch<0, 36, 4, 2, 576, 5120, false, true>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                         n_slots, cap, fuse, limit, sum_order, ctr,
+                                                         sync, out, aux, topk_ids_raw, topk_i64,
+                                                         expert_map_ptr, global_E);
+    if (dq == 3)
+      return launch<3, 36, 4, 2, 576, 5120, false, true>(a, w, s, sorted, eids, ntpp, topk_w, topk,
+                                                         n_slots, cap, fuse, limit, sum_order, ctr,
+                                                         sync, out, aux, topk_ids_raw, topk_i64,
+                                                         expert_map_ptr, global_E);
+  }
   // DeepSeek-V4-Flash experts: hidden 4096, intermediate 2048 (R = 64 / 128)
   DSV4_CASE2(true, 4096, 4096, 64, 0, 4, 1)
   DSV4_CASE2(true, 4096, 4096, 64, 1, 4, 2)
