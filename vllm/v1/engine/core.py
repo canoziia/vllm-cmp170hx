@@ -816,10 +816,12 @@ class EngineCore:
                     )
                 else:
                     # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                    # from the prior step. Persist it on the engine: the next call to
+                    # this method must consume it, even if this batch never entered the
+                    # queue (see the empty-queue backfill below).
+                    self.deferred_step = (scheduler_output, exec_future)
 
-            if not deferred_scheduler_output:
+            if self.deferred_step is None:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if len(batch_queue) < self.batch_queue_size and (
@@ -889,6 +891,7 @@ class EngineCore:
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
+            self.deferred_step = None
             # Update the deferred scheduler output before computing its grammar
             # bitmask.
             if getattr(
